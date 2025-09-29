@@ -1,0 +1,21 @@
+[package]
+name = "genmeta-ssh3-proto"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+bytes = { workspace = true }
+dashmap = { workspace = true }
+derive_more = { workspace = true, features = ["display", "debug", "from"] }
+either = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+serde = { workspace = true }
+serde_cbor = { workspace = true }
+pin-project-lite = { workspace = true }
+snafu = { workspace = true }
+socks5-proto = { workspace = true }
+socket2 = { workspace = true }
+tokio = { workspace = true, features = ["net", "macros", "time"] }
+tokio-util = { workspace = true, features = ["codec", "io", "rt"] }
+tracing = { workspace = true }

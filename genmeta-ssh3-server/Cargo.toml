@@ -1,0 +1,29 @@
+[package]
+name = "genmeta-ssh3-server"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+bytes = { workspace = true }
+derive_more = { workspace = true, features = ["deref"] }
+futures = { workspace = true }
+http = { workspace = true }
+proto = { workspace = true }
+snafu = { workspace = true }
+nix = { workspace = true, features = [
+    "fs",
+    "ioctl",
+    "process",
+    "signal",
+    "socket",
+    "term",
+    "user",
+] }
+pam-client = { workspace = true, optional = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+
+[features]
+default = ["pam"]
+pam = ["dep:pam-client"]

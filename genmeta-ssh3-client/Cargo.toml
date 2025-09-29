@@ -1,0 +1,16 @@
+[package]
+name = "genmeta-ssh3-client"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+bytes = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }
+peg = { workspace = true }
+proto = { workspace = true }
+rpassword = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true, features = ["signal", "net", "macros", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
