@@ -113,14 +113,24 @@ async fn update_winsize(mut message_sender: impl Sink<ClientSessionMessage> + Un
         tracing::debug!(target: "session", "Window size updates listener not available on this platform, using polling pre 10ms fallback");
         use tokio::time::{Duration, Interval, interval};
 
+        let window_size_eq = |x: &terminal::WindowSize, y: &terminal::WindowSize| {
+            x.columns == y.columns && x.height == y.height && x.rows == y.rows && x.width == y.width
+        };
+        let window_size_clone = |x: &terminal::WindowSize| terminal::WindowSize {
+            rows: x.rows,
+            columns: x.columns,
+            width: x.width,
+            height: x.height,
+        };
+
         let interval = interval(Duration::from_millis(10));
         let initial_size = terminal::window_size().context(GetWindowSizeSnafu)?;
-        let fold = |(mut interval, current_size): (Interval, _)| async move {
+        let fold = move |(mut interval, current_size): (Interval, _)| async move {
             loop {
                 _ = interval.tick().await;
-                match terminal::size().context(GetWindowSizeSnafu) {
-                    Ok(new_size) if new_size != current_size => {
-                        return Some((Ok(new_size), (interval, new_size)));
+                match terminal::window_size().context(GetWindowSizeSnafu) {
+                    Ok(new_size) if window_size_eq(&new_size, &current_size) => {
+                        return Some((Ok(window_size_clone(&new_size)), (interval, new_size)));
                     }
                     Err(error) => {
                         return Some((Err(error), (interval, current_size)));
