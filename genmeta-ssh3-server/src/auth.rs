@@ -90,10 +90,20 @@ impl UserContext {
     ) -> Result<Self, Error> {
         #[cfg(feature = "pam")]
         {
-            let pam = (|| {
-                pam::skip_verify(&user.name, clientname)?.whatever_context("Cert login failed")
-            })()
-            .context(PamSnafu)?;
+            use snafu::Report;
+            let pam = match pam::skip_verify(clientname, &user.name).context(PamSnafu)? {
+                Ok(pam) => pam,
+                Err(error) => {
+                    use snafu::{FromString, IntoError};
+
+                    tracing::info!(target: "pam", "Verify password failed: {}", Report::from_error(&error));
+                    _ = sender.cancel(format!("Login failed: {error}")).await;
+                    return Err(PamSnafu {}.into_error(Whatever::with_source(
+                        Box::new(error),
+                        "Cert login Failed".to_owned(),
+                    )));
+                }
+            };
             accept(sender).await?;
             Ok(Self { user, pam })
         }

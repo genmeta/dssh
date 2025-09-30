@@ -130,7 +130,6 @@ where
             tracing::error!(target: "sshd", "Failed to relay data between gateway and sshd: {}", Report::from_error(&error));
         }
         _ = sshd_stream.shutdown().await;
-        drop(sshd_stream);
         // 等待一秒钟时间正常退出，否则自动触发SIGKILL（KillOnDrop）
         tokio::time::sleep(Duration::from_secs(1)).await;
     };
@@ -144,6 +143,8 @@ where
         _ = relay => {},
         _ = watch => {},
     }
+
+    _ = sshd_stream.shutdown().await;
 
     Ok(())
 }
