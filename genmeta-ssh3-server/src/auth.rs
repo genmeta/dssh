@@ -59,7 +59,7 @@ pub struct UserContext {
     #[deref]
     pub user: unistd::User,
     #[cfg(feature = "pam")]
-    pub pam: pam_client::Context<pam::ConversationHandler>,
+    pub pam: pam_client2::Context<pam::ConversationHandler>,
 }
 
 impl UserContext {
@@ -111,7 +111,7 @@ pub async fn auth_password(
     clientname: &str,
     sender: &mut FramedSender<ServerAuthMessage>,
     recver: &mut FramedRecver<ClientAuthMessage>,
-) -> Result<pam_client::Context<pam::ConversationHandler>, Error> {
+) -> Result<pam_client2::Context<pam::ConversationHandler>, Error> {
     let base_prompt = format!("{username}@{localhost}'s password: ");
     sender
         .send(ServerAuthMessage::Password {

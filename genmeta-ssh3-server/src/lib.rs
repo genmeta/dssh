@@ -245,7 +245,7 @@ pub async fn sshd_main(
             .whatever_context(format!("Failed to set PAM item RHOST to {clientname}"))?;
         tracing::debug!(target: "sshd", "pam_open_session()");
         user.pam
-            .open_session(pam_client::Flag::NONE)
+            .open_session(pam_client2::Flag::NONE)
             .whatever_context("Failed to open PAM session")?
             .leak()
     };

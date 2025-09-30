@@ -1,6 +1,6 @@
 use std::ffi::{CStr, CString};
 
-use pam_client::conv_null;
+use pam_client2::conv_null;
 use snafu::{Report, ResultExt};
 
 use crate::Whatever;
@@ -10,23 +10,23 @@ pub struct PasswordConversation {
     password: String,
 }
 
-impl pam_client::ConversationHandler for PasswordConversation {
-    fn prompt_echo_on(&mut self, msg: &CStr) -> Result<CString, pam_client::ErrorCode> {
+impl pam_client2::ConversationHandler for PasswordConversation {
+    fn prompt_echo_on(&mut self, msg: &CStr) -> Result<CString, pam_client2::ErrorCode> {
         tracing::debug!(target: "pam", "Request username with prompt: {}", msg.to_string_lossy());
         CString::new(self.username.as_str())
             .inspect_err(|e| {
                 tracing::error!(target: "pam", "Failed to convert username to C-Style String: {}", Report::from_error(e));
             })
-            .map_err(|_| pam_client::ErrorCode::CONV_ERR)
+            .map_err(|_| pam_client2::ErrorCode::CONV_ERR)
     }
 
-    fn prompt_echo_off(&mut self, msg: &CStr) -> Result<CString, pam_client::ErrorCode> {
+    fn prompt_echo_off(&mut self, msg: &CStr) -> Result<CString, pam_client2::ErrorCode> {
         tracing::debug!(target: "pam", "Request password with prompt: {}", msg.to_string_lossy());
         CString::new(self.password.as_str())
             .inspect_err(|e| {
                 tracing::error!(target: "pam", "Failed to convert password to C-Style String: {}", Report::from_error(e));
             })
-            .map_err(|_| pam_client::ErrorCode::CONV_ERR)
+            .map_err(|_| pam_client2::ErrorCode::CONV_ERR)
     }
 
     fn text_info(&mut self, msg: &CStr) {
@@ -43,15 +43,15 @@ pub enum ConversationHandler {
     Null(conv_null::Conversation),
 }
 
-impl pam_client::ConversationHandler for ConversationHandler {
-    fn prompt_echo_on(&mut self, msg: &CStr) -> Result<CString, pam_client::ErrorCode> {
+impl pam_client2::ConversationHandler for ConversationHandler {
+    fn prompt_echo_on(&mut self, msg: &CStr) -> Result<CString, pam_client2::ErrorCode> {
         match self {
             ConversationHandler::Password(c) => c.prompt_echo_on(msg),
             ConversationHandler::Null(c) => c.prompt_echo_on(msg),
         }
     }
 
-    fn prompt_echo_off(&mut self, msg: &CStr) -> Result<CString, pam_client::ErrorCode> {
+    fn prompt_echo_off(&mut self, msg: &CStr) -> Result<CString, pam_client2::ErrorCode> {
         match self {
             ConversationHandler::Password(c) => c.prompt_echo_off(msg),
             ConversationHandler::Null(c) => c.prompt_echo_off(msg),
@@ -72,7 +72,7 @@ impl pam_client::ConversationHandler for ConversationHandler {
         }
     }
 
-    fn radio_prompt(&mut self, prompt: &CStr) -> Result<bool, pam_client::ErrorCode> {
+    fn radio_prompt(&mut self, prompt: &CStr) -> Result<bool, pam_client2::ErrorCode> {
         match self {
             ConversationHandler::Password(c) => c.radio_prompt(prompt),
             ConversationHandler::Null(c) => c.radio_prompt(prompt),
@@ -83,7 +83,7 @@ impl pam_client::ConversationHandler for ConversationHandler {
         &mut self,
         r#type: u8,
         data: &[u8],
-    ) -> Result<(u8, Vec<u8>), pam_client::ErrorCode> {
+    ) -> Result<(u8, Vec<u8>), pam_client2::ErrorCode> {
         match self {
             ConversationHandler::Password(c) => c.binary_prompt(r#type, data),
             ConversationHandler::Null(c) => c.binary_prompt(r#type, data),
@@ -96,8 +96,8 @@ pub fn verify_password<'s>(
     client_name: &str,
     username: &'s str,
     password: &'s str,
-) -> Result<Result<pam_client::Context<ConversationHandler>, pam_client::Error>, Whatever> {
-    let mut context = pam_client::Context::new(
+) -> Result<Result<pam_client2::Context<ConversationHandler>, pam_client2::Error>, Whatever> {
+    let mut context = pam_client2::Context::new(
         "login",
         Some(username),
         ConversationHandler::Password(PasswordConversation {
@@ -109,8 +109,8 @@ pub fn verify_password<'s>(
 
     if let Err(error) = (|| {
         context.set_rhost(Some(client_name))?;
-        context.authenticate(pam_client::Flag::NONE)?;
-        context.acct_mgmt(pam_client::Flag::NONE)
+        context.authenticate(pam_client2::Flag::NONE)?;
+        context.acct_mgmt(pam_client2::Flag::NONE)
     })() {
         return Ok(Err(error));
     }
@@ -121,8 +121,8 @@ pub fn verify_password<'s>(
 pub fn skip_verify(
     client_name: &str,
     username: &str,
-) -> Result<Result<pam_client::Context<ConversationHandler>, pam_client::Error>, Whatever> {
-    let mut context = pam_client::Context::new(
+) -> Result<Result<pam_client2::Context<ConversationHandler>, pam_client2::Error>, Whatever> {
+    let mut context = pam_client2::Context::new(
         "login",
         Some(username),
         ConversationHandler::Null(conv_null::Conversation::new()),
@@ -131,7 +131,7 @@ pub fn skip_verify(
 
     if let Err(error) = (|| {
         context.set_rhost(Some(client_name))?;
-        context.acct_mgmt(pam_client::Flag::NONE)
+        context.acct_mgmt(pam_client2::Flag::NONE)
     })() {
         return Ok(Err(error));
     }

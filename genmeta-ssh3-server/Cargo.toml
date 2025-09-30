@@ -19,11 +19,11 @@ nix = { workspace = true, features = [
     "term",
     "user",
 ] }
-pam-client = { workspace = true, optional = true }
+pam-client2 = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 
 [features]
 default = ["pam"]
-pam = ["dep:pam-client"]
+pam = ["dep:pam-client2"]
