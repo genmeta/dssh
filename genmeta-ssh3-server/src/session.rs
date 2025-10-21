@@ -1,5 +1,6 @@
 use std::{
     env,
+    ffi::CString,
     os::unix::prelude::{AsFd, AsRawFd, CommandExt},
     pin::Pin,
     process::Command,
@@ -74,7 +75,7 @@ pub async fn relay<'e, I: Iterator<Item = (&'e str, &'e str)>>(
         };
     };
 
-    let command = new_command(user, cmds, envs);
+    let command = new_command(user, cmds, envs)?;
 
     Ok(match pseudo {
         true => {
@@ -92,7 +93,7 @@ pub fn new_command<'e>(
     user: &auth::UserContext,
     exec: Option<&str>,
     environments: impl Iterator<Item = (&'e str, &'e str)>,
-) -> Command {
+) -> Result<Command, Whatever> {
     let mut command = std::process::Command::new(&user.shell);
 
     const STDPATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -104,10 +105,23 @@ pub fn new_command<'e>(
     };
 
     command
-        .arg0(shell.file_name().expect("path terminates wont be `..`."))
-        .uid(user.uid.as_raw())
-        .gid(user.gid.as_raw())
         .current_dir(&user.dir)
+        .arg0(shell.file_name().expect("path terminates wont be `..`."));
+
+    unsafe {
+        let username = CString::new(user.name.clone())
+            .whatever_context("Failed to convert username to c-style string")?;
+        let gid = user.gid;
+        let uid = user.uid;
+        command.pre_exec(move || {
+            unistd::setgid(gid)?;
+            unistd::initgroups(&username, gid)?;
+            unistd::setuid(uid)?;
+            Ok(())
+        });
+    }
+
+    command
         .env_clear()
         // TODO: client environment
         .env("USER", &user.name)
@@ -144,7 +158,7 @@ pub fn new_command<'e>(
         command.args(["-c", program]);
     }
 
-    command
+    Ok(command)
 }
 
 pub fn exec_no_pty(
@@ -237,8 +251,6 @@ pub fn exec_pty(
             ))
         }
         pty::ForkptyResult::Child => {
-            // forkpty应该已经setsid了
-
             let error = command.exec();
             eprintln!("Failed to exec: {error}");
             std::process::exit(1)
