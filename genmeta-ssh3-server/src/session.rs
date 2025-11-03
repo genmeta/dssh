@@ -115,7 +115,10 @@ pub fn new_command<'e>(
         let uid = user.uid;
         command.pre_exec(move || {
             unistd::setgid(gid)?;
-            unistd::initgroups(&username, gid)?;
+            // FIX ME: 对于macos, gid_t似乎是u32，但是此函数固定接受c_int?
+            if libc::initgroups(username.as_c_str().as_ptr(), gid.as_raw() as _) != 0 {
+                return Err(io::Error::last_os_error());
+            }
             unistd::setuid(uid)?;
             Ok(())
         });
