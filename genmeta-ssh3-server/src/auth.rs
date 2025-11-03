@@ -35,11 +35,15 @@ pub enum Error {
     Pam { source: Whatever },
 }
 
-pub async fn find_user(username: &str) -> Result<unistd::User, Error> {
-    match unistd::User::from_name(username).context(CannotFoundUserSnafu)? {
-        Some(user) => Ok(user),
-        None => NotFoundSnafu.fail(),
-    }
+pub async fn find_user(
+    username: &str,
+    sender: &mut FramedSender<ServerAuthMessage>,
+) -> Result<unistd::User, Error> {
+    let Some(user) = unistd::User::from_name(username).context(CannotFoundUserSnafu)? else {
+        _ = sender.cancel(Error::NotFound {}).await;
+        return NotFoundSnafu.fail();
+    };
+    Ok(user)
 }
 
 pub async fn reject_deny(

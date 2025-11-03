@@ -103,7 +103,10 @@ where
 
     let (child, gateway) = tokio::task::spawn_blocking(move || {
         match unsafe { unistd::fork() }.map_err(io::Error::from)? {
-            unistd::ForkResult::Parent { child } => io::Result::Ok((child, gateway)),
+            unistd::ForkResult::Parent { child } => {
+                drop(sshd);
+                io::Result::Ok((child, gateway))
+            },
             unistd::ForkResult::Child => {
                 drop(gateway);
                 match sshd_main(&config, request, &final_pattern, exactly_matched, &client_name,sshd) {
@@ -145,6 +148,7 @@ where
     }
 
     _ = sshd_stream.shutdown().await;
+    _ = h3_stream.writer_mut().shutdown().await;
 
     Ok(())
 }
@@ -193,7 +197,7 @@ pub async fn sshd_main(
     let mut recver = auth_channel.recver.framed();
     let mut user: UserContext = async {
         auth::reject_deny(config, &username, &mut sender).await?;
-        let user = auth::find_user(&username).await?;
+        let user = auth::find_user(&username, &mut sender).await?;
 
         if config.ssh_login.iter().any(|auth| auth == "ssl")
             && exactly_matched
