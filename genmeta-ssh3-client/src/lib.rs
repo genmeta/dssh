@@ -69,7 +69,7 @@ pub async fn run(
         forwards
     };
 
-    let (mux, mut incomings) = mux::Mux::new(
+    let (mut mux, mut incomings) = mux::MuxContext::new(
         mux::Role::Client,
         codec::FramedRead::new(reader, cbor_codec::CborDecoder::default()),
         codec::FramedWrite::new(writer, cbor_codec::CborEncoder::default()),
@@ -207,5 +207,7 @@ pub async fn run(
         Ok(session.await.expect("Never panic")?)
     };
 
-    tokio::try_join!(recv_requests, run).map(|_| ())
+    let result = tokio::try_join!(recv_requests, run).map(|_| ());
+    mux.shutdown().await;
+    result
 }

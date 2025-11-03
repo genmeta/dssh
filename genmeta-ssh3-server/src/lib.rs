@@ -168,203 +168,216 @@ pub async fn sshd_main(
         .whatever_context("Failed to make sshd socket async")?
         .split();
 
-    let (mux, mut incomings) = mux::Mux::new(
+    let (mut mux, mut incomings) = mux::MuxContext::new(
         mux::Role::Server,
         codec::FramedRead::new(read_stream, cbor_codec::CborDecoder::default()),
         codec::FramedWrite::new(write_stream, cbor_codec::CborEncoder::default()),
     );
 
-    let localhost = request.uri().host().unwrap_or_default();
-    // THINK：Server不是.genemta.net结尾的情况?
-    let localhost = trim_suffix_once(localhost, SUFFIX).unwrap_or(localhost);
-    let path_username = request.uri().path()[final_pattern.len()..].trim_start_matches('/');
+    let main = async {
+        let localhost = request.uri().host().unwrap_or_default();
+        // THINK：Server不是.genemta.net结尾的情况?
+        let localhost = trim_suffix_once(localhost, SUFFIX).unwrap_or(localhost);
+        let path_username = request.uri().path()[final_pattern.len()..].trim_start_matches('/');
 
-    let auth_channel = incomings
-        .next()
-        .await
-        .context(auth::StreamClosedSnafu)
-        .context(AuthSnafu { username: None })?
-        .context(ReceiveMessageSnafu)?;
+        let auth_channel = incomings
+            .next()
+            .await
+            .context(auth::StreamClosedSnafu)
+            .context(AuthSnafu { username: None })?
+            .context(ReceiveMessageSnafu)?;
 
-    let messages::Request::Auth { username } = auth_channel.request else {
-        return UnexpectedRequestSnafu {
-            expect: "Auth",
-            request: auth_channel.request,
-        }
-        .fail();
-    };
-    let mut sender = auth_channel.sender.framed();
-    let mut recver = auth_channel.recver.framed();
-    let mut user: UserContext = async {
-        auth::reject_deny(config, &username, &mut sender).await?;
-        let user = auth::find_user(&username, &mut sender).await?;
-
-        if config.ssh_login.iter().any(|auth| auth == "ssl")
-            && exactly_matched
-            && path_username == username
-        {
-            return UserContext::skip_verify(user, clientname, &mut sender).await;
-        }
-
-        if config.ssh_login.iter().any(|auth| auth == "basic") {
-            return UserContext::verify_password(
-                user,
-                localhost,
-                clientname,
-                &mut sender,
-                &mut recver,
-            )
-            .await;
-        }
-
-        unreachable!("No suitable auth method found, but this should have been caught earlier");
-    }
-    .await
-    .context(AuthSnafu { username })?;
-
-    #[cfg(feature = "pam")]
-    let pam_session_token = {
-        // in openssh/auth-pam.c:
-        //
-        // #ifdef PAM_TTY_KLUDGE
-        // 	/*
-        // 	 * Some silly PAM modules (e.g. pam_time) require a TTY to operate.
-        // 	 * sshd doesn't set the tty until too late in the auth process and
-        // 	 * may not even set one (for tty-less connections)
-        // 	 */
-        // 	debug("PAM: setting PAM_TTY to \"ssh\"");
-        // 	sshpam_err = pam_set_item(sshpam_handle, PAM_TTY, "ssh");
-        // 	if (sshpam_err != PAM_SUCCESS) {
-        // 		pam_end(sshpam_handle, sshpam_err);
-        // 		sshpam_handle = NULL;
-        // 		return (-1);
-        // 	}
-        // #endif
-        tracing::debug!(target: "sshd", "pam_set_item(PAM_PTY, ssh)");
-        user.pam
-            .set_tty(Some("ssh"))
-            .whatever_context("Failed to set PAM item TTY to ssh")?;
-        tracing::debug!(target: "sshd", "pam_set_item(PAM_RHOST, {clientname})");
-        user.pam
-            .set_rhost(Some(clientname))
-            .whatever_context(format!("Failed to set PAM item RHOST to {clientname}"))?;
-        tracing::debug!(target: "sshd", "pam_open_session()");
-        user.pam
-            .open_session(pam_client2::Flag::NONE)
-            .whatever_context("Failed to open PAM session")?
-            .leak()
-    };
-
-    let mut tasks = JoinSet::new();
-    let mut handle_new_channel =
-        async |mux::NewChannel {
-                   token,
-                   request,
-                   sender,
-                   recver,
-               }: mux::NewChannel| {
-            match request.clone() {
-                messages::Request::Auth { .. } => {
-                    Err("Client send Auth request after  completed".into())
-                        .context(HandleRequestSnafu { request })
-                }
-                messages::Request::Exec {
-                    pseudo,
-                    commands,
-                    environments,
-                } => {
-                    let envs = environments.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-                    let cmds = commands.as_deref();
-                    let relay =
-                        session::relay(clientname, &user, pseudo, cmds, envs, sender, recver)
-                            .await
-                            .map_err(From::from)
-                            .context(HandleRequestSnafu { request })?;
-                    tokio::spawn(relay.in_current_span());
-                    Ok(())
-                }
-
-                messages::Request::Direct { to: local } => {
-                    let forward = forward::accept_forward(sender, recver, local.clone())
-                        .await
-                        .map_err(Into::into)
-                        .context(HandleRequestSnafu { request })?;
-                    tasks.spawn(
-                        async move {
-                            if let Err(error) = forward.await {
-                                tracing::error!(
-                                    target: "local_forward",
-                                    "Failed to forward data to `{local}`: {}",
-                                    Report::from_error(&error)
-                                );
-                            }
-                        }
-                        .in_current_span(),
-                    );
-                    Ok(())
-                }
-                messages::Request::Forward { listen, socks } => {
-                    let mux = mux.clone();
-                    let listen_result = if socks {
-                        socks::listen_remote_forward(mux, token, sender, recver, listen.clone())
-                            .await
-                            .map(Either::Left)
-                    } else {
-                        forward::listen_remote_forward(mux, token, sender, recver, listen.clone())
-                            .await
-                            .map(Either::Right)
-                    };
-
-                    let accept_forward = listen_result
-                        .map_err(Into::into)
-                        .context(HandleRequestSnafu { request })?;
-
-                    tasks.spawn(
-                        async move {
-                            if let Err(accept_error) = accept_forward.await {
-                                tracing::error!(
-                                    target: "remote_forward",
-                                    "Failed to accept incoming connection to `{listen}`: {}",
-                                    Report::from_error(&accept_error)
-                                );
-                            }
-                        }
-                        .in_current_span(),
-                    );
-                    Ok(())
-                }
-                request => UnexpectedRequestSnafu {
-                    expect: "Shell, Exec, Direct or Forward",
-                    request,
-                }
-                .fail(),
+        let messages::Request::Auth { username } = auth_channel.request else {
+            return UnexpectedRequestSnafu {
+                expect: "Auth",
+                request: auth_channel.request,
             }
+            .fail();
+        };
+        let mut sender = auth_channel.sender.framed();
+        let mut recver = auth_channel.recver.framed();
+        let mut user: UserContext = async {
+            auth::reject_deny(config, &username, &mut sender).await?;
+            let user = auth::find_user(&username, &mut sender).await?;
+
+            if config.ssh_login.iter().any(|auth| auth == "ssl")
+                && exactly_matched
+                && path_username == username
+            {
+                return UserContext::skip_verify(user, clientname, &mut sender).await;
+            }
+
+            if config.ssh_login.iter().any(|auth| auth == "basic") {
+                return UserContext::verify_password(
+                    user,
+                    localhost,
+                    clientname,
+                    &mut sender,
+                    &mut recver,
+                )
+                .await;
+            }
+
+            unreachable!("No suitable auth method found, but this should have been caught earlier");
+        }
+        .await
+        .context(AuthSnafu { username })?;
+
+        #[cfg(feature = "pam")]
+        let pam_session_token = {
+            // in openssh/auth-pam.c:
+            //
+            // #ifdef PAM_TTY_KLUDGE
+            // 	/*
+            // 	 * Some silly PAM modules (e.g. pam_time) require a TTY to operate.
+            // 	 * sshd doesn't set the tty until too late in the auth process and
+            // 	 * may not even set one (for tty-less connections)
+            // 	 */
+            // 	debug("PAM: setting PAM_TTY to \"ssh\"");
+            // 	sshpam_err = pam_set_item(sshpam_handle, PAM_TTY, "ssh");
+            // 	if (sshpam_err != PAM_SUCCESS) {
+            // 		pam_end(sshpam_handle, sshpam_err);
+            // 		sshpam_handle = NULL;
+            // 		return (-1);
+            // 	}
+            // #endif
+            tracing::debug!(target: "sshd", "pam_set_item(PAM_PTY, ssh)");
+            user.pam
+                .set_tty(Some("ssh"))
+                .whatever_context("Failed to set PAM item TTY to ssh")?;
+            tracing::debug!(target: "sshd", "pam_set_item(PAM_RHOST, {clientname})");
+            user.pam
+                .set_rhost(Some(clientname))
+                .whatever_context(format!("Failed to set PAM item RHOST to {clientname}"))?;
+            tracing::debug!(target: "sshd", "pam_open_session()");
+            user.pam
+                .open_session(pam_client2::Flag::NONE)
+                .whatever_context("Failed to open PAM session")?
+                .leak()
         };
 
-    let mut result = Ok(());
+        let mut tasks = JoinSet::new();
+        let mut handle_new_channel =
+            async |mux::NewChannel {
+                       token,
+                       request,
+                       sender,
+                       recver,
+                   }: mux::NewChannel| {
+                match request.clone() {
+                    messages::Request::Auth { .. } => {
+                        Err("Client send Auth request after  completed".into())
+                            .context(HandleRequestSnafu { request })
+                    }
+                    messages::Request::Exec {
+                        pseudo,
+                        commands,
+                        environments,
+                    } => {
+                        let envs = environments.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+                        let cmds = commands.as_deref();
+                        let relay =
+                            session::relay(clientname, &user, pseudo, cmds, envs, sender, recver)
+                                .await
+                                .map_err(From::from)
+                                .context(HandleRequestSnafu { request })?;
+                        tokio::spawn(relay.in_current_span());
+                        Ok(())
+                    }
 
-    while let Some(new_channel) = incomings
-        .next()
-        .await
-        .transpose()
-        .context(ReceiveMessageSnafu)?
-    {
-        let span =
-            tracing::info_span!(target: "sshd", "handle_new_channel", request=%new_channel.request);
-        if let Err(handle_error) = handle_new_channel(new_channel).instrument(span).await {
-            tracing::warn!(target: "sshd", "Error occurs in handling new channel, ending tasks: {}", Report::from_error(&handle_error));
-            tasks.detach_all();
-            result = Err(handle_error);
-            break;
+                    messages::Request::Direct { to: local } => {
+                        let forward = forward::accept_forward(sender, recver, local.clone())
+                            .await
+                            .map_err(Into::into)
+                            .context(HandleRequestSnafu { request })?;
+                        tasks.spawn(
+                            async move {
+                                if let Err(error) = forward.await {
+                                    tracing::error!(
+                                        target: "local_forward",
+                                        "Failed to forward data to `{local}`: {}",
+                                        Report::from_error(&error)
+                                    );
+                                }
+                            }
+                            .in_current_span(),
+                        );
+                        Ok(())
+                    }
+                    messages::Request::Forward { listen, socks } => {
+                        let mux = mux.clone();
+                        let listen_result = if socks {
+                            socks::listen_remote_forward(mux, token, sender, recver, listen.clone())
+                                .await
+                                .map(Either::Left)
+                        } else {
+                            forward::listen_remote_forward(
+                                mux,
+                                token,
+                                sender,
+                                recver,
+                                listen.clone(),
+                            )
+                            .await
+                            .map(Either::Right)
+                        };
+
+                        let accept_forward = listen_result
+                            .map_err(Into::into)
+                            .context(HandleRequestSnafu { request })?;
+
+                        tasks.spawn(
+                            async move {
+                                if let Err(accept_error) = accept_forward.await {
+                                    tracing::error!(
+                                        target: "remote_forward",
+                                        "Failed to accept incoming connection to `{listen}`: {}",
+                                        Report::from_error(&accept_error)
+                                    );
+                                }
+                            }
+                            .in_current_span(),
+                        );
+                        Ok(())
+                    }
+                    request => UnexpectedRequestSnafu {
+                        expect: "Shell, Exec, Direct or Forward",
+                        request,
+                    }
+                    .fail(),
+                }
+            };
+
+        let mut result = Ok(());
+
+        while let Some(new_channel) = incomings
+            .next()
+            .await
+            .transpose()
+            .context(ReceiveMessageSnafu)?
+        {
+            let span = tracing::info_span!(target: "sshd", "handle_new_channel", request=%new_channel.request);
+            if let Err(handle_error) = handle_new_channel(new_channel).instrument(span).await {
+                tracing::warn!(target: "sshd", "Error occurs in handling new channel, ending tasks: {}", Report::from_error(&handle_error));
+                tasks.detach_all();
+                result = Err(handle_error);
+                break;
+            }
         }
-    }
-    _ = tasks.join_all().await;
+        _ = tasks.join_all().await;
 
-    #[cfg(feature = "pam")]
-    {
-        tracing::debug!(target: "sshd", "pam_close_session()");
-        drop(user.pam.unleak_session(pam_session_token));
-    }
+        #[cfg(feature = "pam")]
+        {
+            tracing::debug!(target: "sshd", "pam_close_session()");
+            drop(user.pam.unleak_session(pam_session_token));
+        }
+        result
+    };
+
+    let result = main.await;
+    tracing::debug!(target: "sshd", "exiting...(shutdown)");
+    mux.shutdown().await;
+    tracing::debug!(target: "sshd", "exit");
     result
 }
 

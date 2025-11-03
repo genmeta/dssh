@@ -13,14 +13,15 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::{DashMap, Entry};
-use derive_more::Display;
+use derive_more::{Deref, Display};
 use futures::{Sink, SinkExt, Stream, StreamExt, channel::mpsc, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 use snafu::{Report, ResultExt, Snafu, ensure};
-use tokio::{io, time};
+use tokio::{io, sync::Notify, time};
 use tokio_util::{
     codec,
     io::{CopyToBytes, SinkWriter, StreamReader},
+    task::AbortOnDropHandle,
 };
 use tracing::Instrument;
 
@@ -75,16 +76,6 @@ pub struct Mux {
     message_sender: mpsc::Sender<Message>,
 }
 
-impl Debug for Mux {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Mux")
-            .field("token_gen", &self.token_gen)
-            .field("channels", &self.channels)
-            .field("message_sender", &"...")
-            .finish()
-    }
-}
-
 #[derive(Debug, Snafu)]
 pub enum ChannelError {
     #[snafu(display("Peer has the same role with local when routing for {token}"))]
@@ -110,75 +101,7 @@ pub enum ReceiveError<Oe: snafu::Error + 'static> {
     StreamClosed { source: Oe },
 }
 
-pub type Incomings<StE = io::Error> = mpsc::Receiver<Result<NewChannel, ReceiveError<StE>>>;
-pub type IncomingStream<'s, StE = io::Error> = BoxStream<'s, Result<NewChannel, ReceiveError<StE>>>;
-
 impl Mux {
-    pub fn new<St, StE, Si>(role: Role, mut stream: St, mut sink: Si) -> (Arc<Self>, Incomings<StE>)
-    where
-        St: Stream<Item = Result<Message, StE>> + Send + Unpin + 'static,
-        StE: snafu::Error + Send,
-        Si: Sink<Message, Error: Error> + Send + Unpin + 'static,
-    {
-        let (message_sender, mut pending_messages) = mpsc::channel::<Message>(8);
-        let mut headrbeat_sender = message_sender.clone();
-        let (mut incoming_forwarder, incomings) = mpsc::channel(8);
-
-        let this = Arc::new(Mux {
-            token_gen: AtomicU64::new(Token::new(role, 0).into_inner()),
-            channels: Arc::new(DashMap::new()),
-            message_sender,
-        });
-
-        let mux = this.clone();
-        let task = async move {
-            let recv_messages = async {
-                while let Some(item) = stream.next().await {
-                    let new_channel = match item {
-                        Ok(item) => mux.receive(item).await.context(AcceptChannelSnafu),
-                        Err(error) => Err(error).context(StreamClosedSnafu),
-                    };
-
-                    let is_err = new_channel.is_err();
-                    if let Some(new_channel) = new_channel.transpose() {
-                        _ = incoming_forwarder.send(new_channel).await;
-                    }
-                    if is_err {
-                        break;
-                    }
-                }
-                tracing::debug!(target: "mux", "Incoming stream closed");
-            };
-            let send_messages = async {
-                while let Some(message) = pending_messages.next().await {
-                    tracing::trace!(target: "mux", ?message, "Send message");
-                    if let Err(error) = sink.send(message).await {
-                        tracing::debug!(target: "mux", "Failed to send message: {}", Report::from_error(error));
-                        return;
-                    }
-                }
-            };
-            let headrbeat = async move {
-                let mut interval = time::interval(time::Duration::from_secs(5));
-                loop {
-                    interval.tick().await;
-                    _ = headrbeat_sender.send(Message::Headrbeat {}).await
-                }
-            };
-            tracing::debug!(target: "mux", "Mux receiving task started");
-            tokio::select! {
-                _ = recv_messages => {},
-                _ = send_messages => {},
-                _ = headrbeat => {},
-            }
-            _ = sink.close().await;
-            tracing::debug!(target: "mux", "Sink closed");
-        };
-
-        tokio::spawn(task.in_current_span());
-        (this, incomings)
-    }
-
     fn token(&self) -> Token {
         Token(self.token_gen.load(SeqCst))
     }
@@ -295,16 +218,124 @@ impl Mux {
         };
         Ok((token, recver, sender))
     }
+}
 
-    fn close(&self) {
-        self.message_sender.clone().close_channel();
+impl Debug for Mux {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mux")
+            .field("token_gen", &self.token_gen)
+            .field("channels", &self.channels)
+            .field("message_sender", &"...")
+            .finish()
     }
 }
 
 impl Drop for Mux {
     fn drop(&mut self) {
         self.channels.clear();
-        self.close();
+        self.message_sender.close_channel();
+    }
+}
+
+#[derive(Debug, Deref)]
+pub struct MuxContext {
+    #[deref]
+    inner: Arc<Mux>,
+    task: AbortOnDropHandle<()>,
+    shutdown: Arc<Notify>,
+}
+
+pub type Incomings<StE = io::Error> = mpsc::Receiver<Result<NewChannel, ReceiveError<StE>>>;
+pub type IncomingStream<'s, StE = io::Error> = BoxStream<'s, Result<NewChannel, ReceiveError<StE>>>;
+
+impl MuxContext {
+    pub fn new<St, StE, Si>(role: Role, mut stream: St, mut sink: Si) -> (Self, Incomings<StE>)
+    where
+        St: Stream<Item = Result<Message, StE>> + Send + Unpin + 'static,
+        StE: snafu::Error + Send,
+        Si: Sink<Message, Error: Error> + Send + Unpin + 'static,
+    {
+        let (message_sender, mut pending_messages) = mpsc::channel::<Message>(8);
+        let mut headrbeat_sender = message_sender.clone();
+        let (mut incoming_forwarder, incomings) = mpsc::channel(8);
+        let shutdown = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = (shutdown.clone(), shutdown);
+
+        let this = Arc::new(Mux {
+            token_gen: AtomicU64::new(Token::new(role, 0).into_inner()),
+            channels: Arc::new(DashMap::new()),
+            message_sender,
+        });
+
+        let mux = this.clone();
+        let task = async move {
+            let recv_messages = async {
+                while let Some(item) = stream.next().await {
+                    let new_channel = match item {
+                        Ok(item) => mux.receive(item).await.context(AcceptChannelSnafu),
+                        Err(error) => Err(error).context(StreamClosedSnafu),
+                    };
+
+                    let is_err = new_channel.is_err();
+                    if let Some(new_channel) = new_channel.transpose() {
+                        _ = incoming_forwarder.send(new_channel).await;
+                    }
+                    if is_err {
+                        break;
+                    }
+                }
+                tracing::debug!(target: "mux", "Incoming stream closed");
+            };
+            let send_messages = async {
+                while let Some(message) = pending_messages.next().await {
+                    tracing::trace!(target: "mux", ?message, "Send message");
+                    if let Err(error) = sink.send(message).await {
+                        tracing::debug!(target: "mux", "Failed to send message: {}", Report::from_error(error));
+                        return;
+                    }
+                }
+            };
+            let headrbeat = async move {
+                let mut interval = time::interval(time::Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    _ = headrbeat_sender.send(Message::Headrbeat {}).await
+                }
+            };
+            tracing::debug!(target: "mux", "Mux receiving task started");
+            tokio::select! {
+                _ = recv_messages => {},
+                _ = send_messages => {},
+                _ = headrbeat => {},
+                _ = shutdown_rx.notified() => {
+                    tracing::debug!(target: "mux", "Mux shutdown notified");
+                    while let Ok(Some(pending_message)) = pending_messages.try_next() {
+                        _ = sink.send(pending_message).await;
+                    }
+                }
+            }
+            _ = sink.close().await;
+            tracing::debug!(target: "mux", "Sink closed");
+        };
+
+        let task = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
+        (
+            MuxContext {
+                inner: this,
+                task,
+                shutdown: shutdown_tx,
+            },
+            incomings,
+        )
+    }
+
+    pub fn mux(&self) -> &Arc<Mux> {
+        &self.inner
+    }
+
+    pub async fn shutdown(&mut self) {
+        self.shutdown.notify_waiters();
+        _ = (&mut self.task).await;
     }
 }
 
@@ -317,7 +348,7 @@ pub struct NewChannel {
 }
 
 impl NewChannel {
-    pub async fn relay(mut self, slave: Arc<Mux>) -> io::Result<()> {
+    pub async fn relay(mut self, slave: Arc<MuxContext>) -> io::Result<()> {
         let (slave_token, slave_recver, mut slave_sender) = slave
             .request(self.request)
             .await
