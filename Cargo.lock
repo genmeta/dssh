@@ -618,6 +618,7 @@ dependencies = [
  "futures",
  "genmeta-ssh3-proto",
  "h3x",
+ "http",
  "remoc",
  "tokio",
  "tracing",
