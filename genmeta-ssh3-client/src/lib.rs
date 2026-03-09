@@ -4,6 +4,8 @@
 //! using Extended CONNECT with `:protocol=ssh3`. Currently supports
 //! Basic (username/password) authentication only.
 
+pub mod forward;
+pub mod session;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use h3x::client::{Request, Response};
