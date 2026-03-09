@@ -1,7 +1,6 @@
 //! SSH3 wire format codec — CBOR message encoding/decoding with h3x-style newtypes.
 //!
-//! Implements the SSH3 channel stream header and CBOR message serialization
-//! per RFC Section 4.1.1 and Section 4.1.4.
+//! Wire format per RFC Section 4.1.1 and Section 4.1.4.
 
 use std::fmt;
 
@@ -9,32 +8,18 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// SSH3 signal value for channel streams (RFC Section 4.1.1).
-///
-/// Each channel stream begins with this magic value encoded as a QUIC varint.
 pub const SIGNAL_VALUE: u32 = 0xaf3627e6;
 
-// ---------------------------------------------------------------------------
-// Newtypes
-// ---------------------------------------------------------------------------
-
 /// SSH3 conversation identifier — the QUIC stream ID of the CONNECT request.
-///
-/// Uniquely identifies an SSH3 session within a QUIC connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConversationId(u64);
 
 impl ConversationId {
-    /// Create a new `ConversationId` from a raw `u64`.
     pub const fn new(id: u64) -> Self {
         Self(id)
     }
 
-    /// Extract the inner `u64` value.
     pub const fn into_inner(self) -> u64 {
         self.0
     }
@@ -47,19 +32,14 @@ impl fmt::Display for ConversationId {
 }
 
 /// SSH3 channel identifier — unique within a conversation.
-///
-/// Identifies a single logical channel (e.g., a shell session, port forward)
-/// within an SSH3 conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelId(u32);
 
 impl ChannelId {
-    /// Create a new `ChannelId` from a raw `u32`.
     pub const fn new(id: u32) -> Self {
         Self(id)
     }
 
-    /// Extract the inner `u32` value.
     pub const fn into_inner(self) -> u32 {
         self.0
     }
@@ -71,45 +51,27 @@ impl fmt::Display for ChannelId {
     }
 }
 
-/// SSH3 message type discriminator.
-///
-/// In the SSH3 RFC, message types are encoded as strings (e.g., `"exit-status"`),
-/// but we also keep a numeric discriminator for efficient dispatch in the
-/// connection protocol layer (following RFC4254 numbering).
+/// SSH3 message type discriminator (RFC4254 numbering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MessageType(u8);
 
 impl MessageType {
-    // Channel-related message type constants (RFC4254 Section 5)
-    /// SSH_MSG_CHANNEL_OPEN (RFC4254 §5.1)
     pub const CHANNEL_OPEN: Self = Self(90);
-    /// SSH_MSG_CHANNEL_OPEN_CONFIRMATION (RFC4254 §5.1)
     pub const CHANNEL_OPEN_CONFIRMATION: Self = Self(91);
-    /// SSH_MSG_CHANNEL_OPEN_FAILURE (RFC4254 §5.1)
     pub const CHANNEL_OPEN_FAILURE: Self = Self(92);
-    /// SSH_MSG_CHANNEL_WINDOW_ADJUST (RFC4254 §5.2)
     pub const CHANNEL_WINDOW_ADJUST: Self = Self(93);
-    /// SSH_MSG_CHANNEL_DATA (RFC4254 §5.2)
     pub const CHANNEL_DATA: Self = Self(94);
-    /// SSH_MSG_CHANNEL_EXTENDED_DATA (RFC4254 §5.2)
     pub const CHANNEL_EXTENDED_DATA: Self = Self(95);
-    /// SSH_MSG_CHANNEL_EOF (RFC4254 §5.3)
     pub const CHANNEL_EOF: Self = Self(96);
-    /// SSH_MSG_CHANNEL_CLOSE (RFC4254 §5.3)
     pub const CHANNEL_CLOSE: Self = Self(97);
-    /// SSH_MSG_CHANNEL_REQUEST (RFC4254 §5.4)
     pub const CHANNEL_REQUEST: Self = Self(98);
-    /// SSH_MSG_CHANNEL_SUCCESS (RFC4254 §5.4)
     pub const CHANNEL_SUCCESS: Self = Self(99);
-    /// SSH_MSG_CHANNEL_FAILURE (RFC4254 §5.4)
     pub const CHANNEL_FAILURE: Self = Self(100);
 
-    /// Create a `MessageType` from a raw `u8`.
     pub const fn new(val: u8) -> Self {
         Self(val)
     }
 
-    /// Extract the inner `u8` value.
     pub const fn into_inner(self) -> u8 {
         self.0
     }
@@ -135,35 +97,24 @@ impl fmt::Display for MessageType {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Channel stream header
-// ---------------------------------------------------------------------------
-
 /// Header sent at the beginning of each channel stream (RFC Section 4.1.1).
 ///
-/// Wire format (all fields as QUIC variable-length integers):
+/// Wire format:
 /// ```text
 /// Signal Value (varint) = 0xaf3627e6
 /// Conversation ID (varint)
 /// Channel Type Length (varint)
-/// Channel Type (UTF-8 string, variable length)
+/// Channel Type (UTF-8 string)
 /// Maximum Message Size (varint)
 /// ```
-///
-/// After this header, the stream carries a sequence of independent CBOR values
-/// (SSH messages).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelStreamHeader {
-    /// The conversation this channel belongs to.
     pub conversation_id: ConversationId,
-    /// Channel type string (e.g., `"session"`, `"direct-tcpip"`).
     pub channel_type: String,
-    /// Maximum size of a single SSH message in bytes.
     pub max_message_size: u64,
 }
 
 impl ChannelStreamHeader {
-    /// Create a new channel stream header.
     pub fn new(
         conversation_id: ConversationId,
         channel_type: String,
@@ -176,33 +127,25 @@ impl ChannelStreamHeader {
         }
     }
 
-    /// Encode the channel stream header into a byte buffer using QUIC varints.
-    ///
-    /// This writes synchronously to a `Vec<u8>` using the h3x `VarInt` encoding
-    /// logic. For async stream writing, see the `Encode` impl on async writers.
     pub fn encode_to_vec(&self) -> Result<Vec<u8>, ChannelHeaderEncodeError> {
         use h3x::varint::VarInt;
 
         let mut buf = Vec::new();
 
-        // Signal value
         let signal = VarInt::from_u64(SIGNAL_VALUE as u64)
             .map_err(|_| ChannelHeaderEncodeError::VarIntOverflow)?;
         encode_varint_sync(signal, &mut buf);
 
-        // Conversation ID
         let conv = VarInt::from_u64(self.conversation_id.into_inner())
             .map_err(|_| ChannelHeaderEncodeError::VarIntOverflow)?;
         encode_varint_sync(conv, &mut buf);
 
-        // Channel type length + channel type bytes
         let ct_bytes = self.channel_type.as_bytes();
         let ct_len = VarInt::from_u64(ct_bytes.len() as u64)
             .map_err(|_| ChannelHeaderEncodeError::VarIntOverflow)?;
         encode_varint_sync(ct_len, &mut buf);
         buf.extend_from_slice(ct_bytes);
 
-        // Maximum message size
         let max_msg = VarInt::from_u64(self.max_message_size)
             .map_err(|_| ChannelHeaderEncodeError::VarIntOverflow)?;
         encode_varint_sync(max_msg, &mut buf);
@@ -210,13 +153,9 @@ impl ChannelStreamHeader {
         Ok(buf)
     }
 
-    /// Decode a channel stream header from a byte slice.
-    ///
-    /// Returns the header and the number of bytes consumed.
     pub fn decode_from_slice(data: &[u8]) -> Result<(Self, usize), ChannelHeaderDecodeError> {
         let mut offset = 0;
 
-        // Signal value
         let (signal, n) =
             decode_varint_sync(&data[offset..]).ok_or(ChannelHeaderDecodeError::Incomplete)?;
         offset += n;
@@ -226,18 +165,15 @@ impl ChannelStreamHeader {
             });
         }
 
-        // Conversation ID
         let (conv_id, n) =
             decode_varint_sync(&data[offset..]).ok_or(ChannelHeaderDecodeError::Incomplete)?;
         offset += n;
 
-        // Channel type length
         let (ct_len, n) =
             decode_varint_sync(&data[offset..]).ok_or(ChannelHeaderDecodeError::Incomplete)?;
         offset += n;
         let ct_len = ct_len.into_inner() as usize;
 
-        // Channel type bytes
         if data.len() < offset + ct_len {
             return Err(ChannelHeaderDecodeError::Incomplete);
         }
@@ -246,7 +182,6 @@ impl ChannelStreamHeader {
             .to_string();
         offset += ct_len;
 
-        // Maximum message size
         let (max_msg, n) =
             decode_varint_sync(&data[offset..]).ok_or(ChannelHeaderDecodeError::Incomplete)?;
         offset += n;
@@ -261,9 +196,7 @@ impl ChannelStreamHeader {
     }
 }
 
-/// Synchronously encode a QUIC VarInt to a buffer.
-///
-/// Mirrors the h3x async `Encode<VarInt>` logic but writes to a `Vec<u8>`.
+/// Sync VarInt encode — mirrors h3x async `Encode<VarInt>` for in-memory use.
 fn encode_varint_sync(vi: h3x::varint::VarInt, buf: &mut Vec<u8>) {
     let x = vi.into_inner();
     if x < 1u64 << 6 {
@@ -282,10 +215,7 @@ fn encode_varint_sync(vi: h3x::varint::VarInt, buf: &mut Vec<u8>) {
     }
 }
 
-/// Synchronously decode a QUIC VarInt from a byte slice.
-///
-/// Returns the decoded VarInt and the number of bytes consumed, or `None` if
-/// the slice is too short.
+/// Sync VarInt decode — returns `(VarInt, bytes_consumed)` or `None` on underflow.
 fn decode_varint_sync(data: &[u8]) -> Option<(h3x::varint::VarInt, usize)> {
     if data.is_empty() {
         return None;
@@ -299,18 +229,13 @@ fn decode_varint_sync(data: &[u8]) -> Option<(h3x::varint::VarInt, usize)> {
     buf[0] = first & 0b0011_1111;
     buf[1..len].copy_from_slice(&data[1..len]);
     let value = u64::from_be_bytes(buf) >> (8 * (8 - len));
-    // Safety: value fits in a VarInt since it was encoded as one
+    // SAFETY: value was decoded from a valid varint encoding, so it fits in VarInt range
     Some((
         unsafe { h3x::varint::VarInt::from_u64_unchecked(value) },
         len,
     ))
 }
 
-// ---------------------------------------------------------------------------
-// CBOR encode/decode helpers
-// ---------------------------------------------------------------------------
-
-/// Encode a serializable value to CBOR bytes using `ciborium`.
 pub fn cbor_encode<T: Serialize>(value: &T) -> Result<Bytes, CborEncodeError> {
     let mut buf = Vec::new();
     ciborium::into_writer(value, &mut buf).map_err(|e| CborEncodeError::Ciborium {
@@ -319,71 +244,49 @@ pub fn cbor_encode<T: Serialize>(value: &T) -> Result<Bytes, CborEncodeError> {
     Ok(Bytes::from(buf))
 }
 
-/// Decode a CBOR value from a byte slice using `ciborium`.
 pub fn cbor_decode<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T, CborDecodeError> {
     ciborium::from_reader(data).map_err(|e| CborDecodeError::Ciborium {
         message: e.to_string(),
     })
 }
 
-// ---------------------------------------------------------------------------
-// Error types
-// ---------------------------------------------------------------------------
-
-/// Errors when encoding a value to CBOR.
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[snafu(visibility(pub(crate)), module)]
 pub enum CborEncodeError {
-    /// ciborium serialization failed.
     #[snafu(display("CBOR encoding failed: {message}"))]
     Ciborium { message: String },
 }
 
-/// Errors when decoding a value from CBOR.
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[snafu(visibility(pub(crate)), module)]
 pub enum CborDecodeError {
-    /// ciborium deserialization failed.
     #[snafu(display("CBOR decoding failed: {message}"))]
     Ciborium { message: String },
-    /// Not enough data to decode a complete CBOR value.
     #[snafu(display("unexpected end of input"))]
     Incomplete,
 }
 
-/// Errors when encoding a channel stream header.
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[snafu(visibility(pub(crate)), module)]
 pub enum ChannelHeaderEncodeError {
-    /// A field value exceeds the QUIC VarInt maximum (2^62 - 1).
     #[snafu(display("value overflows QUIC VarInt range"))]
     VarIntOverflow,
 }
 
-/// Errors when decoding a channel stream header.
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[snafu(visibility(pub(crate)), module)]
 pub enum ChannelHeaderDecodeError {
-    /// Not enough bytes to decode the header.
     #[snafu(display("unexpected end of input"))]
     Incomplete,
-    /// The signal value does not match the expected SSH3 magic.
     #[snafu(display("invalid signal value: expected {:#x}, got {got:#x}", SIGNAL_VALUE))]
     InvalidSignal { got: u64 },
-    /// The channel type is not valid UTF-8.
     #[snafu(display("channel type is not valid UTF-8"))]
     InvalidUtf8,
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- Newtype construction & Display -----------------------------------------
 
     #[test]
     fn conversation_id_new_and_inner() {
@@ -440,8 +343,6 @@ mod tests {
         assert_eq!(SIGNAL_VALUE, 0xaf3627e6);
     }
 
-    // -- CBOR roundtrip tests ---------------------------------------------------
-
     #[test]
     fn conversation_id_cbor_roundtrip() {
         let id = ConversationId::new(42);
@@ -490,63 +391,41 @@ mod tests {
         assert_eq!(id, decoded);
     }
 
-    // -- CBOR hex dump tests ---------------------------------------------------
-
     #[test]
-    fn cbor_encode_conversation_id_hex() {
-        // ConversationId is a newtype struct wrapping u64.
-        // ciborium encodes newtype structs transparently, so
-        // ConversationId(0) → CBOR unsigned int 0 → 0x00
-        let id = ConversationId::new(0);
-        let bytes = cbor_encode(&id).unwrap();
-        assert_eq!(
-            &bytes[..],
-            &[0x00],
-            "ConversationId(0) should encode as CBOR uint 0"
-        );
-
-        // ConversationId(23) → CBOR unsigned int 23 → 0x17
-        let id = ConversationId::new(23);
-        let bytes = cbor_encode(&id).unwrap();
-        assert_eq!(
-            &bytes[..],
-            &[0x17],
-            "ConversationId(23) should encode as CBOR uint 23"
-        );
-
-        // ConversationId(24) → CBOR unsigned int 24 → 0x18 0x18
-        let id = ConversationId::new(24);
-        let bytes = cbor_encode(&id).unwrap();
-        assert_eq!(
-            &bytes[..],
-            &[0x18, 0x18],
-            "ConversationId(24) should encode as CBOR uint 24"
-        );
-
-        // ConversationId(1000) → CBOR unsigned int 1000 → 0x19 0x03 0xe8
-        let id = ConversationId::new(1000);
-        let bytes = cbor_encode(&id).unwrap();
-        assert_eq!(
-            &bytes[..],
-            &[0x19, 0x03, 0xe8],
-            "ConversationId(1000) should encode as CBOR uint 1000"
-        );
+    fn cbor_conversation_id_0_encodes_as_0x00() {
+        let bytes = cbor_encode(&ConversationId::new(0)).unwrap();
+        assert_eq!(&bytes[..], &[0x00]);
     }
 
     #[test]
-    fn cbor_encode_channel_id_hex() {
-        // ChannelId(0) → CBOR uint 0 → 0x00
-        let id = ChannelId::new(0);
-        let bytes = cbor_encode(&id).unwrap();
-        assert_eq!(&bytes[..], &[0x00]);
+    fn cbor_conversation_id_23_encodes_as_0x17() {
+        let bytes = cbor_encode(&ConversationId::new(23)).unwrap();
+        assert_eq!(&bytes[..], &[0x17]);
+    }
 
-        // ChannelId(255) → CBOR uint 255 → 0x18 0xff
-        let id = ChannelId::new(255);
-        let bytes = cbor_encode(&id).unwrap();
+    #[test]
+    fn cbor_conversation_id_24_encodes_as_two_bytes() {
+        let bytes = cbor_encode(&ConversationId::new(24)).unwrap();
+        assert_eq!(&bytes[..], &[0x18, 0x18]);
+    }
+
+    #[test]
+    fn cbor_conversation_id_1000_encodes_as_three_bytes() {
+        let bytes = cbor_encode(&ConversationId::new(1000)).unwrap();
+        assert_eq!(&bytes[..], &[0x19, 0x03, 0xe8]);
+    }
+
+    #[test]
+    fn cbor_channel_id_0_encodes_as_0x00() {
+        let bytes = cbor_encode(&ChannelId::new(0)).unwrap();
+        assert_eq!(&bytes[..], &[0x00]);
+    }
+
+    #[test]
+    fn cbor_channel_id_255_encodes_as_two_bytes() {
+        let bytes = cbor_encode(&ChannelId::new(255)).unwrap();
         assert_eq!(&bytes[..], &[0x18, 0xff]);
     }
-
-    // -- Channel stream header tests -------------------------------------------
 
     #[test]
     fn channel_stream_header_roundtrip() {
@@ -562,17 +441,13 @@ mod tests {
     fn channel_stream_header_signal_value_present() {
         let header = ChannelStreamHeader::new(ConversationId::new(0), "session".to_string(), 1024);
         let encoded = header.encode_to_vec().unwrap();
-
-        // The first bytes should be the varint-encoded SIGNAL_VALUE (0xaf3627e6).
-        // 0xaf3627e6 = 2_939_602_918, which is >= 2^30 so it encodes as 8-byte varint.
         let (signal, _) = decode_varint_sync(&encoded).unwrap();
         assert_eq!(signal.into_inner(), SIGNAL_VALUE as u64);
     }
 
     #[test]
     fn channel_stream_header_invalid_signal() {
-        // Construct bytes with wrong signal value (varint 0x00 instead of 0xaf3627e6)
-        let data = [0x00]; // varint 0
+        let data = [0x00];
         let result = ChannelStreamHeader::decode_from_slice(&data);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -608,7 +483,6 @@ mod tests {
             ChannelStreamHeader::new(ConversationId::new(42), "session".to_string(), 65536);
         let encoded = header.encode_to_vec().unwrap();
 
-        // Truncate at various points — all should return Incomplete
         for truncate_at in 1..encoded.len() {
             let result = ChannelStreamHeader::decode_from_slice(&encoded[..truncate_at]);
             assert!(
@@ -617,8 +491,6 @@ mod tests {
             );
         }
     }
-
-    // -- Varint sync roundtrip tests -------------------------------------------
 
     #[test]
     fn varint_sync_roundtrip_small() {
@@ -631,8 +503,8 @@ mod tests {
     }
 
     #[test]
-    fn varint_sync_roundtrip_1byte() {
-        let vi = h3x::varint::VarInt::from_u32(63); // max 1-byte varint
+    fn varint_sync_roundtrip_1byte_max() {
+        let vi = h3x::varint::VarInt::from_u32(63);
         let mut buf = Vec::new();
         encode_varint_sync(vi, &mut buf);
         assert_eq!(buf.len(), 1);
@@ -642,8 +514,8 @@ mod tests {
     }
 
     #[test]
-    fn varint_sync_roundtrip_2byte() {
-        let vi = h3x::varint::VarInt::from_u32(64); // min 2-byte varint
+    fn varint_sync_roundtrip_2byte_min() {
+        let vi = h3x::varint::VarInt::from_u32(64);
         let mut buf = Vec::new();
         encode_varint_sync(vi, &mut buf);
         assert_eq!(buf.len(), 2);
@@ -653,8 +525,8 @@ mod tests {
     }
 
     #[test]
-    fn varint_sync_roundtrip_4byte() {
-        let vi = h3x::varint::VarInt::from_u32(16384); // min 4-byte varint
+    fn varint_sync_roundtrip_4byte_min() {
+        let vi = h3x::varint::VarInt::from_u32(16384);
         let mut buf = Vec::new();
         encode_varint_sync(vi, &mut buf);
         assert_eq!(buf.len(), 4);
@@ -664,8 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn varint_sync_roundtrip_8byte() {
-        // SIGNAL_VALUE = 0xaf3627e6 is > 2^30, needs 8-byte varint
+    fn varint_sync_roundtrip_8byte_signal_value() {
         let vi = h3x::varint::VarInt::from_u64(SIGNAL_VALUE as u64).unwrap();
         let mut buf = Vec::new();
         encode_varint_sync(vi, &mut buf);
@@ -674,8 +545,6 @@ mod tests {
         assert_eq!(decoded.into_inner(), SIGNAL_VALUE as u64);
         assert_eq!(n, 8);
     }
-
-    // -- Error case tests ------------------------------------------------------
 
     #[test]
     fn cbor_decode_invalid_data() {
