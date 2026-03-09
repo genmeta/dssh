@@ -1874,7 +1874,7 @@ Max Concurrent: 7 (Wave 5)
   - Files: `genmeta-ssh3-server/src/session/request.rs`, `genmeta-ssh3-server/src/session/mod.rs`
   - Pre-commit: `cargo test -p genmeta-ssh3-server -- session`
 
-- [ ] 17. PTY 分配 + 终端处理
+- [x] 17. PTY 分配 + 终端处理
 
   **What to do**:
   - 在 `genmeta-ssh3-server/src/session/pty.rs` 中实现：
@@ -1957,7 +1957,7 @@ Max Concurrent: 7 (Wave 5)
   - Pre-commit: `cargo test -p genmeta-ssh3-server -- session::pty`
 
 
-- [ ] 18. Direct-TCP 转发（原始字节流）
+- [x] 18. Direct-TCP 转发（原始字节流）
 
   **What to do**:
   - 在 `genmeta-ssh3-server/src/forward/direct_tcp.rs` 中实现：
@@ -2064,7 +2064,7 @@ Max Concurrent: 7 (Wave 5)
   - Pre-commit: `cargo test -p genmeta-ssh3-server -- forward`
 
 
-- [ ] 19. Reverse-TCP 转发（global request + 服务端主动开通道）
+- [x] 19. Reverse-TCP 转发（global request + 服务端主动开通道）
 
   **What to do**:
   - 在 `genmeta-ssh3-server/src/forward/reverse_tcp.rs` 中实现：
@@ -2165,7 +2165,7 @@ Max Concurrent: 7 (Wave 5)
   - Files: `genmeta-ssh3-server/src/forward/reverse_tcp.rs`, `genmeta-ssh3-server/src/forward/mod.rs`
   - Pre-commit: `cargo test -p genmeta-ssh3-server -- forward`
 
-- [ ] 20. Streamlocal (Unix Socket) 转发
+- [x] 20. Streamlocal (Unix Socket) 转发
 
   **What to do**:
   - 在 `genmeta-ssh3-server/src/forward/streamlocal.rs` 中实现：
@@ -2257,7 +2257,7 @@ Max Concurrent: 7 (Wave 5)
   - Files: `genmeta-ssh3-server/src/forward/streamlocal.rs`, `genmeta-ssh3-server/src/forward/mod.rs`
   - Pre-commit: `cargo test -p genmeta-ssh3-server -- forward`
 
-- [ ] 21. SOCKS5 代理（服务端）
+- [x] 21. SOCKS5 代理（服务端）
 
   **What to do**:
   - 在 `genmeta-ssh3-server/src/forward/socks5.rs` 中实现：

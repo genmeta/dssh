@@ -612,10 +612,20 @@ dependencies = [
 name = "genmeta-ssh3-client"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "genmeta-ssh3-proto",
+ "genmeta-ssh3-server",
+ "gm-quic",
  "h3x",
+ "http",
+ "rustls",
+ "snafu",
  "tokio",
+ "tokio-util",
+ "tower-service",
  "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]
