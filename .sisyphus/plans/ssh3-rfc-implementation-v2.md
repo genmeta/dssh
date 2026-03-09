@@ -1598,7 +1598,7 @@ Max Concurrent: 7 (Wave 5)
   - Files: `genmeta-ssh3-server/src/bin/ssh3-session.rs`
   - Pre-commit: `cargo build -p genmeta-ssh3-server --bin ssh3-session`
 
-- [ ] 14. ChildProcess 主进程管理
+- [x] 14. ChildProcess 主进程管理
 
   **What to do**:
   - 在 `genmeta-ssh3-server/src/child.rs` 中实现：

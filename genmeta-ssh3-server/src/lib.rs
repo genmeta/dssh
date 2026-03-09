@@ -6,3 +6,4 @@ pub mod version;
 pub mod handler;
 pub mod session_impl;
 pub mod child;
+pub mod channel;

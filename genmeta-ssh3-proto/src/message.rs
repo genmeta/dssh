@@ -17,7 +17,7 @@ use crate::codec::{SshBool, SshBytes, SshString};
 /// from traditional SSH — channels are opened via HTTP semantics and flow control
 /// is handled by QUIC.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SshMessage {
+pub enum SshMessage {
     /// SSH_MSG_GLOBAL_REQUEST = 80
     GlobalRequest {
         request_type: String,
