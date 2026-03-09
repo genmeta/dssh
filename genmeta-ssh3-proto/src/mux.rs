@@ -309,7 +309,7 @@ impl MuxContext {
                 _ = headrbeat => {},
                 _ = shutdown_rx.notified() => {
                     tracing::debug!(target: "mux", "Mux shutdown notified");
-                    while let Ok(Some(pending_message)) = pending_messages.try_next() {
+                    while let Ok(pending_message) = pending_messages.try_recv() {
                         _ = sink.send(pending_message).await;
                     }
                 }
