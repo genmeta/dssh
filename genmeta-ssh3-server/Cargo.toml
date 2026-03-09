@@ -25,3 +25,4 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tower-service = "0.3"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tracing-appender = "0.2"
+genmeta-ssh3-client = { path = "../genmeta-ssh3-client" }

@@ -648,6 +648,7 @@ name = "genmeta-ssh3-server"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "genmeta-ssh3-client",
  "genmeta-ssh3-proto",
  "gm-quic",
  "h3x",
