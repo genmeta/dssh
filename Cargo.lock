@@ -603,6 +603,7 @@ dependencies = [
 name = "genmeta-ssh3-proto"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "h3x",
  "snafu",
