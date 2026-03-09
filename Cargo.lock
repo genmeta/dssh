@@ -713,6 +713,7 @@ dependencies = [
  "h3x",
  "remoc",
  "serde",
+ "serde_json",
  "snafu 0.8.9",
  "tokio",
  "tracing",

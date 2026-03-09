@@ -12,3 +12,6 @@ serde = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["net", "macros", "time"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
