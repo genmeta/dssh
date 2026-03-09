@@ -13,6 +13,8 @@ use tokio::{
     sync::mpsc,
 };
 
+use crate::forward;
+
 // ---------------------------------------------------------------------------
 // Channel events dispatched via mpsc
 // ---------------------------------------------------------------------------
@@ -55,14 +57,15 @@ pub async fn handle_channel<R, W>(
     writer: W,
 ) -> io::Result<()>
 where
-    R: AsyncRead + Send + Unpin,
-    W: AsyncWrite + Send + Unpin,
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
 {
     match header.channel_type.as_str() {
         "session" => handle_session_channel(header, reader, writer).await,
-        "direct-tcpip" | "forwarded-tcpip" | "direct-streamlocal@openssh.com"
+        "direct-tcpip" => forward::direct_tcp::handle_direct_tcp(header, reader, writer).await,
+        "forwarded-tcpip" | "direct-streamlocal@openssh.com"
         | "forwarded-streamlocal@openssh.com" => {
-            // Stub dispatch points — actual forwarding implemented in Tasks 18-20.
+            // Stub dispatch points — actual forwarding implemented in Tasks 19-20.
             Ok(())
         }
         _ => {
@@ -491,7 +494,6 @@ mod tests {
     #[tokio::test]
     async fn forwarding_channel_types_stub() {
         let forwarding_types = [
-            "direct-tcpip",
             "forwarded-tcpip",
             "direct-streamlocal@openssh.com",
             "forwarded-streamlocal@openssh.com",
