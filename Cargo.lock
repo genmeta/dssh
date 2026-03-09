@@ -632,6 +632,7 @@ dependencies = [
  "gm-quic",
  "h3x",
  "http",
+ "libc",
  "rand",
  "remoc",
  "rustls",

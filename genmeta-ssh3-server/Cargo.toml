@@ -10,9 +10,11 @@ h3x = { path = "../../h3x" }
 tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "time"] }
 tracing = "0.1"
 futures = "0.3"
-remoc = { version = "0.18", default-features = false, features = ["remoc_macro", "rtc", "serde"] }
+remoc = { version = "0.18", default-features = false, features = ["remoc_macro", "rtc", "serde", "default-codec-json"] }
 http = "1"
 rand = "0.9"
+libc = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [dev-dependencies]
 gm-quic = { path = "../../gm-quic/gm-quic" }

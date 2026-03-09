@@ -1512,7 +1512,7 @@ Max Concurrent: 7 (Wave 5)
   - Files: `genmeta-ssh3-server/src/auth/pam.rs`, `genmeta-ssh3-server/src/auth/mod.rs`
   - Pre-commit: `cargo test -p genmeta-ssh3-server -- auth::pam`
 
-- [ ] 13. ssh3-session 子进程二进制
+- [x] 13. ssh3-session 子进程二进制
 
   **What to do**:
   - 在 `genmeta-ssh3-server/src/bin/ssh3-session.rs` 中实现子进程入口：
@@ -1562,10 +1562,10 @@ Max Concurrent: 7 (Wave 5)
   **File Boundary**: 只可修改 `genmeta-ssh3-server/src/bin/ssh3-session.rs`、可能添加 `genmeta-ssh3-server/src/session_impl.rs`
 
   **Acceptance Criteria**:
-  - [ ] `cargo build -p genmeta-ssh3-server --bin ssh3-session` 成功
-  - [ ] 子进程启动后通过 RTC 提供 SshSession 服务
-  - [ ] 主进程可通过 SshSessionClient 调用 run_session()
-  - [ ] 不在子进程中注册 Protocol
+  - [x] `cargo build -p genmeta-ssh3-server --bin ssh3-session` 成功
+  - [x] 子进程启动后通过 RTC 提供 SshSession 服务
+  - [x] 主进程可通过 SshSessionClient 调用 run_session()
+  - [x] 不在子进程中注册 Protocol
 
   **QA Scenarios (MANDATORY):**
   ```
