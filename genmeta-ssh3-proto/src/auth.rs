@@ -5,13 +5,13 @@ use crate::error::Ssh3Error;
 
 /// Authentication credential — only Basic auth is supported.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AuthCredential {
+pub enum AuthCredential {
     Basic { username: String, password: String },
 }
 
 /// Authentication scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthScheme {
+pub enum AuthScheme {
     Basic,
 }
 
@@ -25,7 +25,7 @@ pub(crate) enum AuthScheme {
 /// let cred = parse_authorization_header("Basic dXNlcjpwYXNz").unwrap();
 /// assert_eq!(cred, AuthCredential::Basic { username: "user".into(), password: "pass".into() });
 /// ```
-pub(crate) fn parse_authorization_header(header_value: &str) -> Result<AuthCredential, Ssh3Error> {
+pub fn parse_authorization_header(header_value: &str) -> Result<AuthCredential, Ssh3Error> {
     let (scheme, credentials) = header_value
         .split_once(' ')
         .ok_or_else(|| Ssh3Error::Auth {
