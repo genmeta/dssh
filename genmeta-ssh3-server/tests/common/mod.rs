@@ -129,3 +129,120 @@ pub fn get_server_authority<S>(servers: &H3Servers<S>) -> Authority {
         _ => unimplemented!("Only Internet addresses are supported now"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// TestChannelService — an h3x Service that handles SSH3 channels end-to-end.
+//
+// Unlike the production Ssh3ConnectHandler (which drops `_rx`), this service
+// keeps the conversation receiver alive and spawns a task to dispatch incoming
+// channel streams via `handle_channel`.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use genmeta_ssh3_server::{
+    auth,
+    channel,
+    protocol::Ssh3Protocol,
+    version,
+};
+use h3x::server::{Request, Response};
+use http::{HeaderValue, Method, StatusCode};
+
+/// A test-only HTTP handler that fully processes SSH3 channels.
+///
+/// Validates the Extended CONNECT, registers a conversation, and spawns
+/// a channel-dispatch loop that calls `handle_channel` for each stream.
+#[derive(Clone)]
+pub struct TestChannelService {
+    protocol: Arc<Ssh3Protocol>,
+    next_conversation_id: Arc<AtomicU64>,
+}
+
+impl TestChannelService {
+    pub fn new(protocol: Arc<Ssh3Protocol>) -> Self {
+        Self {
+            protocol,
+            next_conversation_id: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl h3x::server::Service for TestChannelService {
+    type Future<'s> = futures::future::BoxFuture<'s, ()>;
+
+    fn serve<'s>(
+        &self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> Self::Future<'s> {
+        let protocol = self.protocol.clone();
+        let next_id = self.next_conversation_id.clone();
+
+        Box::pin(async move {
+            let method = request.method();
+            let proto_str = request.protocol().as_ref().map(|p| p.as_str().to_owned());
+            let headers = request.headers();
+
+            // 1. Validate method is CONNECT.
+            if method != Method::CONNECT {
+                response.set_status(StatusCode::BAD_REQUEST);
+                return;
+            }
+
+            // 2. Validate :protocol is "ssh3".
+            match proto_str.as_deref() {
+                Some("ssh3") => {}
+                _ => {
+                    response.set_status(StatusCode::BAD_REQUEST);
+                    return;
+                }
+            }
+
+            // 3. Version negotiation.
+            let version = match version::negotiate_version(headers) {
+                Ok(v) => v,
+                Err(_) => {
+                    response.set_status(StatusCode::BAD_REQUEST);
+                    return;
+                }
+            };
+
+            // 4. Authentication.
+            match auth::extract_auth_credential(headers) {
+                Ok(_credential) => {}
+                Err(challenge) => {
+                    response
+                        .set_status(StatusCode::UNAUTHORIZED)
+                        .set_header(
+                            http::header::WWW_AUTHENTICATE,
+                            HeaderValue::from_str(&challenge.www_authenticate)
+                                .unwrap_or_else(|_| HeaderValue::from_static("Basic")),
+                        );
+                    return;
+                }
+            }
+
+            // All checks passed — register conversation and KEEP rx alive.
+            let conversation_id = next_id.fetch_add(1, Ordering::Relaxed);
+            let mut rx = protocol.register_conversation(conversation_id).await;
+            tracing::info!(conversation_id, "registered SSH3 conversation (test)");
+
+            response
+                .set_status(StatusCode::OK)
+                .set_header("ssh-version", version::version_response_header(&version));
+
+            // Spawn a task that consumes dispatched channel streams.
+            tokio::spawn(async move {
+                while let Some((header, reader, writer)) = rx.recv().await {
+                    // Spawn each channel handler independently.
+                    tokio::spawn(async move {
+                        if let Err(e) = channel::handle_channel(header, reader, writer).await {
+                            tracing::warn!("channel handler error: {e}");
+                        }
+                    });
+                }
+            });
+        })
+    }
+}
