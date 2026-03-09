@@ -5,3 +5,4 @@ pub mod auth;
 pub mod codec;
 mod message;
 mod conversation;
+pub mod session;

@@ -3,7 +3,10 @@
 //! Delegates to [`genmeta_ssh3_proto::auth::parse_authorization_header`] for
 //! the actual parsing and returns an [`AuthChallenge`] on failure so the caller
 //! can build a proper `401 Unauthorized` response.
+//!
+//! Also provides PAM-based password authentication via the [`pam`] submodule.
 
+pub(crate) mod pam;
 use genmeta_ssh3_proto::auth::{parse_authorization_header, AuthCredential};
 
 /// An auth rejection — carries the information needed for a `401` response.

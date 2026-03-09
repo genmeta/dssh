@@ -7,11 +7,12 @@ edition = "2024"
 [dependencies]
 genmeta-ssh3-proto = { path = "../genmeta-ssh3-proto" }
 h3x = { path = "../../h3x" }
-tokio = { version = "1", features = ["rt", "macros", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "time"] }
 tracing = "0.1"
 futures = "0.3"
 remoc = { version = "0.18", default-features = false, features = ["remoc_macro", "rtc", "serde"] }
 http = "1"
+rand = "0.9"
 
 [dev-dependencies]
 gm-quic = { path = "../../gm-quic/gm-quic" }

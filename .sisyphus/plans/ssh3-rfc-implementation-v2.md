@@ -1350,7 +1350,7 @@ Max Concurrent: 7 (Wave 5)
 
 ### Wave 4: Multi-Process Architecture
 
-- [ ] 11. SshSession RTC Trait + SessionInit/AuthResult 类型
+- [x] 11. SshSession RTC Trait + SessionInit/AuthResult 类型
 
   **What to do**:
   - 在 `genmeta-ssh3-proto/src/session.rs` 中定义：
@@ -1428,7 +1428,7 @@ Max Concurrent: 7 (Wave 5)
   - Files: `genmeta-ssh3-proto/src/session.rs`, `genmeta-ssh3-proto/src/lib.rs`
   - Pre-commit: `cargo check -p genmeta-ssh3-proto`
 
-- [ ] 12. PAM Wrapper
+- [x] 12. PAM Wrapper
 
   **What to do**:
   - 在 `genmeta-ssh3-server/src/auth/pam.rs` 中实现 PAM 4 阶段认证：
