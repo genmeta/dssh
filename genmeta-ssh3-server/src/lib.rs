@@ -3,3 +3,4 @@
 pub mod protocol;
 pub mod auth;
 pub mod version;
+pub mod handler;
