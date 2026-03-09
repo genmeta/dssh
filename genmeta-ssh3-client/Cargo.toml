@@ -7,7 +7,7 @@ edition = "2024"
 [dependencies]
 genmeta-ssh3-proto = { path = "../genmeta-ssh3-proto" }
 h3x = { path = "../../h3x" }
-tokio = { version = "1", features = ["rt", "macros", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "net"] }
 tracing = "0.1"
 base64 = "0.22"
 snafu = "0.9"

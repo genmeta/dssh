@@ -6,6 +6,7 @@
 
 pub mod forward;
 pub mod session;
+pub mod socks5;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use h3x::client::{Request, Response};
