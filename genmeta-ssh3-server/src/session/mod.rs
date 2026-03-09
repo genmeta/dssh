@@ -5,3 +5,4 @@
 //! exit-signal request types.
 
 pub mod request;
+pub mod pty;

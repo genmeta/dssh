@@ -1683,7 +1683,7 @@ Max Concurrent: 7 (Wave 5)
 
 ### Wave 5: Session + Forwarding
 
-- [ ] 15. Channel Open/Confirm/Data 处理（Session 通道）
+- [x] 15. Channel Open/Confirm/Data 处理（Session 通道）
 
   **What to do**:
   - 在 `genmeta-ssh3-server/src/channel.rs` 中实现通道生命周期处理：
@@ -1779,7 +1779,7 @@ Max Concurrent: 7 (Wave 5)
   - Files: `genmeta-ssh3-server/src/channel.rs`, `genmeta-ssh3-server/src/lib.rs`
   - Pre-commit: `cargo test -p genmeta-ssh3-server -- channel`
 
-- [ ] 16. Exec/Shell/Subsystem 请求处理
+- [x] 16. Exec/Shell/Subsystem 请求处理
 
   **What to do**:
   - 在 `genmeta-ssh3-server/src/session/request.rs` 中解析 ChannelRequest 的 request_data：

@@ -643,6 +643,7 @@ dependencies = [
  "h3x",
  "http",
  "libc",
+ "nix 0.29.0",
  "rand",
  "remoc",
  "rustls",
