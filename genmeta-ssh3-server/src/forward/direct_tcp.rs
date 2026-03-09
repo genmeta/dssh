@@ -19,7 +19,7 @@
 use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
 use h3x::codec::DecodeExt;
 use h3x::varint::VarInt;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 /// Default maximum message size advertised in ChannelOpenConfirmation.
@@ -76,8 +76,8 @@ where
     // can occur when both copy futures share a single task (join!/select!).
     let (tcp_reader, tcp_writer) = tcp_stream.into_split();
 
-    let q2t = tokio::spawn(relay(reader, tcp_writer));
-    let t2q = tokio::spawn(relay(tcp_reader, writer));
+    let q2t = tokio::spawn(super::relay(reader, tcp_writer));
+    let t2q = tokio::spawn(super::relay(tcp_reader, writer));
 
     // Wait for both directions to complete.
     let _ = q2t.await;
@@ -86,16 +86,6 @@ where
     Ok(())
 }
 
-/// Copy all bytes from `reader` to `writer`, then shut down `writer`.
-async fn relay<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let n = tokio::io::copy(&mut reader, &mut writer).await?;
-    writer.shutdown().await?;
-    Ok(n)
-}
 
 #[cfg(test)]
 mod tests {
