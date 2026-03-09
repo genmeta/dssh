@@ -7,3 +7,4 @@ pub mod handler;
 pub mod session_impl;
 pub mod child;
 pub mod channel;
+pub mod session;
