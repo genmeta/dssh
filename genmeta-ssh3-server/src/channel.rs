@@ -63,9 +63,10 @@ where
     match header.channel_type.as_str() {
         "session" => handle_session_channel(header, reader, writer).await,
         "direct-tcpip" => forward::direct_tcp::handle_direct_tcp(header, reader, writer).await,
-        "forwarded-tcpip" | "direct-streamlocal@openssh.com"
-        | "forwarded-streamlocal@openssh.com" => {
-            // Stub dispatch points — actual forwarding implemented in Tasks 19-20.
+        "direct-streamlocal@openssh.com" => forward::streamlocal::handle_direct_streamlocal(header, reader, writer).await,
+        "socks5" => forward::socks5::handle_socks5(header, reader, writer).await,
+        "forwarded-tcpip" | "forwarded-streamlocal@openssh.com" => {
+            // Stub dispatch points — server-initiated channels, not normally received here.
             Ok(())
         }
         _ => {
@@ -495,7 +496,6 @@ mod tests {
     async fn forwarding_channel_types_stub() {
         let forwarding_types = [
             "forwarded-tcpip",
-            "direct-streamlocal@openssh.com",
             "forwarded-streamlocal@openssh.com",
         ];
 
