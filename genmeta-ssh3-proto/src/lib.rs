@@ -2,6 +2,6 @@
 
 mod error;
 mod auth;
-mod codec;
+pub mod codec;
 mod message;
 mod conversation;

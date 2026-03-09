@@ -615,6 +615,7 @@ dependencies = [
 name = "genmeta-ssh3-server"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "genmeta-ssh3-proto",
  "h3x",
  "remoc",

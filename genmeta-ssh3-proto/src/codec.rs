@@ -17,7 +17,7 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// A UTF-8 string encoded as varint length-prefix + UTF-8 bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SshString(pub String);
+pub struct SshString(pub String);
 
 /// Raw bytes encoded as varint length-prefix + raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub(crate) struct SshBool(pub bool);
 
 /// SSH3 channel header, encoded field-by-field using QUIC varints and SSH strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChannelHeader {
+pub struct ChannelHeader {
     pub signal_value: u32,
     pub conversation_id: u64,
     pub channel_type: String,
