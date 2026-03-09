@@ -12,3 +12,12 @@ tracing = "0.1"
 futures = "0.3"
 remoc = { version = "0.18", default-features = false, features = ["remoc_macro", "rtc", "serde"] }
 http = "1"
+
+[dev-dependencies]
+gm-quic = { path = "../../gm-quic/gm-quic" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower-service = "0.3"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-appender = "0.2"
