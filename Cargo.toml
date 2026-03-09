@@ -9,32 +9,27 @@ members = [
 
 [workspace.dependencies]
 bytes = { version = "1", features = ["serde"] }
-crossterm = "0.29"
-dashmap = "6"
+ciborium = "0.2"
 derive_more = "2"
 dirs = "6"
 either = "1"
 futures = "0.3"
+h3x = { path = "../h3x" }
 http = "1"
 nix = "0.30"
-# pam-client2 = { path = "pam-client" }
 pam-client2 = { git = "ssh://git@github.com/eareimu/pam-client.git" }
 peg = "0.8"
 pin-project-lite = "0.2"
 regex = "1"
 regex-syntax = "0.8"
-rpassword = "7"
+remoc = { version = "0.14", features = ["serde", "codec-bincode"] }
 serde = { version = "1", features = ["derive"] }
-serde_cbor = "0.11"
 snafu = "0.8"
-socks5-proto = "0.4"
-socket2 = "0.5"
 tokio = "1"
 tokio-util = { version = "0.7" }
 tracing = { version = "0.1", default-features = false, features = [
     "std",
     "attributes",
 ] }
-
 
 proto = { path = "genmeta-ssh3-proto", package = "genmeta-ssh3-proto" }
