@@ -1,11 +1,11 @@
 [package]
 name = "genmeta-ssh3-client"
-version = "0.3.0"
+description = "SSH3 client implementation"
+version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-h3x = { workspace = true }
-proto = { workspace = true }
-snafu = { workspace = true }
-tokio = { workspace = true, features = ["signal", "net", "macros", "time"] }
-tracing = { workspace = true }
+genmeta-ssh3-proto = { path = "../genmeta-ssh3-proto" }
+h3x = { path = "../../h3x" }
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util"] }
+tracing = "0.1"

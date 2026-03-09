@@ -1,1 +1,1 @@
-// SSH3 client - greenfield
+//! SSH3 client implementation

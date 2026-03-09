@@ -1,29 +1,12 @@
 [package]
 name = "genmeta-ssh3-server"
-version = "0.3.0"
+description = "SSH3 server implementation"
+version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-h3x = { workspace = true }
-futures = { workspace = true }
-http = { workspace = true }
-nix = { workspace = true, features = ["fs", "ioctl", "process", "signal", "socket", "term", "user"] }
-pam-client2 = { workspace = true, optional = true }
-proto = { workspace = true }
-remoc = { workspace = true }
-snafu = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-
-[dev-dependencies]
-gm-quic = { workspace = true }
-rustls = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }
-tokio-util = { workspace = true, features = ["rt"] }
-tower-service = "0.3"
-tracing-appender = { workspace = true }
-tracing-subscriber = { workspace = true }
-
-[features]
-default = ["pam"]
-pam = ["dep:pam-client2"]
+genmeta-ssh3-proto = { path = "../genmeta-ssh3-proto" }
+h3x = { path = "../../h3x" }
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util"] }
+tracing = "0.1"
+remoc = { version = "0.18", default-features = false, features = ["remoc_macro", "rtc", "serde"] }
