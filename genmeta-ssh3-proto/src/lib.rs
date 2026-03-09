@@ -3,3 +3,5 @@
 mod error;
 mod auth;
 mod codec;
+mod message;
+mod conversation;
