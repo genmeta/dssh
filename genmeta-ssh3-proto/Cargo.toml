@@ -7,10 +7,11 @@ edition = "2024"
 bytes = { workspace = true }
 ciborium = { workspace = true }
 h3x = { workspace = true }
+futures = { workspace = true }
 remoc = { workspace = true }
 serde = { workspace = true }
 snafu = { workspace = true }
-tokio = { workspace = true, features = ["net", "macros", "time"] }
+tokio = { workspace = true, features = ["net", "macros", "time", "sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
