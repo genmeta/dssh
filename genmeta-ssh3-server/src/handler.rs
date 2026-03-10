@@ -1,17 +1,26 @@
 //! HTTP-layer Extended CONNECT handler for SSH3.
 //!
-//! Receives an Extended CONNECT request with `:protocol = ssh3`, validates the
-//! SSH version, extracts authentication credentials, registers a conversation
-//! with [`Ssh3Protocol`], and returns 200 OK with the negotiated `ssh-version`
-//! response header.
+//! Implements [`tower_service::Service`] for `http::Request`, receiving an
+//! Extended CONNECT request with `:protocol = ssh3`, validating the SSH
+//! version, extracting authentication credentials, registering a conversation
+//! with [`Ssh3Protocol`], and returning 200 OK with the negotiated
+//! `ssh-version` response header.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    convert::Infallible,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
 };
 
-use h3x::server::{Request, Response};
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use h3x::message::stream::MessageStreamError;
+use h3x::qpack::field::Protocol;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use http_body_util::{Empty, combinators::UnsyncBoxBody};
 
 use crate::{auth, protocol::Ssh3Protocol, version};
 
@@ -110,20 +119,30 @@ impl Ssh3ConnectHandler {
     }
 }
 
-impl h3x::server::Service for Ssh3ConnectHandler {
-    type Future<'s> = futures::future::BoxFuture<'s, ()>;
+impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>>
+    for Ssh3ConnectHandler
+{
+    type Response = http::Response<Empty<Bytes>>;
+    type Error = Infallible;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn serve<'s>(
-        &self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> Self::Future<'s> {
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(
+        &mut self,
+        request: http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
+    ) -> Self::Future {
         let protocol = self.protocol.clone();
         let next_id = self.next_conversation_id.clone();
 
         Box::pin(async move {
-            let method = request.method();
-            let proto_str = request.protocol().as_ref().map(|p| p.as_str().to_owned());
+            let method = request.method().clone();
+            let proto_str = request
+                .extensions()
+                .get::<Protocol>()
+                .map(|p| p.as_str().to_owned());
             let headers = request.headers();
 
             let decision = evaluate_connect(
@@ -132,31 +151,35 @@ impl h3x::server::Service for Ssh3ConnectHandler {
                 headers,
             );
 
+            let mut response = http::Response::new(Empty::new());
+
             match decision {
                 ConnectDecision::Ok { version_header } => {
                     let conversation_id = next_id.fetch_add(1, Ordering::Relaxed);
                     let _rx = protocol.register_conversation(conversation_id).await;
                     tracing::info!(conversation_id, "registered SSH3 conversation");
 
+                    *response.status_mut() = StatusCode::OK;
                     response
-                        .set_status(StatusCode::OK)
-                        .set_header("ssh-version", version_header);
+                        .headers_mut()
+                        .insert("ssh-version", version_header);
                 }
                 ConnectDecision::BadRequest(msg) => {
                     tracing::warn!(%msg, "SSH3 CONNECT rejected");
-                    response.set_status(StatusCode::BAD_REQUEST);
+                    *response.status_mut() = StatusCode::BAD_REQUEST;
                 }
                 ConnectDecision::Unauthorized { www_authenticate } => {
                     tracing::warn!("SSH3 CONNECT unauthorized");
-                    response
-                        .set_status(StatusCode::UNAUTHORIZED)
-                        .set_header(
-                            http::header::WWW_AUTHENTICATE,
-                            HeaderValue::from_str(&www_authenticate)
-                                .unwrap_or_else(|_| HeaderValue::from_static("Basic")),
-                        );
+                    *response.status_mut() = StatusCode::UNAUTHORIZED;
+                    response.headers_mut().insert(
+                        http::header::WWW_AUTHENTICATE,
+                        HeaderValue::from_str(&www_authenticate)
+                            .unwrap_or_else(|_| HeaderValue::from_static("Basic")),
+                    );
                 }
             }
+
+            Ok(response)
         })
     }
 }
