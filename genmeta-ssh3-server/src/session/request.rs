@@ -383,6 +383,7 @@ where
     // Send EOF + Close.
     SshMessage::ChannelEof.encode_into(&mut *writer).await?;
     SshMessage::ChannelClose.encode_into(&mut *writer).await?;
+    writer.shutdown().await?;
 
     // Clean up stdin relay task.
     stdin_task.abort();
@@ -511,6 +512,7 @@ where
     // Send EOF + Close.
     SshMessage::ChannelEof.encode_into(&mut *writer).await?;
     SshMessage::ChannelClose.encode_into(&mut *writer).await?;
+    writer.shutdown().await?;
 
     // Clean up stdin relay task.
     stdin_task.abort();

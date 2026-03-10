@@ -13,7 +13,7 @@ use std::sync::Arc;
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
 use h3x::codec::{DecodeFrom, EncodeInto};
 use tokio::{
-    io::{self, AsyncRead, AsyncWrite},
+    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
 
@@ -352,6 +352,7 @@ where
             }
             ChannelEvent::Eof => {
                 SshMessage::ChannelEof.encode_into(&mut writer).await?;
+                writer.shutdown().await?;
                 break;
             }
             ChannelEvent::Close => {
