@@ -1,9 +1,9 @@
 //! [`SshSession`] trait implementation for the ssh3-session child process.
 //!
 //! This module provides [`Ssh3SessionImpl`], which implements the RTC
-//! [`SshSession`] trait defined in `genmeta-ssh3-proto`. The main server
-//! process spawns the `ssh3-session` binary, and remote calls to
-//! [`run_session`](SshSession::run_session) are dispatched here.
+//! [`SshSession`] trait. The ssh3-session child process performs privilege
+//! dropping (setgid/setuid), while channel dispatch (PTY, shell, forwarding)
+//! occurs in the main server process, since the child has no access to QUIC streams.
 
 use genmeta_ssh3_proto::session::{SessionError, SessionInit, SshSession};
 
@@ -40,8 +40,8 @@ fn drop_privileges(_uid: u32, _gid: u32) -> Result<(), SessionError> {
 /// Implementation of the [`SshSession`] RTC trait.
 ///
 /// This is the server-side object that receives remote calls from the parent
-/// process. Currently it performs privilege dropping and logs session start;
-/// actual channel handling (PTY, shell, forwarding) is deferred to Wave 5.
+/// process. It handles privilege dropping (setgid/setuid) for the authenticated
+/// user; channel dispatch happens in the main server process.
 pub struct Ssh3SessionImpl;
 
 impl SshSession for Ssh3SessionImpl {
@@ -49,8 +49,8 @@ impl SshSession for Ssh3SessionImpl {
         // 1. Drop privileges: setgid first, then setuid.
         drop_privileges(init.uid, init.gid)?;
 
-        // 2. Placeholder for actual session logic (PTY, shell, channels).
-        //    Full implementation deferred to Wave 5.
+        // 2. Channel dispatch (PTY, shell, forwarding) occurs in the main server
+        //    process; this child process handles privilege separation only.
         tracing::info!(
             conversation_id = init.conversation_id,
             username = %init.username,
