@@ -24,6 +24,8 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Empty, combinators::UnsyncBoxBody};
 
 use crate::{auth, channel::GlobalRequestContext, child::ChildProcess, protocol::Ssh3Protocol, version};
+use crate::auth::pam::PamBackend;
+use genmeta_ssh3_proto::auth::AuthCredential;
 
 /// Result of validating the SSH3 Extended CONNECT request at the HTTP layer.
 ///
@@ -34,6 +36,7 @@ enum ConnectDecision {
     /// All validation passed — proceed with conversation setup.
     Ok {
         version_header: HeaderValue,
+        credential: Option<AuthCredential>,
     },
     /// Protocol or version error — return 400 Bad Request.
     BadRequest(String),
@@ -87,16 +90,16 @@ fn evaluate_connect(
     match auth::extract_auth_credential(headers) {
         Ok(credential) => {
             tracing::debug!(?credential, "authenticated SSH3 CONNECT");
+            ConnectDecision::Ok {
+                version_header: version::version_response_header(&version),
+                credential: Some(credential),
+            }
         }
         Err(challenge) => {
             return ConnectDecision::Unauthorized {
                 www_authenticate: challenge.www_authenticate,
             };
         }
-    }
-
-    ConnectDecision::Ok {
-        version_header: version::version_response_header(&version),
     }
 }
 
@@ -108,18 +111,19 @@ fn evaluate_connect(
 pub struct Ssh3ConnectHandler {
     protocol: Arc<Ssh3Protocol>,
     next_conversation_id: Arc<AtomicU64>,
+    pam_backend: Option<Arc<dyn PamBackend>>,
 }
 
 impl Ssh3ConnectHandler {
     /// Creates a new handler backed by the given protocol instance.
-    pub fn new(protocol: Arc<Ssh3Protocol>) -> Self {
+    pub fn new(protocol: Arc<Ssh3Protocol>, pam_backend: Option<Arc<dyn PamBackend>>) -> Self {
         Self {
             protocol,
             next_conversation_id: Arc::new(AtomicU64::new(0)),
+            pam_backend,
         }
     }
 }
-
 impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>>
     for Ssh3ConnectHandler
 {
@@ -137,6 +141,7 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
     ) -> Self::Future {
         let protocol = self.protocol.clone();
         let next_id = self.next_conversation_id.clone();
+        let pam_backend = self.pam_backend.clone();
 
         Box::pin(async move {
             let method = request.method().clone();
@@ -155,13 +160,34 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
             let mut response = http::Response::new(Empty::new());
 
             match decision {
-                ConnectDecision::Ok { version_header } => {
+                ConnectDecision::Ok { version_header, credential } => {
                     // TODO: Replace with h3x StreamId when available
                     let conversation_id = request
                         .extensions()
                         .get::<VarInt>()
                         .map(|v| v.into_inner())
                         .unwrap_or_else(|| next_id.fetch_add(1, Ordering::Relaxed));
+
+                    // If PAM backend is configured, validate credentials
+                    if let Some(ref backend) = pam_backend {
+                        if let Some(AuthCredential::Basic { ref username, ref password }) = credential {
+                            match crate::auth::pam::pam_authenticate(backend.as_ref(), username, password).await {
+                                Ok(_auth_result) => {
+                                    tracing::info!(%username, "PAM authentication succeeded");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%e, "PAM authentication failed");
+                                    *response.status_mut() = StatusCode::UNAUTHORIZED;
+                                    response.headers_mut().insert(
+                                        http::header::WWW_AUTHENTICATE,
+                                        HeaderValue::from_static("Basic"),
+                                    );
+                                    return Ok(response);
+                                }
+                            }
+                        }
+                    }
+
                     let mut rx = protocol.register_conversation(conversation_id).await;
                     tracing::info!(conversation_id, "registered SSH3 conversation");
 
@@ -268,7 +294,7 @@ mod tests {
         let decision = evaluate_connect(&Method::CONNECT, Some("ssh3"), &headers);
 
         match decision {
-            ConnectDecision::Ok { version_header } => {
+            ConnectDecision::Ok { version_header, .. } => {
                 assert_eq!(version_header.to_str().unwrap(), "michel-ssh3-00");
             }
             other => panic!("expected Ok, got {other:?}"),
@@ -421,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn handler_registers_conversation() {
         let protocol = Arc::new(Ssh3Protocol::new());
-        let handler = Ssh3ConnectHandler::new(protocol.clone());
+        let handler = Ssh3ConnectHandler::new(protocol.clone(), None);
 
         // Simulate what the handler would do on success.
         let conversation_id = handler.next_conversation_id.fetch_add(1, Ordering::Relaxed);

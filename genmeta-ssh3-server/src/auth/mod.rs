@@ -6,7 +6,7 @@
 //!
 //! Also provides PAM-based password authentication via the [`pam`] submodule.
 
-pub(crate) mod pam;
+pub mod pam;
 use genmeta_ssh3_proto::auth::{parse_authorization_header, AuthCredential};
 
 /// An auth rejection — carries the information needed for a `401` response.

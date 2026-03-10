@@ -165,13 +165,16 @@ use http_body_util::{Empty, combinators::UnsyncBoxBody};
 pub struct TestChannelService {
     protocol: Arc<Ssh3Protocol>,
     next_conversation_id: Arc<AtomicU64>,
+    #[allow(dead_code)]
+    pam_backend: Option<Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend>>,
 }
 
 impl TestChannelService {
-    pub fn new(protocol: Arc<Ssh3Protocol>) -> Self {
+    pub fn new(protocol: Arc<Ssh3Protocol>, pam_backend: Option<Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend>>) -> Self {
         Self {
             protocol,
             next_conversation_id: Arc::new(AtomicU64::new(0)),
+            pam_backend,
         }
     }
 }

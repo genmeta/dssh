@@ -113,7 +113,7 @@ pub struct UserInfo {
 /// Stage 1 (`pam_start`) is implicit — the backend manages transaction setup.
 /// Stage 4 (`pam_end`) is handled via `Drop` semantics on the backend.
 #[allow(dead_code)]
-pub(crate) trait PamBackend: Send + Sync {
+pub trait PamBackend: Send + Sync {
     /// Authenticate the user (PAM stage 2: `pam_authenticate`).
     fn authenticate(
         &self,
@@ -139,7 +139,7 @@ pub(crate) trait PamBackend: Send + Sync {
 ///
 /// Gate behind the `pam` feature flag, which enables the `pam-client2` dep.
 #[cfg(feature = "pam")]
-pub(crate) struct SystemPam;
+pub struct SystemPam;
 
 #[cfg(feature = "pam")]
 struct PasswordConversation {
@@ -233,7 +233,7 @@ impl PamBackend for SystemPam {
 /// On any failure, adds a random delay (100–500 ms) for timing-attack
 /// protection before returning `AuthResult::Failure`.
 #[allow(dead_code)]
-pub(crate) async fn pam_authenticate(
+pub async fn pam_authenticate(
     backend: &dyn PamBackend,
     username: &str,
     password: &str,

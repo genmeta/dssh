@@ -83,7 +83,7 @@ async fn main() {
 
     // Build the SSH3 handler chain.
     let protocol = Arc::new(Ssh3Protocol::default());
-    let handler = Ssh3ConnectHandler::new(protocol);
+    let handler = Ssh3ConnectHandler::new(protocol, None);
     let service = TowerService(handler);
 
     // Build the H3/QUIC server using the same pattern as test infrastructure.

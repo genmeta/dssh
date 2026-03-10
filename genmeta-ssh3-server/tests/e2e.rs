@@ -40,7 +40,7 @@ async fn setup_server() -> (
     http::uri::Authority,
 ) {
     let protocol = Arc::new(Ssh3Protocol::default());
-    let handler = Ssh3ConnectHandler::new(protocol);
+    let handler = Ssh3ConnectHandler::new(protocol, None);
     let service = TowerService(handler);
 
     let server = test_server(service).await;
@@ -58,7 +58,7 @@ fn smoke_connect() {
     run("smoke_connect", async move {
         // 1. Build server with SSH3 handler wrapped in TowerService
         let protocol = Arc::new(Ssh3Protocol::default());
-        let handler = Ssh3ConnectHandler::new(protocol);
+        let handler = Ssh3ConnectHandler::new(protocol, None);
         let service = TowerService(handler);
 
         // 2. Start server
@@ -164,7 +164,7 @@ fn auth_failure_via_client() {
         // — but we need to send one that's invalid.
         // The server rejects Bearer tokens and malformed headers.
         let protocol = Arc::new(Ssh3Protocol::default());
-        let handler = Ssh3ConnectHandler::new(protocol);
+        let handler = Ssh3ConnectHandler::new(protocol, None);
         let service = TowerService(handler);
         let server = test_server(service).await;
         let authority = get_server_authority(&server);
