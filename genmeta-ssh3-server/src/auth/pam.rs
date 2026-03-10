@@ -13,11 +13,20 @@
 //! as timing-attack protection before returning [`PamError`].
 
 
+#[cfg(feature = "pam")]
+use std::ffi::CStr;
+#[cfg(feature = "pam")]
+use std::ffi::CString;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use rand::Rng;
+
+#[cfg(feature = "pam")]
+use nix::unistd::User;
+#[cfg(feature = "pam")]
+use pam_client2::{Context, Flag};
 
 /// The fixed PAM service name for SSH3 authentication.
 #[allow(dead_code)]
@@ -126,36 +135,86 @@ pub(crate) trait PamBackend: Send + Sync {
 // SystemPam — real PAM backend (deferred implementation)
 // ---------------------------------------------------------------------------
 
-/// Real PAM backend that calls into the system's `libpam`.
-/// 
-/// This is a stub — actual C FFI integration with `pam`/`pam-sys` crate
-/// is deferred until we add OS-specific C library linkage.
-#[allow(dead_code)]
+/// Real PAM backend that calls into the system's `libpam` via `pam-client2`.
+///
+/// Gate behind the `pam` feature flag, which enables the `pam-client2` dep.
+#[cfg(feature = "pam")]
 pub(crate) struct SystemPam;
 
+#[cfg(feature = "pam")]
+struct PasswordConversation {
+    username: String,
+    password: String,
+}
+
+#[cfg(feature = "pam")]
+impl pam_client2::ConversationHandler for PasswordConversation {
+    fn prompt_echo_on(&mut self, msg: &CStr) -> Result<CString, pam_client2::ErrorCode> {
+        tracing::debug!(target: "pam", "Request username with prompt: {}", msg.to_string_lossy());
+        CString::new(self.username.as_str()).map_err(|_| pam_client2::ErrorCode::CONV_ERR)
+    }
+
+    fn prompt_echo_off(&mut self, msg: &CStr) -> Result<CString, pam_client2::ErrorCode> {
+        tracing::debug!(target: "pam", "Request password with prompt: {}", msg.to_string_lossy());
+        CString::new(self.password.as_str()).map_err(|_| pam_client2::ErrorCode::CONV_ERR)
+    }
+
+    fn text_info(&mut self, msg: &CStr) {
+        tracing::debug!(target: "pam", "PAM info: {}", msg.to_string_lossy());
+    }
+
+    fn error_msg(&mut self, msg: &CStr) {
+        tracing::warn!(target: "pam", "PAM error: {}", msg.to_string_lossy());
+    }
+}
+
+#[cfg(feature = "pam")]
 impl PamBackend for SystemPam {
     fn authenticate(
         &self,
-        _service: &str,
-        _username: &str,
-        _password: &str,
+        service: &str,
+        username: &str,
+        password: &str,
     ) -> Result<(), PamError> {
-        // TODO: Call pam_start → pam_authenticate via pam-sys FFI.
-        // Requires linking against libpam (-lpam) and handling
-        // the PAM conversation callback for password supply.
-        todo!("SystemPam::authenticate — requires libpam C FFI linkage")
+        let mut context = Context::new(
+            service,
+            Some(username),
+            PasswordConversation {
+                username: username.to_owned(),
+                password: password.to_owned(),
+            },
+        )
+        .map_err(|e| PamError::new(format!("failed to create PAM context: {e}")))?;
+
+        context
+            .authenticate(Flag::NONE)
+            .map_err(|e| PamError::new(format!("pam_authenticate failed: {e}")))
     }
 
-    fn acct_mgmt(&self, _service: &str, _username: &str) -> Result<(), PamError> {
-        // TODO: Call pam_acct_mgmt via the open PAM handle.
-        todo!("SystemPam::acct_mgmt — requires libpam C FFI linkage")
+    fn acct_mgmt(&self, service: &str, username: &str) -> Result<(), PamError> {
+        let mut context = Context::new(
+            service,
+            Some(username),
+            pam_client2::conv_null::Conversation::new(),
+        )
+        .map_err(|e| PamError::new(format!("failed to create PAM context: {e}")))?;
+
+        context
+            .acct_mgmt(Flag::NONE)
+            .map_err(|e| PamError::new(format!("pam_acct_mgmt failed: {e}")))
     }
 
-    fn get_user_info(&self, _username: &str) -> Result<UserInfo, PamError> {
-        // TODO: Use nix::unistd::User::from_name(username) to resolve
-        // uid, gid, home directory, and login shell.
-        // Do not add `nix` as a dependency yet.
-        todo!("SystemPam::get_user_info — requires nix crate for getpwnam")
+    fn get_user_info(&self, username: &str) -> Result<UserInfo, PamError> {
+        let user = User::from_name(username)
+            .map_err(|e| PamError::new(format!("getpwnam syscall failed: {e}")))?
+            .ok_or_else(|| PamError::new(format!("user '{username}' not found")))?;
+
+        Ok(UserInfo {
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            home: user.dir,
+            shell: user.shell,
+        })
     }
 }
 
