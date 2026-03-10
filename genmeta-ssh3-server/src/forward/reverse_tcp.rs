@@ -190,6 +190,8 @@ impl ReverseTcpForwarder {
         &self,
         bind_address: &str,
         bind_port: u16,
+        stream_factory: super::StreamFactory,
+        conversation_id: u64,
     ) -> io::Result<u16> {
         let addr = format!("{}:{}", bind_address, bind_port);
         let listener = TcpListener::bind(&addr).await?;
@@ -197,19 +199,35 @@ impl ReverseTcpForwarder {
 
         let key = (bind_address.to_string(), actual_port);
 
+        // Clone bind_address for use inside the spawned task.
+        let bind_address_clone = bind_address.to_string();
+
         // Spawn the accept loop as a background task.
-        // For now, the accept loop just accepts and drops connections since
-        // we don't have the StreamFactory/conversation wired in yet.
-        // The full integration will happen when the server main loop is
-        // connected to the conversation layer.
         let handle = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((_stream, _peer_addr)) => {
-                        // In a fully integrated server, each accepted connection
-                        // would open a forwarded-tcpip channel via StreamFactory.
-                        // For now, connections are accepted and dropped.
-                        tracing::debug!("reverse-tcp accepted connection (no channel handler wired)");
+                    Ok((tcp_stream, peer_addr)) => {
+                        let factory = stream_factory.clone();
+                        let addr = bind_address_clone.clone();
+                        let port = actual_port;
+                        let conv_id = conversation_id;
+                        tokio::spawn(async move {
+                            match factory().await {
+                                Ok((reader, writer)) => {
+                                    if let Err(e) = handle_forwarded_tcpip_channel(
+                                        reader, writer, tcp_stream,
+                                        &addr, port,
+                                        &peer_addr.ip().to_string(), peer_addr.port(),
+                                        conv_id,
+                                    ).await {
+                                        tracing::warn!(%e, "forwarded-tcpip channel error");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%e, "failed to open QUIC stream for forwarded-tcpip");
+                                }
+                            }
+                        });
                     }
                     Err(e) => {
                         tracing::warn!(%e, "reverse-tcp accept error");
@@ -340,8 +358,17 @@ mod tests {
     use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
     use h3x::codec::DecodeExt;
     use h3x::varint::VarInt;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn test_stream_factory() -> crate::forward::StreamFactory {
+        Arc::new(|| Box::pin(async {
+            let (client, _server) = tokio::io::duplex(8192);
+            let (cr, cw) = tokio::io::split(client);
+            Ok((Box::new(cr) as Box<dyn AsyncRead + Send + Unpin>,
+                Box::new(cw) as Box<dyn AsyncWrite + Send + Unpin>))
+        }))
+    }
 
     // -------------------------------------------------------------------
     // Test 1: tcpip_forward_request_roundtrip
@@ -416,7 +443,7 @@ mod tests {
 
         // Start listening on an ephemeral port.
         let port = forwarder
-            .start_listening("127.0.0.1", 0)
+            .start_listening("127.0.0.1", 0, test_stream_factory(), 1)
             .await
             .unwrap();
         assert!(port > 0, "allocated port should be > 0");
@@ -452,11 +479,11 @@ mod tests {
 
         // Bind with port 0 twice — should get different ports.
         let port1 = forwarder
-            .start_listening("127.0.0.1", 0)
+            .start_listening("127.0.0.1", 0, test_stream_factory(), 1)
             .await
             .unwrap();
         let port2 = forwarder
-            .start_listening("127.0.0.1", 0)
+            .start_listening("127.0.0.1", 0, test_stream_factory(), 2)
             .await
             .unwrap();
 

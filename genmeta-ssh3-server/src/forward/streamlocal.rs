@@ -207,19 +207,43 @@ impl ReverseStreamlocalForwarder {
     /// The accept loop is spawned as a background task. Each accepted
     /// connection will be handled but requires a channel open mechanism
     /// (via the conversation layer) which will be integrated later.
-    pub async fn start_listening(&self, socket_path: &str) -> io::Result<()> {
+    pub async fn start_listening(
+        &self,
+        socket_path: &str,
+        stream_factory: super::StreamFactory,
+        conversation_id: u64,
+    ) -> io::Result<()> {
         let listener = UnixListener::bind(socket_path)?;
 
         let key = socket_path.to_string();
+
+        // Clone socket_path for use inside the spawned task.
+        let socket_path_clone = socket_path.to_string();
 
         // Spawn the accept loop as a background task.
         let handle = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((_stream, _peer_addr)) => {
-                        tracing::debug!(
-                            "reverse-streamlocal accepted connection (no channel handler wired)"
-                        );
+                    Ok((unix_stream, _peer_addr)) => {
+                        let factory = stream_factory.clone();
+                        let path = socket_path_clone.clone();
+                        let conv_id = conversation_id;
+                        tokio::spawn(async move {
+                            match factory().await {
+                                Ok((reader, writer)) => {
+                                    if let Err(e) = handle_forwarded_streamlocal_channel(
+                                        reader, writer, unix_stream,
+                                        &path,
+                                        conv_id,
+                                    ).await {
+                                        tracing::warn!(%e, "forwarded-streamlocal channel error");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%e, "failed to open QUIC stream for forwarded-streamlocal");
+                                }
+                            }
+                        });
                     }
                     Err(e) => {
                         tracing::warn!(%e, "reverse-streamlocal accept error");
@@ -345,8 +369,16 @@ mod tests {
     use h3x::codec::{DecodeExt, EncodeExt};
     use h3x::varint::VarInt;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+    fn test_stream_factory() -> crate::forward::StreamFactory {
+        Arc::new(|| Box::pin(async {
+            let (client, _server) = tokio::io::duplex(8192);
+            let (cr, cw) = tokio::io::split(client);
+            Ok((Box::new(cr) as Box<dyn AsyncRead + Send + Unpin>,
+                Box::new(cw) as Box<dyn AsyncWrite + Send + Unpin>))
+        }))
+    }
     /// Atomic counter for unique test socket paths.
     static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -572,7 +604,7 @@ mod tests {
         let sock_path = test_sock_path("fwd-startstop");
 
         // Start listening.
-        forwarder.start_listening(&sock_path).await.unwrap();
+        forwarder.start_listening(&sock_path, test_stream_factory(), 1).await.unwrap();
 
         // Verify the listener is active by checking internal state.
         {

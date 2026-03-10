@@ -10,6 +10,9 @@ pub mod reverse_tcp;
 pub mod streamlocal;
 pub mod socks5;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// Copy all bytes from `reader` to `writer`, then shut down `writer`.
@@ -24,3 +27,13 @@ where
     writer.shutdown().await?;
     Ok(n)
 }
+
+/// Factory for opening server-initiated QUIC bidirectional streams.
+/// Returns (reader, writer) halves for a new stream.
+pub type StreamFactory = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = io::Result<(
+        Box<dyn AsyncRead + Send + Unpin>,
+        Box<dyn AsyncWrite + Send + Unpin>,
+    )>> + Send>>
+    + Send + Sync
+>;
