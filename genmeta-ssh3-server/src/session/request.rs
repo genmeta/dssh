@@ -10,6 +10,7 @@
 //! - `exit-status` — process exit code (server→client direction)
 //! - `exit-signal` — process killed by signal (server→client direction)
 
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::process::Stdio;
 
 use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
@@ -21,7 +22,10 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::channel::ChannelEvent;
-
+use crate::session::pty::{
+    PtyPair, PtyRequest, SignalRequest, WindowChangeRequest,
+    parse_pty_request, parse_signal, parse_window_change, set_window_size,
+};
 // ---------------------------------------------------------------------------
 // Parsed request types
 // ---------------------------------------------------------------------------
@@ -60,6 +64,12 @@ pub enum RequestAction {
     Exec(String),
     /// Launch an interactive shell.
     Shell,
+    /// Allocate a PTY with the given parameters.
+    AllocatePty(PtyRequest),
+    /// Resize the terminal window.
+    WindowChange(WindowChangeRequest),
+    /// Deliver a signal to the running process.
+    Signal(SignalRequest),
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +213,27 @@ where
             }
             Ok(Some(RequestAction::Shell))
         }
+        "pty-req" => {
+            let req = parse_pty_request(request_data).await?;
+            if want_reply {
+                SshMessage::ChannelSuccess.encode_into(writer).await?;
+            }
+            Ok(Some(RequestAction::AllocatePty(req)))
+        }
+        "window-change" => {
+            let req = parse_window_change(request_data).await?;
+            if want_reply {
+                SshMessage::ChannelSuccess.encode_into(writer).await?;
+            }
+            Ok(Some(RequestAction::WindowChange(req)))
+        }
+        "signal" => {
+            let req = parse_signal(request_data).await?;
+            if want_reply {
+                SshMessage::ChannelSuccess.encode_into(writer).await?;
+            }
+            Ok(Some(RequestAction::Signal(req)))
+        }
         "subsystem" => {
             // MVP: subsystem not implemented, return failure.
             let _req = parse_subsystem_request(request_data).await?;
@@ -237,12 +268,58 @@ where
 
 /// Spawn `/bin/sh -c <command>`, copy stdout → ChannelData, stderr →
 /// ChannelExtendedData, then send exit-status + EOF + Close.
-pub async fn run_exec<W>(command: &str, writer: &mut W, event_rx: mpsc::Receiver<ChannelEvent>) -> io::Result<()>
+///
+/// When `pty` is `Some`, the child process uses the PTY slave as stdin/stdout/stderr,
+/// and the PTY master is used for I/O relay.
+pub async fn run_exec<W>(
+    command: &str,
+    writer: &mut W,
+    event_rx: mpsc::Receiver<ChannelEvent>,
+    pty: Option<PtyPair>,
+) -> io::Result<()>
 where
     W: AsyncWrite + Send + Unpin,
 {
-    let mut child = match tokio::process::Command::new("/bin/sh")
-        .args(["-c", command])
+    if let Some(pty_pair) = pty {
+        run_command_with_pty("/bin/sh", &["-c", command], writer, event_rx, pty_pair).await
+    } else {
+        run_command_piped("/bin/sh", &["-c", command], writer, event_rx).await
+    }
+}
+
+/// Launch an interactive shell, copy stdout → ChannelData, stderr →
+/// ChannelExtendedData, then send exit-status + EOF + Close.
+///
+/// When `pty` is `Some`, the child process uses the PTY slave as stdin/stdout/stderr,
+/// and the PTY master is used for I/O relay.
+pub async fn run_shell<W>(
+    shell_path: &str,
+    writer: &mut W,
+    event_rx: mpsc::Receiver<ChannelEvent>,
+    pty: Option<PtyPair>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Send + Unpin,
+{
+    if let Some(pty_pair) = pty {
+        run_command_with_pty(shell_path, &[], writer, event_rx, pty_pair).await
+    } else {
+        run_command_piped(shell_path, &[], writer, event_rx).await
+    }
+}
+
+/// Run a command with piped stdio (no PTY).
+async fn run_command_piped<W>(
+    program: &str,
+    args: &[&str],
+    writer: &mut W,
+    event_rx: mpsc::Receiver<ChannelEvent>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Send + Unpin,
+{
+    let mut child = match tokio::process::Command::new(program)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::piped())
@@ -272,7 +349,7 @@ where
                     break;
                 }
                 ChannelEvent::Eof => break,
-                _ => { /* T5 will extend this to handle Signal/WindowChange */ }
+                _ => {}
             }
         }
         drop(stdin); // Close stdin to signal EOF to child
@@ -314,69 +391,124 @@ where
     Ok(())
 }
 
-/// Launch an interactive shell, copy stdout → ChannelData, stderr →
-/// ChannelExtendedData, then send exit-status + EOF + Close.
-pub async fn run_shell<W>(shell_path: &str, writer: &mut W, event_rx: mpsc::Receiver<ChannelEvent>) -> io::Result<()>
+/// Run a command with PTY: child uses slave as stdin/stdout/stderr,
+/// master is used for I/O relay.
+async fn run_command_with_pty<W>(
+    program: &str,
+    args: &[&str],
+    writer: &mut W,
+    event_rx: mpsc::Receiver<ChannelEvent>,
+    pty_pair: PtyPair,
+) -> io::Result<()>
 where
     W: AsyncWrite + Send + Unpin,
 {
-    let mut child = match tokio::process::Command::new(shell_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::piped())
+    // Duplicate the slave fd for stdout and stderr before consuming for stdin.
+    let slave_raw = pty_pair.slave.as_raw_fd();
+    let stdout_fd = unsafe { libc::dup(slave_raw) };
+    if stdout_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stderr_fd = unsafe { libc::dup(slave_raw) };
+    if stderr_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stdin_fd = pty_pair.slave.into_raw_fd();
+
+    let mut child = match tokio::process::Command::new(program)
+        .args(args)
+        .stdin(unsafe { Stdio::from_raw_fd(stdin_fd) })
+        .stdout(unsafe { Stdio::from_raw_fd(stdout_fd) })
+        .stderr(unsafe { Stdio::from_raw_fd(stderr_fd) })
         .spawn()
     {
         Ok(child) => child,
         Err(e) => {
-            tracing::error!(%e, "failed to spawn shell");
+            tracing::error!(%e, "failed to spawn command with PTY");
             SshMessage::ChannelFailure.encode_into(writer).await?;
             return Err(e);
         }
     };
 
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let stdin = child.stdin.take().unwrap();
+    // Get child PID for signal delivery.
+    let child_pid = child.id().unwrap_or(0) as i32;
 
-    // Spawn a stdin relay task: reads ChannelEvent::Data from event_rx -> writes to stdin.
+    // Wrap PTY master into async file for reading/writing.
+    let master_raw_fd = pty_pair.master.as_raw_fd();
+    let master_file = std::fs::File::from(pty_pair.master);
+    let master_tokio = tokio::fs::File::from(master_file);
+    let (mut master_reader, master_writer) = tokio::io::split(master_tokio);
+
+    // Spawn stdin relay task: reads ChannelEvent::Data -> writes to PTY master,
+    // handles Signal and WindowChange events.
     let stdin_task = tokio::spawn(async move {
-        let mut stdin = stdin;
+        let mut master_writer = master_writer;
         let mut event_rx = event_rx;
         while let Some(event) = event_rx.recv().await {
             match event {
                 ChannelEvent::Data(data)
-                    if stdin.write_all(&data).await.is_err() =>
+                    if master_writer.write_all(&data).await.is_err() =>
                 {
                     break;
                 }
+                ChannelEvent::Request {
+                    request_type,
+                    request_data,
+                    ..
+                } => {
+                    match request_type.as_str() {
+                        "signal" => {
+                            if let Ok(req) = parse_signal(&request_data).await
+                                && child_pid > 0
+                            {
+                                let sig = match req.signal_name.as_str() {
+                                    "HUP" => Some(libc::SIGHUP),
+                                    "INT" => Some(libc::SIGINT),
+                                    "QUIT" => Some(libc::SIGQUIT),
+                                    "KILL" => Some(libc::SIGKILL),
+                                    "TERM" => Some(libc::SIGTERM),
+                                    "USR1" => Some(libc::SIGUSR1),
+                                    "USR2" => Some(libc::SIGUSR2),
+                                    _ => None,
+                                };
+                                if let Some(sig) = sig {
+                                    unsafe { libc::kill(child_pid, sig) };
+                                }
+                            }
+                        }
+                        "window-change" => {
+                            if let Ok(req) = parse_window_change(&request_data).await {
+                                let _ = set_window_size(master_raw_fd, &req);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 ChannelEvent::Eof => break,
-                _ => { /* T5 will extend this to handle Signal/WindowChange */ }
+                _ => {}
             }
         }
-        drop(stdin); // Close stdin to signal EOF to child
+        drop(master_writer);
     });
 
-    let (stdout_result, stderr_result) = tokio::join!(
-        copy_stream_to_channel_data(&mut stdout, writer),
-        read_all_stderr(&mut stderr),
-    );
+    // Read from PTY master → ChannelData (PTY combines stdout+stderr).
+    let stdout_result = copy_stream_to_channel_data(&mut master_reader, writer).await;
 
-    let stderr_data = stderr_result?;
-    if !stderr_data.is_empty() {
-        SshMessage::ChannelExtendedData {
-            data_type: 1,
-            data: stderr_data,
-        }.encode_into(&mut *writer)
-        .await?;
+    // EIO is expected when the child exits and the slave side closes.
+    if let Err(ref e) = stdout_result
+        && e.raw_os_error() != Some(libc::EIO)
+    {
+        stdout_result?;
     }
 
-    stdout_result?;
-
+    // Wait for process to exit.
     let status = child.wait().await?;
     let exit_code = status.code().unwrap_or(255) as u32;
 
+    // Send exit-status request.
     send_exit_status(exit_code, writer).await?;
 
+    // Send EOF + Close.
     SshMessage::ChannelEof.encode_into(&mut *writer).await?;
     SshMessage::ChannelClose.encode_into(&mut *writer).await?;
 
@@ -553,7 +685,7 @@ mod tests {
 
         // Run "echo hello" and capture all output.
         let (_, rx) = mpsc::channel(1);
-        run_exec("echo hello", &mut server_writer, rx).await.unwrap();
+        run_exec("echo hello", &mut server_writer, rx, None).await.unwrap();
         drop(server_writer);
 
         // Collect all messages sent to the client.
@@ -644,7 +776,7 @@ mod tests {
 
         // Run a command that will fail (nonexistent binary).
         let (_, rx) = mpsc::channel(1);
-        run_exec("__nonexistent_command_xyz_2024__", &mut server_writer, rx)
+        run_exec("__nonexistent_command_xyz_2024__", &mut server_writer, rx, None)
             .await
             .unwrap();
         drop(server_writer);
@@ -996,7 +1128,7 @@ mod tests {
 
         // Shell with no stdin will immediately hit EOF and exit.
         let (_, rx) = mpsc::channel(1);
-        run_shell("/bin/sh", &mut server_writer, rx).await.unwrap();
+        run_shell("/bin/sh", &mut server_writer, rx, None).await.unwrap();
         drop(server_writer);
 
         // Should eventually get exit-status, EOF, Close
@@ -1033,7 +1165,7 @@ mod tests {
         let mut server_writer = server_writer;
 
         let (_, rx) = mpsc::channel(1);
-        run_exec("echo stderr_msg >&2", &mut server_writer, rx)
+        run_exec("echo stderr_msg >&2", &mut server_writer, rx, None)
             .await
             .unwrap();
         drop(server_writer);

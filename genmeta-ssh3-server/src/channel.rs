@@ -7,6 +7,8 @@
 //! - Sending `ChannelOpenConfirmation(91)` or `ChannelOpenFailure(92)`
 //! - Running the session channel message loop (data, requests, EOF, close)
 
+use std::os::fd::AsRawFd;
+
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
 use h3x::codec::{DecodeFrom, EncodeInto};
 use tokio::{
@@ -15,6 +17,7 @@ use tokio::{
 };
 
 use crate::forward;
+use crate::session::pty::{PtyPair, allocate_pty, set_window_size};
 use crate::session::request::{handle_request, RequestAction, run_exec, run_shell};
 
 // ---------------------------------------------------------------------------
@@ -123,19 +126,43 @@ where
     });
 
     // Dispatch loop: consume events until an exec/shell request arrives.
+    // Tracks PTY allocation state: None (idle) or Some(PtyPair) (PTY allocated).
+    let mut pty_pair: Option<PtyPair> = None;
+
     while let Some(event) = event_rx.recv().await {
         match event {
             ChannelEvent::Request { .. } => {
                 match handle_request(&event, &mut writer).await? {
                     Some(RequestAction::Exec(cmd)) => {
-                        run_exec(&cmd, &mut writer, event_rx).await?;
+                        run_exec(&cmd, &mut writer, event_rx, pty_pair.take()).await?;
                         return Ok(());
                     }
                     Some(RequestAction::Shell) => {
                         let shell = std::env::var("SHELL")
                             .unwrap_or_else(|_| "/bin/sh".to_string());
-                        run_shell(&shell, &mut writer, event_rx).await?;
+                        run_shell(&shell, &mut writer, event_rx, pty_pair.take()).await?;
                         return Ok(());
+                    }
+                    Some(RequestAction::AllocatePty(req)) => {
+                        match allocate_pty(&req) {
+                            Ok(pair) => {
+                                pty_pair = Some(pair);
+                                tracing::info!(term = %req.term_type, "PTY allocated");
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, "PTY allocation failed");
+                                // PTY failure is non-fatal — exec/shell will use piped stdio
+                            }
+                        }
+                    }
+                    Some(RequestAction::WindowChange(req)) => {
+                        if let Some(ref pair) = pty_pair {
+                            let _ = set_window_size(pair.master.as_raw_fd(), &req);
+                        }
+                    }
+                    Some(RequestAction::Signal(_)) => {
+                        // Signal before exec/shell — no process to signal yet
+                        tracing::debug!("ignoring signal before exec/shell");
                     }
                     None => { /* unrecognized request, continue loop */ }
                 }
