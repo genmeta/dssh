@@ -24,6 +24,7 @@ use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
 use h3x::varint::VarInt;
 use tokio::io::{self, duplex, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
 // Helper: build the standard SSH3 server (handler wrapped in TowerService).
@@ -432,7 +433,8 @@ fn test_basic_exec() {
         assert_eq!(success, SshMessage::ChannelSuccess);
 
         // Server: run the exec command.
-        run_exec("echo hello", &mut server_writer).await.expect("run_exec failed");
+        let (_, rx) = mpsc::channel(1);
+        run_exec("echo hello", &mut server_writer, rx).await.expect("run_exec failed");
         drop(server_writer);
 
         // Client: collect all remaining messages from server.
@@ -526,7 +528,8 @@ fn test_exec_with_stderr() {
         assert_eq!(success, SshMessage::ChannelSuccess);
 
         // Server: run the exec command (produces stderr).
-        run_exec("echo stderr_msg >&2", &mut server_writer).await.expect("run_exec failed");
+        let (_, rx) = mpsc::channel(1);
+        run_exec("echo stderr_msg >&2", &mut server_writer, rx).await.expect("run_exec failed");
         drop(server_writer);
 
         // Client: collect all messages.
@@ -683,7 +686,8 @@ fn test_multiple_channels() {
                 );
 
                 // Run exec and collect results.
-                run_exec(&cmd, &mut server_writer).await.expect("run_exec failed");
+        let (_, rx) = mpsc::channel(1);
+                run_exec(&cmd, &mut server_writer, rx).await.expect("run_exec failed");
                 drop(server_writer);
 
                 let mut messages = Vec::new();

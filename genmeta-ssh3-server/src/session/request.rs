@@ -18,6 +18,7 @@ use h3x::{
     varint::VarInt,
 };
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::channel::ChannelEvent;
 
@@ -236,7 +237,7 @@ where
 
 /// Spawn `/bin/sh -c <command>`, copy stdout → ChannelData, stderr →
 /// ChannelExtendedData, then send exit-status + EOF + Close.
-pub async fn run_exec<W>(command: &str, writer: &mut W) -> io::Result<()>
+pub async fn run_exec<W>(command: &str, writer: &mut W, event_rx: mpsc::Receiver<ChannelEvent>) -> io::Result<()>
 where
     W: AsyncWrite + Send + Unpin,
 {
@@ -244,6 +245,7 @@ where
         .args(["-c", command])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .stdin(Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
@@ -256,6 +258,25 @@ where
 
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
+    let stdin = child.stdin.take().unwrap();
+
+    // Spawn a stdin relay task: reads ChannelEvent::Data from event_rx -> writes to stdin.
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin = stdin;
+        let mut event_rx = event_rx;
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                ChannelEvent::Data(data)
+                    if stdin.write_all(&data).await.is_err() =>
+                {
+                    break;
+                }
+                ChannelEvent::Eof => break,
+                _ => { /* T5 will extend this to handle Signal/WindowChange */ }
+            }
+        }
+        drop(stdin); // Close stdin to signal EOF to child
+    });
 
     // Read stdout and stderr concurrently, sending as channel messages.
     let (stdout_result, stderr_result) = tokio::join!(
@@ -286,18 +307,23 @@ where
     SshMessage::ChannelEof.encode_into(&mut *writer).await?;
     SshMessage::ChannelClose.encode_into(&mut *writer).await?;
 
+    // Clean up stdin relay task.
+    stdin_task.abort();
+    let _ = stdin_task.await;
+
     Ok(())
 }
 
 /// Launch an interactive shell, copy stdout → ChannelData, stderr →
 /// ChannelExtendedData, then send exit-status + EOF + Close.
-pub async fn run_shell<W>(shell_path: &str, writer: &mut W) -> io::Result<()>
+pub async fn run_shell<W>(shell_path: &str, writer: &mut W, event_rx: mpsc::Receiver<ChannelEvent>) -> io::Result<()>
 where
     W: AsyncWrite + Send + Unpin,
 {
     let mut child = match tokio::process::Command::new(shell_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .stdin(Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
@@ -310,6 +336,25 @@ where
 
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
+    let stdin = child.stdin.take().unwrap();
+
+    // Spawn a stdin relay task: reads ChannelEvent::Data from event_rx -> writes to stdin.
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin = stdin;
+        let mut event_rx = event_rx;
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                ChannelEvent::Data(data)
+                    if stdin.write_all(&data).await.is_err() =>
+                {
+                    break;
+                }
+                ChannelEvent::Eof => break,
+                _ => { /* T5 will extend this to handle Signal/WindowChange */ }
+            }
+        }
+        drop(stdin); // Close stdin to signal EOF to child
+    });
 
     let (stdout_result, stderr_result) = tokio::join!(
         copy_stream_to_channel_data(&mut stdout, writer),
@@ -334,6 +379,10 @@ where
 
     SshMessage::ChannelEof.encode_into(&mut *writer).await?;
     SshMessage::ChannelClose.encode_into(&mut *writer).await?;
+
+    // Clean up stdin relay task.
+    stdin_task.abort();
+    let _ = stdin_task.await;
 
     Ok(())
 }
@@ -503,7 +552,8 @@ mod tests {
         let mut server_writer = server_writer;
 
         // Run "echo hello" and capture all output.
-        run_exec("echo hello", &mut server_writer).await.unwrap();
+        let (_, rx) = mpsc::channel(1);
+        run_exec("echo hello", &mut server_writer, rx).await.unwrap();
         drop(server_writer);
 
         // Collect all messages sent to the client.
@@ -593,7 +643,8 @@ mod tests {
         let mut server_writer = server_writer;
 
         // Run a command that will fail (nonexistent binary).
-        run_exec("__nonexistent_command_xyz_2024__", &mut server_writer)
+        let (_, rx) = mpsc::channel(1);
+        run_exec("__nonexistent_command_xyz_2024__", &mut server_writer, rx)
             .await
             .unwrap();
         drop(server_writer);
@@ -944,7 +995,8 @@ mod tests {
         let mut server_writer = server_writer;
 
         // Shell with no stdin will immediately hit EOF and exit.
-        run_shell("/bin/sh", &mut server_writer).await.unwrap();
+        let (_, rx) = mpsc::channel(1);
+        run_shell("/bin/sh", &mut server_writer, rx).await.unwrap();
         drop(server_writer);
 
         // Should eventually get exit-status, EOF, Close
@@ -980,7 +1032,8 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(65536);
         let mut server_writer = server_writer;
 
-        run_exec("echo stderr_msg >&2", &mut server_writer)
+        let (_, rx) = mpsc::channel(1);
+        run_exec("echo stderr_msg >&2", &mut server_writer, rx)
             .await
             .unwrap();
         drop(server_writer);
