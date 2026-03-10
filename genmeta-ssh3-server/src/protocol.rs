@@ -8,11 +8,13 @@
 use std::{
     collections::HashMap,
     fmt::Debug,
+    future::Future,
     pin::Pin,
     sync::Arc,
 };
 
 use futures::future::BoxFuture;
+use tokio::io;
 use tokio::sync::{Mutex, mpsc};
 
 use genmeta_ssh3_proto::codec::ChannelHeader;
@@ -46,6 +48,9 @@ pub type DispatchedStream = (ChannelHeader, BoxReader, BoxWriter);
 /// appropriate conversation via mpsc. Other streams are passed through.
 pub struct Ssh3Protocol {
     registry: Mutex<HashMap<u64, mpsc::Sender<DispatchedStream>>>,
+    /// Factory for opening server-initiated QUIC bidirectional streams.
+    /// Lazily populated from the QUIC connection on the first `accept_bi` call.
+    stream_factory: Mutex<Option<crate::forward::StreamFactory>>,
 }
 
 impl Debug for Ssh3Protocol {
@@ -59,7 +64,13 @@ impl Ssh3Protocol {
     pub fn new() -> Self {
         Self {
             registry: Mutex::new(HashMap::new()),
+            stream_factory: Mutex::new(None),
         }
+    }
+
+    /// Returns the stream factory, if one has been populated by `accept_bi`.
+    pub async fn get_stream_factory(&self) -> Option<crate::forward::StreamFactory> {
+        self.stream_factory.lock().await.clone()
     }
 
     /// Registers a conversation, returning a receiver for dispatched streams.
@@ -162,10 +173,34 @@ impl<C: quic::Connection + ?Sized> Protocol<C> for Ssh3Protocol {
 
     fn accept_bi<'a>(
         &'a self,
-        _connection: &'a Arc<QuicConnection<C>>,
+        connection: &'a Arc<QuicConnection<C>>,
         stream: BoxPeekableBiStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
-        Box::pin(self.accept_bi::<C>(stream))
+        // Lazily populate the stream factory from the QUIC connection.
+        let conn = connection.clone();
+        Box::pin(async move {
+            {
+                let mut factory = self.stream_factory.lock().await;
+                if factory.is_none() {
+                    let conn = conn.clone();
+                    *factory = Some(Arc::new(move || {
+                        let conn = conn.clone();
+                        Box::pin(async move {
+                            let (reader, writer) = conn.open_bi().await.map_err(|e| {
+                                io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string())
+                            })?;
+                            let async_reader = StreamReader::new(reader);
+                            let async_writer = SinkWriter::new(writer);
+                            Ok((
+                                Box::new(async_reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                                Box::new(async_writer) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                            ))
+                        }) as Pin<Box<dyn Future<Output = io::Result<(Box<dyn tokio::io::AsyncRead + Send + Unpin>, Box<dyn tokio::io::AsyncWrite + Send + Unpin>)>> + Send>>
+                    }));
+                }
+            }
+            self.accept_bi::<C>(stream).await
+        })
     }
 }
 

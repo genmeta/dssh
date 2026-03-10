@@ -8,6 +8,7 @@
 //! - Running the session channel message loop (data, requests, EOF, close)
 
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
 use h3x::codec::{DecodeFrom, EncodeInto};
@@ -17,9 +18,29 @@ use tokio::{
 };
 
 use crate::forward;
+use crate::forward::reverse_tcp::ReverseTcpForwarder;
+use crate::forward::streamlocal::ReverseStreamlocalForwarder;
 use crate::session::pty::{PtyPair, allocate_pty, set_window_size};
 use crate::session::request::{handle_request, RequestAction, run_exec, run_shell};
 
+// ---------------------------------------------------------------------------
+// Global request context for reverse forwarding
+// ---------------------------------------------------------------------------
+
+/// Context passed to `handle_channel` for handling `"global-request"` channels.
+///
+/// Contains the reverse TCP and streamlocal forwarders, the stream factory for
+/// opening server-initiated QUIC streams, and the conversation ID.
+pub struct GlobalRequestContext {
+    /// Reverse TCP forwarder (manages `tcpip-forward` listeners).
+    pub tcp_forwarder: Arc<ReverseTcpForwarder>,
+    /// Reverse streamlocal forwarder (manages `streamlocal-forward@openssh.com` listeners).
+    pub streamlocal_forwarder: Arc<ReverseStreamlocalForwarder>,
+    /// Factory for opening server-initiated QUIC bidirectional streams.
+    pub stream_factory: forward::StreamFactory,
+    /// Conversation ID for opened channels.
+    pub conversation_id: u64,
+}
 // ---------------------------------------------------------------------------
 // Channel events dispatched via mpsc
 // ---------------------------------------------------------------------------
@@ -54,12 +75,14 @@ const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
 ///
 /// Reads the `channel_type` from the [`ChannelHeader`] and dispatches:
 /// - `"session"` → confirm + run message loop
-/// - TCP/streamlocal forwarding types → stub (returns `Ok(())`)
+/// - `"global-request"` → decode and handle global requests (requires `global_ctx`)
+/// - TCP/streamlocal forwarding types → appropriate handler
 /// - Unknown → send `ChannelOpenFailure(92)` with reason_code=3
 pub async fn handle_channel<R, W>(
     header: ChannelHeader,
     reader: R,
     writer: W,
+    global_ctx: Option<Arc<GlobalRequestContext>>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -73,6 +96,9 @@ where
         "forwarded-tcpip" | "forwarded-streamlocal@openssh.com" => {
             // Stub dispatch points — server-initiated channels, not normally received here.
             Ok(())
+        }
+        "global-request" => {
+            handle_global_request_channel(reader, writer, global_ctx).await
         }
         _ => {
             handle_unknown_channel(header, writer).await
@@ -93,6 +119,163 @@ where
         description: "unknown channel type".into(),
     };
     failure.encode_into(&mut writer).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Global request channel handling
+// ---------------------------------------------------------------------------
+
+/// Handle a `"global-request"` channel.
+///
+/// This channel type carries SSH `GlobalRequest(80)` messages. Unlike session
+/// channels, no `ChannelOpenConfirmation` is sent. The server decodes the
+/// `GlobalRequest`, dispatches by `request_type`, and sends back
+/// `RequestSuccess(81)` or `RequestFailure(82)`.
+async fn handle_global_request_channel<R, W>(
+    mut reader: R,
+    mut writer: W,
+    global_ctx: Option<Arc<GlobalRequestContext>>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    use crate::forward::reverse_tcp::{TcpipForwardRequest, CancelTcpipForwardRequest, TcpipForwardReply};
+    use crate::forward::streamlocal::{StreamlocalForwardRequest, CancelStreamlocalForwardRequest};
+
+    // Read a single GlobalRequest from the stream.
+    let msg = SshMessage::decode_from(&mut reader).await?;
+
+    let SshMessage::GlobalRequest {
+        request_type,
+        want_reply,
+        data,
+    } = msg
+    else {
+        tracing::warn!("expected GlobalRequest on global-request channel, got {msg:?}");
+        return Ok(());
+    };
+
+    let ctx = match global_ctx {
+        Some(ctx) => ctx,
+        None => {
+            tracing::warn!("global-request channel received but no GlobalRequestContext");
+            if want_reply {
+                SshMessage::RequestFailure.encode_into(&mut writer).await?;
+            }
+            return Ok(());
+        }
+    };
+
+    match request_type.as_str() {
+        "tcpip-forward" => {
+            let req = TcpipForwardRequest::decode_from_bytes(&data).await?;
+            tracing::info!(
+                bind_address = %req.bind_address,
+                bind_port = req.bind_port,
+                "tcpip-forward request"
+            );
+            match ctx.tcp_forwarder.start_listening(
+                &req.bind_address,
+                req.bind_port as u16,
+                ctx.stream_factory.clone(),
+                ctx.conversation_id,
+            ).await {
+                Ok(actual_port) => {
+                    if want_reply {
+                        let reply_data = TcpipForwardReply {
+                            allocated_port: actual_port as u32,
+                        }
+                        .encode_to_bytes()
+                        .await;
+                        SshMessage::RequestSuccess { data: reply_data }
+                            .encode_into(&mut writer)
+                            .await?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "tcpip-forward bind failed");
+                    if want_reply {
+                        SshMessage::RequestFailure.encode_into(&mut writer).await?;
+                    }
+                }
+            }
+        }
+        "cancel-tcpip-forward" => {
+            let req = CancelTcpipForwardRequest::decode_from_bytes(&data).await?;
+            tracing::info!(
+                bind_address = %req.bind_address,
+                bind_port = req.bind_port,
+                "cancel-tcpip-forward request"
+            );
+            let stopped = ctx.tcp_forwarder.stop_listening(
+                &req.bind_address,
+                req.bind_port as u16,
+            ).await;
+            if want_reply {
+                if stopped {
+                    SshMessage::RequestSuccess { data: vec![] }
+                        .encode_into(&mut writer)
+                        .await?;
+                } else {
+                    SshMessage::RequestFailure.encode_into(&mut writer).await?;
+                }
+            }
+        }
+        "streamlocal-forward@openssh.com" => {
+            let req = StreamlocalForwardRequest::decode_from_bytes(&data).await?;
+            tracing::info!(
+                socket_path = %req.socket_path,
+                "streamlocal-forward request"
+            );
+            match ctx.streamlocal_forwarder.start_listening(
+                &req.socket_path,
+                ctx.stream_factory.clone(),
+                ctx.conversation_id,
+            ).await {
+                Ok(()) => {
+                    if want_reply {
+                        SshMessage::RequestSuccess { data: vec![] }
+                            .encode_into(&mut writer)
+                            .await?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "streamlocal-forward bind failed");
+                    if want_reply {
+                        SshMessage::RequestFailure.encode_into(&mut writer).await?;
+                    }
+                }
+            }
+        }
+        "cancel-streamlocal-forward@openssh.com" => {
+            let req = CancelStreamlocalForwardRequest::decode_from_bytes(&data).await?;
+            tracing::info!(
+                socket_path = %req.socket_path,
+                "cancel-streamlocal-forward request"
+            );
+            let stopped = ctx.streamlocal_forwarder.stop_listening(
+                &req.socket_path,
+            ).await;
+            if want_reply {
+                if stopped {
+                    SshMessage::RequestSuccess { data: vec![] }
+                        .encode_into(&mut writer)
+                        .await?;
+                } else {
+                    SshMessage::RequestFailure.encode_into(&mut writer).await?;
+                }
+            }
+        }
+        _ => {
+            tracing::warn!(request_type, "unknown global request type");
+            if want_reply {
+                SshMessage::RequestFailure.encode_into(&mut writer).await?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -336,7 +519,7 @@ mod tests {
 
         // Server handles the channel
         let server_handle = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer)
+            handle_channel(header, server_reader, server_writer, None)
                 .await
                 .unwrap();
         });
@@ -370,7 +553,7 @@ mod tests {
             max_message_size: 65536,
         };
 
-        handle_channel(header, server_reader, server_writer)
+        handle_channel(header, server_reader, server_writer, None)
             .await
             .unwrap();
 
@@ -570,7 +753,7 @@ mod tests {
                 max_message_size: 65536,
             };
 
-            let result = handle_channel(header, server_reader, server_writer).await;
+            let result = handle_channel(header, server_reader, server_writer, None).await;
             assert!(
                 result.is_ok(),
                 "forwarding type {channel_type} should return Ok(())"

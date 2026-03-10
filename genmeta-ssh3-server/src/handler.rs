@@ -22,7 +22,7 @@ use h3x::qpack::field::Protocol;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Empty, combinators::UnsyncBoxBody};
 
-use crate::{auth, child::ChildProcess, protocol::Ssh3Protocol, version};
+use crate::{auth, channel::GlobalRequestContext, child::ChildProcess, protocol::Ssh3Protocol, version};
 
 /// Result of validating the SSH3 Extended CONNECT request at the HTTP layer.
 ///
@@ -193,10 +193,22 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                             }
                         };
 
+                        // Build reverse-forwarding context.
+                        let tcp_forwarder = Arc::new(crate::forward::reverse_tcp::ReverseTcpForwarder::new());
+                        let streamlocal_forwarder = Arc::new(crate::forward::streamlocal::ReverseStreamlocalForwarder::new());
+                        let protocol_for_ctx = protocol.clone();
+
                         while let Some((header, reader, writer)) = rx.recv().await {
+                            // Build GlobalRequestContext lazily (needs stream_factory from protocol).
+                            let global_ctx = protocol_for_ctx.get_stream_factory().await.map(|sf| Arc::new(GlobalRequestContext {
+                                tcp_forwarder: tcp_forwarder.clone(),
+                                streamlocal_forwarder: streamlocal_forwarder.clone(),
+                                stream_factory: sf,
+                                conversation_id,
+                            }));
                             // Spawn each channel handler independently.
                             tokio::spawn(async move {
-                                if let Err(e) = crate::channel::handle_channel(header, reader, writer).await {
+                                if let Err(e) = crate::channel::handle_channel(header, reader, writer, global_ctx).await {
                                     tracing::warn!("channel handler error: {e}");
                                 }
                             });
