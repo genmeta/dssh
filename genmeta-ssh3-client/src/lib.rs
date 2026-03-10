@@ -84,11 +84,12 @@ impl Ssh3Client {
     /// - `ssh-version`: `michel-ssh3-00`
     /// - `Authorization`: Basic auth from config
     ///
-    /// Returns an [`Ssh3Connection`] containing the negotiated version on success.
+    /// Returns an [`Ssh3Connection`] containing the negotiated version and
+    /// the underlying h3x connection handle on success.
     pub async fn connect<C>(
         &self,
         client: &h3x::client::Client<C>,
-    ) -> Result<Ssh3Connection, ClientError>
+    ) -> Result<Ssh3Connection<std::sync::Arc<h3x::connection::Connection<C::Connection>>>, ClientError>
     where
         C: h3x::quic::Connect + Sync,
         C::Connection: Send + 'static,
@@ -169,22 +170,30 @@ impl Ssh3Client {
             "SSH3 connection established"
         );
 
-        Ok(Ssh3Connection { server_version })
+        Ok(Ssh3Connection { server_version, connection })
     }
 }
 
 /// An established SSH3 conversation over an Extended CONNECT stream.
 ///
-/// Contains the negotiated SSH version from a successful handshake.
-pub struct Ssh3Connection {
+/// Contains the negotiated SSH version and the underlying h3x connection
+/// handle from a successful handshake.
+pub struct Ssh3Connection<C> {
     /// The negotiated SSH3 version string.
     server_version: String,
+    /// The h3x connection handle for opening channels.
+    connection: C,
 }
 
-impl Ssh3Connection {
+impl<C> Ssh3Connection<C> {
     /// Returns the negotiated SSH version string.
     pub fn server_version(&self) -> &str {
         &self.server_version
+    }
+
+    /// Returns a reference to the underlying h3x connection handle.
+    pub fn connection(&self) -> &C {
+        &self.connection
     }
 }
 
