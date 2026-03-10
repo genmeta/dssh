@@ -12,6 +12,8 @@ tracing = "0.1"
 base64 = "0.22"
 snafu = "0.9"
 http = "1"
+http-body-util = "0.1"
+bytes = "1"
 
 [dev-dependencies]
 genmeta-ssh3-server = { path = "../genmeta-ssh3-server" }

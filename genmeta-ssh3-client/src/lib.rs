@@ -9,11 +9,11 @@ pub mod session;
 pub mod socks5;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use h3x::client::{Request, Response};
+use bytes::Bytes;
 use h3x::qpack::field::Protocol;
 use http::{HeaderValue, Method, StatusCode};
+use http_body_util::Empty;
 use snafu::Snafu;
-
 /// The SSH3 version string used in the `ssh-version` header.
 pub const SSH_VERSION: &str = "michel-ssh3-00";
 
@@ -76,15 +76,15 @@ impl Ssh3Client {
 
     /// Connects to the SSH3 server using the provided h3x `Client`.
     ///
-    /// Sends an Extended CONNECT request with:
+    /// Obtains a connection via `client.connect(authority)`, then sends an
+    /// Extended CONNECT request via `connection.execute_hyper_request()` with:
     /// - Method: CONNECT
-    /// - `:protocol`: ssh3
+    /// - `:protocol`: ssh3 (via `Protocol` extension)
     /// - Path: `/.well-known/ssh3/connect`
     /// - `ssh-version`: `michel-ssh3-00`
     /// - `Authorization`: Basic auth from config
     ///
-    /// Returns an [`Ssh3Connection`] wrapping the h3x Request/Response
-    /// conversation handles on success.
+    /// Returns an [`Ssh3Connection`] containing the negotiated version on success.
     pub async fn connect<C>(
         &self,
         client: &h3x::client::Client<C>,
@@ -95,19 +95,41 @@ impl Ssh3Client {
         <C::Connection as h3x::quic::ManageStream>::StreamReader: Send,
         <C::Connection as h3x::quic::ManageStream>::StreamWriter: Send,
     {
-        let uri = format!("https://{}{}", self.config.authority, SSH3_CONNECT_PATH);
+        let authority: http::uri::Authority = self
+            .config
+            .authority
+            .parse()
+            .map_err(|e| ClientError::ConnectFailed {
+                message: format!("invalid authority: {e}"),
+            })?;
 
-        let (request, mut response) = client
-            .new_request()
-            .with_method(Method::CONNECT)
-            .with_protocol(Protocol::new("ssh3"))
-            .with_uri(uri.parse().map_err(|e| ClientError::ConnectFailed {
-                message: format!("invalid URI: {e}"),
-            })?)
-            .with_header("ssh-version", HeaderValue::from_static(SSH_VERSION))
-            .with_header(http::header::AUTHORIZATION, self.basic_auth_header())
-            .auto_close(false)
-            .execute()
+        let connection = client
+            .connect(authority.clone())
+            .await
+            .map_err(|e| ClientError::ConnectFailed {
+                message: format!("{e}"),
+            })?;
+
+        let uri: http::Uri =
+            format!("https://{authority}{SSH3_CONNECT_PATH}")
+                .parse()
+                .map_err(|e| ClientError::ConnectFailed {
+                    message: format!("invalid URI: {e}"),
+                })?;
+
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(uri)
+            .header("ssh-version", SSH_VERSION)
+            .header(http::header::AUTHORIZATION, self.basic_auth_header())
+            .extension(Protocol::new("ssh3"))
+            .body(Empty::<Bytes>::new())
+            .map_err(|e| ClientError::ConnectFailed {
+                message: format!("failed to build request: {e}"),
+            })?;
+
+        let response = connection
+            .execute_hyper_request(request)
             .await
             .map_err(|e| ClientError::ConnectFailed {
                 message: format!("{e}"),
@@ -126,7 +148,8 @@ impl Ssh3Client {
 
         // Validate ssh-version response header.
         let server_version = response
-            .header("ssh-version")
+            .headers()
+            .get("ssh-version")
             .ok_or_else(|| ClientError::ProtocolError {
                 message: "missing ssh-version response header".into(),
             })?
@@ -146,23 +169,14 @@ impl Ssh3Client {
             "SSH3 connection established"
         );
 
-        Ok(Ssh3Connection {
-            request,
-            response,
-            server_version,
-        })
+        Ok(Ssh3Connection { server_version })
     }
 }
 
 /// An established SSH3 conversation over an Extended CONNECT stream.
 ///
-/// Wraps the h3x `Request` (write side) and `Response` (read side)
-/// from a successful Extended CONNECT handshake.
+/// Contains the negotiated SSH version from a successful handshake.
 pub struct Ssh3Connection {
-    /// The write side of the conversation stream (client → server).
-    request: Request,
-    /// The read side of the conversation stream (server → client).
-    response: Response,
     /// The negotiated SSH3 version string.
     server_version: String,
 }
@@ -171,16 +185,6 @@ impl Ssh3Connection {
     /// Returns the negotiated SSH version string.
     pub fn server_version(&self) -> &str {
         &self.server_version
-    }
-
-    /// Returns a mutable reference to the underlying h3x `Request` (write side).
-    pub fn request_mut(&mut self) -> &mut Request {
-        &mut self.request
-    }
-
-    /// Returns a mutable reference to the underlying h3x `Response` (read side).
-    pub fn response_mut(&mut self) -> &mut Response {
-        &mut self.response
     }
 }
 
