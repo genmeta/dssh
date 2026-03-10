@@ -21,11 +21,15 @@ use genmeta_ssh3_server::channel::handle_channel;
 use genmeta_ssh3_server::forward::direct_tcp::handle_direct_tcp;
 use genmeta_ssh3_server::session::request::{encode_exit_status, handle_request, run_exec};
 use genmeta_ssh3_proto::codec::SshString;
-use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
+use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
 use h3x::varint::VarInt;
 use tokio::io::{self, duplex, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use genmeta_ssh3_server::channel::GlobalRequestContext;
+use genmeta_ssh3_server::forward::StreamFactory;
+use genmeta_ssh3_server::forward::reverse_tcp::{ReverseTcpForwarder, TcpipForwardRequest, CancelTcpipForwardRequest, TcpipForwardReply};
+use genmeta_ssh3_server::forward::streamlocal::{ReverseStreamlocalForwarder, StreamlocalForwardRequest};
 
 // ---------------------------------------------------------------------------
 // Helper: build the standard SSH3 server (handler wrapped in TowerService).
@@ -1165,5 +1169,471 @@ fn test_window_change_signal() {
         assert!(messages.iter().any(|m| matches!(m, SshMessage::ChannelClose)));
 
         server_task.await.unwrap();
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 18. Global request E2E: tcpip-forward → RequestSuccess with allocated_port.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_global_request_tcpip_forward() {
+    run("test_global_request_tcpip_forward", async move {
+        let tcp_forwarder = Arc::new(ReverseTcpForwarder::new());
+        let streamlocal_forwarder = Arc::new(ReverseStreamlocalForwarder::new());
+        let stream_factory: StreamFactory = Arc::new(|| {
+            Box::pin(async {
+                let (a, _b) = tokio::io::duplex(8192);
+                let (ar, aw) = tokio::io::split(a);
+                Ok((
+                    Box::new(ar) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                    Box::new(aw) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                ))
+            })
+        });
+        let ctx = Arc::new(GlobalRequestContext {
+            tcp_forwarder: tcp_forwarder.clone(),
+            streamlocal_forwarder: streamlocal_forwarder.clone(),
+            stream_factory,
+            conversation_id: 1,
+        });
+
+        let header = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "global-request".into(),
+            max_message_size: 1 << 20,
+        };
+
+        let (client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+
+        let server_task = tokio::spawn(async move {
+            handle_channel(header, server_reader, server_writer, Some(ctx))
+                .await
+                .expect("handle_channel failed");
+        });
+
+        let mut writer = client_writer;
+
+        // Send tcpip-forward request with ephemeral port.
+        let req_data = TcpipForwardRequest {
+            bind_address: "127.0.0.1".into(),
+            bind_port: 0,
+        }
+        .encode_to_bytes()
+        .await;
+        SshMessage::GlobalRequest {
+            request_type: "tcpip-forward".into(),
+            want_reply: true,
+            data: req_data,
+        }
+        .encode_into(&mut writer)
+        .await
+        .unwrap();
+        drop(writer);
+
+        // Read RequestSuccess with allocated_port.
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        match msg {
+            SshMessage::RequestSuccess { data } => {
+                let reply = TcpipForwardReply::decode_from_bytes(&data).await.unwrap();
+                assert!(reply.allocated_port > 0, "allocated_port should be > 0, got {}", reply.allocated_port);
+                // Clean up: stop the listener.
+                tcp_forwarder.stop_listening("127.0.0.1", reply.allocated_port as u16).await;
+            }
+            other => panic!("expected RequestSuccess, got {other:?}"),
+        }
+
+        server_task.await.unwrap();
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 19. Global request E2E: cancel-tcpip-forward — forward then cancel.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_global_request_cancel_tcpip_forward() {
+    run("test_global_request_cancel_tcpip_forward", async move {
+        let tcp_forwarder = Arc::new(ReverseTcpForwarder::new());
+        let streamlocal_forwarder = Arc::new(ReverseStreamlocalForwarder::new());
+
+        // Helper to build a GlobalRequestContext sharing the same forwarders.
+        let make_ctx = {
+            let tcp = tcp_forwarder.clone();
+            let sl = streamlocal_forwarder.clone();
+            move || {
+                let stream_factory: StreamFactory = Arc::new(|| {
+                    Box::pin(async {
+                        let (a, _b) = tokio::io::duplex(8192);
+                        let (ar, aw) = tokio::io::split(a);
+                        Ok((
+                            Box::new(ar) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                            Box::new(aw) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                        ))
+                    })
+                });
+                Arc::new(GlobalRequestContext {
+                    tcp_forwarder: tcp.clone(),
+                    streamlocal_forwarder: sl.clone(),
+                    stream_factory,
+                    conversation_id: 1,
+                })
+            }
+        };
+
+        // --- Channel 1: tcpip-forward to get allocated_port ---
+        let (cw1, sr1) = duplex(65536);
+        let (sw1, mut cr1) = duplex(65536);
+        let ctx1 = make_ctx();
+        let h1 = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "global-request".into(),
+            max_message_size: 1 << 20,
+        };
+        let t1 = tokio::spawn(async move {
+            handle_channel(h1, sr1, sw1, Some(ctx1)).await.unwrap();
+        });
+        let mut w1 = cw1;
+        let req_data = TcpipForwardRequest {
+            bind_address: "127.0.0.1".into(),
+            bind_port: 0,
+        }.encode_to_bytes().await;
+        SshMessage::GlobalRequest {
+            request_type: "tcpip-forward".into(),
+            want_reply: true,
+            data: req_data,
+        }.encode_into(&mut w1).await.unwrap();
+        drop(w1);
+
+        let msg = SshMessage::decode_from(&mut cr1).await.unwrap();
+        let allocated_port = match msg {
+            SshMessage::RequestSuccess { data } => {
+                let reply = TcpipForwardReply::decode_from_bytes(&data).await.unwrap();
+                assert!(reply.allocated_port > 0);
+                reply.allocated_port
+            }
+            other => panic!("expected RequestSuccess, got {other:?}"),
+        };
+        t1.await.unwrap();
+
+        // --- Channel 2: cancel-tcpip-forward (should succeed) ---
+        let (cw2, sr2) = duplex(65536);
+        let (sw2, mut cr2) = duplex(65536);
+        let ctx2 = make_ctx();
+        let h2 = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "global-request".into(),
+            max_message_size: 1 << 20,
+        };
+        let t2 = tokio::spawn(async move {
+            handle_channel(h2, sr2, sw2, Some(ctx2)).await.unwrap();
+        });
+        let mut w2 = cw2;
+        let cancel_data = CancelTcpipForwardRequest {
+            bind_address: "127.0.0.1".into(),
+            bind_port: allocated_port,
+        }.encode_to_bytes().await;
+        SshMessage::GlobalRequest {
+            request_type: "cancel-tcpip-forward".into(),
+            want_reply: true,
+            data: cancel_data,
+        }.encode_into(&mut w2).await.unwrap();
+        drop(w2);
+
+        let msg2 = SshMessage::decode_from(&mut cr2).await.unwrap();
+        assert!(matches!(msg2, SshMessage::RequestSuccess { .. }), "first cancel should succeed, got {msg2:?}");
+        t2.await.unwrap();
+
+        // --- Channel 3: cancel same address again (should fail) ---
+        let (cw3, sr3) = duplex(65536);
+        let (sw3, mut cr3) = duplex(65536);
+        let ctx3 = make_ctx();
+        let h3 = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "global-request".into(),
+            max_message_size: 1 << 20,
+        };
+        let t3 = tokio::spawn(async move {
+            handle_channel(h3, sr3, sw3, Some(ctx3)).await.unwrap();
+        });
+        let mut w3 = cw3;
+        let cancel_data2 = CancelTcpipForwardRequest {
+            bind_address: "127.0.0.1".into(),
+            bind_port: allocated_port,
+        }.encode_to_bytes().await;
+        SshMessage::GlobalRequest {
+            request_type: "cancel-tcpip-forward".into(),
+            want_reply: true,
+            data: cancel_data2,
+        }.encode_into(&mut w3).await.unwrap();
+        drop(w3);
+
+        let msg3 = SshMessage::decode_from(&mut cr3).await.unwrap();
+        assert!(matches!(msg3, SshMessage::RequestFailure), "second cancel should fail, got {msg3:?}");
+        t3.await.unwrap();
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 20. Global request E2E: reverse TCP forwarded channel — full data path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_reverse_tcp_forwarded_channel() {
+    run("test_reverse_tcp_forwarded_channel", async move {
+        let tcp_forwarder = Arc::new(ReverseTcpForwarder::new());
+        let streamlocal_forwarder = Arc::new(ReverseStreamlocalForwarder::new());
+
+        // stream_factory that captures the client end via mpsc channel.
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<tokio::io::DuplexStream>();
+        let stream_factory: StreamFactory = Arc::new(move || {
+            let tx = stream_tx.clone();
+            Box::pin(async move {
+                let (server_end, client_end) = tokio::io::duplex(65536);
+                let _ = tx.send(client_end);
+                let (r, w) = tokio::io::split(server_end);
+                Ok((
+                    Box::new(r) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                    Box::new(w) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                ))
+            })
+        });
+        let ctx = Arc::new(GlobalRequestContext {
+            tcp_forwarder: tcp_forwarder.clone(),
+            streamlocal_forwarder: streamlocal_forwarder.clone(),
+            stream_factory,
+            conversation_id: 1,
+        });
+
+        // Step 1: Start tcpip-forward → get allocated_port.
+        let (cw, sr) = duplex(65536);
+        let (sw, mut cr) = duplex(65536);
+        let h = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "global-request".into(),
+            max_message_size: 1 << 20,
+        };
+        let t = tokio::spawn(async move {
+            handle_channel(h, sr, sw, Some(ctx)).await.unwrap();
+        });
+        let mut w = cw;
+        let req_data = TcpipForwardRequest {
+            bind_address: "127.0.0.1".into(),
+            bind_port: 0,
+        }.encode_to_bytes().await;
+        SshMessage::GlobalRequest {
+            request_type: "tcpip-forward".into(),
+            want_reply: true,
+            data: req_data,
+        }.encode_into(&mut w).await.unwrap();
+        drop(w);
+
+        let msg = SshMessage::decode_from(&mut cr).await.unwrap();
+        let allocated_port = match msg {
+            SshMessage::RequestSuccess { data } => {
+                TcpipForwardReply::decode_from_bytes(&data).await.unwrap().allocated_port
+            }
+            other => panic!("expected RequestSuccess for tcpip-forward, got {other:?}"),
+        };
+        assert!(allocated_port > 0);
+        t.await.unwrap();
+
+        // Step 2: Connect to the forwarded port.
+        let mut tcp_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{allocated_port}"))
+            .await
+            .expect("should connect to forwarded port");
+
+        // Step 3: The forwarder's accept loop calls stream_factory, giving us
+        // the client_end via the mpsc channel. Read ChannelHeader + request_data
+        // from it, then send confirmation and bridge data.
+        let client_end = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream_rx.recv(),
+        )
+        .await
+        .expect("timeout waiting for stream_factory")
+        .expect("stream_rx closed");
+
+        let (mut client_end_reader, mut client_end_writer) = tokio::io::split(client_end);
+
+        // Read the ChannelHeader the forwarder wrote.
+        let fwd_header = ChannelHeader::decode_from(&mut client_end_reader).await.unwrap();
+        assert_eq!(fwd_header.channel_type, "forwarded-tcpip");
+        assert_eq!(fwd_header.conversation_id, 1);
+
+        // Read forwarded-tcpip request_data fields.
+        let connected_addr = SshString::decode_from(&mut client_end_reader).await.unwrap();
+        assert_eq!(connected_addr.0, "127.0.0.1");
+        let _connected_port: VarInt = client_end_reader.decode_one().await.unwrap();
+        let _originator_addr = SshString::decode_from(&mut client_end_reader).await.unwrap();
+        let _originator_port: VarInt = client_end_reader.decode_one().await.unwrap();
+
+        // Send ChannelOpenConfirmation to accept the channel.
+        SshMessage::ChannelOpenConfirmation { max_message_size: 1 << 20 }
+            .encode_into(&mut client_end_writer)
+            .await
+            .unwrap();
+
+        // Step 4: Bidirectional data — write from TCP, read from client_end and vice versa.
+        tcp_stream.write_all(b"hello-from-tcp").await.unwrap();
+        tcp_stream.shutdown().await.unwrap();
+
+        // Read data from the QUIC side (relayed from TCP).
+        let mut buf = Vec::new();
+        client_end_reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"hello-from-tcp", "data from TCP should arrive on QUIC side");
+
+        // Clean up.
+        drop(client_end_writer);
+        tcp_forwarder.stop_listening("127.0.0.1", allocated_port as u16).await;
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 21. Global request E2E: unknown request type → RequestFailure.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_global_request_unknown_type() {
+    run("test_global_request_unknown_type", async move {
+        let tcp_forwarder = Arc::new(ReverseTcpForwarder::new());
+        let streamlocal_forwarder = Arc::new(ReverseStreamlocalForwarder::new());
+        let stream_factory: StreamFactory = Arc::new(|| {
+            Box::pin(async {
+                let (a, _b) = tokio::io::duplex(8192);
+                let (ar, aw) = tokio::io::split(a);
+                Ok((
+                    Box::new(ar) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                    Box::new(aw) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                ))
+            })
+        });
+        let ctx = Arc::new(GlobalRequestContext {
+            tcp_forwarder,
+            streamlocal_forwarder,
+            stream_factory,
+            conversation_id: 1,
+        });
+
+        let header = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "global-request".into(),
+            max_message_size: 1 << 20,
+        };
+
+        let (client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+
+        let server_task = tokio::spawn(async move {
+            handle_channel(header, server_reader, server_writer, Some(ctx))
+                .await
+                .expect("handle_channel failed");
+        });
+
+        let mut writer = client_writer;
+
+        // Send an unknown global request type.
+        SshMessage::GlobalRequest {
+            request_type: "nonsense-request-type".into(),
+            want_reply: true,
+            data: vec![],
+        }
+        .encode_into(&mut writer)
+        .await
+        .unwrap();
+        drop(writer);
+
+        // Should get RequestFailure.
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(matches!(msg, SshMessage::RequestFailure), "expected RequestFailure, got {msg:?}");
+
+        server_task.await.unwrap();
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 22. Global request E2E: streamlocal-forward@openssh.com → RequestSuccess.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_global_request_streamlocal_forward() {
+    run("test_global_request_streamlocal_forward", async move {
+        let tcp_forwarder = Arc::new(ReverseTcpForwarder::new());
+        let streamlocal_forwarder = Arc::new(ReverseStreamlocalForwarder::new());
+        let stream_factory: StreamFactory = Arc::new(|| {
+            Box::pin(async {
+                let (a, _b) = tokio::io::duplex(8192);
+                let (ar, aw) = tokio::io::split(a);
+                Ok((
+                    Box::new(ar) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                    Box::new(aw) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                ))
+            })
+        });
+        let ctx = Arc::new(GlobalRequestContext {
+            tcp_forwarder,
+            streamlocal_forwarder: streamlocal_forwarder.clone(),
+            stream_factory,
+            conversation_id: 1,
+        });
+
+        // Use a unique socket path to avoid collisions.
+        let socket_path = format!("/tmp/test-ssh3-streamlocal-{}-{}.sock", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+
+        let header = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "global-request".into(),
+            max_message_size: 1 << 20,
+        };
+
+        let (client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+
+        let server_task = tokio::spawn(async move {
+            handle_channel(header, server_reader, server_writer, Some(ctx))
+                .await
+                .expect("handle_channel failed");
+        });
+
+        let mut writer = client_writer;
+
+        // Send streamlocal-forward request.
+        let req_data = StreamlocalForwardRequest {
+            socket_path: socket_path.clone(),
+        }
+        .encode_to_bytes()
+        .await;
+        SshMessage::GlobalRequest {
+            request_type: "streamlocal-forward@openssh.com".into(),
+            want_reply: true,
+            data: req_data,
+        }
+        .encode_into(&mut writer)
+        .await
+        .unwrap();
+        drop(writer);
+
+        // Should get RequestSuccess with empty data.
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        match msg {
+            SshMessage::RequestSuccess { data } => {
+                assert!(data.is_empty(), "streamlocal-forward reply data should be empty");
+            }
+            other => panic!("expected RequestSuccess, got {other:?}"),
+        }
+
+        server_task.await.unwrap();
+
+        // Clean up: stop the listener and remove the socket file.
+        streamlocal_forwarder.stop_listening(&socket_path).await;
+        let _ = std::fs::remove_file(&socket_path);
     })
 }
