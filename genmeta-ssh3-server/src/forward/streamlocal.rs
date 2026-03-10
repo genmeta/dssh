@@ -97,8 +97,19 @@ where
     let q2u = tokio::spawn(super::relay(reader, unix_writer));
     let u2q = tokio::spawn(super::relay(unix_reader, writer));
 
-    let _ = q2u.await;
-    let _ = u2q.await;
+    // Wait for both directions, handle errors.
+    tokio::select! {
+        result = q2u => {
+            if let Ok(Err(e)) = result {
+                tracing::warn!("relay quic→unix error: {e}");
+            }
+        }
+        result = u2q => {
+            if let Ok(Err(e)) = result {
+                tracing::warn!("relay unix→quic error: {e}");
+            }
+        }
+    }
 
     Ok(())
 }
@@ -352,8 +363,19 @@ where
     let q2u = tokio::spawn(super::relay(reader, unix_writer));
     let u2q = tokio::spawn(super::relay(unix_reader, writer));
 
-    let _ = q2u.await;
-    let _ = u2q.await;
+    // Wait for both directions, handle errors.
+    tokio::select! {
+        result = q2u => {
+            if let Ok(Err(e)) = result {
+                tracing::warn!("relay quic→unix error: {e}");
+            }
+        }
+        result = u2q => {
+            if let Ok(Err(e)) = result {
+                tracing::warn!("relay unix→quic error: {e}");
+            }
+        }
+    }
 
     Ok(())
 }
