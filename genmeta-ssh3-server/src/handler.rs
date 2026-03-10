@@ -19,6 +19,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use h3x::message::stream::MessageStreamError;
 use h3x::qpack::field::Protocol;
+use h3x::varint::VarInt;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Empty, combinators::UnsyncBoxBody};
 
@@ -155,7 +156,12 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
 
             match decision {
                 ConnectDecision::Ok { version_header } => {
-                    let conversation_id = next_id.fetch_add(1, Ordering::Relaxed);
+                    // TODO: Replace with h3x StreamId when available
+                    let conversation_id = request
+                        .extensions()
+                        .get::<VarInt>()
+                        .map(|v| v.into_inner())
+                        .unwrap_or_else(|| next_id.fetch_add(1, Ordering::Relaxed));
                     let mut rx = protocol.register_conversation(conversation_id).await;
                     tracing::info!(conversation_id, "registered SSH3 conversation");
 
