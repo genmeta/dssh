@@ -22,7 +22,7 @@ use h3x::qpack::field::Protocol;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Empty, combinators::UnsyncBoxBody};
 
-use crate::{auth, protocol::Ssh3Protocol, version};
+use crate::{auth, child::ChildProcess, protocol::Ssh3Protocol, version};
 
 /// Result of validating the SSH3 Extended CONNECT request at the HTTP layer.
 ///
@@ -165,6 +165,34 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                         .insert("ssh-version", version_header);
                     // Spawn a task that consumes dispatched channel streams.
                     tokio::spawn(async move {
+                        // Attempt to spawn child process for privilege separation.
+                        let _child_process = match std::env::current_exe() {
+                            Ok(exe) => {
+                                let session_bin = exe.parent()
+                                    .map(|p| p.join("ssh3-session"))
+                                    .unwrap_or_default();
+                                if session_bin.exists() {
+                                    match ChildProcess::spawn(&session_bin).await {
+                                        Ok((child, _session_client)) => {
+                                            tracing::info!(conversation_id, "spawned child process for privilege separation");
+                                            Some(child)
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(%e, "failed to spawn child process, continuing without");
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    tracing::debug!(path = %session_bin.display(), "ssh3-session binary not found, skipping child process");
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "cannot determine executable path, skipping child process");
+                                None
+                            }
+                        };
+
                         while let Some((header, reader, writer)) = rx.recv().await {
                             // Spawn each channel handler independently.
                             tokio::spawn(async move {
