@@ -17,6 +17,7 @@ use tokio_util::task::AbortOnDropHandle;
 use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::message::SshMessage;
 use genmeta_ssh3_server::channel::open_session_channel;
+use genmeta_ssh3_server::channel::handle_channel;
 use genmeta_ssh3_server::forward::direct_tcp::handle_direct_tcp;
 use genmeta_ssh3_server::session::request::{encode_exit_status, handle_request, run_exec};
 use genmeta_ssh3_proto::codec::SshString;
@@ -741,5 +742,428 @@ fn test_multiple_channels() {
                 "channel {i}: expected ChannelClose"
             );
         }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 14. Production path: exec with stdin — handle_channel() with duplex streams.
+//     Server dispatches to handle_session_channel() (production path, NOT
+//     open_session_channel()).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_production_exec_with_stdin() {
+    run("test_production_exec_with_stdin", async move {
+        // Create two duplex pairs: one for each direction.
+        let (client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+
+        let header = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "session".into(),
+            max_message_size: 1 << 20,
+        };
+
+        // Spawn server-side handle_channel (production path).
+        let server_task = tokio::spawn(async move {
+            handle_channel(header, server_reader, server_writer, None)
+                .await
+                .expect("handle_channel failed");
+        });
+
+        // Client side: read confirmation, send exec, send data, collect output.
+        let mut writer = client_writer;
+
+        // 1. Read ChannelOpenConfirmation.
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(
+            matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }),
+            "expected ChannelOpenConfirmation, got {confirm:?}"
+        );
+
+        // 2. Send exec request: "cat" (reads stdin and echoes to stdout).
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, "cat", true)
+            .await
+            .unwrap();
+
+        // 3. Read ChannelSuccess (reply to want_reply=true).
+        let success = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert_eq!(success, SshMessage::ChannelSuccess);
+
+        // 4. Send stdin data via ChannelData.
+        SshMessage::ChannelData {
+            data: b"hello from stdin\n".to_vec(),
+        }
+        .encode_into(&mut writer)
+        .await
+        .unwrap();
+
+        // 5. Signal EOF to close stdin.
+        SshMessage::ChannelEof
+            .encode_into(&mut writer)
+            .await
+            .unwrap();
+
+        // 6. Collect server responses.
+        let mut messages = Vec::new();
+        loop {
+            match SshMessage::decode_from(&mut client_reader).await {
+                Ok(msg) => {
+                    let done = matches!(msg, SshMessage::ChannelClose);
+                    messages.push(msg);
+                    if done {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("unexpected decode error: {e}"),
+            }
+        }
+
+        // 7. Verify stdout contains the stdin data.
+        let has_hello = messages.iter().any(|m| match m {
+            SshMessage::ChannelData { data } => {
+                String::from_utf8_lossy(data).contains("hello from stdin")
+            }
+            _ => false,
+        });
+        assert!(has_hello, "expected ChannelData containing 'hello from stdin', got: {messages:?}");
+
+        // 8. Verify exit-status=0.
+        let has_exit_0 = messages.iter().any(|m| match m {
+            SshMessage::ChannelRequest {
+                request_type,
+                request_data,
+                ..
+            } => request_type == "exit-status" && *request_data == encode_exit_status(0),
+            _ => false,
+        });
+        assert!(has_exit_0, "expected exit-status=0, got: {messages:?}");
+
+        // 9. Verify EOF and Close.
+        assert!(messages.iter().any(|m| matches!(m, SshMessage::ChannelEof)), "expected ChannelEof");
+        assert!(messages.iter().any(|m| matches!(m, SshMessage::ChannelClose)), "expected ChannelClose");
+
+        server_task.await.unwrap();
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 15. Production path: exec stdin echo — "echo hello" via handle_channel().
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_production_exec_stdin_echo() {
+    run("test_production_exec_stdin_echo", async move {
+        let (client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+
+        let header = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "session".into(),
+            max_message_size: 1 << 20,
+        };
+
+        let server_task = tokio::spawn(async move {
+            handle_channel(header, server_reader, server_writer, None)
+                .await
+                .expect("handle_channel failed");
+        });
+
+        let mut writer = client_writer;
+
+        // Read ChannelOpenConfirmation.
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }));
+
+        // Send exec request: "echo hello".
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, "echo hello", true)
+            .await
+            .unwrap();
+
+        // Read ChannelSuccess.
+        let success = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert_eq!(success, SshMessage::ChannelSuccess);
+
+        // Send EOF (no stdin needed for echo).
+        SshMessage::ChannelEof.encode_into(&mut writer).await.unwrap();
+
+        // Collect server responses.
+        let mut messages = Vec::new();
+        loop {
+            match SshMessage::decode_from(&mut client_reader).await {
+                Ok(msg) => {
+                    let done = matches!(msg, SshMessage::ChannelClose);
+                    messages.push(msg);
+                    if done {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("unexpected decode error: {e}"),
+            }
+        }
+
+        // Verify stdout contains "hello".
+        let has_hello = messages.iter().any(|m| match m {
+            SshMessage::ChannelData { data } => {
+                String::from_utf8_lossy(data).contains("hello")
+            }
+            _ => false,
+        });
+        assert!(has_hello, "expected ChannelData containing 'hello', got: {messages:?}");
+
+        // Verify exit-status=0.
+        let has_exit_0 = messages.iter().any(|m| match m {
+            SshMessage::ChannelRequest {
+                request_type,
+                request_data,
+                ..
+            } => request_type == "exit-status" && *request_data == encode_exit_status(0),
+            _ => false,
+        });
+        assert!(has_exit_0, "expected exit-status=0, got: {messages:?}");
+
+        // Verify EOF and Close.
+        assert!(messages.iter().any(|m| matches!(m, SshMessage::ChannelEof)));
+        assert!(messages.iter().any(|m| matches!(m, SshMessage::ChannelClose)));
+
+        // Verify ordering: exit-status < EOF < Close.
+        let exit_pos = messages.iter().position(|m| matches!(m, SshMessage::ChannelRequest { request_type, .. } if request_type == "exit-status")).unwrap();
+        let eof_pos = messages.iter().position(|m| matches!(m, SshMessage::ChannelEof)).unwrap();
+        let close_pos = messages.iter().position(|m| matches!(m, SshMessage::ChannelClose)).unwrap();
+        assert!(exit_pos < eof_pos, "exit-status should come before EOF");
+        assert!(eof_pos < close_pos, "EOF should come before Close");
+
+        server_task.await.unwrap();
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 16. Production path: PTY shell session — allocate PTY, run shell, send
+//     input, verify output comes back.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pty_shell_session() {
+    run("test_pty_shell_session", async move {
+        let (client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+
+        let header = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "session".into(),
+            max_message_size: 1 << 20,
+        };
+
+        let server_task = tokio::spawn(async move {
+            handle_channel(header, server_reader, server_writer, None)
+                .await
+                .expect("handle_channel failed");
+        });
+
+        let mut writer = client_writer;
+
+        // Read ChannelOpenConfirmation.
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }));
+
+        // 1. Send pty-req to allocate a PTY.
+        genmeta_ssh3_client::session::send_pty_request(
+            &mut writer,
+            "xterm-256color",
+            80,  // width_cols
+            24,  // height_rows
+            0,   // width_px
+            0,   // height_px
+            &[], // terminal_modes
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Read ChannelSuccess for pty-req.
+        let pty_success = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert_eq!(pty_success, SshMessage::ChannelSuccess);
+
+        // 2. Send exec request with PTY — "echo pty_test_marker".
+        //    Using exec over a PTY exercises the same code path as shell+PTY
+        //    (run_command_with_pty) but is deterministic: no interactive prompt,
+        //    no shell startup files.
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, "echo pty_test_marker", true)
+            .await
+            .unwrap();
+
+        // Read ChannelSuccess for exec.
+        let exec_success = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert_eq!(exec_success, SshMessage::ChannelSuccess);
+
+        // 3. Send EOF (no stdin needed, command produces output on its own).
+        SshMessage::ChannelEof
+            .encode_into(&mut writer)
+            .await
+            .unwrap();
+
+        // 4. Collect server responses — look for PTY output and exit-status.
+        let mut messages = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, SshMessage::decode_from(&mut client_reader)).await {
+                Ok(Ok(msg)) => {
+                    let done = matches!(msg, SshMessage::ChannelClose);
+                    messages.push(msg);
+                    if done {
+                        break;
+                    }
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        // 5. Verify PTY output contains the marker.
+        let has_marker = messages.iter().any(|m| match m {
+            SshMessage::ChannelData { data } => {
+                String::from_utf8_lossy(data).contains("pty_test_marker")
+            }
+            _ => false,
+        });
+        assert!(has_marker, "expected ChannelData containing 'pty_test_marker', got: {messages:?}");
+
+        // 6. Verify exit-status=0.
+        let has_exit_0 = messages.iter().any(|m| match m {
+            SshMessage::ChannelRequest {
+                request_type,
+                request_data,
+                ..
+            } => request_type == "exit-status" && *request_data == encode_exit_status(0),
+            _ => false,
+        });
+        assert!(has_exit_0, "expected exit-status=0, got: {messages:?}");
+
+        // 7. Verify EOF and Close.
+        assert!(messages.iter().any(|m| matches!(m, SshMessage::ChannelEof)), "expected ChannelEof");
+        assert!(messages.iter().any(|m| matches!(m, SshMessage::ChannelClose)), "expected ChannelClose");
+
+        let _ = server_task.await;
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 17. Production path: window-change — allocate PTY, send window-change,
+//     verify the server doesn't crash and the session continues normally.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_window_change_signal() {
+    run("test_window_change_signal", async move {
+        let (client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+
+        let header = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "session".into(),
+            max_message_size: 1 << 20,
+        };
+
+        let server_task = tokio::spawn(async move {
+            handle_channel(header, server_reader, server_writer, None)
+                .await
+                .expect("handle_channel failed");
+        });
+
+        let mut writer = client_writer;
+
+        // Read ChannelOpenConfirmation.
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }));
+
+        // 1. Send pty-req.
+        genmeta_ssh3_client::session::send_pty_request(
+            &mut writer,
+            "xterm",
+            80,
+            24,
+            0,
+            0,
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
+
+        let pty_success = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert_eq!(pty_success, SshMessage::ChannelSuccess);
+
+        // 2. Send window-change BEFORE shell/exec (tests pre-session window change).
+        genmeta_ssh3_client::session::send_window_change(&mut writer, 120, 40, 960, 800)
+            .await
+            .unwrap();
+
+        // No reply expected for window-change (want_reply=false per RFC 4254 §6.7).
+
+        // 3. Send exec request (simpler than shell for testing).
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, "echo wc_test_ok", true)
+            .await
+            .unwrap();
+
+        // Read ChannelSuccess for exec.
+        let exec_success = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert_eq!(exec_success, SshMessage::ChannelSuccess);
+
+        // Send EOF.
+        SshMessage::ChannelEof.encode_into(&mut writer).await.unwrap();
+
+        // 4. Collect messages.
+        let mut messages = Vec::new();
+        loop {
+            match SshMessage::decode_from(&mut client_reader).await {
+                Ok(msg) => {
+                    let done = matches!(msg, SshMessage::ChannelClose);
+                    messages.push(msg);
+                    if done {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("unexpected decode error: {e}"),
+            }
+        }
+
+        // 5. Verify stdout contains "wc_test_ok" — proves the session survived
+        //    the window-change and completed normally.
+        let has_output = messages.iter().any(|m| match m {
+            SshMessage::ChannelData { data } => {
+                String::from_utf8_lossy(data).contains("wc_test_ok")
+            }
+            _ => false,
+        });
+        assert!(has_output, "expected ChannelData containing 'wc_test_ok', got: {messages:?}");
+
+        // 6. Verify exit-status=0.
+        let has_exit_0 = messages.iter().any(|m| match m {
+            SshMessage::ChannelRequest {
+                request_type,
+                request_data,
+                ..
+            } => request_type == "exit-status" && *request_data == encode_exit_status(0),
+            _ => false,
+        });
+        assert!(has_exit_0, "expected exit-status=0, got: {messages:?}");
+
+        // 7. Verify EOF and Close.
+        assert!(messages.iter().any(|m| matches!(m, SshMessage::ChannelEof)));
+        assert!(messages.iter().any(|m| matches!(m, SshMessage::ChannelClose)));
+
+        server_task.await.unwrap();
     })
 }
