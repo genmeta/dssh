@@ -3,16 +3,17 @@ use common::*;
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use genmeta_ssh3_client::{
     Ssh3Client, Ssh3ClientConfig, SSH3_CONNECT_PATH, SSH_VERSION,
 };
 use genmeta_ssh3_server::handler::Ssh3ConnectHandler;
 use genmeta_ssh3_server::protocol::Ssh3Protocol;
+use h3x::hyper::server::TowerService;
 use h3x::qpack::field::Protocol;
-use h3x::server::Router;
-use http::{HeaderValue, Method, StatusCode};
+use http::{Method, StatusCode};
+use http_body_util::Empty;
 use tokio_util::task::AbortOnDropHandle;
-
 use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::message::SshMessage;
 use genmeta_ssh3_server::channel::open_session_channel;
@@ -25,7 +26,7 @@ use tokio::io::{self, duplex, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 // ---------------------------------------------------------------------------
-// Helper: build the standard SSH3 server (protocol + handler + router).
+// Helper: build the standard SSH3 server (handler wrapped in TowerService).
 // ---------------------------------------------------------------------------
 
 async fn setup_server() -> (
@@ -34,9 +35,9 @@ async fn setup_server() -> (
 ) {
     let protocol = Arc::new(Ssh3Protocol::default());
     let handler = Ssh3ConnectHandler::new(protocol);
-    let router = Router::new().connect("/.well-known/ssh3/connect", handler);
+    let service = TowerService(handler);
 
-    let server = test_server(router).await;
+    let server = test_server(service).await;
     let authority = get_server_authority(&server);
     let handle = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await; }));
     (handle, authority)
@@ -49,41 +50,40 @@ async fn setup_server() -> (
 #[test]
 fn smoke_connect() {
     run("smoke_connect", async move {
-        // 1. Build router with SSH3 handler
+        // 1. Build server with SSH3 handler wrapped in TowerService
         let protocol = Arc::new(Ssh3Protocol::default());
         let handler = Ssh3ConnectHandler::new(protocol);
-        let router = Router::new().connect("/.well-known/ssh3/connect", handler);
+        let service = TowerService(handler);
 
         // 2. Start server
-        let server = test_server(router).await;
+        let server = test_server(service).await;
         let authority = get_server_authority(&server);
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
 
-        // 3. Create client and send Extended CONNECT
+        // 3. Create client and send Extended CONNECT via execute_hyper_request
         let client = test_client();
-        let (_request, mut response) = client
-            .new_request()
-            .with_method(Method::CONNECT)
-            .with_protocol(Protocol::new("ssh3"))
-            .with_uri(
-                format!("https://{authority}/.well-known/ssh3/connect")
-                    .parse()
-                    .unwrap(),
-            )
-            .with_header("ssh-version", HeaderValue::from_static("michel-ssh3-00"))
-            .with_header(
+        let connection = client.connect(authority.clone()).await.expect("connect failed");
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{authority}/.well-known/ssh3/connect"))
+            .header("ssh-version", "michel-ssh3-00")
+            .header(
                 http::header::AUTHORIZATION,
-                HeaderValue::from_static("Basic dGVzdDp0ZXN0cGFzcw=="), // test:testpass
+                "Basic dGVzdDp0ZXN0cGFzcw==", // test:testpass
             )
-            .auto_close(false)
-            .execute()
+            .extension(Protocol::new("ssh3"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = connection
+            .execute_hyper_request(request)
             .await
             .expect("CONNECT request failed");
 
         // 4. Verify response
         assert_eq!(response.status(), http::StatusCode::OK);
         let ssh_version = response
-            .header("ssh-version")
+            .headers()
+            .get("ssh-version")
             .expect("missing ssh-version response header");
         assert_eq!(ssh_version.to_str().unwrap(), "michel-ssh3-00");
     })
@@ -122,19 +122,17 @@ fn auth_failure_missing_header() {
         let (_serve, authority) = setup_server().await;
 
         let client = test_client();
-        let (_request, mut response) = client
-            .new_request()
-            .with_method(Method::CONNECT)
-            .with_protocol(Protocol::new("ssh3"))
-            .with_uri(
-                format!("https://{authority}{SSH3_CONNECT_PATH}")
-                    .parse()
-                    .unwrap(),
-            )
-            .with_header("ssh-version", HeaderValue::from_static(SSH_VERSION))
+        let connection = client.connect(authority.clone()).await.expect("connect failed");
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{authority}{SSH3_CONNECT_PATH}"))
+            .header("ssh-version", SSH_VERSION)
             // No Authorization header.
-            .auto_close(false)
-            .execute()
+            .extension(Protocol::new("ssh3"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = connection
+            .execute_hyper_request(request)
             .await
             .expect("CONNECT request itself should succeed at HTTP level");
 
@@ -142,7 +140,8 @@ fn auth_failure_missing_header() {
 
         // WWW-Authenticate header should be present.
         let www_auth = response
-            .header(http::header::WWW_AUTHENTICATE)
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
             .expect("missing WWW-Authenticate header");
         assert_eq!(www_auth.to_str().unwrap(), "Basic");
     })
@@ -160,29 +159,27 @@ fn auth_failure_via_client() {
         // The server rejects Bearer tokens and malformed headers.
         let protocol = Arc::new(Ssh3Protocol::default());
         let handler = Ssh3ConnectHandler::new(protocol);
-        let router = Router::new().connect(SSH3_CONNECT_PATH, handler);
-        let server = test_server(router).await;
+        let service = TowerService(handler);
+        let server = test_server(service).await;
         let authority = get_server_authority(&server);
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
 
         // Send a raw CONNECT with Bearer auth (unsupported).
         let client = test_client();
-        let (_request, response) = client
-            .new_request()
-            .with_method(Method::CONNECT)
-            .with_protocol(Protocol::new("ssh3"))
-            .with_uri(
-                format!("https://{authority}{SSH3_CONNECT_PATH}")
-                    .parse()
-                    .unwrap(),
-            )
-            .with_header("ssh-version", HeaderValue::from_static(SSH_VERSION))
-            .with_header(
+        let connection = client.connect(authority.clone()).await.expect("connect failed");
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{authority}{SSH3_CONNECT_PATH}"))
+            .header("ssh-version", SSH_VERSION)
+            .header(
                 http::header::AUTHORIZATION,
-                HeaderValue::from_static("Bearer some-token"),
+                "Bearer some-token",
             )
-            .auto_close(false)
-            .execute()
+            .extension(Protocol::new("ssh3"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = connection
+            .execute_hyper_request(request)
             .await
             .expect("CONNECT transport should succeed");
 
@@ -200,22 +197,20 @@ fn version_negotiation() {
         let (_serve, authority) = setup_server().await;
 
         let client = test_client();
-        let (_request, mut response) = client
-            .new_request()
-            .with_method(Method::CONNECT)
-            .with_protocol(Protocol::new("ssh3"))
-            .with_uri(
-                format!("https://{authority}{SSH3_CONNECT_PATH}")
-                    .parse()
-                    .unwrap(),
-            )
-            .with_header("ssh-version", HeaderValue::from_static(SSH_VERSION))
-            .with_header(
+        let connection = client.connect(authority.clone()).await.expect("connect failed");
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{authority}{SSH3_CONNECT_PATH}"))
+            .header("ssh-version", SSH_VERSION)
+            .header(
                 http::header::AUTHORIZATION,
-                HeaderValue::from_static("Basic dGVzdDp0ZXN0cGFzcw=="),
+                "Basic dGVzdDp0ZXN0cGFzcw==",
             )
-            .auto_close(false)
-            .execute()
+            .extension(Protocol::new("ssh3"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = connection
+            .execute_hyper_request(request)
             .await
             .expect("CONNECT should succeed");
 
@@ -223,7 +218,8 @@ fn version_negotiation() {
 
         // Server must echo back the same SSH version.
         let server_version = response
-            .header("ssh-version")
+            .headers()
+            .get("ssh-version")
             .expect("missing ssh-version");
         assert_eq!(server_version.to_str().unwrap(), SSH_VERSION);
     })
@@ -239,25 +235,23 @@ fn invalid_version_rejected() {
         let (_serve, authority) = setup_server().await;
 
         let client = test_client();
-        let (_request, response) = client
-            .new_request()
-            .with_method(Method::CONNECT)
-            .with_protocol(Protocol::new("ssh3"))
-            .with_uri(
-                format!("https://{authority}{SSH3_CONNECT_PATH}")
-                    .parse()
-                    .unwrap(),
-            )
-            .with_header(
+        let connection = client.connect(authority.clone()).await.expect("connect failed");
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{authority}{SSH3_CONNECT_PATH}"))
+            .header(
                 "ssh-version",
-                HeaderValue::from_static("unsupported-version-42"),
+                "unsupported-version-42",
             )
-            .with_header(
+            .header(
                 http::header::AUTHORIZATION,
-                HeaderValue::from_static("Basic dGVzdDp0ZXN0cGFzcw=="),
+                "Basic dGVzdDp0ZXN0cGFzcw==",
             )
-            .auto_close(false)
-            .execute()
+            .extension(Protocol::new("ssh3"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = connection
+            .execute_hyper_request(request)
             .await
             .expect("transport should succeed");
 
@@ -314,22 +308,20 @@ fn wire_format_compliance() {
         let (_serve, authority) = setup_server().await;
 
         let client = test_client();
-        let (_request, mut response) = client
-            .new_request()
-            .with_method(Method::CONNECT)
-            .with_protocol(Protocol::new("ssh3"))
-            .with_uri(
-                format!("https://{authority}{SSH3_CONNECT_PATH}")
-                    .parse()
-                    .unwrap(),
-            )
-            .with_header("ssh-version", HeaderValue::from_static(SSH_VERSION))
-            .with_header(
+        let connection = client.connect(authority.clone()).await.expect("connect failed");
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{authority}{SSH3_CONNECT_PATH}"))
+            .header("ssh-version", SSH_VERSION)
+            .header(
                 http::header::AUTHORIZATION,
-                HeaderValue::from_static("Basic dGVzdDp0ZXN0cGFzcw=="),
+                "Basic dGVzdDp0ZXN0cGFzcw==",
             )
-            .auto_close(false)
-            .execute()
+            .extension(Protocol::new("ssh3"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = connection
+            .execute_hyper_request(request)
             .await
             .expect("CONNECT should succeed");
 
@@ -337,11 +329,11 @@ fn wire_format_compliance() {
         assert_eq!(response.status(), StatusCode::OK);
 
         // 2. ssh-version header must be present and match.
-        let ver = response.header("ssh-version").unwrap();
+        let ver = response.headers().get("ssh-version").unwrap();
         assert_eq!(ver.to_str().unwrap(), SSH_VERSION);
 
         // 3. No content-type: application/cbor — SSH3 uses SSH binary, not CBOR.
-        let ct = response.header("content-type");
+        let ct = response.headers().get("content-type");
         if let Some(ct_val) = ct {
             let s = ct_val.to_str().unwrap_or("");
             assert!(
@@ -367,22 +359,20 @@ fn missing_version_rejected() {
         let (_serve, authority) = setup_server().await;
 
         let client = test_client();
-        let (_request, response) = client
-            .new_request()
-            .with_method(Method::CONNECT)
-            .with_protocol(Protocol::new("ssh3"))
-            .with_uri(
-                format!("https://{authority}{SSH3_CONNECT_PATH}")
-                    .parse()
-                    .unwrap(),
-            )
+        let connection = client.connect(authority.clone()).await.expect("connect failed");
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{authority}{SSH3_CONNECT_PATH}"))
             // No ssh-version header.
-            .with_header(
+            .header(
                 http::header::AUTHORIZATION,
-                HeaderValue::from_static("Basic dGVzdDp0ZXN0cGFzcw=="),
+                "Basic dGVzdDp0ZXN0cGFzcw==",
             )
-            .auto_close(false)
-            .execute()
+            .extension(Protocol::new("ssh3"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = connection
+            .execute_hyper_request(request)
             .await
             .expect("transport should succeed");
 

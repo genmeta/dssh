@@ -613,11 +613,13 @@ name = "genmeta-ssh3-client"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytes",
  "genmeta-ssh3-proto",
  "genmeta-ssh3-server",
  "gm-quic",
  "h3x",
  "http",
+ "http-body-util",
  "rustls",
  "snafu",
  "tokio",
@@ -647,12 +649,14 @@ dependencies = [
 name = "genmeta-ssh3-server"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
  "genmeta-ssh3-client",
  "genmeta-ssh3-proto",
  "gm-quic",
  "h3x",
  "http",
+ "http-body-util",
  "libc",
  "nix 0.29.0",
  "rand",
