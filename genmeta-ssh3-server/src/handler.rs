@@ -156,13 +156,24 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
             match decision {
                 ConnectDecision::Ok { version_header } => {
                     let conversation_id = next_id.fetch_add(1, Ordering::Relaxed);
-                    let _rx = protocol.register_conversation(conversation_id).await;
+                    let mut rx = protocol.register_conversation(conversation_id).await;
                     tracing::info!(conversation_id, "registered SSH3 conversation");
 
                     *response.status_mut() = StatusCode::OK;
                     response
                         .headers_mut()
                         .insert("ssh-version", version_header);
+                    // Spawn a task that consumes dispatched channel streams.
+                    tokio::spawn(async move {
+                        while let Some((header, reader, writer)) = rx.recv().await {
+                            // Spawn each channel handler independently.
+                            tokio::spawn(async move {
+                                if let Err(e) = crate::channel::handle_channel(header, reader, writer).await {
+                                    tracing::warn!("channel handler error: {e}");
+                                }
+                            });
+                        }
+                    });
                 }
                 ConnectDecision::BadRequest(msg) => {
                     tracing::warn!(%msg, "SSH3 CONNECT rejected");
