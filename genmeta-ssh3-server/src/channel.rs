@@ -8,6 +8,7 @@
 //! - Running the session channel message loop (data, requests, EOF, close)
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
+use h3x::codec::{DecodeFrom, EncodeInto};
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
     sync::mpsc,
@@ -87,7 +88,7 @@ where
         reason_code: 3,
         description: "unknown channel type".into(),
     };
-    SshMessage::encode(&failure, &mut writer).await?;
+    failure.encode_into(&mut writer).await?;
     Ok(())
 }
 
@@ -112,7 +113,7 @@ where
     let confirm = SshMessage::ChannelOpenConfirmation {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
-    SshMessage::encode(&confirm, &mut writer).await?;
+    confirm.encode_into(&mut writer).await?;
 
     // Run the message loop, discarding the event receiver.
     let (_event_rx, result) = run_message_loop(reader, writer).await;
@@ -135,7 +136,7 @@ where
     let confirm = SshMessage::ChannelOpenConfirmation {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
-    SshMessage::encode(&confirm, &mut writer).await?;
+    confirm.encode_into(&mut writer).await?;
 
     let (event_tx, event_rx) = mpsc::channel(64);
     tokio::spawn(async move {
@@ -171,7 +172,7 @@ where
     R: AsyncRead + Send + Unpin,
 {
     loop {
-        let msg = match SshMessage::decode(&mut reader).await {
+        let msg = match SshMessage::decode_from(&mut reader).await {
             Ok(msg) => msg,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 // Stream closed — normal termination.
@@ -235,7 +236,7 @@ mod tests {
     /// Helper: encode messages into writer half, then drop to signal EOF.
     async fn encode_messages(mut writer: impl AsyncWrite + Send + Unpin, messages: &[SshMessage]) {
         for msg in messages {
-            SshMessage::encode(msg, &mut writer).await.unwrap();
+            msg.encode_into(&mut writer).await.unwrap();
         }
         drop(writer);
     }
@@ -276,7 +277,7 @@ mod tests {
         });
 
         // Read the ChannelOpenConfirmation from the server
-        let confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
                 assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
@@ -309,7 +310,7 @@ mod tests {
             .unwrap();
 
         // Read the ChannelOpenFailure from the server
-        let failure = SshMessage::decode(&mut client_reader).await.unwrap();
+        let failure = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match failure {
             SshMessage::ChannelOpenFailure {
                 reason_code,
@@ -333,15 +334,12 @@ mod tests {
 
         // Send data then close
         let client_handle = tokio::spawn(async move {
-            SshMessage::encode(
-                &SshMessage::ChannelData {
-                    data: b"test-data".to_vec(),
-                },
-                &mut client_writer,
-            )
+            SshMessage::ChannelData {
+                data: b"test-data".to_vec(),
+            }.encode_into(&mut client_writer)
             .await
             .unwrap();
-            SshMessage::encode(&SshMessage::ChannelClose, &mut client_writer)
+            SshMessage::ChannelClose.encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
@@ -354,7 +352,7 @@ mod tests {
                 .unwrap();
 
         // Read confirmation from client side
-        let confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert!(matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }));
 
         // Receive the data event
@@ -378,17 +376,14 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let client_handle = tokio::spawn(async move {
-            SshMessage::encode(
-                &SshMessage::ChannelRequest {
-                    request_type: "exec".into(),
-                    want_reply: true,
-                    request_data: b"ls -la".to_vec(),
-                },
-                &mut client_writer,
-            )
+            SshMessage::ChannelRequest {
+                request_type: "exec".into(),
+                want_reply: true,
+                request_data: b"ls -la".to_vec(),
+            }.encode_into(&mut client_writer)
             .await
             .unwrap();
-            SshMessage::encode(&SshMessage::ChannelClose, &mut client_writer)
+            SshMessage::ChannelClose.encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
@@ -400,7 +395,7 @@ mod tests {
                 .unwrap();
 
         // Read confirmation
-        let _confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let _confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
 
         // Receive the request event
         let event = event_rx.recv().await.unwrap();
@@ -426,10 +421,10 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let client_handle = tokio::spawn(async move {
-            SshMessage::encode(&SshMessage::ChannelEof, &mut client_writer)
+            SshMessage::ChannelEof.encode_into(&mut client_writer)
                 .await
                 .unwrap();
-            SshMessage::encode(&SshMessage::ChannelClose, &mut client_writer)
+            SshMessage::ChannelClose.encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
@@ -441,7 +436,7 @@ mod tests {
                 .unwrap();
 
         // Read confirmation
-        let _confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let _confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
 
         // Receive EOF event
         let event = event_rx.recv().await.unwrap();
@@ -464,7 +459,7 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let client_handle = tokio::spawn(async move {
-            SshMessage::encode(&SshMessage::ChannelClose, &mut client_writer)
+            SshMessage::ChannelClose.encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
@@ -476,7 +471,7 @@ mod tests {
                 .unwrap();
 
         // Read confirmation
-        let _confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let _confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
 
         // Receive close event
         let event = event_rx.recv().await.unwrap();
@@ -528,16 +523,13 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let client_handle = tokio::spawn(async move {
-            SshMessage::encode(
-                &SshMessage::ChannelExtendedData {
-                    data_type: 1, // stderr
-                    data: b"error output".to_vec(),
-                },
-                &mut client_writer,
-            )
+            SshMessage::ChannelExtendedData {
+                data_type: 1, // stderr
+                data: b"error output".to_vec(),
+            }.encode_into(&mut client_writer)
             .await
             .unwrap();
-            SshMessage::encode(&SshMessage::ChannelClose, &mut client_writer)
+            SshMessage::ChannelClose.encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
@@ -549,7 +541,7 @@ mod tests {
                 .unwrap();
 
         // Read confirmation
-        let _confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let _confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
 
         // Receive extended data event
         let event = event_rx.recv().await.unwrap();
@@ -575,21 +567,18 @@ mod tests {
 
         let client_handle = tokio::spawn(async move {
             // Send success and failure, then close
-            SshMessage::encode(&SshMessage::ChannelSuccess, &mut client_writer)
+            SshMessage::ChannelSuccess.encode_into(&mut client_writer)
                 .await
                 .unwrap();
-            SshMessage::encode(&SshMessage::ChannelFailure, &mut client_writer)
+            SshMessage::ChannelFailure.encode_into(&mut client_writer)
                 .await
                 .unwrap();
-            SshMessage::encode(
-                &SshMessage::ChannelData {
-                    data: b"after".to_vec(),
-                },
-                &mut client_writer,
-            )
+            SshMessage::ChannelData {
+                data: b"after".to_vec(),
+            }.encode_into(&mut client_writer)
             .await
             .unwrap();
-            SshMessage::encode(&SshMessage::ChannelClose, &mut client_writer)
+            SshMessage::ChannelClose.encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
@@ -601,7 +590,7 @@ mod tests {
                 .unwrap();
 
         // Read confirmation
-        let _confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let _confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
 
         // ChannelSuccess and ChannelFailure should NOT appear as events.
         // The next event should be the data message.

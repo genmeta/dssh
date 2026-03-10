@@ -17,7 +17,7 @@
 //! NOT wrapped in `SSH_MSG_CHANNEL_DATA(94)`.
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
-use h3x::codec::DecodeExt;
+use h3x::codec::{DecodeExt, DecodeFrom, EncodeInto};
 use h3x::varint::VarInt;
 use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -43,9 +43,9 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // Parse request_data fields (RFC 4254 §7.2).
-    let dest_host = SshString::decode(&mut reader).await?;
+    let dest_host = SshString::decode_from(&mut reader).await?;
     let dest_port: VarInt = reader.decode_one().await?;
-    let _originator_host = SshString::decode(&mut reader).await?;
+    let _originator_host = SshString::decode_from(&mut reader).await?;
     let _originator_port: VarInt = reader.decode_one().await?;
 
     let dest_port = dest_port.into_inner() as u16;
@@ -60,7 +60,7 @@ where
                 reason_code: SSH_OPEN_CONNECT_FAILED,
                 description: format!("connect failed: {e}"),
             };
-            SshMessage::encode(&failure, &mut writer).await?;
+            failure.encode_into(&mut writer).await?;
             return Ok(());
         }
     };
@@ -69,7 +69,7 @@ where
     let confirm = SshMessage::ChannelOpenConfirmation {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
-    SshMessage::encode(&confirm, &mut writer).await?;
+    confirm.encode_into(&mut writer).await?;
 
     // Bridge raw bytes bidirectionally between QUIC stream and TCP socket.
     // We spawn two tasks for true concurrency — this avoids deadlocks that
@@ -104,15 +104,13 @@ mod tests {
         originator_port: u32,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
-        SshString(dest_host.to_owned())
-            .encode(&mut buf)
+        SshString(dest_host.to_owned()).encode_into(&mut buf)
             .await
             .unwrap();
         buf.encode_one(VarInt::try_from(dest_port as u64).unwrap())
             .await
             .unwrap();
-        SshString(originator_host.to_owned())
-            .encode(&mut buf)
+        SshString(originator_host.to_owned()).encode_into(&mut buf)
             .await
             .unwrap();
         buf.encode_one(VarInt::try_from(originator_port as u64).unwrap())
@@ -130,9 +128,9 @@ mod tests {
         let data = encode_request_data("example.com", 8080, "192.168.1.1", 54321).await;
 
         let mut reader = &data[..];
-        let dest_host = SshString::decode(&mut reader).await.unwrap();
+        let dest_host = SshString::decode_from(&mut reader).await.unwrap();
         let dest_port: VarInt = reader.decode_one().await.unwrap();
-        let originator_host = SshString::decode(&mut reader).await.unwrap();
+        let originator_host = SshString::decode_from(&mut reader).await.unwrap();
         let originator_port: VarInt = reader.decode_one().await.unwrap();
 
         assert_eq!(dest_host, SshString("example.com".into()));
@@ -216,7 +214,7 @@ mod tests {
         });
 
         // Read ChannelOpenConfirmation from the server.
-        let confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
                 assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
@@ -268,7 +266,7 @@ mod tests {
             .unwrap();
 
         // Should receive ChannelOpenFailure(92) with reason_code=2.
-        let msg = SshMessage::decode(&mut client_reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match msg {
             SshMessage::ChannelOpenFailure {
                 reason_code,
@@ -332,7 +330,7 @@ mod tests {
         });
 
         // Read ChannelOpenConfirmation.
-        let confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert!(
             matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }),
             "expected ChannelOpenConfirmation, got {confirm:?}"

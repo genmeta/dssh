@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, mpsc};
 use genmeta_ssh3_proto::codec::ChannelHeader;
 use h3x::{
     codec::{
-        BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, SinkWriter, StreamReader,
+        BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, DecodeFrom, SinkWriter, StreamReader,
     },
     connection::{QuicConnection, StreamError},
     protocol::{Protocol, StreamVerdict},
@@ -119,7 +119,7 @@ impl Ssh3Protocol {
         let stream_writer = writer.map_sink(|b| b as Pin<Box<dyn quic::WriteStream + Send>>);
 
         // Decode the full ChannelHeader from the reset reader.
-        let header = match ChannelHeader::decode(&mut stream_reader).await {
+        let header = match ChannelHeader::decode_from(&mut stream_reader).await {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!("failed to decode SSH3 ChannelHeader: {e}");
@@ -172,13 +172,13 @@ impl<C: quic::Connection + ?Sized> Protocol<C> for Ssh3Protocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use h3x::codec::EncodeExt;
+    use h3x::codec::{EncodeExt, EncodeInto};
     use tokio::io::{AsyncReadExt, duplex};
 
     /// Helper: encode a ChannelHeader into raw bytes.
     async fn encode_channel_header(header: &ChannelHeader) -> Vec<u8> {
         let (mut w, mut r) = duplex(4096);
-        header.encode(&mut w).await.unwrap();
+        header.encode_into(&mut w).await.unwrap();
         drop(w);
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).await.unwrap();
@@ -267,7 +267,7 @@ mod tests {
         let (mut w, mut r) = duplex(4096);
         tokio::io::AsyncWriteExt::write_all(&mut w, &data).await.unwrap();
         drop(w);
-        let decoded = ChannelHeader::decode(&mut r).await.unwrap();
+        let decoded = ChannelHeader::decode_from(&mut r).await.unwrap();
         assert_eq!(decoded.signal_value, SSH3_SIGNAL_VALUE);
         assert_eq!(decoded.conversation_id, 12345);
         assert_eq!(decoded.channel_type, "session");
@@ -365,7 +365,7 @@ mod tests {
         let (mut w, mut r) = duplex(4096);
         tokio::io::AsyncWriteExt::write_all(&mut w, &data).await.unwrap();
         drop(w);
-        let decoded = ChannelHeader::decode(&mut r).await.unwrap();
+        let decoded = ChannelHeader::decode_from(&mut r).await.unwrap();
         assert_eq!(decoded, header);
     }
 

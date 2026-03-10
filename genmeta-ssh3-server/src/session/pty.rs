@@ -7,7 +7,7 @@ use std::io;
 use std::os::fd::{OwnedFd, RawFd};
 
 use genmeta_ssh3_proto::codec::SshString;
-use h3x::{codec::DecodeExt, varint::VarInt};
+use h3x::{codec::{DecodeExt, DecodeFrom}, varint::VarInt};
 use nix::pty::{openpty, Winsize};
 
 // ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ pub struct PtyPair {
 pub async fn parse_pty_request(request_data: &[u8]) -> io::Result<PtyRequest> {
     let mut reader = request_data;
 
-    let term_type = SshString::decode(&mut reader).await?;
+    let term_type = SshString::decode_from(&mut reader).await?;
 
     let width_cols: VarInt = reader.decode_one().await?;
     let height_rows: VarInt = reader.decode_one().await?;
@@ -128,7 +128,7 @@ pub async fn parse_window_change(request_data: &[u8]) -> io::Result<WindowChange
 /// - `SshString`: signal name (without "SIG" prefix, e.g., "INT", "TERM", "KILL")
 pub async fn parse_signal(request_data: &[u8]) -> io::Result<SignalRequest> {
     let mut reader = request_data;
-    let signal_name = SshString::decode(&mut reader).await?;
+    let signal_name = SshString::decode_from(&mut reader).await?;
     Ok(SignalRequest {
         signal_name: signal_name.0,
     })
@@ -183,11 +183,11 @@ pub fn set_window_size(master_fd: RawFd, request: &WindowChangeRequest) -> io::R
 /// Encode a PtyRequest into wire bytes for testing.
 #[cfg(test)]
 async fn encode_pty_request(req: &PtyRequest) -> io::Result<Vec<u8>> {
-    use h3x::codec::EncodeExt;
+    use h3x::codec::{EncodeExt, EncodeInto};
     use tokio::io::AsyncWriteExt;
 
     let mut buf = Vec::new();
-    SshString(req.term_type.clone()).encode(&mut buf).await?;
+    SshString(req.term_type.clone()).encode_into(&mut buf).await?;
 
     let width_cols = VarInt::try_from(req.width_cols as u64)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -243,8 +243,9 @@ async fn encode_window_change(req: &WindowChangeRequest) -> io::Result<Vec<u8>> 
 /// Encode a SignalRequest into wire bytes for testing.
 #[cfg(test)]
 async fn encode_signal(req: &SignalRequest) -> io::Result<Vec<u8>> {
+    use h3x::codec::EncodeInto;
     let mut buf = Vec::new();
-    SshString(req.signal_name.clone()).encode(&mut buf).await?;
+    SshString(req.signal_name.clone()).encode_into(&mut buf).await?;
     Ok(buf)
 }
 

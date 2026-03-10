@@ -19,7 +19,7 @@ use genmeta_ssh3_server::channel::open_session_channel;
 use genmeta_ssh3_server::forward::direct_tcp::handle_direct_tcp;
 use genmeta_ssh3_server::session::request::{encode_exit_status, handle_request, run_exec};
 use genmeta_ssh3_proto::codec::SshString;
-use h3x::codec::EncodeExt;
+use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
 use h3x::varint::VarInt;
 use tokio::io::{self, duplex, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -411,7 +411,7 @@ fn test_basic_exec() {
                 .expect("open_session_channel failed");
 
         // Client: read ChannelOpenConfirmation.
-        let confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert!(
             matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }),
             "expected ChannelOpenConfirmation, got {confirm:?}"
@@ -422,8 +422,8 @@ fn test_basic_exec() {
             .await
             .unwrap();
         // Send EOF + Close to signal we're done sending.
-        SshMessage::encode(&SshMessage::ChannelEof, &mut client_writer).await.unwrap();
-        SshMessage::encode(&SshMessage::ChannelClose, &mut client_writer).await.unwrap();
+        SshMessage::ChannelEof.encode_into(&mut client_writer).await.unwrap();
+        SshMessage::ChannelClose.encode_into(&mut client_writer).await.unwrap();
         drop(client_writer);
 
         // Server: receive the exec request event and handle it.
@@ -438,7 +438,7 @@ fn test_basic_exec() {
         );
 
         // Client: read ChannelSuccess (reply to want_reply=true).
-        let success = SshMessage::decode(&mut client_reader).await.unwrap();
+        let success = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert_eq!(success, SshMessage::ChannelSuccess);
 
         // Server: run the exec command.
@@ -448,7 +448,7 @@ fn test_basic_exec() {
         // Client: collect all remaining messages from server.
         let mut messages = Vec::new();
         loop {
-            match SshMessage::decode(&mut client_reader).await {
+            match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => messages.push(msg),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => panic!("unexpected decode error: {e}"),
@@ -509,7 +509,7 @@ fn test_exec_with_stderr() {
                 .expect("open_session_channel failed");
 
         // Client: read ChannelOpenConfirmation.
-        let confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert!(matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }));
 
         // Client: send exec request that writes to stderr.
@@ -520,8 +520,8 @@ fn test_exec_with_stderr() {
         )
         .await
         .unwrap();
-        SshMessage::encode(&SshMessage::ChannelEof, &mut client_writer).await.unwrap();
-        SshMessage::encode(&SshMessage::ChannelClose, &mut client_writer).await.unwrap();
+        SshMessage::ChannelEof.encode_into(&mut client_writer).await.unwrap();
+        SshMessage::ChannelClose.encode_into(&mut client_writer).await.unwrap();
         drop(client_writer);
 
         // Server: handle the request and run exec.
@@ -532,7 +532,7 @@ fn test_exec_with_stderr() {
             .expect("expected Exec action");
 
         // Client: read ChannelSuccess.
-        let success = SshMessage::decode(&mut client_reader).await.unwrap();
+        let success = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert_eq!(success, SshMessage::ChannelSuccess);
 
         // Server: run the exec command (produces stderr).
@@ -542,7 +542,7 @@ fn test_exec_with_stderr() {
         // Client: collect all messages.
         let mut messages = Vec::new();
         loop {
-            match SshMessage::decode(&mut client_reader).await {
+            match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => messages.push(msg),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => panic!("unexpected decode error: {e}"),
@@ -604,9 +604,9 @@ fn test_direct_tcp_forward() {
 
         // Encode direct-tcpip request_data fields.
         let mut request_data = Vec::new();
-        SshString("127.0.0.1".into()).encode(&mut request_data).await.unwrap();
+        SshString("127.0.0.1".into()).encode_into(&mut request_data).await.unwrap();
         request_data.encode_one(VarInt::try_from(addr.port() as u64).unwrap()).await.unwrap();
-        SshString("127.0.0.1".into()).encode(&mut request_data).await.unwrap();
+        SshString("127.0.0.1".into()).encode_into(&mut request_data).await.unwrap();
         request_data.encode_one(VarInt::try_from(12345u64).unwrap()).await.unwrap();
 
         let header = ChannelHeader {
@@ -635,7 +635,7 @@ fn test_direct_tcp_forward() {
         });
 
         // Client: read ChannelOpenConfirmation.
-        let confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert!(
             matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }),
             "expected ChannelOpenConfirmation, got {confirm:?}"
@@ -686,7 +686,7 @@ fn test_multiple_channels() {
                         .expect("open_session_channel failed");
 
                 // Read ChannelOpenConfirmation.
-                let confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+                let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
                 assert!(
                     matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }),
                     "channel {i}: expected ChannelOpenConfirmation"
@@ -698,7 +698,7 @@ fn test_multiple_channels() {
 
                 let mut messages = Vec::new();
                 loop {
-                    match SshMessage::decode(&mut client_reader).await {
+                    match SshMessage::decode_from(&mut client_reader).await {
                         Ok(msg) => messages.push(msg),
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                         Err(e) => panic!("channel {i}: unexpected decode error: {e}"),

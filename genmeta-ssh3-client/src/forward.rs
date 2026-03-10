@@ -10,7 +10,7 @@
 
 use genmeta_ssh3_proto::codec::{ChannelHeader, SshString};
 use genmeta_ssh3_proto::message::SshMessage;
-use h3x::codec::{DecodeExt, EncodeExt};
+use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
 use h3x::varint::VarInt;
 use tokio::io::{self, AsyncRead, AsyncWrite};
 
@@ -38,12 +38,12 @@ pub async fn encode_direct_tcpip_request_data(
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
 
-    SshString(dest_host.to_owned()).encode(&mut buf).await?;
+    SshString(dest_host.to_owned()).encode_into(&mut buf).await?;
     let dp = VarInt::try_from(dest_port as u64)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     buf.encode_one(dp).await?;
 
-    SshString(originator_host.to_owned()).encode(&mut buf).await?;
+    SshString(originator_host.to_owned()).encode_into(&mut buf).await?;
     let op = VarInt::try_from(originator_port as u64)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     buf.encode_one(op).await?;
@@ -70,15 +70,15 @@ pub async fn write_direct_tcpip_channel_open<W: AsyncWrite + Send + Unpin>(
         channel_type: "direct-tcpip".to_string(),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
-    header.encode(writer).await?;
+    header.encode_into(&mut *writer).await?;
 
     // Write request_data fields inline on the stream (NOT as SshBytes — the
     // server reads them directly after the ChannelHeader).
-    SshString(dest_host.to_owned()).encode(writer).await?;
+    SshString(dest_host.to_owned()).encode_into(&mut *writer).await?;
     let dp = VarInt::try_from(dest_port as u64)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     writer.encode_one(dp).await?;
-    SshString(originator_host.to_owned()).encode(writer).await?;
+    SshString(originator_host.to_owned()).encode_into(&mut *writer).await?;
     let op = VarInt::try_from(originator_port as u64)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     writer.encode_one(op).await?;
@@ -97,7 +97,7 @@ pub async fn encode_tcpip_forward_request(
     bind_port: u32,
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    SshString(bind_address.to_owned()).encode(&mut buf).await?;
+    SshString(bind_address.to_owned()).encode_into(&mut buf).await?;
     let bp = VarInt::try_from(bind_port as u64)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     buf.encode_one(bp).await?;
@@ -125,14 +125,11 @@ pub async fn send_tcpip_forward_request<W: AsyncWrite + Send + Unpin>(
     bind_port: u32,
 ) -> io::Result<()> {
     let data = encode_tcpip_forward_request(bind_address, bind_port).await?;
-    SshMessage::encode(
-        &SshMessage::GlobalRequest {
-            request_type: "tcpip-forward".into(),
-            want_reply: true,
-            data,
-        },
-        writer,
-    )
+    SshMessage::GlobalRequest {
+        request_type: "tcpip-forward".into(),
+        want_reply: true,
+        data,
+    }.encode_into(writer)
     .await
 }
 
@@ -143,14 +140,11 @@ pub async fn send_cancel_tcpip_forward_request<W: AsyncWrite + Send + Unpin>(
     bind_port: u32,
 ) -> io::Result<()> {
     let data = encode_cancel_tcpip_forward_request(bind_address, bind_port).await?;
-    SshMessage::encode(
-        &SshMessage::GlobalRequest {
-            request_type: "cancel-tcpip-forward".into(),
-            want_reply: true,
-            data,
-        },
-        writer,
-    )
+    SshMessage::GlobalRequest {
+        request_type: "cancel-tcpip-forward".into(),
+        want_reply: true,
+        data,
+    }.encode_into(writer)
     .await
 }
 
@@ -192,9 +186,9 @@ pub struct ForwardedTcpipInfo {
 pub async fn read_forwarded_tcpip_info<R: AsyncRead + Send + Unpin>(
     reader: &mut R,
 ) -> io::Result<ForwardedTcpipInfo> {
-    let connected_address = SshString::decode(reader).await?;
+    let connected_address = SshString::decode_from(&mut *reader).await?;
     let connected_port: VarInt = reader.decode_one().await?;
-    let originator_address = SshString::decode(reader).await?;
+    let originator_address = SshString::decode_from(&mut *reader).await?;
     let originator_port: VarInt = reader.decode_one().await?;
 
     Ok(ForwardedTcpipInfo {
@@ -213,7 +207,7 @@ pub async fn accept_forwarded_channel<W: AsyncWrite + Send + Unpin>(
     let confirm = SshMessage::ChannelOpenConfirmation {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
-    SshMessage::encode(&confirm, writer).await
+    confirm.encode_into(writer).await
 }
 
 /// Reject a server-initiated `forwarded-tcpip` channel by sending
@@ -227,7 +221,7 @@ pub async fn reject_forwarded_channel<W: AsyncWrite + Send + Unpin>(
         reason_code,
         description: description.to_owned(),
     };
-    SshMessage::encode(&failure, writer).await
+    failure.encode_into(writer).await
 }
 
 // ---------------------------------------------------------------------------
@@ -258,9 +252,9 @@ mod tests {
                 .unwrap();
 
         let mut reader = &data[..];
-        let dest_host = SshString::decode(&mut reader).await.unwrap();
+        let dest_host = SshString::decode_from(&mut reader).await.unwrap();
         let dest_port: VarInt = reader.decode_one().await.unwrap();
-        let originator_host = SshString::decode(&mut reader).await.unwrap();
+        let originator_host = SshString::decode_from(&mut reader).await.unwrap();
         let originator_port: VarInt = reader.decode_one().await.unwrap();
 
         assert_eq!(dest_host, SshString("example.com".into()));
@@ -308,17 +302,17 @@ mod tests {
         drop(writer);
 
         // Read the ChannelHeader
-        let header = ChannelHeader::decode(&mut reader).await.unwrap();
+        let header = ChannelHeader::decode_from(&mut reader).await.unwrap();
         assert_eq!(header.signal_value, CHANNEL_SIGNAL_VALUE);
         assert_eq!(header.conversation_id, 42);
         assert_eq!(header.channel_type, "direct-tcpip");
         assert_eq!(header.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
 
         // Read request_data fields
-        let dest_host = SshString::decode(&mut reader).await.unwrap();
-        let dest_port: VarInt = (&mut reader).decode_one().await.unwrap();
-        let originator_host = SshString::decode(&mut reader).await.unwrap();
-        let originator_port: VarInt = (&mut reader).decode_one().await.unwrap();
+        let dest_host = SshString::decode_from(&mut reader).await.unwrap();
+        let dest_port: VarInt = reader.decode_one().await.unwrap();
+        let originator_host = SshString::decode_from(&mut reader).await.unwrap();
+        let originator_port: VarInt = reader.decode_one().await.unwrap();
 
         assert_eq!(dest_host, SshString("example.com".into()));
         assert_eq!(dest_port.into_inner(), 80);
@@ -364,7 +358,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let msg = SshMessage::decode(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::GlobalRequest {
                 request_type,
@@ -393,7 +387,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let msg = SshMessage::decode(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::GlobalRequest {
                 request_type,
@@ -442,15 +436,13 @@ mod tests {
     async fn read_forwarded_tcpip_info_roundtrip() {
         // Encode the fields the same way the server does
         let mut buf = Vec::new();
-        SshString("192.168.1.100".into())
-            .encode(&mut buf)
+        SshString("192.168.1.100".into()).encode_into(&mut buf)
             .await
             .unwrap();
         buf.encode_one(VarInt::try_from(80u64).unwrap())
             .await
             .unwrap();
-        SshString("10.0.0.1".into())
-            .encode(&mut buf)
+        SshString("10.0.0.1".into()).encode_into(&mut buf)
             .await
             .unwrap();
         buf.encode_one(VarInt::try_from(54321u64).unwrap())
@@ -476,7 +468,7 @@ mod tests {
         accept_forwarded_channel(&mut writer).await.unwrap();
         drop(writer);
 
-        let msg = SshMessage::decode(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
                 assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
@@ -497,7 +489,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let msg = SshMessage::decode(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::ChannelOpenFailure {
                 reason_code,

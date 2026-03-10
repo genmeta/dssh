@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use genmeta_ssh3_proto::message::SshMessage;
+use h3x::codec::DecodeFrom;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -243,7 +244,7 @@ where
     .await?;
 
     // Read the server's response: ChannelOpenConfirmation or ChannelOpenFailure.
-    let response = SshMessage::decode(&mut ch_reader).await?;
+    let response = SshMessage::decode_from(&mut ch_reader).await?;
     match response {
         SshMessage::ChannelOpenConfirmation { .. } => {
             // Success — send SOCKS5 success reply.
@@ -306,6 +307,7 @@ async fn send_reply<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use h3x::codec::EncodeInto;
     use genmeta_ssh3_proto::codec::ChannelHeader;
     use genmeta_ssh3_proto::message::SshMessage;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -380,25 +382,22 @@ mod tests {
         mut server_writer: DuplexStream,
     ) {
         // Read the channel header the client wrote.
-        let header = ChannelHeader::decode(&mut server_reader).await.unwrap();
+        let header = ChannelHeader::decode_from(&mut server_reader).await.unwrap();
         assert_eq!(header.channel_type, "direct-tcpip");
 
         // Read request_data fields (dest_host, dest_port, originator_host, originator_port).
         use genmeta_ssh3_proto::codec::SshString;
         use h3x::codec::DecodeExt;
         use h3x::varint::VarInt;
-        let _dest_host = SshString::decode(&mut server_reader).await.unwrap();
-        let _dest_port: VarInt = (&mut server_reader).decode_one().await.unwrap();
-        let _orig_host = SshString::decode(&mut server_reader).await.unwrap();
-        let _orig_port: VarInt = (&mut server_reader).decode_one().await.unwrap();
+        let _dest_host = SshString::decode_from(&mut server_reader).await.unwrap();
+        let _dest_port: VarInt = server_reader.decode_one().await.unwrap();
+        let _orig_host = SshString::decode_from(&mut server_reader).await.unwrap();
+        let _orig_port: VarInt = server_reader.decode_one().await.unwrap();
 
         // Send ChannelOpenConfirmation.
-        SshMessage::encode(
-            &SshMessage::ChannelOpenConfirmation {
-                max_message_size: TEST_MAX_MESSAGE_SIZE,
-            },
-            &mut server_writer,
-        )
+        SshMessage::ChannelOpenConfirmation {
+            max_message_size: TEST_MAX_MESSAGE_SIZE,
+        }.encode_into(&mut server_writer)
         .await
         .unwrap();
 
@@ -415,25 +414,22 @@ mod tests {
         mut server_writer: DuplexStream,
     ) {
         // Read the channel header.
-        let _header = ChannelHeader::decode(&mut server_reader).await.unwrap();
+        let _header = ChannelHeader::decode_from(&mut server_reader).await.unwrap();
 
         // Read request_data fields.
         use genmeta_ssh3_proto::codec::SshString;
         use h3x::codec::DecodeExt;
         use h3x::varint::VarInt;
-        let _dest_host = SshString::decode(&mut server_reader).await.unwrap();
-        let _dest_port: VarInt = (&mut server_reader).decode_one().await.unwrap();
-        let _orig_host = SshString::decode(&mut server_reader).await.unwrap();
-        let _orig_port: VarInt = (&mut server_reader).decode_one().await.unwrap();
+        let _dest_host = SshString::decode_from(&mut server_reader).await.unwrap();
+        let _dest_port: VarInt = server_reader.decode_one().await.unwrap();
+        let _orig_host = SshString::decode_from(&mut server_reader).await.unwrap();
+        let _orig_port: VarInt = server_reader.decode_one().await.unwrap();
 
         // Send ChannelOpenFailure.
-        SshMessage::encode(
-            &SshMessage::ChannelOpenFailure {
-                reason_code: 2, // SSH_OPEN_CONNECT_FAILED
-                description: "connection refused by server".to_string(),
-            },
-            &mut server_writer,
-        )
+        SshMessage::ChannelOpenFailure {
+            reason_code: 2, // SSH_OPEN_CONNECT_FAILED
+            description: "connection refused by server".to_string(),
+        }.encode_into(&mut server_writer)
         .await
         .unwrap();
 

@@ -11,7 +11,7 @@
 
 use genmeta_ssh3_proto::codec::SshString;
 use genmeta_ssh3_proto::message::SshMessage;
-use h3x::codec::{DecodeExt, EncodeExt};
+use h3x::codec::{DecodeExt, EncodeExt, EncodeInto};
 use h3x::varint::VarInt;
 use tokio::io::{self, AsyncWrite, AsyncWriteExt};
 
@@ -24,7 +24,7 @@ use tokio::io::{self, AsyncWrite, AsyncWriteExt};
 /// The server will parse this with `parse_exec_command` (Task 16).
 pub async fn encode_exec_request_data(command: &str) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    SshString(command.to_owned()).encode(&mut buf).await?;
+    SshString(command.to_owned()).encode_into(&mut buf).await?;
     Ok(buf)
 }
 
@@ -45,7 +45,7 @@ pub async fn encode_pty_request_data(
     terminal_modes: &[u8],
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    SshString(term.to_owned()).encode(&mut buf).await?;
+    SshString(term.to_owned()).encode_into(&mut buf).await?;
 
     let to_varint =
         |v: u32| VarInt::try_from(v as u64).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e));
@@ -100,14 +100,11 @@ pub async fn send_exec_request<W: AsyncWrite + Send + Unpin>(
     want_reply: bool,
 ) -> io::Result<()> {
     let request_data = encode_exec_request_data(command).await?;
-    SshMessage::encode(
-        &SshMessage::ChannelRequest {
-            request_type: "exec".into(),
-            want_reply,
-            request_data,
-        },
-        writer,
-    )
+    SshMessage::ChannelRequest {
+        request_type: "exec".into(),
+        want_reply,
+        request_data,
+    }.encode_into(writer)
     .await
 }
 
@@ -116,14 +113,11 @@ pub async fn send_shell_request<W: AsyncWrite + Send + Unpin>(
     writer: &mut W,
     want_reply: bool,
 ) -> io::Result<()> {
-    SshMessage::encode(
-        &SshMessage::ChannelRequest {
-            request_type: "shell".into(),
-            want_reply,
-            request_data: vec![],
-        },
-        writer,
-    )
+    SshMessage::ChannelRequest {
+        request_type: "shell".into(),
+        want_reply,
+        request_data: vec![],
+    }.encode_into(writer)
     .await
 }
 
@@ -142,14 +136,11 @@ pub async fn send_pty_request<W: AsyncWrite + Send + Unpin>(
     let request_data =
         encode_pty_request_data(term, width_cols, height_rows, width_px, height_px, terminal_modes)
             .await?;
-    SshMessage::encode(
-        &SshMessage::ChannelRequest {
-            request_type: "pty-req".into(),
-            want_reply,
-            request_data,
-        },
-        writer,
-    )
+    SshMessage::ChannelRequest {
+        request_type: "pty-req".into(),
+        want_reply,
+        request_data,
+    }.encode_into(writer)
     .await
 }
 
@@ -165,14 +156,11 @@ pub async fn send_window_change<W: AsyncWrite + Send + Unpin>(
 ) -> io::Result<()> {
     let request_data =
         encode_window_change_request_data(width_cols, height_rows, width_px, height_px).await?;
-    SshMessage::encode(
-        &SshMessage::ChannelRequest {
-            request_type: "window-change".into(),
-            want_reply: false,
-            request_data,
-        },
-        writer,
-    )
+    SshMessage::ChannelRequest {
+        request_type: "window-change".into(),
+        want_reply: false,
+        request_data,
+    }.encode_into(writer)
     .await
 }
 
@@ -255,6 +243,7 @@ pub async fn message_to_session_event(msg: SshMessage) -> io::Result<Option<Sess
 #[cfg(test)]
 mod tests {
     use super::*;
+    use h3x::codec::DecodeFrom;
     use genmeta_ssh3_proto::message::SshMessage;
     use genmeta_ssh3_server::session::request::{
         encode_exit_status, encode_exit_status_data, parse_exec_command,
@@ -297,7 +286,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let msg = SshMessage::decode(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::ChannelRequest {
                 request_type,
@@ -324,7 +313,7 @@ mod tests {
         send_shell_request(&mut writer, true).await.unwrap();
         drop(writer);
 
-        let msg = SshMessage::decode(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::ChannelRequest {
                 request_type,
@@ -521,34 +510,28 @@ mod tests {
 
         // Server writes responses
         let server_task = tokio::spawn(async move {
-            SshMessage::encode(&SshMessage::ChannelSuccess, &mut server_writer)
+            SshMessage::ChannelSuccess.encode_into(&mut server_writer)
                 .await
                 .unwrap();
-            SshMessage::encode(
-                &SshMessage::ChannelData {
-                    data: b"hello\n".to_vec(),
-                },
-                &mut server_writer,
-            )
+            SshMessage::ChannelData {
+                data: b"hello\n".to_vec(),
+            }.encode_into(&mut server_writer)
             .await
             .unwrap();
 
             let exit_data = encode_exit_status_data(0).await.unwrap();
-            SshMessage::encode(
-                &SshMessage::ChannelRequest {
-                    request_type: "exit-status".into(),
-                    want_reply: false,
-                    request_data: exit_data,
-                },
-                &mut server_writer,
-            )
+            SshMessage::ChannelRequest {
+                request_type: "exit-status".into(),
+                want_reply: false,
+                request_data: exit_data,
+            }.encode_into(&mut server_writer)
             .await
             .unwrap();
 
-            SshMessage::encode(&SshMessage::ChannelEof, &mut server_writer)
+            SshMessage::ChannelEof.encode_into(&mut server_writer)
                 .await
                 .unwrap();
-            SshMessage::encode(&SshMessage::ChannelClose, &mut server_writer)
+            SshMessage::ChannelClose.encode_into(&mut server_writer)
                 .await
                 .unwrap();
 
@@ -558,7 +541,7 @@ mod tests {
         // Client reads and converts to SessionEvents
         let mut events = Vec::new();
         loop {
-            match SshMessage::decode(&mut client_reader).await {
+            match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => {
                     if let Some(event) = message_to_session_event(msg).await.unwrap() {
                         events.push(event);
@@ -595,7 +578,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let msg = SshMessage::decode(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::ChannelRequest {
                 request_type,
@@ -625,7 +608,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let msg = SshMessage::decode(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::ChannelRequest {
                 request_type,
@@ -653,21 +636,15 @@ mod tests {
         let (mut server_writer, mut client_reader) = duplex(8192);
 
         // Server sends stdout then stderr
-        SshMessage::encode(
-            &SshMessage::ChannelData {
-                data: b"stdout data".to_vec(),
-            },
-            &mut server_writer,
-        )
+        SshMessage::ChannelData {
+            data: b"stdout data".to_vec(),
+        }.encode_into(&mut server_writer)
         .await
         .unwrap();
-        SshMessage::encode(
-            &SshMessage::ChannelExtendedData {
-                data_type: 1,
-                data: b"stderr data".to_vec(),
-            },
-            &mut server_writer,
-        )
+        SshMessage::ChannelExtendedData {
+            data_type: 1,
+            data: b"stderr data".to_vec(),
+        }.encode_into(&mut server_writer)
         .await
         .unwrap();
         drop(server_writer);
@@ -677,7 +654,7 @@ mod tests {
         let mut stderr = Vec::new();
 
         loop {
-            match SshMessage::decode(&mut client_reader).await {
+            match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => {
                     if let Some(event) = message_to_session_event(msg).await.unwrap() {
                         match event {

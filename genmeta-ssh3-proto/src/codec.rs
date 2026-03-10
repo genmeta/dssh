@@ -1,16 +1,12 @@
 //! SSH3 binary wire format codec.
 //!
 //! All types use QUIC varint length-prefix + raw bytes encoding,
-//! following the h3x `Encode`/`Decode` trait patterns on `AsyncWrite`/`AsyncRead`.
-//!
-//! Due to the orphan rule, blanket `impl<S> Encode<LocalType> for S` is not possible
-//! when `Encode` is defined in h3x. Instead, each type provides inherent `encode`/`decode`
-//! async methods that internally delegate to h3x `VarInt` Encode/Decode impls (which are
-//! valid because VarInt is defined in h3x alongside the traits).
+//! implementing h3x's `EncodeInto`/`DecodeFrom` traits on `AsyncWrite`/`AsyncRead`.
 
+use std::pin::pin;
 
 use h3x::{
-    codec::{DecodeExt, EncodeExt},
+    codec::{DecodeFrom, EncodeInto},
     varint::VarInt,
 };
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -40,22 +36,40 @@ pub struct ChannelHeader {
 // SshString
 // ---------------------------------------------------------------------------
 
-impl SshString {
-    pub async fn encode<S: AsyncWrite + Send + Unpin>(
-        &self,
-        stream: &mut S,
-    ) -> Result<(), io::Error> {
+impl<S: AsyncWrite + Send> EncodeInto<S> for SshString {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+        let mut stream = pin!(stream);
         let len = VarInt::try_from(self.0.len() as u64)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        stream.encode_one(len).await?;
+        len.encode_into(&mut stream).await?;
         stream.write_all(self.0.as_bytes()).await?;
         Ok(())
     }
+}
 
-    pub async fn decode<S: AsyncRead + Send + Unpin>(
-        stream: &mut S,
-    ) -> Result<Self, io::Error> {
-        let len: VarInt = stream.decode_one().await?;
+impl<S: AsyncWrite + Send> EncodeInto<S> for &SshString {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+        let mut stream = pin!(stream);
+        let len = VarInt::try_from(self.0.len() as u64)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        len.encode_into(&mut stream).await?;
+        stream.write_all(self.0.as_bytes()).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for SshString {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, io::Error> {
+        let mut stream = pin!(stream);
+        let len = VarInt::decode_from(&mut stream).await?;
         let len = len.into_inner() as usize;
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
@@ -69,22 +83,40 @@ impl SshString {
 // SshBytes
 // ---------------------------------------------------------------------------
 
-impl SshBytes {
-    pub async fn encode<S: AsyncWrite + Send + Unpin>(
-        &self,
-        stream: &mut S,
-    ) -> Result<(), io::Error> {
+impl<S: AsyncWrite + Send> EncodeInto<S> for SshBytes {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+        let mut stream = pin!(stream);
         let len = VarInt::try_from(self.0.len() as u64)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        stream.encode_one(len).await?;
+        len.encode_into(&mut stream).await?;
         stream.write_all(&self.0).await?;
         Ok(())
     }
+}
 
-    pub async fn decode<S: AsyncRead + Send + Unpin>(
-        stream: &mut S,
-    ) -> Result<Self, io::Error> {
-        let len: VarInt = stream.decode_one().await?;
+impl<S: AsyncWrite + Send> EncodeInto<S> for &SshBytes {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+        let mut stream = pin!(stream);
+        let len = VarInt::try_from(self.0.len() as u64)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        len.encode_into(&mut stream).await?;
+        stream.write_all(&self.0).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for SshBytes {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, io::Error> {
+        let mut stream = pin!(stream);
+        let len = VarInt::decode_from(&mut stream).await?;
         let len = len.into_inner() as usize;
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
@@ -96,18 +128,33 @@ impl SshBytes {
 // SshBool
 // ---------------------------------------------------------------------------
 
-impl SshBool {
-    pub async fn encode<S: AsyncWrite + Send + Unpin>(
-        &self,
-        stream: &mut S,
-    ) -> Result<(), io::Error> {
+impl<S: AsyncWrite + Send> EncodeInto<S> for SshBool {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+        let mut stream = pin!(stream);
         stream.write_u8(if self.0 { 0x01 } else { 0x00 }).await?;
         Ok(())
     }
+}
 
-    pub async fn decode<S: AsyncRead + Send + Unpin>(
-        stream: &mut S,
-    ) -> Result<Self, io::Error> {
+impl<S: AsyncWrite + Send> EncodeInto<S> for &SshBool {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+        let mut stream = pin!(stream);
+        stream.write_u8(if self.0 { 0x01 } else { 0x00 }).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for SshBool {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, io::Error> {
+        let mut stream = pin!(stream);
         let byte = stream.read_u8().await?;
         match byte {
             0x00 => Ok(SshBool(false)),
@@ -124,47 +171,45 @@ impl SshBool {
 // ChannelHeader (encode by reference, decode returns owned)
 // ---------------------------------------------------------------------------
 
-impl ChannelHeader {
-    pub async fn encode<S: AsyncWrite + Send + Unpin>(
-        &self,
-        stream: &mut S,
-    ) -> Result<(), io::Error> {
-        stream
-            .encode_one(
-                VarInt::try_from(self.signal_value as u64)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
-            )
+impl<S: AsyncWrite + Send> EncodeInto<S> for &ChannelHeader {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+        let mut stream = pin!(stream);
+        VarInt::try_from(self.signal_value as u64)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            .encode_into(&mut stream)
             .await?;
-        stream
-            .encode_one(
-                VarInt::try_from(self.conversation_id)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
-            )
+        VarInt::try_from(self.conversation_id)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            .encode_into(&mut stream)
             .await?;
         SshString(self.channel_type.clone())
-            .encode(stream)
+            .encode_into(&mut stream)
             .await?;
-        stream
-            .encode_one(
-                VarInt::try_from(self.max_message_size)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
-            )
+        VarInt::try_from(self.max_message_size)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            .encode_into(&mut stream)
             .await?;
         Ok(())
     }
+}
 
-    pub async fn decode<S: AsyncRead + Send + Unpin>(
-        stream: &mut S,
-    ) -> Result<Self, io::Error> {
-        let signal_value: VarInt = stream.decode_one().await?;
+impl<S: AsyncRead + Send> DecodeFrom<S> for ChannelHeader {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, io::Error> {
+        let mut stream = pin!(stream);
+        let signal_value = VarInt::decode_from(&mut stream).await?;
         let signal_value = signal_value.into_inner() as u32;
 
-        let conversation_id: VarInt = stream.decode_one().await?;
+        let conversation_id = VarInt::decode_from(&mut stream).await?;
         let conversation_id = conversation_id.into_inner();
 
-        let channel_type = SshString::decode(stream).await?;
+        let channel_type = SshString::decode_from(&mut stream).await?;
 
-        let max_message_size: VarInt = stream.decode_one().await?;
+        let max_message_size = VarInt::decode_from(&mut stream).await?;
         let max_message_size = max_message_size.into_inner();
 
         Ok(ChannelHeader {
@@ -179,6 +224,7 @@ impl ChannelHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use h3x::codec::EncodeExt;
     use tokio::io::duplex;
 
     // -----------------------------------------------------------------------
@@ -188,25 +234,25 @@ mod tests {
     #[tokio::test]
     async fn ssh_string_roundtrip() {
         let (mut writer, mut reader) = duplex(1024);
-        SshString("hello".into()).encode(&mut writer).await.unwrap();
+        SshString("hello".into()).encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = SshString::decode(&mut reader).await.unwrap();
+        let decoded = SshString::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, SshString("hello".into()));
     }
 
     #[tokio::test]
     async fn ssh_string_empty_roundtrip() {
         let (mut writer, mut reader) = duplex(1024);
-        SshString(String::new()).encode(&mut writer).await.unwrap();
+        SshString(String::new()).encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = SshString::decode(&mut reader).await.unwrap();
+        let decoded = SshString::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, SshString(String::new()));
     }
 
     #[tokio::test]
     async fn ssh_string_hex_dump() {
         let (mut writer, mut reader) = duplex(1024);
-        SshString("hi".into()).encode(&mut writer).await.unwrap();
+        SshString("hi".into()).encode_into(&mut writer).await.unwrap();
         drop(writer);
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
@@ -222,27 +268,27 @@ mod tests {
     async fn ssh_bytes_roundtrip() {
         let (mut writer, mut reader) = duplex(1024);
         SshBytes(vec![0xde, 0xad, 0xbe, 0xef])
-            .encode(&mut writer)
+            .encode_into(&mut writer)
             .await
             .unwrap();
         drop(writer);
-        let decoded = SshBytes::decode(&mut reader).await.unwrap();
+        let decoded = SshBytes::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, SshBytes(vec![0xde, 0xad, 0xbe, 0xef]));
     }
 
     #[tokio::test]
     async fn ssh_bytes_empty_roundtrip() {
         let (mut writer, mut reader) = duplex(1024);
-        SshBytes(Vec::new()).encode(&mut writer).await.unwrap();
+        SshBytes(Vec::new()).encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = SshBytes::decode(&mut reader).await.unwrap();
+        let decoded = SshBytes::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, SshBytes(Vec::new()));
     }
 
     #[tokio::test]
     async fn ssh_bytes_hex_dump() {
         let (mut writer, mut reader) = duplex(1024);
-        SshBytes(vec![0xff]).encode(&mut writer).await.unwrap();
+        SshBytes(vec![0xff]).encode_into(&mut writer).await.unwrap();
         drop(writer);
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
@@ -257,26 +303,26 @@ mod tests {
     #[tokio::test]
     async fn ssh_bool_true_roundtrip() {
         let (mut writer, mut reader) = duplex(1024);
-        SshBool(true).encode(&mut writer).await.unwrap();
+        SshBool(true).encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = SshBool::decode(&mut reader).await.unwrap();
+        let decoded = SshBool::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, SshBool(true));
     }
 
     #[tokio::test]
     async fn ssh_bool_false_roundtrip() {
         let (mut writer, mut reader) = duplex(1024);
-        SshBool(false).encode(&mut writer).await.unwrap();
+        SshBool(false).encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = SshBool::decode(&mut reader).await.unwrap();
+        let decoded = SshBool::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, SshBool(false));
     }
 
     #[tokio::test]
     async fn ssh_bool_hex_dump() {
         let (mut writer, mut reader) = duplex(1024);
-        SshBool(true).encode(&mut writer).await.unwrap();
-        SshBool(false).encode(&mut writer).await.unwrap();
+        SshBool(true).encode_into(&mut writer).await.unwrap();
+        SshBool(false).encode_into(&mut writer).await.unwrap();
         drop(writer);
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
@@ -288,7 +334,7 @@ mod tests {
         let (mut writer, mut reader) = duplex(1024);
         writer.write_u8(0x02).await.unwrap();
         drop(writer);
-        let result = SshBool::decode(&mut reader).await;
+        let result = SshBool::decode_from(&mut reader).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -307,9 +353,9 @@ mod tests {
             channel_type: "session".into(),
             max_message_size: 65535,
         };
-        header.encode(&mut writer).await.unwrap();
+        header.encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = ChannelHeader::decode(&mut reader).await.unwrap();
+        let decoded = ChannelHeader::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, header);
     }
 
@@ -322,9 +368,9 @@ mod tests {
             channel_type: String::new(),
             max_message_size: 0,
         };
-        header.encode(&mut writer).await.unwrap();
+        header.encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = ChannelHeader::decode(&mut reader).await.unwrap();
+        let decoded = ChannelHeader::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, header);
     }
 
@@ -337,7 +383,7 @@ mod tests {
             channel_type: "x".into(),
             max_message_size: 3,
         };
-        header.encode(&mut writer).await.unwrap();
+        header.encode_into(&mut writer).await.unwrap();
         drop(writer);
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
@@ -385,9 +431,9 @@ mod tests {
             channel_type: "session".into(),
             max_message_size: 1 << 20,
         };
-        header.encode(&mut writer).await.unwrap();
+        header.encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = ChannelHeader::decode(&mut reader).await.unwrap();
+        let decoded = ChannelHeader::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, header);
     }
 
@@ -405,9 +451,9 @@ mod tests {
             channel_type: String::new(),
             max_message_size: 0,
         };
-        header.encode(&mut writer).await.unwrap();
+        header.encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = ChannelHeader::decode(&mut reader).await.unwrap();
+        let decoded = ChannelHeader::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, header);
     }
 
@@ -421,9 +467,9 @@ mod tests {
             channel_type: String::new(),
             max_message_size: 0,
         };
-        header.encode(&mut writer).await.unwrap();
+        header.encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = ChannelHeader::decode(&mut reader).await.unwrap();
+        let decoded = ChannelHeader::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, header);
     }
 
@@ -431,9 +477,9 @@ mod tests {
     async fn ssh_string_large_roundtrip() {
         let (mut writer, mut reader) = duplex(1024 * 1024);
         let large = "a".repeat(1000);
-        SshString(large.clone()).encode(&mut writer).await.unwrap();
+        SshString(large.clone()).encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = SshString::decode(&mut reader).await.unwrap();
+        let decoded = SshString::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, SshString(large));
     }
 
@@ -441,9 +487,9 @@ mod tests {
     async fn ssh_bytes_large_roundtrip() {
         let (mut writer, mut reader) = duplex(1024 * 1024);
         let large = vec![0xAB; 1000];
-        SshBytes(large.clone()).encode(&mut writer).await.unwrap();
+        SshBytes(large.clone()).encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = SshBytes::decode(&mut reader).await.unwrap();
+        let decoded = SshBytes::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, SshBytes(large));
     }
 
@@ -456,9 +502,9 @@ mod tests {
             channel_type: String::new(),
             max_message_size: 0,
         };
-        header.encode(&mut writer).await.unwrap();
+        header.encode_into(&mut writer).await.unwrap();
         drop(writer);
-        let decoded = ChannelHeader::decode(&mut reader).await.unwrap();
+        let decoded = ChannelHeader::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, header);
     }
 }

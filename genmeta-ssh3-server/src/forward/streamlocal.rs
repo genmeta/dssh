@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
-use h3x::codec::DecodeExt;
+use h3x::codec::{DecodeExt, DecodeFrom, EncodeInto};
 use h3x::varint::VarInt;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -67,8 +67,8 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // Parse request_data fields.
-    let socket_path = SshString::decode(&mut reader).await?;
-    let _reserved_string = SshString::decode(&mut reader).await?;
+    let socket_path = SshString::decode_from(&mut reader).await?;
+    let _reserved_string = SshString::decode_from(&mut reader).await?;
     let _reserved_uint32: VarInt = reader.decode_one().await?;
 
     // Attempt Unix socket connection.
@@ -80,7 +80,7 @@ where
                 reason_code: SSH_OPEN_CONNECT_FAILED,
                 description: format!("connect failed: {e}"),
             };
-            SshMessage::encode(&failure, &mut writer).await?;
+            failure.encode_into(&mut writer).await?;
             return Ok(());
         }
     };
@@ -89,7 +89,7 @@ where
     let confirm = SshMessage::ChannelOpenConfirmation {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
-    SshMessage::encode(&confirm, &mut writer).await?;
+    confirm.encode_into(&mut writer).await?;
 
     // Bridge raw bytes bidirectionally between QUIC stream and Unix socket.
     let (unix_reader, unix_writer) = unix_stream.into_split();
@@ -117,8 +117,7 @@ impl StreamlocalForwardRequest {
     /// Encode into wire format: SshString(socket_path).
     pub async fn encode_to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        SshString(self.socket_path.clone())
-            .encode(&mut buf)
+        SshString(self.socket_path.clone()).encode_into(&mut buf)
             .await
             .expect("vec write cannot fail");
         buf
@@ -127,7 +126,7 @@ impl StreamlocalForwardRequest {
     /// Decode from wire format bytes.
     pub async fn decode_from_bytes(data: &[u8]) -> io::Result<Self> {
         let mut reader = data;
-        let socket_path = SshString::decode(&mut reader).await?;
+        let socket_path = SshString::decode_from(&mut reader).await?;
         Ok(StreamlocalForwardRequest {
             socket_path: socket_path.0,
         })
@@ -144,8 +143,7 @@ impl CancelStreamlocalForwardRequest {
     /// Encode into wire format: SshString(socket_path).
     pub async fn encode_to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        SshString(self.socket_path.clone())
-            .encode(&mut buf)
+        SshString(self.socket_path.clone()).encode_into(&mut buf)
             .await
             .expect("vec write cannot fail");
         buf
@@ -154,7 +152,7 @@ impl CancelStreamlocalForwardRequest {
     /// Decode from wire format bytes.
     pub async fn decode_from_bytes(data: &[u8]) -> io::Result<Self> {
         let mut reader = data;
-        let socket_path = SshString::decode(&mut reader).await?;
+        let socket_path = SshString::decode_from(&mut reader).await?;
         Ok(CancelStreamlocalForwardRequest {
             socket_path: socket_path.0,
         })
@@ -174,9 +172,9 @@ async fn encode_forwarded_streamlocal_request_data<W: AsyncWrite + Send + Unpin>
     writer: &mut W,
     socket_path: &str,
 ) -> io::Result<()> {
-    SshString(socket_path.to_string()).encode(writer).await?;
+    SshString(socket_path.to_string()).encode_into(&mut *writer).await?;
     // reserved string (empty)
-    SshString(String::new()).encode(writer).await?;
+    SshString(String::new()).encode_into(&mut *writer).await?;
     Ok(())
 }
 
@@ -298,14 +296,14 @@ where
         channel_type: "forwarded-streamlocal@openssh.com".to_string(),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
-    header.encode(&mut writer).await?;
+    header.encode_into(&mut writer).await?;
 
     // 2. Write request_data fields.
     encode_forwarded_streamlocal_request_data(&mut writer, socket_path).await?;
     writer.flush().await?;
 
     // 3. Read response from client.
-    let response = SshMessage::decode(&mut reader).await?;
+    let response = SshMessage::decode_from(&mut reader).await?;
     match response {
         SshMessage::ChannelOpenConfirmation { .. } => {
             // Client accepted — bridge raw bytes.
@@ -366,12 +364,10 @@ mod tests {
         reserved_uint32: u32,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
-        SshString(socket_path.to_owned())
-            .encode(&mut buf)
+        SshString(socket_path.to_owned()).encode_into(&mut buf)
             .await
             .unwrap();
-        SshString(reserved_string.to_owned())
-            .encode(&mut buf)
+        SshString(reserved_string.to_owned()).encode_into(&mut buf)
             .await
             .unwrap();
         buf.encode_one(VarInt::try_from(reserved_uint32 as u64).unwrap())
@@ -389,8 +385,8 @@ mod tests {
         let data = encode_request_data("/var/run/app.sock", "", 0).await;
 
         let mut reader = &data[..];
-        let socket_path = SshString::decode(&mut reader).await.unwrap();
-        let reserved_string = SshString::decode(&mut reader).await.unwrap();
+        let socket_path = SshString::decode_from(&mut reader).await.unwrap();
+        let reserved_string = SshString::decode_from(&mut reader).await.unwrap();
         let reserved_uint32: VarInt = reader.decode_one().await.unwrap();
 
         assert_eq!(socket_path, SshString("/var/run/app.sock".into()));
@@ -463,7 +459,7 @@ mod tests {
         });
 
         // Read ChannelOpenConfirmation from the server.
-        let confirm = SshMessage::decode(&mut client_reader).await.unwrap();
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
                 assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
@@ -515,7 +511,7 @@ mod tests {
             .unwrap();
 
         // Should receive ChannelOpenFailure(92) with reason_code=2.
-        let msg = SshMessage::decode(&mut client_reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match msg {
             SshMessage::ChannelOpenFailure {
                 reason_code,
@@ -644,15 +640,15 @@ mod tests {
         });
 
         // Client side: read ChannelHeader.
-        let header = ChannelHeader::decode(&mut client_reader).await.unwrap();
+        let header = ChannelHeader::decode_from(&mut client_reader).await.unwrap();
         assert_eq!(header.signal_value, CHANNEL_SIGNAL_VALUE);
         assert_eq!(header.conversation_id, 42);
         assert_eq!(header.channel_type, "forwarded-streamlocal@openssh.com");
         assert_eq!(header.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
 
         // Client side: read request_data fields.
-        let received_path = SshString::decode(&mut client_reader).await.unwrap();
-        let reserved_string = SshString::decode(&mut client_reader).await.unwrap();
+        let received_path = SshString::decode_from(&mut client_reader).await.unwrap();
+        let reserved_string = SshString::decode_from(&mut client_reader).await.unwrap();
 
         assert_eq!(received_path, SshString(sock_path.clone()));
         assert_eq!(reserved_string, SshString("".into()));
@@ -663,7 +659,7 @@ mod tests {
             let confirm = SshMessage::ChannelOpenConfirmation {
                 max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             };
-            SshMessage::encode(&confirm, &mut client_writer).await.unwrap();
+            confirm.encode_into(&mut client_writer).await.unwrap();
 
             // Send data through the channel (raw bytes, no wrapping).
             client_writer.write_all(b"hello-streamlocal").await.unwrap();

@@ -14,7 +14,7 @@ use std::process::Stdio;
 
 use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
 use h3x::{
-    codec::{DecodeExt, EncodeExt},
+    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
     varint::VarInt,
 };
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -70,7 +70,7 @@ pub enum RequestAction {
 /// The command is encoded as an `SshString` (varint length prefix + UTF-8 bytes).
 pub async fn parse_exec_command(request_data: &[u8]) -> io::Result<String> {
     let mut reader = request_data;
-    let ssh_string = SshString::decode(&mut reader).await?;
+    let ssh_string = SshString::decode_from(&mut reader).await?;
     Ok(ssh_string.0)
 }
 
@@ -79,7 +79,7 @@ pub async fn parse_exec_command(request_data: &[u8]) -> io::Result<String> {
 /// The subsystem name is encoded as an `SshString`.
 pub async fn parse_subsystem_request(request_data: &[u8]) -> io::Result<SubsystemRequest> {
     let mut reader = request_data;
-    let subsystem_name = SshString::decode(&mut reader).await?;
+    let subsystem_name = SshString::decode_from(&mut reader).await?;
     Ok(SubsystemRequest {
         subsystem_name: subsystem_name.0,
     })
@@ -98,12 +98,12 @@ pub async fn parse_exit_status_request(request_data: &[u8]) -> io::Result<ExitSt
 /// error_message(SshString) + language_tag(SshString).
 pub async fn parse_exit_signal_request(request_data: &[u8]) -> io::Result<ExitSignalRequest> {
     let mut reader = request_data;
-    let signal_name = SshString::decode(&mut reader).await?;
+    let signal_name = SshString::decode_from(&mut reader).await?;
     // core_dumped is a single byte boolean (0x00 or 0x01), matching SshBool encoding.
     let core_dumped_byte = AsyncReadExt::read_u8(&mut reader).await?;
     let core_dumped = core_dumped_byte != 0;
-    let error_message = SshString::decode(&mut reader).await?;
-    let language_tag = SshString::decode(&mut reader).await?;
+    let error_message = SshString::decode_from(&mut reader).await?;
+    let language_tag = SshString::decode_from(&mut reader).await?;
     Ok(ExitSignalRequest {
         signal_name: signal_name.0,
         core_dumped,
@@ -155,10 +155,10 @@ pub async fn encode_exit_signal_data(
     language_tag: &str,
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    SshString(signal_name.to_owned()).encode(&mut buf).await?;
+    SshString(signal_name.to_owned()).encode_into(&mut buf).await?;
     buf.write_u8(if core_dumped { 0x01 } else { 0x00 }).await?;
-    SshString(error_message.to_owned()).encode(&mut buf).await?;
-    SshString(language_tag.to_owned()).encode(&mut buf).await?;
+    SshString(error_message.to_owned()).encode_into(&mut buf).await?;
+    SshString(language_tag.to_owned()).encode_into(&mut buf).await?;
     Ok(buf)
 }
 
@@ -192,13 +192,13 @@ where
         "exec" => {
             let command = parse_exec_command(request_data).await?;
             if want_reply {
-                SshMessage::encode(&SshMessage::ChannelSuccess, writer).await?;
+                SshMessage::ChannelSuccess.encode_into(writer).await?;
             }
             Ok(Some(RequestAction::Exec(command)))
         }
         "shell" => {
             if want_reply {
-                SshMessage::encode(&SshMessage::ChannelSuccess, writer).await?;
+                SshMessage::ChannelSuccess.encode_into(writer).await?;
             }
             Ok(Some(RequestAction::Shell))
         }
@@ -206,7 +206,7 @@ where
             // MVP: subsystem not implemented, return failure.
             let _req = parse_subsystem_request(request_data).await?;
             if want_reply {
-                SshMessage::encode(&SshMessage::ChannelFailure, writer).await?;
+                SshMessage::ChannelFailure.encode_into(writer).await?;
             }
             Ok(None)
         }
@@ -223,7 +223,7 @@ where
         _ => {
             // Unknown request type — send failure if reply requested.
             if want_reply {
-                SshMessage::encode(&SshMessage::ChannelFailure, writer).await?;
+                SshMessage::ChannelFailure.encode_into(writer).await?;
             }
             Ok(None)
         }
@@ -249,7 +249,7 @@ where
         Ok(child) => child,
         Err(e) => {
             tracing::error!(%e, "failed to spawn command");
-            SshMessage::encode(&SshMessage::ChannelFailure, writer).await?;
+            SshMessage::ChannelFailure.encode_into(writer).await?;
             return Err(e);
         }
     };
@@ -266,13 +266,10 @@ where
     // Send any stderr data as ChannelExtendedData.
     let stderr_data = stderr_result?;
     if !stderr_data.is_empty() {
-        SshMessage::encode(
-            &SshMessage::ChannelExtendedData {
-                data_type: 1,
-                data: stderr_data,
-            },
-            writer,
-        )
+        SshMessage::ChannelExtendedData {
+            data_type: 1,
+            data: stderr_data,
+        }.encode_into(&mut *writer)
         .await?;
     }
 
@@ -286,8 +283,8 @@ where
     send_exit_status(exit_code, writer).await?;
 
     // Send EOF + Close.
-    SshMessage::encode(&SshMessage::ChannelEof, writer).await?;
-    SshMessage::encode(&SshMessage::ChannelClose, writer).await?;
+    SshMessage::ChannelEof.encode_into(&mut *writer).await?;
+    SshMessage::ChannelClose.encode_into(&mut *writer).await?;
 
     Ok(())
 }
@@ -306,7 +303,7 @@ where
         Ok(child) => child,
         Err(e) => {
             tracing::error!(%e, "failed to spawn shell");
-            SshMessage::encode(&SshMessage::ChannelFailure, writer).await?;
+            SshMessage::ChannelFailure.encode_into(writer).await?;
             return Err(e);
         }
     };
@@ -321,13 +318,10 @@ where
 
     let stderr_data = stderr_result?;
     if !stderr_data.is_empty() {
-        SshMessage::encode(
-            &SshMessage::ChannelExtendedData {
-                data_type: 1,
-                data: stderr_data,
-            },
-            writer,
-        )
+        SshMessage::ChannelExtendedData {
+            data_type: 1,
+            data: stderr_data,
+        }.encode_into(&mut *writer)
         .await?;
     }
 
@@ -338,8 +332,8 @@ where
 
     send_exit_status(exit_code, writer).await?;
 
-    SshMessage::encode(&SshMessage::ChannelEof, writer).await?;
-    SshMessage::encode(&SshMessage::ChannelClose, writer).await?;
+    SshMessage::ChannelEof.encode_into(&mut *writer).await?;
+    SshMessage::ChannelClose.encode_into(&mut *writer).await?;
 
     Ok(())
 }
@@ -354,14 +348,11 @@ where
     W: AsyncWrite + Send + Unpin,
 {
     let request_data = encode_exit_status_data(exit_code).await?;
-    SshMessage::encode(
-        &SshMessage::ChannelRequest {
-            request_type: "exit-status".into(),
-            want_reply: false,
-            request_data,
-        },
-        writer,
-    )
+    SshMessage::ChannelRequest {
+        request_type: "exit-status".into(),
+        want_reply: false,
+        request_data,
+    }.encode_into(writer)
     .await
 }
 
@@ -378,14 +369,11 @@ where
 {
     let request_data =
         encode_exit_signal_data(signal_name, core_dumped, error_message, language_tag).await?;
-    SshMessage::encode(
-        &SshMessage::ChannelRequest {
-            request_type: "exit-signal".into(),
-            want_reply: false,
-            request_data,
-        },
-        writer,
-    )
+    SshMessage::ChannelRequest {
+        request_type: "exit-signal".into(),
+        want_reply: false,
+        request_data,
+    }.encode_into(writer)
     .await
 }
 
@@ -408,12 +396,9 @@ where
         if n == 0 {
             break;
         }
-        SshMessage::encode(
-            &SshMessage::ChannelData {
-                data: buf[..n].to_vec(),
-            },
-            writer,
-        )
+        SshMessage::ChannelData {
+            data: buf[..n].to_vec(),
+        }.encode_into(&mut *writer)
         .await?;
     }
     Ok(())
@@ -447,7 +432,7 @@ mod tests {
     async fn parse_exec_command_simple() {
         // Encode "echo hello" as SshString
         let (mut writer, mut reader) = duplex(4096);
-        SshString("echo hello".into()).encode(&mut writer).await.unwrap();
+        SshString("echo hello".into()).encode_into(&mut writer).await.unwrap();
         drop(writer);
 
         let mut buf = Vec::new();
@@ -461,7 +446,7 @@ mod tests {
     async fn parse_exec_command_empty() {
         // Encode empty string as SshString
         let (mut writer, mut reader) = duplex(4096);
-        SshString(String::new()).encode(&mut writer).await.unwrap();
+        SshString(String::new()).encode_into(&mut writer).await.unwrap();
         drop(writer);
 
         let mut buf = Vec::new();
@@ -524,7 +509,7 @@ mod tests {
         // Collect all messages sent to the client.
         let mut messages = Vec::new();
         loop {
-            match SshMessage::decode(&mut client_reader).await {
+            match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => messages.push(msg),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => panic!("unexpected error: {e}"),
@@ -616,7 +601,7 @@ mod tests {
         // Collect all messages.
         let mut messages = Vec::new();
         loop {
-            match SshMessage::decode(&mut client_reader).await {
+            match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => messages.push(msg),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => panic!("unexpected error: {e}"),
@@ -662,8 +647,7 @@ mod tests {
 
         // Build SshString-encoded subsystem name for request_data
         let mut request_data_buf = Vec::new();
-        SshString("sftp".into())
-            .encode(&mut request_data_buf)
+        SshString("sftp".into()).encode_into(&mut request_data_buf)
             .await
             .unwrap();
 
@@ -679,7 +663,7 @@ mod tests {
         drop(server_writer);
 
         // Should have sent ChannelFailure.
-        let msg = SshMessage::decode(&mut client_reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert_eq!(msg, SshMessage::ChannelFailure);
     }
 
@@ -694,7 +678,7 @@ mod tests {
 
         // Build request_data containing SshString("ls -la")
         let (mut enc_writer, mut enc_reader) = duplex(4096);
-        SshString("ls -la".into()).encode(&mut enc_writer).await.unwrap();
+        SshString("ls -la".into()).encode_into(&mut enc_writer).await.unwrap();
         drop(enc_writer);
         let mut request_data = Vec::new();
         enc_reader.read_to_end(&mut request_data).await.unwrap();
@@ -711,7 +695,7 @@ mod tests {
         drop(server_writer);
 
         // Should have sent ChannelSuccess (want_reply=true).
-        let msg = SshMessage::decode(&mut client_reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert_eq!(msg, SshMessage::ChannelSuccess);
     }
 
@@ -731,7 +715,7 @@ mod tests {
 
         drop(server_writer);
 
-        let msg = SshMessage::decode(&mut client_reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert_eq!(msg, SshMessage::ChannelSuccess);
     }
 
@@ -751,7 +735,7 @@ mod tests {
 
         drop(server_writer);
 
-        let msg = SshMessage::decode(&mut client_reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert_eq!(msg, SshMessage::ChannelFailure);
     }
 
@@ -772,7 +756,7 @@ mod tests {
         drop(server_writer);
 
         // No reply should have been sent.
-        let result = SshMessage::decode(&mut client_reader).await;
+        let result = SshMessage::decode_from(&mut client_reader).await;
         assert!(
             result.is_err(),
             "no message should be sent when want_reply=false"
@@ -850,7 +834,7 @@ mod tests {
         send_exit_status(42, &mut writer).await.unwrap();
         drop(writer);
 
-        let msg = SshMessage::decode(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::ChannelRequest {
                 request_type,
@@ -878,7 +862,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let msg = SshMessage::decode(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::ChannelRequest {
                 request_type,
@@ -904,7 +888,7 @@ mod tests {
     #[tokio::test]
     async fn parse_subsystem_name() {
         let mut buf = Vec::new();
-        SshString("sftp".into()).encode(&mut buf).await.unwrap();
+        SshString("sftp".into()).encode_into(&mut buf).await.unwrap();
         let req = parse_subsystem_request(&buf).await.unwrap();
         assert_eq!(req.subsystem_name, "sftp");
     }
@@ -968,7 +952,7 @@ mod tests {
         let mut found_eof = false;
         let mut found_close = false;
         loop {
-            let msg = match SshMessage::decode(&mut client_reader).await {
+            let msg = match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => msg,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => panic!("unexpected error: {e}"),
@@ -1004,7 +988,7 @@ mod tests {
         // Collect all messages
         let mut messages = Vec::new();
         loop {
-            match SshMessage::decode(&mut client_reader).await {
+            match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => messages.push(msg),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => panic!("unexpected error: {e}"),

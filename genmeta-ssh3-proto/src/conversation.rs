@@ -10,7 +10,7 @@
 use std::{future::Future, ops::DerefMut, pin::Pin};
 
 use h3x::{
-    codec::{DecodeExt, EncodeExt},
+    codec::{DecodeExt, DecodeFrom, EncodeInto},
     varint::VarInt,
 };
 use tokio::{
@@ -107,30 +107,39 @@ pub(crate) struct GlobalRequest {
     pub data: Vec<u8>,
 }
 
-impl GlobalRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for &GlobalRequest {
+    type Output = ();
+    type Error = io::Error;
+
     /// Encode SSH_MSG_GLOBAL_REQUEST(80) onto a stream.
-    pub async fn encode<S: AsyncWrite + Send + Unpin>(
-        &self,
-        stream: &mut S,
-    ) -> Result<(), io::Error> {
+    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+        let mut stream = std::pin::pin!(stream);
         let msg_type = VarInt::try_from(SSH_MSG_GLOBAL_REQUEST)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        stream.encode_one(msg_type).await?;
-        SshString(self.request_type.clone()).encode(stream).await?;
-        SshBool(self.want_reply).encode(stream).await?;
-        SshBytes(self.data.clone()).encode(stream).await?;
+        msg_type.encode_into(&mut stream).await?;
+        SshString(self.request_type.clone())
+            .encode_into(&mut stream)
+            .await?;
+        SshBool(self.want_reply)
+            .encode_into(&mut stream)
+            .await?;
+        SshBytes(self.data.clone())
+            .encode_into(&mut stream)
+            .await?;
         Ok(())
     }
+}
 
+impl GlobalRequest {
     /// Decode SSH_MSG_GLOBAL_REQUEST(80) body from a stream.
     ///
     /// Assumes the message type varint (80) has already been consumed.
     pub async fn decode_body<S: AsyncRead + Send + Unpin>(
         stream: &mut S,
     ) -> Result<Self, io::Error> {
-        let request_type = SshString::decode(stream).await?;
-        let want_reply = SshBool::decode(stream).await?;
-        let data = SshBytes::decode(stream).await?;
+        let request_type = SshString::decode_from(&mut *stream).await?;
+        let want_reply = SshBool::decode_from(&mut *stream).await?;
+        let data = SshBytes::decode_from(&mut *stream).await?;
         Ok(GlobalRequest {
             request_type: request_type.0,
             want_reply: want_reply.0,
@@ -150,8 +159,8 @@ pub(crate) async fn encode_request_success<S: AsyncWrite + Send + Unpin>(
 ) -> Result<(), io::Error> {
     let msg_type = VarInt::try_from(SSH_MSG_REQUEST_SUCCESS)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    stream.encode_one(msg_type).await?;
-    SshBytes(data.to_vec()).encode(stream).await?;
+    msg_type.encode_into(&mut *stream).await?;
+    SshBytes(data.to_vec()).encode_into(&mut *stream).await?;
     Ok(())
 }
 
@@ -161,7 +170,7 @@ pub(crate) async fn encode_request_failure<S: AsyncWrite + Send + Unpin>(
 ) -> Result<(), io::Error> {
     let msg_type = VarInt::try_from(SSH_MSG_REQUEST_FAILURE)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    stream.encode_one(msg_type).await?;
+    msg_type.encode_into(&mut *stream).await?;
     Ok(())
 }
 
@@ -228,7 +237,7 @@ where
             channel_type: channel_type.to_string(),
             max_message_size,
         };
-        header.encode(&mut write).await?;
+        header.encode_into(&mut write).await?;
 
         Ok((read, write))
     }
@@ -252,7 +261,7 @@ where
                 want_reply,
                 data: data.to_vec(),
             };
-            req.encode(&mut *writer).await?;
+            req.encode_into(&mut *writer).await?;
             writer.flush().await?;
         }
 
@@ -267,7 +276,7 @@ where
 
         match msg_type {
             SSH_MSG_REQUEST_SUCCESS => {
-                let payload = SshBytes::decode(&mut *reader).await?;
+                let payload = SshBytes::decode_from(&mut *reader).await?;
                 Ok(Some(payload.0))
             }
             SSH_MSG_REQUEST_FAILURE => Err(io::Error::new(
@@ -354,6 +363,7 @@ mod tests {
     /// - remote read half (reads from conversation writer)
     /// - channel dispatch sender
     /// - stream factory sender (pre-load streams for `open_channel`)
+    #[allow(clippy::type_complexity)]
     fn make_conversation() -> (
         LocalConversation<ChannelStreamFactory>,
         DuplexStream,
@@ -400,7 +410,7 @@ mod tests {
         let (_read, _write) = conv.open_channel("session", 65535).await.unwrap();
 
         // Verify the header was written by decoding from the remote read half
-        let decoded = ChannelHeader::decode(&mut remote_read_half).await.unwrap();
+        let decoded = ChannelHeader::decode_from(&mut remote_read_half).await.unwrap();
         assert_eq!(decoded.signal_value, CHANNEL_SIGNAL_VALUE);
         assert_eq!(decoded.conversation_id, 42);
         assert_eq!(decoded.channel_type, "session");
@@ -535,7 +545,7 @@ mod tests {
             want_reply: false,
             data: b"LANG=en_US.UTF-8".to_vec(),
         };
-        req.encode(&mut remote_write).await.unwrap();
+        req.encode_into(&mut remote_write).await.unwrap();
         remote_write.flush().await.unwrap();
 
         // Receive it
