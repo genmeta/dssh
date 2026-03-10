@@ -130,7 +130,7 @@ impl Ssh3Protocol {
         // Look up the conversation and dispatch.
         let registry = self.registry.lock().await;
         if let Some(sender) = registry.get(&header.conversation_id) {
-            if let Err(_) = sender.try_send((header, stream_reader, stream_writer)) {
+            if sender.try_send((header, stream_reader, stream_writer)).is_err() {
                 tracing::warn!("conversation channel full or closed, dropping stream");
             }
         } else {

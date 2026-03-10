@@ -51,10 +51,10 @@ impl ChildProcess {
         // child_stdin: parent writes -> child reads
         // child_stdout: child writes -> parent reads
         let child_stdin = child.stdin.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "failed to capture child stdin")
+            std::io::Error::other("failed to capture child stdin")
         })?;
         let child_stdout = child.stdout.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "failed to capture child stdout")
+            std::io::Error::other("failed to capture child stdout")
         })?;
 
         // Establish remoc connection.

@@ -257,6 +257,11 @@ impl ReverseStreamlocalForwarder {
         }
     }
 }
+impl Default for ReverseStreamlocalForwarder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // handle_forwarded_streamlocal_channel

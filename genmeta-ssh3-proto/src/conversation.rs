@@ -5,8 +5,9 @@
 //!
 //! [`LocalConversation`] is the server-side implementation that wraps the
 //! conversation stream plus an mpsc receiver for dispatched channel streams.
+#![allow(dead_code)]
 
-use std::{future::Future, pin::Pin};
+use std::{future::Future, ops::DerefMut, pin::Pin};
 
 use h3x::{
     codec::{DecodeExt, EncodeExt},
@@ -34,6 +35,7 @@ const SSH_MSG_REQUEST_FAILURE: u64 = 82;
 /// Creates new bidirectional stream pairs.
 ///
 /// In production this maps to QUIC `open_bi()`.  In tests a
+#[allow(clippy::type_complexity)]
 /// `tokio::io::duplex()` pair is returned instead.
 pub(crate) trait StreamFactory: Send + Sync {
     type Read: AsyncRead + Send + Unpin;
@@ -169,6 +171,7 @@ pub(crate) async fn encode_request_failure<S: AsyncWrite + Send + Unpin>(
 
 /// Server-side conversation backed by a CONNECT stream and an mpsc dispatch
 /// queue for inbound channels.
+#[allow(clippy::type_complexity)]
 pub(crate) struct LocalConversation<F: StreamFactory> {
     conversation_id: u64,
     /// Read half of the conversation (CONNECT) stream.
@@ -259,7 +262,7 @@ where
 
         // Read the reply from the conversation stream.
         let mut reader = self.conversation_reader.lock().await;
-        let msg_type: VarInt = (&mut *reader).decode_one().await?;
+        let msg_type: VarInt = reader.deref_mut().decode_one().await?;
         let msg_type = msg_type.into_inner();
 
         match msg_type {
@@ -280,7 +283,7 @@ where
 
     async fn recv_global_request(&self) -> io::Result<(String, bool, Vec<u8>)> {
         let mut reader = self.conversation_reader.lock().await;
-        let msg_type: VarInt = (&mut *reader).decode_one().await?;
+        let msg_type: VarInt = reader.deref_mut().decode_one().await?;
         let msg_type = msg_type.into_inner();
 
         if msg_type != SSH_MSG_GLOBAL_REQUEST {

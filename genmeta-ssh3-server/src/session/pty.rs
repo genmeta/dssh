@@ -151,7 +151,7 @@ pub fn allocate_pty(request: &PtyRequest) -> io::Result<PtyPair> {
     };
 
     let pty_result = openpty(Some(&winsize), None)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
 
     Ok(PtyPair {
         master: pty_result.master,

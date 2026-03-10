@@ -128,6 +128,7 @@ pub async fn send_shell_request<W: AsyncWrite + Send + Unpin>(
 }
 
 /// Send a ChannelRequest with request_type="pty-req".
+#[allow(clippy::too_many_arguments)]
 pub async fn send_pty_request<W: AsyncWrite + Send + Unpin>(
     writer: &mut W,
     term: &str,

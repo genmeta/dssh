@@ -165,6 +165,7 @@ async fn encode_forwarded_tcpip_request_data<W: AsyncWrite + Send + Unpin>(
 /// When a client sends a `tcpip-forward` global request, the server calls
 /// [`start_listening`] which binds a `TcpListener` and spawns an accept loop.
 /// When `cancel-tcpip-forward` arrives, [`stop_listening`] aborts the task.
+#[allow(clippy::type_complexity)]
 pub struct ReverseTcpForwarder {
     /// Active listeners keyed by (bind_address, bind_port).
     /// The JoinHandle can be aborted to stop the listener.
@@ -243,6 +244,11 @@ impl ReverseTcpForwarder {
         }
     }
 }
+impl Default for ReverseTcpForwarder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // handle_forwarded_tcpip_channel
@@ -256,6 +262,7 @@ impl ReverseTcpForwarder {
 /// 1. Writes a [`ChannelHeader`] with channel_type `"forwarded-tcpip"` to `writer`
 /// 2. Writes the request_data fields (connected_addr/port, originator_addr/port)
 /// 3. Reads a response from `reader` — either `ChannelOpenConfirmation(91)` or
+#[allow(clippy::too_many_arguments)]
 ///    `ChannelOpenFailure(92)`
 /// 4. On confirmation, bridges raw bytes between the TCP stream and the QUIC stream
 /// 5. On failure, closes the TCP stream gracefully

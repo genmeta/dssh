@@ -12,6 +12,7 @@
 //! [`AuthResult::Success`]. On failure, a random delay (100–500 ms) is added
 //! as timing-attack protection before returning [`PamError`].
 
+
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -19,6 +20,7 @@ use std::time::Duration;
 use rand::Rng;
 
 /// The fixed PAM service name for SSH3 authentication.
+#[allow(dead_code)]
 const PAM_SERVICE: &str = "ssh3";
 
 // ---------------------------------------------------------------------------
@@ -26,10 +28,11 @@ const PAM_SERVICE: &str = "ssh3";
 // ---------------------------------------------------------------------------
 
 /// Result of a successful PAM authentication, including resolved user info.
-///
+/// 
 /// Defined locally because `genmeta-ssh3-proto::session::AuthResult` is being
 /// built in a parallel task. Will be unified later.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum AuthResult {
     /// Credentials verified and account is valid.
     Success {
@@ -48,12 +51,14 @@ pub enum AuthResult {
 
 /// Error type for PAM authentication failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct PamError {
     /// Human-readable description of what went wrong.
     pub message: String,
 }
 
 impl PamError {
+    #[allow(dead_code)]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -74,10 +79,11 @@ impl std::error::Error for PamError {}
 // ---------------------------------------------------------------------------
 
 /// Resolved POSIX user information, returned on successful authentication.
-///
+/// 
 /// In production, this would come from `nix::unistd::User::from_name()`.
 /// For testing, it is provided by the mock backend.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct UserInfo {
     pub uid: u32,
     pub gid: u32,
@@ -90,13 +96,14 @@ pub struct UserInfo {
 // ---------------------------------------------------------------------------
 
 /// Abstraction over PAM operations to enable testing without `libpam`.
-///
+/// 
 /// Each method corresponds to a stage in the PAM transaction:
 /// - `authenticate` → `pam_authenticate` (stage 2)
 /// - `acct_mgmt` → `pam_acct_mgmt` (stage 3)
-///
+/// 
 /// Stage 1 (`pam_start`) is implicit — the backend manages transaction setup.
 /// Stage 4 (`pam_end`) is handled via `Drop` semantics on the backend.
+#[allow(dead_code)]
 pub(crate) trait PamBackend: Send + Sync {
     /// Authenticate the user (PAM stage 2: `pam_authenticate`).
     fn authenticate(
@@ -110,7 +117,7 @@ pub(crate) trait PamBackend: Send + Sync {
     fn acct_mgmt(&self, service: &str, username: &str) -> Result<(), PamError>;
 
     /// Look up user info (uid, gid, home, shell) for the given username.
-    ///
+    /// 
     /// In production, this would call `nix::unistd::User::from_name()`.
     fn get_user_info(&self, username: &str) -> Result<UserInfo, PamError>;
 }
@@ -120,7 +127,7 @@ pub(crate) trait PamBackend: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Real PAM backend that calls into the system's `libpam`.
-///
+/// 
 /// This is a stub — actual C FFI integration with `pam`/`pam-sys` crate
 /// is deferred until we add OS-specific C library linkage.
 #[allow(dead_code)]
@@ -157,15 +164,16 @@ impl PamBackend for SystemPam {
 // ---------------------------------------------------------------------------
 
 /// Authenticate a user via PAM with the 4-stage flow.
-///
+/// 
 /// 1. **pam_start** — implicit (backend manages transaction setup)
 /// 2. **pam_authenticate** — verify credentials
 /// 3. **pam_acct_mgmt** — check account validity
 /// 4. **pam_end** — implicit (backend cleanup via Drop)
-///
+/// 
 /// On success, queries user info and returns `AuthResult::Success`.
 /// On any failure, adds a random delay (100–500 ms) for timing-attack
 /// protection before returning `AuthResult::Failure`.
+#[allow(dead_code)]
 pub(crate) async fn pam_authenticate(
     backend: &dyn PamBackend,
     username: &str,
@@ -198,10 +206,11 @@ pub(crate) async fn pam_authenticate(
 }
 
 /// Add a random delay between 100–500 ms as timing-attack protection.
-///
+/// 
 /// This ensures that failed authentications take roughly the same amount
 /// of wall-clock time regardless of which stage failed, making it harder
 /// for an attacker to distinguish "wrong username" from "wrong password".
+#[allow(dead_code)]
 async fn add_random_delay() {
     let delay_ms = rand::rng().random_range(100..=500);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
