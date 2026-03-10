@@ -15,6 +15,7 @@ use tokio::{
 };
 
 use crate::forward;
+use crate::session::request::{handle_request, RequestAction, run_exec, run_shell};
 
 // ---------------------------------------------------------------------------
 // Channel events dispatched via mpsc
@@ -106,8 +107,8 @@ async fn handle_session_channel<R, W>(
     mut writer: W,
 ) -> io::Result<()>
 where
-    R: AsyncRead + Send + Unpin,
-    W: AsyncWrite + Send + Unpin,
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
 {
     // Send ChannelOpenConfirmation(91).
     let confirm = SshMessage::ChannelOpenConfirmation {
@@ -115,9 +116,45 @@ where
     };
     confirm.encode_into(&mut writer).await?;
 
-    // Run the message loop, discarding the event receiver.
-    let (_event_rx, result) = run_message_loop(reader, writer).await;
-    result
+    // Spawn the message-loop reader, producing events into the channel.
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    tokio::spawn(async move {
+        let _ = run_message_loop_with_sender(reader, event_tx).await;
+    });
+
+    // Dispatch loop: consume events until an exec/shell request arrives.
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            ChannelEvent::Request { .. } => {
+                match handle_request(&event, &mut writer).await? {
+                    Some(RequestAction::Exec(cmd)) => {
+                        run_exec(&cmd, &mut writer, event_rx).await?;
+                        return Ok(());
+                    }
+                    Some(RequestAction::Shell) => {
+                        let shell = std::env::var("SHELL")
+                            .unwrap_or_else(|_| "/bin/sh".to_string());
+                        run_shell(&shell, &mut writer, event_rx).await?;
+                        return Ok(());
+                    }
+                    None => { /* unrecognized request, continue loop */ }
+                }
+            }
+            ChannelEvent::Eof => {
+                SshMessage::ChannelEof.encode_into(&mut writer).await?;
+                break;
+            }
+            ChannelEvent::Close => {
+                SshMessage::ChannelClose.encode_into(&mut writer).await?;
+                break;
+            }
+            ChannelEvent::Data(_) | ChannelEvent::ExtendedData { .. } => {
+                // No exec/shell running yet — data before a request is meaningless.
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Open a session channel, send confirmation, and return the event receiver
@@ -150,6 +187,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Run the channel message loop, returning an event receiver and the loop result.
+#[allow(dead_code)]
 async fn run_message_loop<R, W>(
     reader: R,
     _writer: W,
