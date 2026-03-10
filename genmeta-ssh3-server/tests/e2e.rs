@@ -1637,3 +1637,322 @@ fn test_global_request_streamlocal_forward() {
         let _ = std::fs::remove_file(&socket_path);
     })
 }
+
+// ===========================================================================
+// TestPamBackend — simple configurable mock for E2E PAM tests
+// ===========================================================================
+
+use std::path::PathBuf;
+use genmeta_ssh3_server::auth::pam::{PamBackend, PamError, UserInfo};
+
+struct TestPamBackend {
+    auth_error: Option<PamError>,
+    user_info: UserInfo,
+}
+
+impl TestPamBackend {
+    /// Backend that always succeeds and returns the given user info.
+    fn success(user_info: UserInfo) -> Self {
+        Self {
+            auth_error: None,
+            user_info,
+        }
+    }
+
+    /// Backend that always fails with the given error message.
+    fn failure(message: &str) -> Self {
+        Self {
+            auth_error: Some(PamError::new(message)),
+            user_info: UserInfo {
+                uid: 0,
+                gid: 0,
+                home: PathBuf::from("/nonexistent"),
+                shell: PathBuf::from("/bin/false"),
+            },
+        }
+    }
+}
+
+impl PamBackend for TestPamBackend {
+    fn authenticate(
+        &self,
+        _service: &str,
+        _username: &str,
+        _password: &str,
+    ) -> Result<(), PamError> {
+        match &self.auth_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    fn acct_mgmt(&self, _service: &str, _username: &str) -> Result<(), PamError> {
+        Ok(())
+    }
+
+    fn get_user_info(&self, _username: &str) -> Result<UserInfo, PamError> {
+        Ok(self.user_info.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 23. PAM auth success — TestPamBackend returns Ok → server responds 200 OK.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pam_auth_success() {
+    run("test_pam_auth_success", async move {
+        let pam = TestPamBackend::success(UserInfo {
+            uid: 1000,
+            gid: 1000,
+            home: PathBuf::from("/home/testuser"),
+            shell: PathBuf::from("/bin/bash"),
+        });
+
+        let protocol = Arc::new(Ssh3Protocol::default());
+        let handler = Ssh3ConnectHandler::new(protocol, Some(Arc::new(pam)));
+        let service = TowerService(handler);
+
+        let server = test_server(service).await;
+        let authority = get_server_authority(&server);
+        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+
+        let client = test_client();
+        let connection = client.connect(authority.clone()).await.expect("connect failed");
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{authority}{SSH3_CONNECT_PATH}"))
+            .header("ssh-version", SSH_VERSION)
+            .header(
+                http::header::AUTHORIZATION,
+                "Basic dGVzdDp0ZXN0cGFzcw==", // test:testpass
+            )
+            .extension(Protocol::new("ssh3"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = connection
+            .execute_hyper_request(request)
+            .await
+            .expect("CONNECT request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ssh_version = response
+            .headers()
+            .get("ssh-version")
+            .expect("missing ssh-version response header");
+        assert_eq!(ssh_version.to_str().unwrap(), SSH_VERSION);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 24. PAM auth failure — TestPamBackend returns Err → server responds 401.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pam_auth_failure() {
+    run("test_pam_auth_failure", async move {
+        let pam = TestPamBackend::failure("invalid credentials");
+
+        let protocol = Arc::new(Ssh3Protocol::default());
+        let handler = Ssh3ConnectHandler::new(protocol, Some(Arc::new(pam)));
+        let service = TowerService(handler);
+
+        let server = test_server(service).await;
+        let authority = get_server_authority(&server);
+        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+
+        let client = test_client();
+        let connection = client.connect(authority.clone()).await.expect("connect failed");
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{authority}{SSH3_CONNECT_PATH}"))
+            .header("ssh-version", SSH_VERSION)
+            .header(
+                http::header::AUTHORIZATION,
+                "Basic dGVzdDp0ZXN0cGFzcw==", // test:testpass
+            )
+            .extension(Protocol::new("ssh3"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = connection
+            .execute_hyper_request(request)
+            .await
+            .expect("CONNECT request should succeed at HTTP level");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // WWW-Authenticate header should be present.
+        let www_auth = response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .expect("missing WWW-Authenticate header");
+        assert_eq!(www_auth.to_str().unwrap(), "Basic");
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 25. Session exec flow — duplex streams, exec command, verify output + exit.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_session_exec_flow() {
+    run("test_session_exec_flow", async move {
+        // Duplex streams simulate QUIC bidi stream.
+        let (mut client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+
+        // Server: open session channel.
+        let (mut event_rx, mut server_writer) =
+            open_session_channel(server_reader, server_writer)
+                .await
+                .expect("open_session_channel failed");
+
+        // Client: read ChannelOpenConfirmation.
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(
+            matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }),
+            "expected ChannelOpenConfirmation, got {confirm:?}"
+        );
+
+        // Client: send exec request for "echo session_flow_test".
+        genmeta_ssh3_client::session::send_exec_request(
+            &mut client_writer,
+            "echo session_flow_test",
+            true,
+        )
+        .await
+        .unwrap();
+        // Signal end of input.
+        SshMessage::ChannelEof
+            .encode_into(&mut client_writer)
+            .await
+            .unwrap();
+        SshMessage::ChannelClose
+            .encode_into(&mut client_writer)
+            .await
+            .unwrap();
+        drop(client_writer);
+
+        // Server: receive exec request and dispatch.
+        let event = event_rx.recv().await.expect("expected exec request event");
+        let action = handle_request(&event, &mut server_writer)
+            .await
+            .expect("handle_request failed")
+            .expect("expected Some(RequestAction::Exec)");
+        assert_eq!(
+            action,
+            genmeta_ssh3_server::session::request::RequestAction::Exec(
+                "echo session_flow_test".into(),
+            )
+        );
+
+        // Client: read ChannelSuccess reply.
+        let success = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert_eq!(success, SshMessage::ChannelSuccess);
+
+        // Server: execute the command.
+        let (_, rx) = mpsc::channel(1);
+        run_exec("echo session_flow_test", &mut server_writer, rx, None)
+            .await
+            .expect("run_exec failed");
+        drop(server_writer);
+
+        // Client: collect all remaining messages.
+        let mut messages = Vec::new();
+        loop {
+            match SshMessage::decode_from(&mut client_reader).await {
+                Ok(msg) => messages.push(msg),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("unexpected decode error: {e}"),
+            }
+        }
+
+        // Verify stdout contains the marker string.
+        let has_marker = messages.iter().any(|m| match m {
+            SshMessage::ChannelData { data } => {
+                String::from_utf8_lossy(data).contains("session_flow_test")
+            }
+            _ => false,
+        });
+        assert!(
+            has_marker,
+            "expected ChannelData containing 'session_flow_test', got: {messages:?}"
+        );
+
+        // Verify exit-status=0.
+        let has_exit_0 = messages.iter().any(|m| matches!(
+            m,
+            SshMessage::ChannelRequest {
+                request_type,
+                want_reply,
+                request_data,
+            } if request_type == "exit-status"
+                && !want_reply
+                && *request_data == encode_exit_status(0)
+        ));
+        assert!(has_exit_0, "expected exit-status 0, got: {messages:?}");
+
+        // Verify EOF and Close are present and correctly ordered.
+        assert!(
+            messages.iter().any(|m| matches!(m, SshMessage::ChannelEof)),
+            "expected ChannelEof"
+        );
+        assert!(
+            messages.iter().any(|m| matches!(m, SshMessage::ChannelClose)),
+            "expected ChannelClose"
+        );
+        let eof_pos = messages
+            .iter()
+            .position(|m| matches!(m, SshMessage::ChannelEof))
+            .unwrap();
+        let close_pos = messages
+            .iter()
+            .position(|m| matches!(m, SshMessage::ChannelClose))
+            .unwrap();
+        assert!(eof_pos < close_pos, "EOF should come before Close");
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 26. EOF→FIN verification — after ChannelEof + ChannelClose, reader detects
+//     stream end (writer.shutdown() causes the underlying stream to close).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_eof_fin_verification() {
+    run("test_eof_fin_verification", async move {
+        // Duplex streams: writer_side → reader_side.
+        let (mut writer_side, mut reader_side) = duplex(65536);
+
+        // Write ChannelEof + ChannelClose, then shutdown the writer.
+        SshMessage::ChannelEof
+            .encode_into(&mut writer_side)
+            .await
+            .unwrap();
+        SshMessage::ChannelClose
+            .encode_into(&mut writer_side)
+            .await
+            .unwrap();
+        writer_side.shutdown().await.unwrap();
+
+        // Reader: decode ChannelEof.
+        let msg1 = SshMessage::decode_from(&mut reader_side).await.unwrap();
+        assert!(
+            matches!(msg1, SshMessage::ChannelEof),
+            "expected ChannelEof, got {msg1:?}"
+        );
+
+        // Reader: decode ChannelClose.
+        let msg2 = SshMessage::decode_from(&mut reader_side).await.unwrap();
+        assert!(
+            matches!(msg2, SshMessage::ChannelClose),
+            "expected ChannelClose, got {msg2:?}"
+        );
+
+        // Reader: verify stream is closed (EOF / FIN).
+        // After shutdown(), any further read should return 0 bytes (EOF).
+        let mut buf = [0u8; 64];
+        let n = reader_side.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "expected EOF (0 bytes read) after writer shutdown");
+    })
+}
