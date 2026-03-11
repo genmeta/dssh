@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::debug!("remoc connection established");
 
     // Create the session implementation and RTC server/client pair.
-    let session_impl = Arc::new(Ssh3SessionImpl);
+    let session_impl = Arc::new(Ssh3SessionImpl::new());
     let (server, client): (
         SshSessionServerShared<Ssh3SessionImpl>,
         SshSessionClient,
