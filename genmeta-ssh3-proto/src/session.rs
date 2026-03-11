@@ -143,11 +143,12 @@ pub trait SshSession: Sync {
 
     /// Handle a non-session channel (forwarding, global-request, etc.).
     ///
-    /// The parent calls this for each non-session channel, passing raw byte
-    /// channel endpoints. The child reads the ChannelHeader from the first
-    /// bytes and dispatches to the appropriate handler.
+    /// The parent calls this for each non-session channel, passing the typed
+    /// `ChannelHeader` and raw byte channel endpoints. The child dispatches
+    /// to the appropriate handler based on the header's channel type.
     async fn handle_channel(
         &self,
+        header: crate::codec::ChannelHeader,
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
     ) -> Result<(), SessionError>;

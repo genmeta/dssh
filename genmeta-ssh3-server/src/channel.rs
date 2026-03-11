@@ -471,22 +471,14 @@ where
     let (from_client_tx, from_client_rx) = remoc::rch::mpsc::channel(64);
     let (to_client_tx, to_client_rx) = remoc::rch::mpsc::channel(64);
 
-    // 2. Serialize ChannelHeader and send as the first message to child
-    let mut header_buf = std::io::Cursor::new(Vec::new());
-    (&header).encode_into(&mut header_buf).await?;
-    from_client_tx
-        .send(header_buf.into_inner())
-        .await
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    // 3. Spawn the RTC call to the child (non-blocking)
+    // 2. Spawn the RTC call to the child (non-blocking), passing header as typed param
     let channel_handle = tokio::spawn(async move {
         session_client
-            .handle_channel(from_client_rx, to_client_tx)
+            .handle_channel(header, from_client_rx, to_client_tx)
             .await
     });
 
-    // 4. Spawn byte bridge: QUIC reader → from_client_tx (raw bytes to child)
+    // 3. Spawn byte bridge: QUIC reader → from_client_tx (raw bytes to child)
     let bridge_to_child = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
@@ -501,7 +493,7 @@ where
         Ok::<(), io::Error>(())
     });
 
-    // 5. Spawn byte bridge: to_client_rx → QUIC writer (raw bytes from child)
+    // 4. Spawn byte bridge: to_client_rx → QUIC writer (raw bytes from child)
     let bridge_from_child = tokio::spawn(async move {
         let mut to_client_rx = to_client_rx;
         loop {
@@ -518,7 +510,7 @@ where
         Ok::<(), io::Error>(())
     });
 
-    // 6. Wait for all tasks
+    // 5. Wait for all tasks
     let _ = tokio::try_join!(
         async { bridge_to_child.await.map_err(io::Error::other)? },
         async { bridge_from_child.await.map_err(io::Error::other)? },

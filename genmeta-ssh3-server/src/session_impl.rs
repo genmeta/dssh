@@ -213,16 +213,12 @@ impl SshSession for Ssh3SessionImpl {
 
     async fn handle_channel(
         &self,
+        header: ChannelHeader,
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
     ) -> Result<(), SessionError> {
-        let mut reader = ChannelReader::new(from_client);
+        let reader = ChannelReader::new(from_client);
         let writer = ChannelWriter::new(to_client);
-
-        // Read ChannelHeader from first bytes (the parent serialized it via handle_channel_byte_bridge).
-        let header = ChannelHeader::decode_from(&mut reader)
-            .await
-            .map_err(|e| SessionError::new(e.to_string()))?;
 
         match header.channel_type.as_str() {
             "direct-tcpip" => {
@@ -552,26 +548,18 @@ mod tests {
     async fn handle_channel_rejects_unknown_type() {
         let session = Ssh3SessionImpl::new();
 
-        // Encode a ChannelHeader with an unknown channel_type.
         let header = ChannelHeader {
             signal_value: 0,
             conversation_id: 42,
             channel_type: "bogus-type".into(),
             max_message_size: 1 << 20,
         };
-        let (mut w, mut r) = tokio::io::duplex(4096);
-        (&header).encode_into(&mut w).await.unwrap();
-        drop(w);
-        let mut header_bytes = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut header_bytes).await.unwrap();
 
-        // Create channels and send the header bytes.
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
-        from_tx.send(header_bytes).await.unwrap();
         drop(from_tx);
 
-        let result = session.handle_channel(from_rx, to_tx).await;
+        let result = session.handle_channel(header, from_rx, to_tx).await;
         assert!(result.is_err(), "expected error for unknown channel type");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -591,29 +579,21 @@ mod tests {
     async fn handle_channel_dispatches_direct_tcpip() {
         let session = Ssh3SessionImpl::new();
 
-        // Encode a ChannelHeader with channel_type = "direct-tcpip".
         let header = ChannelHeader {
             signal_value: 0,
             conversation_id: 42,
             channel_type: "direct-tcpip".into(),
             max_message_size: 1 << 20,
         };
-        let (mut w, mut r) = tokio::io::duplex(4096);
-        (&header).encode_into(&mut w).await.unwrap();
-        drop(w);
-        let mut header_bytes = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut header_bytes).await.unwrap();
 
-        // Create channels and send the header bytes.
         // The direct-tcpip handler expects additional connection data after the header,
-        // but we just send the header and close. The handler should dispatch to
+        // but we just close the channel. The handler should dispatch to
         // handle_direct_tcp (not unknown-type error) and fail while parsing connection info.
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
-        from_tx.send(header_bytes).await.unwrap();
         drop(from_tx);
 
-        let result = session.handle_channel(from_rx, to_tx).await;
+        let result = session.handle_channel(header, from_rx, to_tx).await;
         // The error should NOT be "unknown channel type" — it was dispatched correctly.
         // It will be a connection/parse error from the direct-tcpip handler.
         match result {
@@ -637,25 +617,18 @@ mod tests {
     async fn handle_channel_global_request_needs_context() {
         let session = Ssh3SessionImpl::new();
 
-        // Encode a ChannelHeader with channel_type = "global-request".
         let header = ChannelHeader {
             signal_value: 0,
             conversation_id: 42,
             channel_type: "global-request".into(),
             max_message_size: 1 << 20,
         };
-        let (mut w, mut r) = tokio::io::duplex(4096);
-        (&header).encode_into(&mut w).await.unwrap();
-        drop(w);
-        let mut header_bytes = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut header_bytes).await.unwrap();
 
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
-        from_tx.send(header_bytes).await.unwrap();
         drop(from_tx);
 
-        let result = session.handle_channel(from_rx, to_tx).await;
+        let result = session.handle_channel(header, from_rx, to_tx).await;
         assert!(result.is_err(), "expected error without global context");
         let err_msg = result.unwrap_err().to_string();
         assert!(
