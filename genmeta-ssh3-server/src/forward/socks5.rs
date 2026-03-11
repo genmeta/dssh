@@ -158,17 +158,12 @@ where
     let t2q = tokio::spawn(super::relay(tcp_reader, writer));
 
     // Wait for both directions, handle errors.
-    tokio::select! {
-        result = q2t => {
-            if let Ok(Err(e)) = result {
-                tracing::warn!("relay quic→socks error: {e}");
-            }
-        }
-        result = t2q => {
-            if let Ok(Err(e)) = result {
-                tracing::warn!("relay socks→quic error: {e}");
-            }
-        }
+    let (r1, r2) = tokio::join!(q2t, t2q);
+    if let Ok(Err(e)) = r1 {
+        tracing::warn!("relay quic→socks error: {e}");
+    }
+    if let Ok(Err(e)) = r2 {
+        tracing::warn!("relay socks→quic error: {e}");
     }
 
     Ok(())
