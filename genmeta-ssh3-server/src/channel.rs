@@ -628,21 +628,6 @@ where
 // Message loop
 // ---------------------------------------------------------------------------
 
-/// Run the channel message loop, returning an event receiver and the loop result.
-#[allow(dead_code)]
-async fn run_message_loop<R, W>(
-    reader: R,
-    _writer: W,
-) -> (mpsc::Receiver<ChannelEvent>, io::Result<()>)
-where
-    R: AsyncRead + Send + Unpin,
-    W: AsyncWrite + Send + Unpin,
-{
-    let (event_tx, event_rx) = mpsc::channel(64);
-    let result = run_message_loop_with_sender(reader, event_tx).await;
-    (event_rx, result)
-}
-
 /// Core message loop: reads `SshMessage` from the stream, dispatches to mpsc.
 pub async fn run_message_loop_with_sender<R>(
     mut reader: R,
