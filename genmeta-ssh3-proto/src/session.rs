@@ -145,6 +145,60 @@ pub trait ParentService: Sync {
     >;
 }
 
+/// Serializable error type for transport-level RTC method returns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TransportError {
+    ChannelClosed(String),
+    OpenFailed(String),
+    Timeout,
+    Other(String),
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChannelClosed(msg) => write!(f, "channel closed: {msg}"),
+            Self::OpenFailed(msg) => write!(f, "open failed: {msg}"),
+            Self::Timeout => write!(f, "timeout"),
+            Self::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for TransportError {}
+
+impl From<remoc::rtc::CallError> for TransportError {
+    fn from(err: remoc::rtc::CallError) -> Self {
+        Self::Other(err.to_string())
+    }
+}
+
+/// RTC trait for SSH3 transport-level channel management.
+///
+/// The `#[remoc::rtc::remote]` macro generates `Ssh3TransportClient`,
+/// `Ssh3TransportServer`, `Ssh3TransportServerShared`, and `Ssh3TransportServerSharedMut`.
+#[remoc::rtc::remote]
+pub trait Ssh3Transport: Sync {
+    /// Accept an incoming channel from the remote peer.
+    ///
+    /// Returns `Ok(None)` when no more channels will arrive (connection closed).
+    async fn accept_channel(&self) -> Result<
+        Option<(crate::codec::ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+        TransportError,
+    >;
+
+    /// Open a new channel toward the remote peer.
+    ///
+    /// If `header` is `None`, no header is written to the underlying stream.
+    async fn open_channel(
+        &self,
+        header: Option<crate::codec::ChannelHeader>,
+    ) -> Result<
+        (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+        TransportError,
+    >;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

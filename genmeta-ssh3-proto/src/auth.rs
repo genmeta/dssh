@@ -4,7 +4,7 @@ use base64::Engine;
 use crate::error::Ssh3Error;
 
 /// Authentication credential — only Basic auth is supported.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AuthCredential {
     Basic { username: String, password: String },
 }
