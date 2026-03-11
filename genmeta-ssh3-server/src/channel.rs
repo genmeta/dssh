@@ -65,7 +65,7 @@ pub enum ChannelEvent {
 }
 
 /// Default maximum message size for session channels.
-const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
+pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
 
 // ---------------------------------------------------------------------------
 // Channel dispatch by type
@@ -413,7 +413,7 @@ where
 }
 
 /// Core message loop: reads `SshMessage` from the stream, dispatches to mpsc.
-async fn run_message_loop_with_sender<R>(
+pub async fn run_message_loop_with_sender<R>(
     mut reader: R,
     event_tx: mpsc::Sender<ChannelEvent>,
 ) -> io::Result<()>

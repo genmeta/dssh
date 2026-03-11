@@ -215,8 +215,12 @@ mod tests {
         // cfg(test), so setuid/setgid will be attempted and may fail if
         // we're not root. We tolerate the error here — the important thing
         // is that the RTC call completes (doesn't hang or panic).
-        let (tx, rx) = remoc::rch::mpsc::channel(16);
-        let result = client.run_session(init, rx, tx).await;
+        // Two separate channel pairs to avoid loopback (writing to to_client
+        // would feed back into from_client if using the same pair).
+        let (_from_tx, from_rx) = remoc::rch::mpsc::channel(16);
+        let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
+        drop(_from_tx);
+        let result = client.run_session(init, from_rx, to_tx).await;
         tracing::info!(?result, "run_session result");
 
         // Clean up.
