@@ -24,7 +24,7 @@ pub(crate) struct SshBytes(pub Vec<u8>);
 pub(crate) struct SshBool(pub bool);
 
 /// SSH3 channel header, encoded field-by-field using QUIC varints and SSH strings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChannelHeader {
     pub signal_value: u32,
     pub conversation_id: u64,
