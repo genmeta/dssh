@@ -435,7 +435,7 @@ where
         Ok::<(), io::Error>(())
     });
 
-    // 6. Wait for all tasks (open_channel_rx is returned for the caller to manage)
+    // 6. Wait for all tasks
     let _ = tokio::try_join!(
         async { bridge_to_child.await.map_err(io::Error::other)? },
         async { bridge_from_child.await.map_err(io::Error::other)? },

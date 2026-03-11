@@ -135,7 +135,7 @@ pub trait ParentService: Sync {
     /// If `header` is `None`, no header is written to the QUIC stream
     /// (the caller is expected to write its own header/data after getting
     /// the reader/writer). This matches the current `build_stream_factory`
-    /// behavior where `header_bytes` is empty.
+    /// behavior where the header argument is `None`.
     async fn open_channel(
         &self,
         header: Option<crate::codec::ChannelHeader>,
