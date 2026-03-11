@@ -96,7 +96,29 @@ pub trait SshSession: Sync {
     /// Called by the main server process on the child process via RTC.
     /// The child process sets up the PTY, shell, and channel handling,
     /// then runs until the session terminates.
-    async fn run_session(&self, init: SessionInit) -> Result<(), SessionError>;
+    ///
+    /// `from_client` receives raw bytes from the SSH client (stdin/channel data).
+    /// `to_client` sends raw bytes back to the SSH client (stdout/channel data).
+    async fn run_session(
+        &self,
+        init: SessionInit,
+        from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
+        to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), SessionError>;
+
+    /// Open a new channel for reverse forwarding.
+    ///
+    /// The child process calls this to request that the parent open a new
+    /// channel back to the SSH client. `header_bytes` contains the serialized
+    /// channel open request. Returns a pair of (receiver, sender) for the
+    /// new channel's raw byte stream.
+    async fn open_channel(
+        &self,
+        header_bytes: Vec<u8>,
+    ) -> Result<
+        (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+        SessionError,
+    >;
 }
 
 #[cfg(test)]
