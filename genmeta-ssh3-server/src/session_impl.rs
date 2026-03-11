@@ -45,7 +45,7 @@ fn drop_privileges(_uid: u32, _gid: u32) -> Result<(), SessionError> {
 pub struct Ssh3SessionImpl;
 
 impl SshSession for Ssh3SessionImpl {
-    async fn run_session(&self, init: SessionInit) -> Result<(), SessionError> {
+    async fn run_session(&self, init: SessionInit, _from_client: remoc::rch::mpsc::Receiver<Vec<u8>>, _to_client: remoc::rch::mpsc::Sender<Vec<u8>>) -> Result<(), SessionError> {
         // 1. Drop privileges: setgid first, then setuid.
         drop_privileges(init.uid, init.gid)?;
 
@@ -60,6 +60,10 @@ impl SshSession for Ssh3SessionImpl {
         );
 
         Ok(())
+    }
+
+    async fn open_channel(&self, _header_bytes: Vec<u8>) -> Result<(remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>), SessionError> {
+        Err(SessionError::new("open_channel not yet implemented".to_string()))
     }
 }
 
@@ -82,7 +86,8 @@ mod tests {
     #[tokio::test]
     async fn run_session_happy_path() {
         let session = Ssh3SessionImpl;
-        let result = session.run_session(sample_init()).await;
+        let (tx, rx) = remoc::rch::mpsc::channel(16);
+        let result = session.run_session(sample_init(), rx, tx).await;
         assert!(result.is_ok());
     }
 
@@ -102,7 +107,8 @@ mod tests {
         assert_eq!(init.username, "bob");
         assert_eq!(init.uid, 2000);
         assert_eq!(init.gid, 2000);
-        assert!(session.run_session(init).await.is_ok());
+        let (tx, rx) = remoc::rch::mpsc::channel(16);
+        assert!(session.run_session(init, rx, tx).await.is_ok());
     }
 
     #[test]

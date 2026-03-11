@@ -9,3 +9,4 @@ pub mod child;
 pub mod channel;
 pub mod session;
 pub mod forward;
+pub mod byte_channel;
