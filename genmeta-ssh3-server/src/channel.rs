@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
-use genmeta_ssh3_proto::session::{SessionInit, SshSession, SshSessionClient, Ssh3Transport, TransportError};
+use genmeta_ssh3_proto::session::{Ssh3Transport, TransportError};
 use h3x::codec::{DecodeFrom, EncodeInto};
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -82,38 +82,14 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
 /// - Unknown → send `ChannelOpenFailure(92)` with reason_code=3
 pub async fn handle_channel<R, W>(
     header: ChannelHeader,
-    reader: R,
+    _reader: R,
     writer: W,
-    session_client: Option<SshSessionClient>,
-    session_init: Option<SessionInit>,
-    parent_client: Option<genmeta_ssh3_proto::session::ParentServiceClient>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    match header.channel_type.as_str() {
-        "session" => {
-            let session_client = session_client.ok_or_else(|| {
-                io::Error::other("no session client available")
-            })?;
-            let session_init = session_init.ok_or_else(|| {
-                io::Error::other("no session init available")
-            })?;
-            let parent = parent_client.ok_or_else(|| {
-                io::Error::other("no parent service client available")
-            })?;
-            handle_session_byte_bridge(header, reader, writer, session_client, session_init, parent).await
-        }
-        _ => {
-            // ALL non-session channels go through the unified byte bridge.
-            // If no session_client is available (e.g. child not spawned), reject.
-            match session_client {
-                Some(sc) => handle_channel_byte_bridge(header, reader, writer, sc).await,
-                None => handle_unknown_channel(header, writer).await,
-            }
-        }
-    }
+    handle_unknown_channel(header, writer).await
 }
 /// Handle an unknown channel type by sending `ChannelOpenFailure(92)`.
 async fn handle_unknown_channel<W>(
@@ -373,152 +349,6 @@ where
             }
         }
     }
-
-    Ok(())
-}
-
-/// Handle a session channel by bridging raw bytes to the child process.
-///
-/// Creates two remoc byte channel pairs and spawns bridge tasks:
-/// - QUIC reader → from_client_tx (raw bytes to child)
-/// - to_client_rx → QUIC writer (raw bytes from child)
-///
-/// The child process sends ChannelOpenConfirmation and handles all SSH
-/// message parsing/dispatch — the parent is a pure byte relay.
-async fn handle_session_byte_bridge<R, W>(
-    _header: ChannelHeader,
-    mut reader: R,
-    mut writer: W,
-    session_client: SshSessionClient,
-    init: SessionInit,
-    parent: genmeta_ssh3_proto::session::ParentServiceClient,
-) -> io::Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-{
-    // 1. Create remoc byte channels (parent-side endpoints)
-    let (from_client_tx, from_client_rx) = remoc::rch::mpsc::channel(64);
-    let (to_client_tx, to_client_rx) = remoc::rch::mpsc::channel(64);
-
-    // 3. Spawn the RTC call to the child (non-blocking)
-    let session_handle = tokio::spawn(async move {
-        session_client.run_session(init, from_client_rx, to_client_tx, parent).await
-    });
-
-    // 4. Spawn byte bridge: QUIC reader → from_client_tx (raw bytes to child)
-    let bridge_to_child = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
-        loop {
-            let n = reader.read(&mut buf).await?;
-            if n == 0 { break; }
-            if from_client_tx.send(buf[..n].to_vec()).await.is_err() {
-                break;
-            }
-        }
-        Ok::<(), io::Error>(())
-    });
-
-    // 5. Spawn byte bridge: to_client_rx → QUIC writer (raw bytes from child)
-    let bridge_from_child = tokio::spawn(async move {
-        let mut to_client_rx = to_client_rx;
-        loop {
-            match to_client_rx.recv().await {
-                Ok(Some(data)) => {
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
-                }
-                Ok(None) => break, // channel closed
-                Err(_) => break,   // channel error
-            }
-        }
-        writer.shutdown().await?;
-        Ok::<(), io::Error>(())
-    });
-
-    // 6. Wait for all tasks
-    let _ = tokio::try_join!(
-        async { bridge_to_child.await.map_err(io::Error::other)? },
-        async { bridge_from_child.await.map_err(io::Error::other)? },
-        async {
-            session_handle.await
-                .map_err(io::Error::other)?
-                .map_err(|e| io::Error::other(e.to_string()))
-        },
-    );
-
-    Ok(())
-}
-
-/// Handle a non-session channel by bridging raw bytes to the child process.
-///
-/// Serializes the [`ChannelHeader`] as the first message so the child can
-/// identify the channel type, then bridges raw bytes bidirectionally.
-/// The child process dispatches to the appropriate handler (T10).
-async fn handle_channel_byte_bridge<R, W>(
-    header: ChannelHeader,
-    mut reader: R,
-    mut writer: W,
-    session_client: SshSessionClient,
-) -> io::Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-{
-    // 1. Create remoc byte channels (parent-side endpoints)
-    let (from_client_tx, from_client_rx) = remoc::rch::mpsc::channel(64);
-    let (to_client_tx, to_client_rx) = remoc::rch::mpsc::channel(64);
-
-    // 2. Spawn the RTC call to the child (non-blocking), passing header as typed param
-    let channel_handle = tokio::spawn(async move {
-        session_client
-            .handle_channel(header, from_client_rx, to_client_tx)
-            .await
-    });
-
-    // 3. Spawn byte bridge: QUIC reader → from_client_tx (raw bytes to child)
-    let bridge_to_child = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
-        loop {
-            let n = reader.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            if from_client_tx.send(buf[..n].to_vec()).await.is_err() {
-                break;
-            }
-        }
-        Ok::<(), io::Error>(())
-    });
-
-    // 4. Spawn byte bridge: to_client_rx → QUIC writer (raw bytes from child)
-    let bridge_from_child = tokio::spawn(async move {
-        let mut to_client_rx = to_client_rx;
-        loop {
-            match to_client_rx.recv().await {
-                Ok(Some(data)) => {
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
-                }
-                Ok(None) => break, // channel closed
-                Err(_) => break,   // channel error
-            }
-        }
-        writer.shutdown().await?;
-        Ok::<(), io::Error>(())
-    });
-
-    // 5. Wait for all tasks
-    let _ = tokio::try_join!(
-        async { bridge_to_child.await.map_err(io::Error::other)? },
-        async { bridge_from_child.await.map_err(io::Error::other)? },
-        async {
-            channel_handle
-                .await
-                .map_err(io::Error::other)?
-                .map_err(|e| io::Error::other(e.to_string()))
-        },
-    );
 
     Ok(())
 }
@@ -901,7 +731,7 @@ mod tests {
             max_message_size: 65536,
         };
 
-        handle_channel(header, server_reader, server_writer, None, None, None)
+        handle_channel(header, server_reader, server_writer)
             .await
             .unwrap();
 
@@ -1103,7 +933,7 @@ mod tests {
                 max_message_size: 65536,
             };
 
-            let result = handle_channel(header, server_reader, server_writer, None, None, None).await;
+            let result = handle_channel(header, server_reader, server_writer).await;
             assert!(
                 result.is_ok(),
                 "forwarding type {channel_type} should return Ok()"

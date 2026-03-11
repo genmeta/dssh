@@ -170,7 +170,7 @@ mod tests {
         }
     }
 
-    // This test was tied to the old push-model API (SshSessionClient).
+    // This test was tied to the old push-model API.
     // In the new pull model, the child waits for ChildBootstrap and performs
     // PAM auth. Task 10 will add an integration test for the full flow.
     #[tokio::test]
