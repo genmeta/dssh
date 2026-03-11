@@ -86,10 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let session = Ssh3SessionImpl::new();
-        // TODO(task-7): session.run(bootstrap.transport, init) — session_impl.rs
-        // needs refactoring to accept Ssh3TransportClient. For now, the child
-        // process exits after sending AuthResult. Task 7 will add the run() call.
-        let _ = (session, init, bootstrap.transport);
+        session.run(bootstrap.transport, init).await?;
     }
 
     tracing::info!("ssh3-session child process exiting");
