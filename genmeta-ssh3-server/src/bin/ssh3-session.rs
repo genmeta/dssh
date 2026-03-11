@@ -1,21 +1,23 @@
 //! SSH3 session child process binary.
 //!
 //! Spawned by the main server process to handle a single SSH3 conversation.
-//! Communicates with the parent via remoc RTC over stdin/stdout.
+//! Communicates with the parent via remoc over stdin/stdout.
 //!
 //! # Protocol
 //!
 //! 1. Parent spawns this binary with stdin/stdout piped.
 //! 2. Child establishes a remoc connection over stdin (read) / stdout (write).
-//! 3. Child creates an [`SshSessionServerShared`] wrapping [`Ssh3SessionImpl`].
-//! 4. Child sends the [`SshSessionClient`] to the parent via the remoc base channel.
-//! 5. Child serves RTC requests until the session terminates.
+//! 3. Child receives [`ChildBootstrap`] from parent (transport client + credential).
+//! 4. Child performs PAM authentication using the credential.
+//! 5. Child sends [`AuthResult`] back to parent.
+//! 6. On success: constructs [`SessionInit`], calls `session.run(transport, init)`.
+//! 7. On failure: exits after sending `AuthResult::Failure`.
 
-use std::sync::Arc;
-
-use genmeta_ssh3_proto::session::{SshSessionClient, SshSessionServerShared};
+use genmeta_ssh3_proto::auth::AuthCredential;
+use genmeta_ssh3_proto::session::{AuthResult, ChildBootstrap};
+#[cfg(feature = "pam")]
+use genmeta_ssh3_server::auth::pam::{pam_authenticate, SystemPam};
 use genmeta_ssh3_server::session_impl::Ssh3SessionImpl;
-use remoc::rtc::ServerShared;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,30 +32,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (conn, mut base_tx, _base_rx): (
+    let (conn, mut base_tx, mut base_rx): (
         _,
-        remoc::rch::base::Sender<_>,
-        remoc::rch::base::Receiver<()>,
+        remoc::rch::base::Sender<AuthResult>,
+        remoc::rch::base::Receiver<ChildBootstrap>,
     ) = remoc::Connect::io(remoc::Cfg::default(), stdin, stdout).await?;
     tokio::spawn(conn);
 
     tracing::debug!("remoc connection established");
 
-    // Create the session implementation and RTC server/client pair.
-    let session_impl = Arc::new(Ssh3SessionImpl::new());
-    let (server, client): (
-        SshSessionServerShared<Ssh3SessionImpl>,
-        SshSessionClient,
-    ) = SshSessionServerShared::new(session_impl, 16);
+    // Receive bootstrap payload from parent (transport client + credential).
+    let bootstrap = base_rx
+        .recv()
+        .await
+        .map_err(|e| format!("failed to receive ChildBootstrap: {e}"))?
+        .ok_or("parent closed base channel without sending ChildBootstrap")?;
 
-    // Send the client proxy to the parent process.
-    base_tx.send(client).await?;
-    tracing::debug!("sent SshSessionClient to parent");
+    tracing::debug!("received ChildBootstrap from parent");
 
-    // Serve RTC requests until the session ends (parent drops the client
-    // or calls a terminal method).
-    server.serve(true).await?;
+    // Extract username and password from credential.
+    let AuthCredential::Basic { username, password } = bootstrap.credential;
+
+    // Perform PAM authentication BEFORE session.run() (must run as root).
+    let auth_result = run_pam_auth(&username, &password).await;
+
+    match &auth_result {
+        AuthResult::Failure { reason } => {
+            tracing::warn!(reason, "PAM authentication failed");
+            let _ = base_tx.send(auth_result).await;
+            return Ok(());
+        }
+        AuthResult::Success { .. } => {
+            base_tx.send(auth_result.clone()).await?;
+            tracing::debug!("sent AuthResult::Success to parent");
+        }
+    }
+
+    // On success, construct SessionInit and run the session.
+    if let AuthResult::Success {
+        uid,
+        gid,
+        home,
+        shell,
+    } = auth_result
+    {
+        let init = genmeta_ssh3_proto::session::SessionInit {
+            conversation_id: 0, // Will be set by handler.rs in future tasks
+            username,
+            uid,
+            gid,
+            home,
+            shell,
+        };
+
+        let session = Ssh3SessionImpl::new();
+        // TODO(task-7): session.run(bootstrap.transport, init) — session_impl.rs
+        // needs refactoring to accept Ssh3TransportClient. For now, the child
+        // process exits after sending AuthResult. Task 7 will add the run() call.
+        let _ = (session, init, bootstrap.transport);
+    }
 
     tracing::info!("ssh3-session child process exiting");
     Ok(())
+}
+
+/// Perform PAM authentication and convert the result to proto's [`AuthResult`].
+#[cfg(feature = "pam")]
+async fn run_pam_auth(username: &str, password: &str) -> AuthResult {
+    let pam_backend = SystemPam;
+    match pam_authenticate(&pam_backend, username, password).await {
+        Ok(genmeta_ssh3_server::auth::pam::AuthResult::Success {
+            uid,
+            gid,
+            home,
+            shell,
+        }) => AuthResult::Success {
+            uid,
+            gid,
+            home,
+            shell,
+        },
+        Ok(genmeta_ssh3_server::auth::pam::AuthResult::Failure { reason }) => {
+            AuthResult::Failure { reason }
+        }
+        Err(pam_err) => AuthResult::Failure {
+            reason: pam_err.to_string(),
+        },
+    }
+}
+
+/// Stub for builds without the `pam` feature — always fails.
+#[cfg(not(feature = "pam"))]
+async fn run_pam_auth(_username: &str, _password: &str) -> AuthResult {
+    AuthResult::Failure {
+        reason: "PAM support not compiled (missing `pam` feature)".into(),
+    }
 }

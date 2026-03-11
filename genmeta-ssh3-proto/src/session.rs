@@ -50,6 +50,14 @@ pub enum AuthResult {
     },
 }
 
+/// Bootstrap payload sent from parent to child process.
+/// Contains the transport client for pulling channels and the credential for PAM auth.
+#[derive(Serialize, Deserialize)]
+pub struct ChildBootstrap {
+    pub transport: Ssh3TransportClient,
+    pub credential: crate::auth::AuthCredential,
+}
+
 /// Serializable error type for RTC method returns.
 ///
 /// Uses a simple string wrapper because `snafu` errors are not `Serialize`/`Deserialize`.

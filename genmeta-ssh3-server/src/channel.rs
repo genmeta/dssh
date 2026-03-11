@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
-use genmeta_ssh3_proto::session::{SessionInit, SshSession, SshSessionClient};
+use genmeta_ssh3_proto::session::{SessionInit, SshSession, SshSessionClient, Ssh3Transport, TransportError};
 use h3x::codec::{DecodeFrom, EncodeInto};
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -23,6 +23,7 @@ use crate::forward::reverse_tcp::ReverseTcpForwarder;
 use crate::forward::streamlocal::ReverseStreamlocalForwarder;
 use crate::session::pty::{PtyPair, allocate_pty, set_window_size};
 use crate::session::request::{handle_request, RequestAction, run_exec, run_shell};
+use crate::protocol::DispatchedStream;
 
 // ---------------------------------------------------------------------------
 // Global request context for reverse forwarding
@@ -675,6 +676,146 @@ where
                 tracing::warn!("unexpected message in channel loop: {other:?}");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ssh3TransportImpl — parent-process transport bridging QUIC ↔ remoc channels
+// ---------------------------------------------------------------------------
+
+/// Parent-process transport that bridges QUIC streams to remoc byte channels.
+///
+/// Implements [`Ssh3Transport`] for use as the RTC server object provided to
+/// the child process. Incoming QUIC streams are received via `channel_rx`;
+/// outgoing streams are opened via `stream_factory`.
+pub struct Ssh3TransportImpl {
+    channel_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<DispatchedStream>>,
+    stream_factory: Option<forward::StreamFactory>,
+}
+
+impl Ssh3TransportImpl {
+    pub fn new(
+        channel_rx: tokio::sync::mpsc::Receiver<DispatchedStream>,
+        stream_factory: Option<forward::StreamFactory>,
+    ) -> Self {
+        Self {
+            channel_rx: tokio::sync::Mutex::new(channel_rx),
+            stream_factory,
+        }
+    }
+}
+
+impl Ssh3Transport for Ssh3TransportImpl {
+    async fn accept_channel(&self) -> Result<
+        Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+        TransportError,
+    > {
+        let dispatched = {
+            let mut rx = self.channel_rx.lock().await;
+            rx.recv().await
+        };
+
+        let (header, mut quic_reader, mut quic_writer) = match dispatched {
+            Some(stream) => stream,
+            None => return Ok(None),
+        };
+
+        // Create remoc byte channel pairs for the child process.
+        let (from_client_tx, from_client_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) = remoc::rch::mpsc::channel(64);
+        let (to_client_tx, to_client_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) = remoc::rch::mpsc::channel(64);
+
+        // Bridge: QUIC reader → from_client_tx (raw bytes to child)
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let n = match quic_reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                if from_client_tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Bridge: to_client_rx → QUIC writer (raw bytes from child)
+        tokio::spawn(async move {
+            let mut to_client_rx = to_client_rx;
+            while let Ok(Some(data)) = to_client_rx.recv().await {
+                if quic_writer.write_all(&data).await.is_err() {
+                    break;
+                }
+                if quic_writer.flush().await.is_err() {
+                    break;
+                }
+            }
+            let _ = quic_writer.shutdown().await;
+        });
+
+        Ok(Some((header, from_client_rx, to_client_tx)))
+    }
+
+    async fn open_channel(
+        &self,
+        header: Option<ChannelHeader>,
+    ) -> Result<
+        (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+        TransportError,
+    > {
+        let stream_factory = self.stream_factory.as_ref().ok_or_else(|| {
+            TransportError::OpenFailed("no stream factory available".into())
+        })?;
+
+        // Open a new QUIC bidirectional stream.
+        let (quic_reader, mut quic_writer) = stream_factory()
+            .await
+            .map_err(|e| TransportError::OpenFailed(e.to_string()))?;
+
+        // Write ChannelHeader if provided.
+        if let Some(h) = &header {
+            h.encode_into(&mut quic_writer)
+                .await
+                .map_err(|e| TransportError::OpenFailed(e.to_string()))?;
+            quic_writer
+                .flush()
+                .await
+                .map_err(|e| TransportError::OpenFailed(e.to_string()))?;
+        }
+
+        // Create remoc byte channel pairs for the child.
+        let (from_remote_tx, from_remote_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) = remoc::rch::mpsc::channel(64);
+        let (to_remote_tx, to_remote_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) = remoc::rch::mpsc::channel(64);
+
+        // Bridge: QUIC reader → from_remote_tx
+        tokio::spawn(async move {
+            let mut quic_reader = quic_reader;
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let n = match quic_reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                if from_remote_tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Bridge: to_remote_rx → QUIC writer
+        tokio::spawn(async move {
+            let mut to_remote_rx = to_remote_rx;
+            while let Ok(Some(data)) = to_remote_rx.recv().await {
+                if quic_writer.write_all(&data).await.is_err() {
+                    break;
+                }
+                if quic_writer.flush().await.is_err() {
+                    break;
+                }
+            }
+            let _ = quic_writer.shutdown().await;
+        });
+
+        Ok((from_remote_rx, to_remote_tx))
     }
 }
 
