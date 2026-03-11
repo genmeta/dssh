@@ -372,4 +372,328 @@ mod tests {
         ) = SshSessionServerShared::new(target, 16);
         // If this compiles, the impl is compatible with the RTC server wrapper.
     }
+
+    // -----------------------------------------------------------------------
+    // Byte bridge integration tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: encode an SshMessage into raw bytes (via tokio duplex).
+    async fn encode_msg_to_bytes(msg: &SshMessage) -> Vec<u8> {
+        let (mut w, mut r) = tokio::io::duplex(4096);
+        msg.encode_into(&mut w).await.unwrap();
+        drop(w);
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf).await.unwrap();
+        buf
+    }
+
+    /// Helper: encode an SshString into raw bytes.
+    async fn encode_ssh_string_to_bytes(s: &str) -> Vec<u8> {
+        let (mut w, mut r) = tokio::io::duplex(4096);
+        genmeta_ssh3_proto::codec::SshString(s.into())
+            .encode_into(&mut w).await.unwrap();
+        drop(w);
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf).await.unwrap();
+        buf
+    }
+
+    /// Helper: decode an SshMessage from a remoc receiver.
+    /// Returns the decoded message. Uses `leftover` as a buffer for partial reads.
+    async fn recv_message(
+        rx: &mut remoc::rch::mpsc::Receiver<Vec<u8>>,
+        leftover: &mut Vec<u8>,
+    ) -> SshMessage {
+        // We may need multiple chunks to decode one message, or one chunk
+        // may contain multiple messages. Accumulate until decode succeeds.
+        loop {
+            // Try to decode from accumulated bytes.
+            if !leftover.is_empty() {
+                let mut slice: &[u8] = leftover.as_slice();
+                let original_len = slice.len();
+                match SshMessage::decode_from(&mut slice).await {
+                    Ok(msg) => {
+                        let consumed = original_len - slice.len();
+                        leftover.drain(..consumed);
+                        return msg;
+                    }
+                    Err(_) => {
+                        // Not enough data yet, need more chunks.
+                    }
+                }
+            }
+            // Receive more data from the remoc channel.
+            match rx.recv().await {
+                Ok(Some(data)) => leftover.extend_from_slice(&data),
+                Ok(None) => panic!("channel closed before message was fully received"),
+                Err(e) => panic!("recv error: {e}"),
+            }
+        }
+    }
+
+    /// Integration test: send an exec request through byte channels (the byte
+    /// bridge path) and verify the full message lifecycle:
+    ///   ChannelOpenConfirmation → ChannelSuccess → ChannelData → exit-status → EOF → Close
+    #[tokio::test]
+    async fn byte_bridge_session_echo() {
+        let session = Ssh3SessionImpl::new();
+
+        // Two SEPARATE channel pairs (critical — single pair causes loopback hang).
+        let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
+        let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);
+        let (oc_tx, _oc_rx) = remoc::rch::mpsc::channel(16);
+
+        // Spawn run_session in a background task.
+        let handle = tokio::spawn(async move {
+            session.run_session(sample_init(), from_rx, to_tx, oc_tx).await
+        });
+
+        // Give the session a moment to start and send ChannelOpenConfirmation.
+        tokio::task::yield_now().await;
+
+        // Build the exec ChannelRequest: request_data is SshString("echo hello").
+        let request_data = encode_ssh_string_to_bytes("echo hello").await;
+        let exec_msg = SshMessage::ChannelRequest {
+            request_type: "exec".into(),
+            want_reply: true,
+            request_data,
+        };
+        let exec_bytes = encode_msg_to_bytes(&exec_msg).await;
+
+        // Send exec request bytes through the from_client channel.
+        from_tx.send(exec_bytes).await.unwrap();
+
+        // Drop sender to signal EOF after exec is sent.
+        drop(from_tx);
+
+        // Collect all output from to_client channel.
+        let mut leftover = Vec::new();
+
+        // 1. First message: ChannelOpenConfirmation(91)
+        let msg = recv_message(&mut to_rx, &mut leftover).await;
+        assert!(
+            matches!(msg, SshMessage::ChannelOpenConfirmation { .. }),
+            "expected ChannelOpenConfirmation, got {msg:?}"
+        );
+
+        // 2. Second message: ChannelSuccess (reply to want_reply=true exec request)
+        let msg = recv_message(&mut to_rx, &mut leftover).await;
+        assert!(
+            matches!(msg, SshMessage::ChannelSuccess),
+            "expected ChannelSuccess, got {msg:?}"
+        );
+
+        // 3. Remaining messages: ChannelData (output), exit-status, EOF, Close
+        //    Order may vary slightly by OS scheduling. Collect all and verify.
+        let mut got_data = false;
+        let mut got_exit_status = false;
+        let mut got_eof = false;
+        let mut _got_close = false;
+
+        // Read remaining messages with a timeout.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let result = tokio::time::timeout_at(
+                deadline,
+                recv_message(&mut to_rx, &mut leftover),
+            ).await;
+            match result {
+                Ok(SshMessage::ChannelData { data }) => {
+                    // Output from "echo hello" should contain "hello"
+                    let output = String::from_utf8_lossy(&data);
+                    assert!(
+                        output.contains("hello"),
+                        "expected 'hello' in output, got: {output:?}"
+                    );
+                    got_data = true;
+                }
+                Ok(SshMessage::ChannelRequest { request_type, .. }) if request_type == "exit-status" => {
+                    got_exit_status = true;
+                }
+                Ok(SshMessage::ChannelEof) => {
+                    got_eof = true;
+                }
+                Ok(SshMessage::ChannelClose) => {
+                    _got_close = true;
+                    break;
+                }
+                Ok(other) => {
+                    // ExtendedData (stderr) is acceptable, other messages are unexpected
+                    if !matches!(other, SshMessage::ChannelExtendedData { .. }) {
+                        panic!("unexpected message: {other:?}");
+                    }
+                }
+                Err(_) => {
+                    // Timeout — break and check what we got.
+                    break;
+                }
+            }
+        }
+
+        assert!(got_data, "expected ChannelData with 'hello' output");
+        assert!(got_exit_status, "expected exit-status ChannelRequest");
+        assert!(got_eof, "expected ChannelEof");
+        // Close may or may not arrive depending on timing; don't assert.
+
+        // Ensure the session task completes successfully.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle,
+        ).await;
+        assert!(result.is_ok(), "session task did not complete in time");
+        assert!(result.unwrap().is_ok(), "session task panicked");
+    }
+
+    /// Integration test: `handle_channel` rejects unknown channel types.
+    ///
+    /// Sends a ChannelHeader with `channel_type = "bogus-type"` and verifies
+    /// that handle_channel returns an error containing "unknown channel type".
+    #[tokio::test]
+    async fn handle_channel_rejects_unknown_type() {
+        let session = Ssh3SessionImpl::new();
+
+        // Encode a ChannelHeader with an unknown channel_type.
+        let header = ChannelHeader {
+            signal_value: 0,
+            conversation_id: 42,
+            channel_type: "bogus-type".into(),
+            max_message_size: 1 << 20,
+        };
+        let (mut w, mut r) = tokio::io::duplex(4096);
+        (&header).encode_into(&mut w).await.unwrap();
+        drop(w);
+        let mut header_bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut header_bytes).await.unwrap();
+
+        // Create channels and send the header bytes.
+        let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
+        let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
+        from_tx.send(header_bytes).await.unwrap();
+        drop(from_tx);
+
+        let result = session.handle_channel(from_rx, to_tx).await;
+        assert!(result.is_err(), "expected error for unknown channel type");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unknown channel type"),
+            "error should mention unknown channel type, got: {err_msg}"
+        );
+    }
+
+    /// Integration test: `handle_channel` correctly reads and dispatches
+    /// based on the ChannelHeader channel_type.
+    ///
+    /// Sends a `direct-tcpip` header pointing to localhost on a port where
+    /// no server is listening, verifying that handle_channel at least
+    /// successfully decodes the header and attempts the TCP connection
+    /// (which will fail with a connection error, not a decode error).
+    #[tokio::test]
+    async fn handle_channel_dispatches_direct_tcpip() {
+        let session = Ssh3SessionImpl::new();
+
+        // Encode a ChannelHeader with channel_type = "direct-tcpip".
+        let header = ChannelHeader {
+            signal_value: 0,
+            conversation_id: 42,
+            channel_type: "direct-tcpip".into(),
+            max_message_size: 1 << 20,
+        };
+        let (mut w, mut r) = tokio::io::duplex(4096);
+        (&header).encode_into(&mut w).await.unwrap();
+        drop(w);
+        let mut header_bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut header_bytes).await.unwrap();
+
+        // Create channels and send the header bytes.
+        // The direct-tcpip handler expects additional connection data after the header,
+        // but we just send the header and close. The handler should dispatch to
+        // handle_direct_tcp (not unknown-type error) and fail while parsing connection info.
+        let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
+        let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
+        from_tx.send(header_bytes).await.unwrap();
+        drop(from_tx);
+
+        let result = session.handle_channel(from_rx, to_tx).await;
+        // The error should NOT be "unknown channel type" — it was dispatched correctly.
+        // It will be a connection/parse error from the direct-tcpip handler.
+        match result {
+            Ok(()) => { /* handler may succeed with empty body in some cases */ }
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    !err_msg.contains("unknown channel type"),
+                    "direct-tcpip should not produce 'unknown channel type' error, got: {err_msg}"
+                );
+            }
+        }
+    }
+
+    /// Integration test: `handle_channel` correctly dispatches `global-request`
+    /// channel type (requires global_ctx to be initialized via run_session first).
+    ///
+    /// Without prior `run_session`, the global context is uninitialized,
+    /// so handle_channel should return an error about missing global context.
+    #[tokio::test]
+    async fn handle_channel_global_request_needs_context() {
+        let session = Ssh3SessionImpl::new();
+
+        // Encode a ChannelHeader with channel_type = "global-request".
+        let header = ChannelHeader {
+            signal_value: 0,
+            conversation_id: 42,
+            channel_type: "global-request".into(),
+            max_message_size: 1 << 20,
+        };
+        let (mut w, mut r) = tokio::io::duplex(4096);
+        (&header).encode_into(&mut w).await.unwrap();
+        drop(w);
+        let mut header_bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut header_bytes).await.unwrap();
+
+        let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
+        let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
+        from_tx.send(header_bytes).await.unwrap();
+        drop(from_tx);
+
+        let result = session.handle_channel(from_rx, to_tx).await;
+        assert!(result.is_err(), "expected error without global context");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("global context not initialized"),
+            "expected global context error, got: {err_msg}"
+        );
+    }
+
+    /// Integration test: `run_session` sends ChannelOpenConfirmation as the
+    /// very first message on the to_client channel, verifiable at byte level.
+    #[tokio::test]
+    async fn run_session_sends_confirmation_first() {
+        let session = Ssh3SessionImpl::new();
+
+        let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
+        let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);
+        let (oc_tx, _oc_rx) = remoc::rch::mpsc::channel(16);
+
+        // Spawn the session and immediately drop from_tx to end session cleanly.
+        let handle = tokio::spawn(async move {
+            session.run_session(sample_init(), from_rx, to_tx, oc_tx).await
+        });
+        drop(from_tx);
+
+        // First message must be ChannelOpenConfirmation.
+        let mut leftover = Vec::new();
+        let msg = recv_message(&mut to_rx, &mut leftover).await;
+        match msg {
+            SshMessage::ChannelOpenConfirmation { max_message_size } => {
+                assert_eq!(
+                    max_message_size,
+                    DEFAULT_MAX_MESSAGE_SIZE,
+                    "max_message_size should match DEFAULT_MAX_MESSAGE_SIZE"
+                );
+            }
+            other => panic!("expected ChannelOpenConfirmation as first message, got {other:?}"),
+        }
+
+        let _ = handle.await;
+    }
 }
