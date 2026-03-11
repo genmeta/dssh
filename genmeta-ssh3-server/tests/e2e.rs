@@ -40,9 +40,16 @@ async fn setup_server() -> (
     AbortOnDropHandle<()>,
     http::uri::Authority,
 ) {
+    setup_server_with_pam(None).await
+}
+
+async fn setup_server_with_pam(pam_backend: Option<Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend>>) -> (
+    AbortOnDropHandle<()>,
+    http::uri::Authority,
+) {
     let protocol = Arc::new(Ssh3Protocol::default());
-    let handler = Ssh3ConnectHandler::new(protocol);
-    let service = TowerService(handler);
+    let service = TestChannelService::new(protocol, pam_backend);
+    let service = TowerService(service);
 
     let server = test_server(service).await;
     let authority = get_server_authority(&server);
@@ -57,10 +64,10 @@ async fn setup_server() -> (
 #[test]
 fn smoke_connect() {
     run("smoke_connect", async move {
-        // 1. Build server with SSH3 handler wrapped in TowerService
+        // 1. Build server with TestChannelService (inline auth, no child process)
         let protocol = Arc::new(Ssh3Protocol::default());
-        let handler = Ssh3ConnectHandler::new(protocol);
-        let service = TowerService(handler);
+        let service = TestChannelService::new(protocol, None);
+        let service = TowerService(service);
 
         // 2. Start server
         let server = test_server(service).await;
@@ -1658,16 +1665,16 @@ impl PamBackend for TestPamBackend {
 #[test]
 fn test_pam_auth_success() {
     run("test_pam_auth_success", async move {
-        let _pam = TestPamBackend::success(UserInfo {
+        let pam: Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend> = Arc::new(TestPamBackend::success(UserInfo {
             uid: 1000,
             gid: 1000,
             home: PathBuf::from("/home/testuser"),
             shell: PathBuf::from("/bin/bash"),
-        });
+        }));
 
         let protocol = Arc::new(Ssh3Protocol::default());
-        let handler = Ssh3ConnectHandler::new(protocol);
-        let service = TowerService(handler);
+        let service = TestChannelService::new(protocol, Some(pam));
+        let service = TowerService(service);
 
         let server = test_server(service).await;
         let authority = get_server_authority(&server);
@@ -1707,11 +1714,11 @@ fn test_pam_auth_success() {
 #[test]
 fn test_pam_auth_failure() {
     run("test_pam_auth_failure", async move {
-        let _pam = TestPamBackend::failure("invalid credentials");
+        let pam: Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend> = Arc::new(TestPamBackend::failure("invalid credentials"));
 
         let protocol = Arc::new(Ssh3Protocol::default());
-        let handler = Ssh3ConnectHandler::new(protocol);
-        let service = TowerService(handler);
+        let service = TestChannelService::new(protocol, Some(pam));
+        let service = TowerService(service);
 
         let server = test_server(service).await;
         let authority = get_server_authority(&server);

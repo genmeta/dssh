@@ -170,14 +170,27 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                     tracing::info!(conversation_id, "registered SSH3 conversation");
 
                     // Locate ssh3-session binary.
-                    let session_bin = match std::env::current_exe() {
-                        Ok(exe) => exe.parent()
-                            .map(|p| p.join("ssh3-session"))
-                            .unwrap_or_default(),
-                        Err(e) => {
-                            tracing::error!(%e, "cannot determine executable path");
-                            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                            return Ok(response);
+                    let session_bin = if let Ok(p) = std::env::var("SSH3_SESSION_BIN") {
+                        std::path::PathBuf::from(p)
+                    } else {
+                        match std::env::current_exe() {
+                            Ok(exe) => {
+                                let parent = exe.parent().map(|p| p.join("ssh3-session")).unwrap_or_default();
+                                if parent.exists() {
+                                    parent
+                                } else {
+                                    // In test builds, exe is in target/<profile>/deps/; try grandparent.
+                                    exe.parent()
+                                        .and_then(|p| p.parent())
+                                        .map(|p| p.join("ssh3-session"))
+                                        .unwrap_or_default()
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, "cannot determine executable path");
+                                *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                                return Ok(response);
+                            }
                         }
                     };
 

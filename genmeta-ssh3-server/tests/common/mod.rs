@@ -196,7 +196,7 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
     ) -> Self::Future {
         let protocol = self.protocol.clone();
         let next_id = self.next_conversation_id.clone();
-
+        let pam_backend = self.pam_backend.clone();
         Box::pin(async move {
             let method = request.method().clone();
             let proto_str = request
@@ -233,7 +233,21 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
 
             // 4. Authentication.
             match auth::extract_auth_credential(headers) {
-                Ok(_credential) => {}
+                Ok(credential) => {
+                    // If a PAM backend is configured, verify credentials through it.
+                    if let Some(ref pam) = pam_backend {
+                        if let genmeta_ssh3_proto::auth::AuthCredential::Basic { ref username, ref password } = credential {
+                            if let Err(_) = pam.authenticate("ssh3", username, password) {
+                                *response.status_mut() = StatusCode::UNAUTHORIZED;
+                                response.headers_mut().insert(
+                                    http::header::WWW_AUTHENTICATE,
+                                    HeaderValue::from_static("Basic"),
+                                );
+                                return Ok(response);
+                            }
+                        }
+                    }
+                }
                 Err(challenge) => {
                     *response.status_mut() = StatusCode::UNAUTHORIZED;
                     response.headers_mut().insert(

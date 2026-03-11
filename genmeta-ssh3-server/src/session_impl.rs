@@ -677,4 +677,107 @@ mod tests {
 
         let _ = handle.await;
     }
+
+    // -----------------------------------------------------------------------
+    // Transport RTC round-trip tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn accept_channel_round_trip() {
+        use genmeta_ssh3_proto::session::Ssh3Transport;
+
+        let header = ChannelHeader {
+            signal_value: 0,
+            conversation_id: 77,
+            channel_type: "session".into(),
+            max_message_size: 4096,
+        };
+
+        let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
+        let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);
+
+        let client = mock_feeding_transport_client(header.clone(), from_rx, to_tx);
+
+        // accept_channel via RTC should return the same header.
+        let result = client.accept_channel().await.unwrap();
+        let (got_header, mut got_rx, got_tx) = result.expect("expected Some channel");
+        assert_eq!(got_header.conversation_id, 77);
+        assert_eq!(got_header.channel_type, "session");
+        assert_eq!(got_header.max_message_size, 4096);
+
+        // Verify data flows: send through got_tx, receive via to_rx.
+        got_tx.send(b"hello".to_vec()).await.unwrap();
+        let data = to_rx.recv().await.unwrap().unwrap();
+        assert_eq!(data, b"hello");
+
+        // Verify data flows the other direction: from_tx → got_rx.
+        from_tx.send(b"world".to_vec()).await.unwrap();
+        let data = got_rx.recv().await.unwrap().unwrap();
+        assert_eq!(data, b"world");
+
+        // Second call should return None (feeding transport exhausted).
+        let result = client.accept_channel().await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn open_channel_round_trip() {
+        use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportServerShared};
+        use remoc::rtc::ServerShared;
+
+        // Mock transport that captures the header and returns byte channels.
+        struct OpenChannelMock {
+            opened: tokio::sync::Mutex<Option<ChannelHeader>>,
+        }
+
+        impl Ssh3Transport for OpenChannelMock {
+            async fn accept_channel(&self) -> Result<
+                Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+                TransportError,
+            > {
+                Ok(None)
+            }
+
+            async fn open_channel(
+                &self,
+                header: Option<ChannelHeader>,
+            ) -> Result<
+                (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+                TransportError,
+            > {
+                if let Some(h) = header {
+                    *self.opened.lock().await = Some(h);
+                }
+                let (tx, rx) = remoc::rch::mpsc::channel(16);
+                Ok((rx, tx))
+            }
+        }
+
+        let mock = std::sync::Arc::new(OpenChannelMock {
+            opened: tokio::sync::Mutex::new(None),
+        });
+        let mock_ref = mock.clone();
+        let (server, client): (_, Ssh3TransportClient) = Ssh3TransportServerShared::new(mock, 16);
+        tokio::spawn(async move { let _ = server.serve(true).await; });
+
+        let header = ChannelHeader {
+            signal_value: 0,
+            conversation_id: 88,
+            channel_type: "direct-tcpip".into(),
+            max_message_size: 8192,
+        };
+
+        let (mut rx, tx) = client.open_channel(Some(header)).await.unwrap();
+
+        // Verify the mock received the header.
+        let captured = mock_ref.opened.lock().await.take();
+        let captured = captured.expect("mock should have received header");
+        assert_eq!(captured.conversation_id, 88);
+        assert_eq!(captured.channel_type, "direct-tcpip");
+
+        // Verify data flows through the channels.
+        tx.send(b"ping".to_vec()).await.unwrap();
+        let data = rx.recv().await.unwrap().unwrap();
+        assert_eq!(data, b"ping");
+    }
 }

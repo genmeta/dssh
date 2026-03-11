@@ -228,4 +228,44 @@ mod tests {
         assert_eq!(decoded.message, "test error");
     }
 
+    #[test]
+    fn ssh3_transport_client_type_exists() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Ssh3TransportClient>();
+    }
+
+    #[test]
+    fn ssh3_transport_server_types_exist() {
+        // Ssh3TransportServerShared<T> requires a concrete impl type.
+        // Create a trivial one to verify the generated type exists and is Send.
+        struct Dummy;
+        impl Ssh3Transport for Dummy {
+            async fn accept_channel(&self) -> Result<
+                Option<(crate::codec::ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+                TransportError,
+            > { Ok(None) }
+            async fn open_channel(&self, _: Option<crate::codec::ChannelHeader>) -> Result<
+                (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+                TransportError,
+            > { Err(TransportError::Other("dummy".into())) }
+        }
+        fn assert_send<T: Send>() {}
+        assert_send::<Ssh3TransportServerShared<Dummy>>();
+    }
+
+    #[test]
+    fn transport_error_roundtrip() {
+        let cases = vec![
+            TransportError::ChannelClosed("gone".into()),
+            TransportError::OpenFailed("refused".into()),
+            TransportError::Timeout,
+            TransportError::Other("oops".into()),
+        ];
+        for err in &cases {
+            let json = serde_json::to_string(err).unwrap();
+            let decoded: TransportError = serde_json::from_str(&json).unwrap();
+            assert_eq!(err.to_string(), decoded.to_string());
+        }
+    }
+
 }
