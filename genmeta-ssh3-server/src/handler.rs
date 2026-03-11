@@ -8,6 +8,7 @@
 
 use std::{
     convert::Infallible,
+
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -26,7 +27,7 @@ use http_body_util::{Empty, combinators::UnsyncBoxBody};
 use crate::{auth, channel::GlobalRequestContext, child::ChildProcess, protocol::Ssh3Protocol, version};
 use crate::auth::pam::PamBackend;
 use genmeta_ssh3_proto::auth::AuthCredential;
-
+use genmeta_ssh3_proto::session::{SessionInit, SshSessionClient};
 /// Result of validating the SSH3 Extended CONNECT request at the HTTP layer.
 ///
 /// Extracted from the request so it can be unit-tested without constructing
@@ -96,9 +97,9 @@ fn evaluate_connect(
             }
         }
         Err(challenge) => {
-            return ConnectDecision::Unauthorized {
+            ConnectDecision::Unauthorized {
                 www_authenticate: challenge.www_authenticate,
-            };
+            }
         }
     }
 }
@@ -169,11 +170,21 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                         .unwrap_or_else(|| next_id.fetch_add(1, Ordering::Relaxed));
 
                     // If PAM backend is configured, validate credentials
-                    if let Some(ref backend) = pam_backend {
-                        if let Some(AuthCredential::Basic { ref username, ref password }) = credential {
+                    let mut session_init: Option<SessionInit> = None;
+                    if let Some(ref backend) = pam_backend && let Some(AuthCredential::Basic { ref username, ref password }) = credential {
                             match crate::auth::pam::pam_authenticate(backend.as_ref(), username, password).await {
-                                Ok(_auth_result) => {
+                                Ok(auth_result) => {
                                     tracing::info!(%username, "PAM authentication succeeded");
+                                    if let crate::auth::pam::AuthResult::Success { uid, gid, home, shell } = auth_result {
+                                        session_init = Some(SessionInit {
+                                            conversation_id,
+                                            username: username.clone(),
+                                            uid,
+                                            gid,
+                                            home,
+                                            shell,
+                                        });
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(%e, "PAM authentication failed");
@@ -185,7 +196,6 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                                     return Ok(response);
                                 }
                             }
-                        }
                     }
 
                     let mut rx = protocol.register_conversation(conversation_id).await;
@@ -198,32 +208,31 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                     // Spawn a task that consumes dispatched channel streams.
                     tokio::spawn(async move {
                         // Attempt to spawn child process for privilege separation.
-                        let _child_process = match std::env::current_exe() {
+                        let (mut _child_process, mut session_client): (Option<ChildProcess>, Option<SshSessionClient>) = (None, None);
+                        match std::env::current_exe() {
                             Ok(exe) => {
                                 let session_bin = exe.parent()
                                     .map(|p| p.join("ssh3-session"))
                                     .unwrap_or_default();
                                 if session_bin.exists() {
                                     match ChildProcess::spawn(&session_bin).await {
-                                        Ok((child, _session_client)) => {
+                                        Ok((child, client)) => {
                                             tracing::info!(conversation_id, "spawned child process for privilege separation");
-                                            Some(child)
+                                            _child_process = Some(child);
+                                            session_client = Some(client);
                                         }
                                         Err(e) => {
                                             tracing::warn!(%e, "failed to spawn child process, continuing without");
-                                            None
                                         }
                                     }
                                 } else {
                                     tracing::debug!(path = %session_bin.display(), "ssh3-session binary not found, skipping child process");
-                                    None
                                 }
                             }
                             Err(e) => {
                                 tracing::warn!(%e, "cannot determine executable path, skipping child process");
-                                None
                             }
-                        };
+                        }
 
                         // Build reverse-forwarding context.
                         let tcp_forwarder = Arc::new(crate::forward::reverse_tcp::ReverseTcpForwarder::new());
@@ -238,9 +247,11 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                                 stream_factory: sf,
                                 conversation_id,
                             }));
-                            // Spawn each channel handler independently.
+                            // Clone before moving into spawned task.
+                            let sc = session_client.clone();
+                            let si = session_init.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = crate::channel::handle_channel(header, reader, writer, global_ctx).await {
+                                if let Err(e) = crate::channel::handle_channel(header, reader, writer, global_ctx, sc, si).await {
                                     tracing::warn!("channel handler error: {e}");
                                 }
                             });

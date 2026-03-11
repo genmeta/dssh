@@ -11,9 +11,10 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
+use genmeta_ssh3_proto::session::{SessionInit, SshSession, SshSessionClient};
 use h3x::codec::{DecodeFrom, EncodeInto};
 use tokio::{
-    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
 
@@ -83,13 +84,23 @@ pub async fn handle_channel<R, W>(
     reader: R,
     writer: W,
     global_ctx: Option<Arc<GlobalRequestContext>>,
+    session_client: Option<SshSessionClient>,
+    session_init: Option<SessionInit>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
     match header.channel_type.as_str() {
-        "session" => handle_session_channel(header, reader, writer).await,
+        "session" => {
+            let session_client = session_client.ok_or_else(|| {
+                io::Error::other("no session client available")
+            })?;
+            let session_init = session_init.ok_or_else(|| {
+                io::Error::other("no session init available")
+            })?;
+            handle_session_byte_bridge(header, reader, writer, session_client, session_init).await
+        }
         "direct-tcpip" => forward::direct_tcp::handle_direct_tcp(header, reader, writer).await,
         "direct-streamlocal@openssh.com" => forward::streamlocal::handle_direct_streamlocal(header, reader, writer).await,
         "socks5" => forward::socks5::handle_socks5(header, reader, writer).await,
@@ -287,7 +298,7 @@ where
 ///
 /// Returns `(event_rx, io::Result<()>)` via spawning, but for direct use
 /// this function drives the loop to completion.
-async fn handle_session_channel<R, W>(
+pub async fn handle_session_channel<R, W>(
     _header: ChannelHeader,
     reader: R,
     mut writer: W,
@@ -364,6 +375,78 @@ where
             }
         }
     }
+
+    Ok(())
+}
+
+/// Handle a session channel by bridging raw bytes to the child process.
+///
+/// Creates two remoc byte channel pairs and spawns bridge tasks:
+/// - QUIC reader → from_client_tx (raw bytes to child)
+/// - to_client_rx → QUIC writer (raw bytes from child)
+///
+/// The child process sends ChannelOpenConfirmation and handles all SSH
+/// message parsing/dispatch — the parent is a pure byte relay.
+async fn handle_session_byte_bridge<R, W>(
+    _header: ChannelHeader,
+    mut reader: R,
+    mut writer: W,
+    session_client: SshSessionClient,
+    init: SessionInit,
+) -> io::Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    // 1. Create remoc byte channels (parent-side endpoints)
+    let (from_client_tx, from_client_rx) = remoc::rch::mpsc::channel(64);
+    let (to_client_tx, to_client_rx) = remoc::rch::mpsc::channel(64);
+
+    // 2. Spawn the RTC call to the child (non-blocking)
+    let session_handle = tokio::spawn(async move {
+        session_client.run_session(init, from_client_rx, to_client_tx).await
+    });
+
+    // 3. Spawn byte bridge: QUIC reader → from_client_tx (raw bytes to child)
+    let bridge_to_child = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 { break; }
+            if from_client_tx.send(buf[..n].to_vec()).await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), io::Error>(())
+    });
+
+    // 4. Spawn byte bridge: to_client_rx → QUIC writer (raw bytes from child)
+    let bridge_from_child = tokio::spawn(async move {
+        let mut to_client_rx = to_client_rx;
+        loop {
+            match to_client_rx.recv().await {
+                Ok(Some(data)) => {
+                    writer.write_all(&data).await?;
+                    writer.flush().await?;
+                }
+                Ok(None) => break, // channel closed
+                Err(_) => break,   // channel error
+            }
+        }
+        writer.shutdown().await?;
+        Ok::<(), io::Error>(())
+    });
+
+    // 5. Wait for all tasks
+    let _ = tokio::try_join!(
+        async { bridge_to_child.await.map_err(io::Error::other)? },
+        async { bridge_from_child.await.map_err(io::Error::other)? },
+        async {
+            session_handle.await
+                .map_err(io::Error::other)?
+                .map_err(|e| io::Error::other(e.to_string()))
+        },
+    );
 
     Ok(())
 }
@@ -518,9 +601,9 @@ mod tests {
             encode_messages(client_writer, &messages).await;
         });
 
-        // Server handles the channel
+        // Server handles the channel (directly, bypassing byte bridge dispatch)
         let server_handle = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, None)
+            handle_session_channel(header, server_reader, server_writer)
                 .await
                 .unwrap();
         });
@@ -554,7 +637,7 @@ mod tests {
             max_message_size: 65536,
         };
 
-        handle_channel(header, server_reader, server_writer, None)
+        handle_channel(header, server_reader, server_writer, None, None, None)
             .await
             .unwrap();
 
@@ -754,7 +837,7 @@ mod tests {
                 max_message_size: 65536,
             };
 
-            let result = handle_channel(header, server_reader, server_writer, None).await;
+            let result = handle_channel(header, server_reader, server_writer, None, None, None).await;
             assert!(
                 result.is_ok(),
                 "forwarding type {channel_type} should return Ok(())"

@@ -18,6 +18,7 @@ use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::message::SshMessage;
 use genmeta_ssh3_server::channel::open_session_channel;
 use genmeta_ssh3_server::channel::handle_channel;
+use genmeta_ssh3_server::channel::handle_session_channel;
 use genmeta_ssh3_server::forward::direct_tcp::handle_direct_tcp;
 use genmeta_ssh3_server::session::request::{encode_exit_status, handle_request, run_exec};
 use genmeta_ssh3_proto::codec::SshString;
@@ -771,7 +772,7 @@ fn test_production_exec_with_stdin() {
 
         // Spawn server-side handle_channel (production path).
         let server_task = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, None)
+            handle_session_channel(header, server_reader, server_writer)
                 .await
                 .expect("handle_channel failed");
         });
@@ -871,7 +872,7 @@ fn test_production_exec_stdin_echo() {
         };
 
         let server_task = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, None)
+            handle_session_channel(header, server_reader, server_writer)
                 .await
                 .expect("handle_channel failed");
         });
@@ -964,7 +965,7 @@ fn test_pty_shell_session() {
         };
 
         let server_task = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, None)
+            handle_session_channel(header, server_reader, server_writer)
                 .await
                 .expect("handle_channel failed");
         });
@@ -1080,7 +1081,7 @@ fn test_window_change_signal() {
         };
 
         let server_task = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, None)
+            handle_session_channel(header, server_reader, server_writer)
                 .await
                 .expect("handle_channel failed");
         });
@@ -1209,7 +1210,7 @@ fn test_global_request_tcpip_forward() {
         let (server_writer, mut client_reader) = duplex(65536);
 
         let server_task = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, Some(ctx))
+            handle_channel(header, server_reader, server_writer, Some(ctx), None, None)
                 .await
                 .expect("handle_channel failed");
         });
@@ -1294,7 +1295,7 @@ fn test_global_request_cancel_tcpip_forward() {
             max_message_size: 1 << 20,
         };
         let t1 = tokio::spawn(async move {
-            handle_channel(h1, sr1, sw1, Some(ctx1)).await.unwrap();
+            handle_channel(h1, sr1, sw1, Some(ctx1), None, None).await.unwrap();
         });
         let mut w1 = cw1;
         let req_data = TcpipForwardRequest {
@@ -1330,7 +1331,7 @@ fn test_global_request_cancel_tcpip_forward() {
             max_message_size: 1 << 20,
         };
         let t2 = tokio::spawn(async move {
-            handle_channel(h2, sr2, sw2, Some(ctx2)).await.unwrap();
+            handle_channel(h2, sr2, sw2, Some(ctx2), None, None).await.unwrap();
         });
         let mut w2 = cw2;
         let cancel_data = CancelTcpipForwardRequest {
@@ -1359,7 +1360,7 @@ fn test_global_request_cancel_tcpip_forward() {
             max_message_size: 1 << 20,
         };
         let t3 = tokio::spawn(async move {
-            handle_channel(h3, sr3, sw3, Some(ctx3)).await.unwrap();
+            handle_channel(h3, sr3, sw3, Some(ctx3), None, None).await.unwrap();
         });
         let mut w3 = cw3;
         let cancel_data2 = CancelTcpipForwardRequest {
@@ -1420,7 +1421,7 @@ fn test_reverse_tcp_forwarded_channel() {
             max_message_size: 1 << 20,
         };
         let t = tokio::spawn(async move {
-            handle_channel(h, sr, sw, Some(ctx)).await.unwrap();
+            handle_channel(h, sr, sw, Some(ctx), None, None).await.unwrap();
         });
         let mut w = cw;
         let req_data = TcpipForwardRequest {
@@ -1532,7 +1533,7 @@ fn test_global_request_unknown_type() {
         let (server_writer, mut client_reader) = duplex(65536);
 
         let server_task = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, Some(ctx))
+            handle_channel(header, server_reader, server_writer, Some(ctx), None, None)
                 .await
                 .expect("handle_channel failed");
         });
@@ -1598,7 +1599,7 @@ fn test_global_request_streamlocal_forward() {
         let (server_writer, mut client_reader) = duplex(65536);
 
         let server_task = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, Some(ctx))
+            handle_channel(header, server_reader, server_writer, Some(ctx), None, None)
                 .await
                 .expect("handle_channel failed");
         });
