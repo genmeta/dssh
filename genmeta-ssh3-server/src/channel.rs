@@ -85,7 +85,7 @@ pub async fn handle_channel<R, W>(
     writer: W,
     session_client: Option<SshSessionClient>,
     session_init: Option<SessionInit>,
-    open_channel_tx: Option<remoc::rch::mpsc::Sender<genmeta_ssh3_proto::session::OpenChannelRequest>>,
+    parent_client: Option<genmeta_ssh3_proto::session::ParentServiceClient>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -99,7 +99,10 @@ where
             let session_init = session_init.ok_or_else(|| {
                 io::Error::other("no session init available")
             })?;
-            handle_session_byte_bridge(header, reader, writer, session_client, session_init, open_channel_tx).await
+            let parent = parent_client.ok_or_else(|| {
+                io::Error::other("no parent service client available")
+            })?;
+            handle_session_byte_bridge(header, reader, writer, session_client, session_init, parent).await
         }
         _ => {
             // ALL non-session channels go through the unified byte bridge.
@@ -387,7 +390,7 @@ async fn handle_session_byte_bridge<R, W>(
     mut writer: W,
     session_client: SshSessionClient,
     init: SessionInit,
-    open_channel_tx: Option<remoc::rch::mpsc::Sender<genmeta_ssh3_proto::session::OpenChannelRequest>>,
+    parent: genmeta_ssh3_proto::session::ParentServiceClient,
 ) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -397,15 +400,9 @@ where
     let (from_client_tx, from_client_rx) = remoc::rch::mpsc::channel(64);
     let (to_client_tx, to_client_rx) = remoc::rch::mpsc::channel(64);
 
-    // 2. Get or create the open_channel sender for the child
-    let oc_tx = open_channel_tx.unwrap_or_else(|| {
-        let (tx, _rx): (remoc::rch::mpsc::Sender<genmeta_ssh3_proto::session::OpenChannelRequest>, _) = remoc::rch::mpsc::channel(16);
-        tx
-    });
-
     // 3. Spawn the RTC call to the child (non-blocking)
     let session_handle = tokio::spawn(async move {
-        session_client.run_session(init, from_client_rx, to_client_tx, oc_tx).await
+        session_client.run_session(init, from_client_rx, to_client_tx, parent).await
     });
 
     // 4. Spawn byte bridge: QUIC reader → from_client_tx (raw bytes to child)
@@ -525,13 +522,13 @@ where
     Ok(())
 }
 
-/// Handle an `OpenChannelRequest` from the child process.
+/// Handle an open-channel request from the child process.
 ///
-/// Opens a new QUIC bidirectional stream via `stream_factory`, writes the
-/// `header_bytes` as the initial channel opening, creates byte bridges,
-/// and returns remoc channel endpoints to the child.
+/// Opens a new QUIC bidirectional stream via `stream_factory`, optionally
+/// writes the `ChannelHeader`, creates byte bridges, and returns remoc
+/// channel endpoints to the child.
 pub async fn handle_open_channel_request(
-    header_bytes: Vec<u8>,
+    header: Option<ChannelHeader>,
     stream_factory: &forward::StreamFactory,
 ) -> Result<
     (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
@@ -544,15 +541,16 @@ pub async fn handle_open_channel_request(
         .await
         .map_err(|e| SessionError::new(e.to_string()))?;
 
-    // 2. Write header_bytes as the initial channel opening.
-    quic_writer
-        .write_all(&header_bytes)
-        .await
-        .map_err(|e| SessionError::new(e.to_string()))?;
-    quic_writer
-        .flush()
-        .await
-        .map_err(|e| SessionError::new(e.to_string()))?;
+    // 2. Write ChannelHeader if provided; skip if None (caller writes its own data).
+    if let Some(h) = &header {
+        h.encode_into(&mut quic_writer)
+            .await
+            .map_err(|e| SessionError::new(e.to_string()))?;
+        quic_writer
+            .flush()
+            .await
+            .map_err(|e| SessionError::new(e.to_string()))?;
+    }
 
     // 3. Create remoc byte channel pairs for the child.
     let (from_remote_tx, from_remote_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) = remoc::rch::mpsc::channel(64);

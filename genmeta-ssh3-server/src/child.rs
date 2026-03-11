@@ -116,6 +116,28 @@ mod tests {
     use genmeta_ssh3_proto::session::{SessionInit, SshSession};
     use std::path::PathBuf;
 
+    struct MockParentService;
+
+    impl genmeta_ssh3_proto::session::ParentService for MockParentService {
+        async fn open_channel(
+            &self,
+            _header: Option<genmeta_ssh3_proto::codec::ChannelHeader>,
+        ) -> Result<
+            (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            genmeta_ssh3_proto::session::SessionError,
+        > {
+            Err(genmeta_ssh3_proto::session::SessionError::new("mock: open_channel not available in tests"))
+        }
+    }
+
+    fn mock_parent_client() -> genmeta_ssh3_proto::session::ParentServiceClient {
+        use remoc::rtc::ServerShared;
+        let mock = std::sync::Arc::new(MockParentService);
+        let (parent_server, parent_client) = genmeta_ssh3_proto::session::ParentServiceServerShared::new(mock, 16);
+        tokio::spawn(async move { let _ = parent_server.serve(true).await; });
+        parent_client
+    }
+
     /// Locate the `ssh3-session` binary built by cargo.
     ///
     /// In test builds, we can derive the path from the test binary's location:
@@ -220,8 +242,8 @@ mod tests {
         let (_from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
         drop(_from_tx);
-        let (oc_tx, _oc_rx) = remoc::rch::mpsc::channel(16);
-        let result = client.run_session(init, from_rx, to_tx, oc_tx).await;
+        let parent = mock_parent_client();
+        let result = client.run_session(init, from_rx, to_tx, parent).await;
         tracing::info!(?result, "run_session result");
 
         // Clean up.

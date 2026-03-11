@@ -85,25 +85,6 @@ impl SessionError {
     }
 }
 
-/// Result type for open-channel responses (remoc byte-channel endpoints or error).
-pub type OpenChannelResult = Result<
-    (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
-    SessionError,
->;
-
-/// Request from the child process to the parent to open a new QUIC channel.
-///
-/// Sent over a dedicated `remoc::rch::mpsc` channel from child → parent.
-/// The parent opens a QUIC bidirectional stream, writes the header bytes,
-/// creates byte bridges, and sends the remoc channel endpoints back via
-/// the embedded oneshot sender.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct OpenChannelRequest {
-    /// Serialized channel header bytes to write at the start of the new stream.
-    pub header_bytes: Vec<u8>,
-    /// Oneshot sender for the response: remoc channel endpoints or error.
-    pub response_tx: remoc::rch::oneshot::Sender<OpenChannelResult>,
-}
 
 /// RTC trait for cross-process SSH3 session management.
 ///
@@ -119,27 +100,15 @@ pub trait SshSession: Sync {
     ///
     /// `from_client` receives raw bytes from the SSH client (stdin/channel data).
     /// `to_client` sends raw bytes back to the SSH client (stdout/channel data).
+    /// `parent` provides the parent-side RTC service for requesting new channels.
     async fn run_session(
         &self,
         init: SessionInit,
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
-        open_channel_tx: remoc::rch::mpsc::Sender<OpenChannelRequest>,
+        parent: ParentServiceClient,
     ) -> Result<(), SessionError>;
 
-    /// Open a new channel for reverse forwarding.
-    ///
-    /// The child process calls this to request that the parent open a new
-    /// channel back to the SSH client. `header_bytes` contains the serialized
-    /// channel open request. Returns a pair of (receiver, sender) for the
-    /// new channel's raw byte stream.
-    async fn open_channel(
-        &self,
-        header_bytes: Vec<u8>,
-    ) -> Result<
-        (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
-        SessionError,
-    >;
 
     /// Handle a non-session channel (forwarding, global-request, etc.).
     ///
@@ -152,6 +121,28 @@ pub trait SshSession: Sync {
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
     ) -> Result<(), SessionError>;
+}
+
+/// Service provided by the parent process to the child session.
+/// Enables the child to request the parent to open new QUIC channels
+/// (e.g., for reverse TCP forwarding or reverse streamlocal forwarding).
+#[remoc::rtc::remote]
+pub trait ParentService: Sync {
+    /// Open a new channel on behalf of the child.
+    /// The parent opens a QUIC stream, optionally writes a ChannelHeader,
+    /// and returns remoc mpsc endpoints bridged to the QUIC stream.
+    ///
+    /// If `header` is `None`, no header is written to the QUIC stream
+    /// (the caller is expected to write its own header/data after getting
+    /// the reader/writer). This matches the current `build_stream_factory`
+    /// behavior where `header_bytes` is empty.
+    async fn open_channel(
+        &self,
+        header: Option<crate::codec::ChannelHeader>,
+    ) -> Result<
+        (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+        SessionError,
+    >;
 }
 
 #[cfg(test)]
@@ -254,5 +245,20 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<SshSessionServerShared<()>>();
         assert_send::<SshSessionServerSharedMut<()>>();
+    }
+
+    /// Verify that the RTC macro generated the ParentServiceClient type.
+    #[test]
+    fn parent_service_client_type_exists() {
+        fn assert_serializable<T: Serialize + for<'de> Deserialize<'de>>() {}
+        assert_serializable::<ParentServiceClient>();
+    }
+
+    /// Verify that the RTC macro generated the ParentService server wrapper types.
+    #[test]
+    fn parent_service_server_types_exist() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ParentServiceServerShared<()>>();
+        assert_send::<ParentServiceServerSharedMut<()>>();
     }
 }

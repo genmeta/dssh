@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::message::SshMessage;
-use genmeta_ssh3_proto::session::{SessionError, SessionInit, SshSession};
-use h3x::codec::{DecodeFrom, EncodeInto};
+use genmeta_ssh3_proto::session::{ParentService, SessionError, SessionInit, SshSession};
+use h3x::codec::EncodeInto;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
@@ -87,14 +87,14 @@ impl SshSession for Ssh3SessionImpl {
         init: SessionInit,
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
-        open_channel_tx: remoc::rch::mpsc::Sender<genmeta_ssh3_proto::session::OpenChannelRequest>,
+        parent: genmeta_ssh3_proto::session::ParentServiceClient,
     ) -> Result<(), SessionError> {
         // 1. Drop privileges: setgid first, then setuid.
         drop_privileges(init.uid, init.gid)?;
 
-        // Build StreamFactory from open_channel_tx so reverse forwarders can
+        // Build StreamFactory from parent's RTC service so reverse forwarders can
         // request new QUIC streams from the parent process.
-        let stream_factory = build_stream_factory(open_channel_tx);
+        let stream_factory = build_stream_factory(parent);
 
         // Create GlobalRequestContext for handle_channel dispatch.
         let global_ctx = Arc::new(GlobalRequestContext {
@@ -195,22 +195,6 @@ impl SshSession for Ssh3SessionImpl {
 
         Ok(())
     }
-
-    async fn open_channel(
-        &self,
-        _header_bytes: Vec<u8>,
-    ) -> Result<
-        (
-            remoc::rch::mpsc::Receiver<Vec<u8>>,
-            remoc::rch::mpsc::Sender<Vec<u8>>,
-        ),
-        SessionError,
-    > {
-        Err(SessionError::new(
-            "open_channel not yet implemented".to_string(),
-        ))
-    }
-
     async fn handle_channel(
         &self,
         header: ChannelHeader,
@@ -256,33 +240,20 @@ impl SshSession for Ssh3SessionImpl {
     }
 }
 
-/// Build a [`StreamFactory`] backed by the `open_channel_tx` RPC channel.
+/// Build a [`StreamFactory`] backed by the parent's RTC service.
 ///
-/// When called, the factory sends an [`OpenChannelRequest`] to the parent
-/// process with empty `header_bytes` (callers write their own headers
-/// through the byte bridge). The parent opens a QUIC bidirectional stream,
-/// creates byte bridges, and returns remoc channel endpoints.
+/// When called, the factory invokes `parent.open_channel(None)` to request
+/// a new QUIC bidirectional stream from the parent process. The parent opens
+/// the stream, creates byte bridges, and returns remoc channel endpoints.
 fn build_stream_factory(
-    open_channel_tx: remoc::rch::mpsc::Sender<genmeta_ssh3_proto::session::OpenChannelRequest>,
+    parent: genmeta_ssh3_proto::session::ParentServiceClient,
 ) -> forward::StreamFactory {
     Arc::new(move || {
-        let caller = open_channel_tx.clone();
+        let caller = parent.clone();
         Box::pin(async move {
-            let (response_tx, response_rx) = remoc::rch::oneshot::channel();
-
-            let request = genmeta_ssh3_proto::session::OpenChannelRequest {
-                header_bytes: vec![],
-                response_tx,
-            };
-
-            caller
-                .send(request)
+            let (from_remote_rx, to_remote_tx) = caller
+                .open_channel(None)
                 .await
-                .map_err(|e| io::Error::other(e.to_string()))?;
-
-            let (from_remote_rx, to_remote_tx) = response_rx
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))?
                 .map_err(|e| io::Error::other(e.to_string()))?;
 
             let reader = Box::new(ChannelReader::new(from_remote_rx))
@@ -297,7 +268,30 @@ fn build_stream_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use h3x::codec::DecodeFrom;
     use std::path::PathBuf;
+
+    struct MockParentService;
+
+    impl genmeta_ssh3_proto::session::ParentService for MockParentService {
+        async fn open_channel(
+            &self,
+            _header: Option<genmeta_ssh3_proto::codec::ChannelHeader>,
+        ) -> Result<
+            (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            genmeta_ssh3_proto::session::SessionError,
+        > {
+            Err(genmeta_ssh3_proto::session::SessionError::new("mock: open_channel not available in tests"))
+        }
+    }
+
+    fn mock_parent_client() -> genmeta_ssh3_proto::session::ParentServiceClient {
+        use remoc::rtc::ServerShared;
+        let mock = std::sync::Arc::new(MockParentService);
+        let (parent_server, parent_client) = genmeta_ssh3_proto::session::ParentServiceServerShared::new(mock, 16);
+        tokio::spawn(async move { let _ = parent_server.serve(true).await; });
+        parent_client
+    }
 
     fn sample_init() -> SessionInit {
         SessionInit {
@@ -318,8 +312,8 @@ mod tests {
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
         // Drop from_tx immediately so reader gets EOF → message loop ends → event_rx returns None.
         drop(_from_tx);
-        let (oc_tx, _oc_rx) = remoc::rch::mpsc::channel(16);
-        let result = session.run_session(sample_init(), from_rx, to_tx, oc_tx).await;
+        let parent = mock_parent_client();
+        let result = session.run_session(sample_init(), from_rx, to_tx, parent).await;
         assert!(result.is_ok());
     }
 
@@ -343,8 +337,8 @@ mod tests {
         let (_from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
         drop(_from_tx);
-        let (oc_tx, _oc_rx) = remoc::rch::mpsc::channel(16);
-        assert!(session.run_session(init, from_rx, to_tx, oc_tx).await.is_ok());
+        let parent = mock_parent_client();
+        assert!(session.run_session(init, from_rx, to_tx, parent).await.is_ok());
     }
 
     #[test]
@@ -437,11 +431,11 @@ mod tests {
         // Two SEPARATE channel pairs (critical — single pair causes loopback hang).
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);
-        let (oc_tx, _oc_rx) = remoc::rch::mpsc::channel(16);
+        let parent = mock_parent_client();
 
         // Spawn run_session in a background task.
         let handle = tokio::spawn(async move {
-            session.run_session(sample_init(), from_rx, to_tx, oc_tx).await
+            session.run_session(sample_init(), from_rx, to_tx, parent).await
         });
 
         // Give the session a moment to start and send ChannelOpenConfirmation.
@@ -645,11 +639,11 @@ mod tests {
 
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);
-        let (oc_tx, _oc_rx) = remoc::rch::mpsc::channel(16);
+        let parent = mock_parent_client();
 
         // Spawn the session and immediately drop from_tx to end session cleanly.
         let handle = tokio::spawn(async move {
-            session.run_session(sample_init(), from_rx, to_tx, oc_tx).await
+            session.run_session(sample_init(), from_rx, to_tx, parent).await
         });
         drop(from_tx);
 
