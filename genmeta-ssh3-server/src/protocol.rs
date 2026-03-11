@@ -22,7 +22,7 @@ use h3x::{
     codec::{
         BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, DecodeFrom, SinkWriter, StreamReader,
     },
-    connection::{QuicConnection, StreamError},
+    connection::StreamError,
     protocol::{Protocol, StreamVerdict},
     quic,
     varint::VarInt,
@@ -139,10 +139,13 @@ impl Ssh3Protocol {
         };
 
         // Look up the conversation and dispatch.
-        let registry = self.registry.lock().await;
-        if let Some(sender) = registry.get(&header.conversation_id) {
-            if sender.try_send((header, stream_reader, stream_writer)).is_err() {
-                tracing::warn!("conversation channel full or closed, dropping stream");
+        let sender = {
+            let registry = self.registry.lock().await;
+            registry.get(&header.conversation_id).cloned()
+        };
+        if let Some(sender) = sender {
+            if let Err(e) = sender.send((header, stream_reader, stream_writer)).await {
+                tracing::warn!("conversation channel closed: {e}");
             }
         } else {
             tracing::warn!(
@@ -164,7 +167,7 @@ impl Default for Ssh3Protocol {
 impl<C: quic::Connection + ?Sized> Protocol<C> for Ssh3Protocol {
     fn accept_uni<'a>(
         &'a self,
-        _connection: &'a Arc<QuicConnection<C>>,
+        _connection: &'a Arc<C>,
         stream: BoxPeekableUniStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
         // SSH3 does not use unidirectional streams — always pass through.
@@ -173,7 +176,7 @@ impl<C: quic::Connection + ?Sized> Protocol<C> for Ssh3Protocol {
 
     fn accept_bi<'a>(
         &'a self,
-        connection: &'a Arc<QuicConnection<C>>,
+        connection: &'a Arc<C>,
         stream: BoxPeekableBiStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
         // Lazily populate the stream factory from the QUIC connection.
