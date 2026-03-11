@@ -17,7 +17,7 @@ use tokio_util::task::AbortOnDropHandle;
 use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::message::SshMessage;
 use genmeta_ssh3_server::channel::open_session_channel;
-use genmeta_ssh3_server::channel::handle_channel;
+use genmeta_ssh3_server::channel::handle_global_request_channel;
 use genmeta_ssh3_server::channel::handle_session_channel;
 use genmeta_ssh3_server::forward::direct_tcp::handle_direct_tcp;
 use genmeta_ssh3_server::session::request::{encode_exit_status, handle_request, run_exec};
@@ -1199,20 +1199,13 @@ fn test_global_request_tcpip_forward() {
             conversation_id: 1,
         });
 
-        let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "global-request".into(),
-            max_message_size: 1 << 20,
-        };
-
         let (client_writer, server_reader) = duplex(65536);
         let (server_writer, mut client_reader) = duplex(65536);
 
         let server_task = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, Some(ctx), None, None)
+            handle_global_request_channel(server_reader, server_writer, Some(ctx))
                 .await
-                .expect("handle_channel failed");
+                .expect("handle_global_request_channel failed");
         });
 
         let mut writer = client_writer;
@@ -1288,14 +1281,8 @@ fn test_global_request_cancel_tcpip_forward() {
         let (cw1, sr1) = duplex(65536);
         let (sw1, mut cr1) = duplex(65536);
         let ctx1 = make_ctx();
-        let h1 = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "global-request".into(),
-            max_message_size: 1 << 20,
-        };
         let t1 = tokio::spawn(async move {
-            handle_channel(h1, sr1, sw1, Some(ctx1), None, None).await.unwrap();
+            handle_global_request_channel(sr1, sw1, Some(ctx1)).await.unwrap();
         });
         let mut w1 = cw1;
         let req_data = TcpipForwardRequest {
@@ -1324,14 +1311,8 @@ fn test_global_request_cancel_tcpip_forward() {
         let (cw2, sr2) = duplex(65536);
         let (sw2, mut cr2) = duplex(65536);
         let ctx2 = make_ctx();
-        let h2 = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "global-request".into(),
-            max_message_size: 1 << 20,
-        };
         let t2 = tokio::spawn(async move {
-            handle_channel(h2, sr2, sw2, Some(ctx2), None, None).await.unwrap();
+            handle_global_request_channel(sr2, sw2, Some(ctx2)).await.unwrap();
         });
         let mut w2 = cw2;
         let cancel_data = CancelTcpipForwardRequest {
@@ -1353,14 +1334,8 @@ fn test_global_request_cancel_tcpip_forward() {
         let (cw3, sr3) = duplex(65536);
         let (sw3, mut cr3) = duplex(65536);
         let ctx3 = make_ctx();
-        let h3 = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "global-request".into(),
-            max_message_size: 1 << 20,
-        };
         let t3 = tokio::spawn(async move {
-            handle_channel(h3, sr3, sw3, Some(ctx3), None, None).await.unwrap();
+            handle_global_request_channel(sr3, sw3, Some(ctx3)).await.unwrap();
         });
         let mut w3 = cw3;
         let cancel_data2 = CancelTcpipForwardRequest {
@@ -1414,14 +1389,8 @@ fn test_reverse_tcp_forwarded_channel() {
         // Step 1: Start tcpip-forward → get allocated_port.
         let (cw, sr) = duplex(65536);
         let (sw, mut cr) = duplex(65536);
-        let h = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "global-request".into(),
-            max_message_size: 1 << 20,
-        };
         let t = tokio::spawn(async move {
-            handle_channel(h, sr, sw, Some(ctx), None, None).await.unwrap();
+            handle_global_request_channel(sr, sw, Some(ctx)).await.unwrap();
         });
         let mut w = cw;
         let req_data = TcpipForwardRequest {
@@ -1522,20 +1491,13 @@ fn test_global_request_unknown_type() {
             conversation_id: 1,
         });
 
-        let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "global-request".into(),
-            max_message_size: 1 << 20,
-        };
-
         let (client_writer, server_reader) = duplex(65536);
         let (server_writer, mut client_reader) = duplex(65536);
 
         let server_task = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, Some(ctx), None, None)
+            handle_global_request_channel(server_reader, server_writer, Some(ctx))
                 .await
-                .expect("handle_channel failed");
+                .expect("handle_global_request_channel failed");
         });
 
         let mut writer = client_writer;
@@ -1588,20 +1550,13 @@ fn test_global_request_streamlocal_forward() {
         // Use a unique socket path to avoid collisions.
         let socket_path = format!("/tmp/test-ssh3-streamlocal-{}-{}.sock", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
 
-        let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "global-request".into(),
-            max_message_size: 1 << 20,
-        };
-
         let (client_writer, server_reader) = duplex(65536);
         let (server_writer, mut client_reader) = duplex(65536);
 
         let server_task = tokio::spawn(async move {
-            handle_channel(header, server_reader, server_writer, Some(ctx), None, None)
+            handle_global_request_channel(server_reader, server_writer, Some(ctx))
                 .await
-                .expect("handle_channel failed");
+                .expect("handle_global_request_channel failed");
         });
 
         let mut writer = client_writer;

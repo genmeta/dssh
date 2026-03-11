@@ -24,7 +24,7 @@ use h3x::varint::VarInt;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Empty, combinators::UnsyncBoxBody};
 
-use crate::{auth, channel::GlobalRequestContext, child::ChildProcess, protocol::Ssh3Protocol, version};
+use crate::{auth, child::ChildProcess, protocol::Ssh3Protocol, version};
 use crate::auth::pam::PamBackend;
 use genmeta_ssh3_proto::auth::AuthCredential;
 use genmeta_ssh3_proto::session::{SessionInit, SshSessionClient};
@@ -234,24 +234,12 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                             }
                         }
 
-                        // Build reverse-forwarding context.
-                        let tcp_forwarder = Arc::new(crate::forward::reverse_tcp::ReverseTcpForwarder::new());
-                        let streamlocal_forwarder = Arc::new(crate::forward::streamlocal::ReverseStreamlocalForwarder::new());
-                        let protocol_for_ctx = protocol.clone();
-
                         while let Some((header, reader, writer)) = rx.recv().await {
-                            // Build GlobalRequestContext lazily (needs stream_factory from protocol).
-                            let global_ctx = protocol_for_ctx.get_stream_factory().await.map(|sf| Arc::new(GlobalRequestContext {
-                                tcp_forwarder: tcp_forwarder.clone(),
-                                streamlocal_forwarder: streamlocal_forwarder.clone(),
-                                stream_factory: sf,
-                                conversation_id,
-                            }));
                             // Clone before moving into spawned task.
                             let sc = session_client.clone();
                             let si = session_init.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = crate::channel::handle_channel(header, reader, writer, global_ctx, sc, si).await {
+                                if let Err(e) = crate::channel::handle_channel(header, reader, writer, sc, si).await {
                                     tracing::warn!("channel handler error: {e}");
                                 }
                             });

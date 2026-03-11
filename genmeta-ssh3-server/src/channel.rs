@@ -83,7 +83,6 @@ pub async fn handle_channel<R, W>(
     header: ChannelHeader,
     reader: R,
     writer: W,
-    global_ctx: Option<Arc<GlobalRequestContext>>,
     session_client: Option<SshSessionClient>,
     session_init: Option<SessionInit>,
 ) -> io::Result<()>
@@ -101,22 +100,16 @@ where
             })?;
             handle_session_byte_bridge(header, reader, writer, session_client, session_init).await
         }
-        "direct-tcpip" => forward::direct_tcp::handle_direct_tcp(header, reader, writer).await,
-        "direct-streamlocal@openssh.com" => forward::streamlocal::handle_direct_streamlocal(header, reader, writer).await,
-        "socks5" => forward::socks5::handle_socks5(header, reader, writer).await,
-        "forwarded-tcpip" | "forwarded-streamlocal@openssh.com" => {
-            // Stub dispatch points — server-initiated channels, not normally received here.
-            Ok(())
-        }
-        "global-request" => {
-            handle_global_request_channel(reader, writer, global_ctx).await
-        }
         _ => {
-            handle_unknown_channel(header, writer).await
+            // ALL non-session channels go through the unified byte bridge.
+            // If no session_client is available (e.g. child not spawned), reject.
+            match session_client {
+                Some(sc) => handle_channel_byte_bridge(header, reader, writer, sc).await,
+                None => handle_unknown_channel(header, writer).await,
+            }
         }
     }
 }
-
 /// Handle an unknown channel type by sending `ChannelOpenFailure(92)`.
 async fn handle_unknown_channel<W>(
     _header: ChannelHeader,
@@ -143,7 +136,7 @@ where
 /// channels, no `ChannelOpenConfirmation` is sent. The server decodes the
 /// `GlobalRequest`, dispatches by `request_type`, and sends back
 /// `RequestSuccess(81)` or `RequestFailure(82)`.
-async fn handle_global_request_channel<R, W>(
+pub async fn handle_global_request_channel<R, W>(
     mut reader: R,
     mut writer: W,
     global_ctx: Option<Arc<GlobalRequestContext>>,
@@ -451,6 +444,87 @@ where
     Ok(())
 }
 
+/// Handle a non-session channel by bridging raw bytes to the child process.
+///
+/// Serializes the [`ChannelHeader`] as the first message so the child can
+/// identify the channel type, then bridges raw bytes bidirectionally.
+/// The child process dispatches to the appropriate handler (T10).
+async fn handle_channel_byte_bridge<R, W>(
+    header: ChannelHeader,
+    mut reader: R,
+    mut writer: W,
+    session_client: SshSessionClient,
+) -> io::Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    // 1. Create remoc byte channels (parent-side endpoints)
+    let (from_client_tx, from_client_rx) = remoc::rch::mpsc::channel(64);
+    let (to_client_tx, to_client_rx) = remoc::rch::mpsc::channel(64);
+
+    // 2. Serialize ChannelHeader and send as the first message to child
+    let mut header_buf = std::io::Cursor::new(Vec::new());
+    (&header).encode_into(&mut header_buf).await?;
+    from_client_tx
+        .send(header_buf.into_inner())
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    // 3. Spawn the RTC call to the child (non-blocking)
+    let channel_handle = tokio::spawn(async move {
+        session_client
+            .handle_channel(from_client_rx, to_client_tx)
+            .await
+    });
+
+    // 4. Spawn byte bridge: QUIC reader → from_client_tx (raw bytes to child)
+    let bridge_to_child = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            if from_client_tx.send(buf[..n].to_vec()).await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), io::Error>(())
+    });
+
+    // 5. Spawn byte bridge: to_client_rx → QUIC writer (raw bytes from child)
+    let bridge_from_child = tokio::spawn(async move {
+        let mut to_client_rx = to_client_rx;
+        loop {
+            match to_client_rx.recv().await {
+                Ok(Some(data)) => {
+                    writer.write_all(&data).await?;
+                    writer.flush().await?;
+                }
+                Ok(None) => break, // channel closed
+                Err(_) => break,   // channel error
+            }
+        }
+        writer.shutdown().await?;
+        Ok::<(), io::Error>(())
+    });
+
+    // 6. Wait for all tasks
+    let _ = tokio::try_join!(
+        async { bridge_to_child.await.map_err(io::Error::other)? },
+        async { bridge_from_child.await.map_err(io::Error::other)? },
+        async {
+            channel_handle
+                .await
+                .map_err(io::Error::other)?
+                .map_err(|e| io::Error::other(e.to_string()))
+        },
+    );
+
+    Ok(())
+}
+
 /// Open a session channel, send confirmation, and return the event receiver
 /// along with a writer for sending messages back.
 ///
@@ -637,7 +711,7 @@ mod tests {
             max_message_size: 65536,
         };
 
-        handle_channel(header, server_reader, server_writer, None, None, None)
+        handle_channel(header, server_reader, server_writer, None, None)
             .await
             .unwrap();
 
@@ -821,6 +895,8 @@ mod tests {
 
     #[tokio::test]
     async fn forwarding_channel_types_stub() {
+        // After T8, non-session channel types with no session_client are treated
+        // as unknown and get ChannelOpenFailure (same as unknown_channel_type).
         let forwarding_types = [
             "forwarded-tcpip",
             "forwarded-streamlocal@openssh.com",
@@ -828,7 +904,7 @@ mod tests {
 
         for channel_type in forwarding_types {
             let (_, server_reader) = duplex(8192);
-            let (server_writer, _) = duplex(8192);
+            let (server_writer, mut client_reader) = duplex(8192);
 
             let header = ChannelHeader {
                 signal_value: 0xaf3627e6,
@@ -837,10 +913,17 @@ mod tests {
                 max_message_size: 65536,
             };
 
-            let result = handle_channel(header, server_reader, server_writer, None, None, None).await;
+            let result = handle_channel(header, server_reader, server_writer, None, None).await;
             assert!(
                 result.is_ok(),
-                "forwarding type {channel_type} should return Ok(())"
+                "forwarding type {channel_type} should return Ok()"
+            );
+
+            // Should receive ChannelOpenFailure since no session_client.
+            let failure = SshMessage::decode_from(&mut client_reader).await.unwrap();
+            assert!(
+                matches!(failure, SshMessage::ChannelOpenFailure { reason_code: 3, .. }),
+                "expected ChannelOpenFailure for {channel_type}, got {failure:?}"
             );
         }
     }

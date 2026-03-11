@@ -170,6 +170,16 @@ impl SshSession for Ssh3SessionImpl {
             "open_channel not yet implemented".to_string(),
         ))
     }
+
+    async fn handle_channel(
+        &self,
+        _from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
+        _to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), SessionError> {
+        // T10 will implement full dispatch. For now, stub.
+        tracing::warn!("handle_channel called but not yet implemented (T10)");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
