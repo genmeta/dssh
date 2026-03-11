@@ -206,6 +206,7 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                         .headers_mut()
                         .insert("ssh-version", version_header);
                     // Spawn a task that consumes dispatched channel streams.
+                    let protocol_for_factory = protocol.clone();
                     tokio::spawn(async move {
                         // Attempt to spawn child process for privilege separation.
                         let (mut _child_process, mut session_client): (Option<ChildProcess>, Option<SshSessionClient>) = (None, None);
@@ -234,12 +235,35 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                             }
                         }
 
+                        // Capture stream factory for open_channel support
+                        let stream_factory = protocol_for_factory.get_stream_factory().await;
+
+                        // Create open_channel request channel (child → parent)
+                        let (open_channel_tx, mut open_channel_rx): (remoc::rch::mpsc::Sender<genmeta_ssh3_proto::session::OpenChannelRequest>, _) = remoc::rch::mpsc::channel(16);
+
+                        // Spawn listener for open_channel requests if stream_factory is available
+                        if let Some(factory) = stream_factory {
+                            tokio::spawn(async move {
+                                while let Ok(Some(req)) = open_channel_rx.recv().await {
+                                    let factory = factory.clone();
+                                    tokio::spawn(async move {
+                                        let result = crate::channel::handle_open_channel_request(
+                                            req.header_bytes,
+                                            &factory,
+                                        ).await;
+                                        let _ = req.response_tx.send(result);
+                                    });
+                                }
+                            });
+                        }
+
                         while let Some((header, reader, writer)) = rx.recv().await {
                             // Clone before moving into spawned task.
                             let sc = session_client.clone();
                             let si = session_init.clone();
+                            let oc_tx = Some(open_channel_tx.clone());
                             tokio::spawn(async move {
-                                if let Err(e) = crate::channel::handle_channel(header, reader, writer, sc, si).await {
+                                if let Err(e) = crate::channel::handle_channel(header, reader, writer, sc, si, oc_tx).await {
                                     tracing::warn!("channel handler error: {e}");
                                 }
                             });

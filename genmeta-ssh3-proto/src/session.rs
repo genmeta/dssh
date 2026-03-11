@@ -85,6 +85,26 @@ impl SessionError {
     }
 }
 
+/// Result type for open-channel responses (remoc byte-channel endpoints or error).
+pub type OpenChannelResult = Result<
+    (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+    SessionError,
+>;
+
+/// Request from the child process to the parent to open a new QUIC channel.
+///
+/// Sent over a dedicated `remoc::rch::mpsc` channel from child → parent.
+/// The parent opens a QUIC bidirectional stream, writes the header bytes,
+/// creates byte bridges, and sends the remoc channel endpoints back via
+/// the embedded oneshot sender.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct OpenChannelRequest {
+    /// Serialized channel header bytes to write at the start of the new stream.
+    pub header_bytes: Vec<u8>,
+    /// Oneshot sender for the response: remoc channel endpoints or error.
+    pub response_tx: remoc::rch::oneshot::Sender<OpenChannelResult>,
+}
+
 /// RTC trait for cross-process SSH3 session management.
 ///
 /// The `#[remoc::rtc::remote]` macro generates `SshSessionClient`,
@@ -104,6 +124,7 @@ pub trait SshSession: Sync {
         init: SessionInit,
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
+        open_channel_tx: remoc::rch::mpsc::Sender<OpenChannelRequest>,
     ) -> Result<(), SessionError>;
 
     /// Open a new channel for reverse forwarding.

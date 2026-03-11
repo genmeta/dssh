@@ -260,7 +260,7 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                 while let Some((header, reader, writer)) = rx.recv().await {
                     // Spawn each channel handler independently.
                     tokio::spawn(async move {
-                        if let Err(e) = channel::handle_channel(header, reader, writer, None, None).await {
+                        if let Err(e) = channel::handle_channel(header, reader, writer, None, None, None).await {
                             tracing::warn!("channel handler error: {e}");
                         }
                     });

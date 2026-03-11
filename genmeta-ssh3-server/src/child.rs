@@ -220,7 +220,8 @@ mod tests {
         let (_from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
         drop(_from_tx);
-        let result = client.run_session(init, from_rx, to_tx).await;
+        let (oc_tx, _oc_rx) = remoc::rch::mpsc::channel(16);
+        let result = client.run_session(init, from_rx, to_tx, oc_tx).await;
         tracing::info!(?result, "run_session result");
 
         // Clean up.

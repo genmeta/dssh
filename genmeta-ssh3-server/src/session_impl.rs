@@ -61,6 +61,7 @@ impl SshSession for Ssh3SessionImpl {
         init: SessionInit,
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
+        _open_channel_tx: remoc::rch::mpsc::Sender<genmeta_ssh3_proto::session::OpenChannelRequest>,
     ) -> Result<(), SessionError> {
         // 1. Drop privileges: setgid first, then setuid.
         drop_privileges(init.uid, init.gid)?;
@@ -206,7 +207,8 @@ mod tests {
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
         // Drop from_tx immediately so reader gets EOF → message loop ends → event_rx returns None.
         drop(_from_tx);
-        let result = session.run_session(sample_init(), from_rx, to_tx).await;
+        let (oc_tx, _oc_rx) = remoc::rch::mpsc::channel(16);
+        let result = session.run_session(sample_init(), from_rx, to_tx, oc_tx).await;
         assert!(result.is_ok());
     }
 
@@ -230,7 +232,8 @@ mod tests {
         let (_from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
         drop(_from_tx);
-        assert!(session.run_session(init, from_rx, to_tx).await.is_ok());
+        let (oc_tx, _oc_rx) = remoc::rch::mpsc::channel(16);
+        assert!(session.run_session(init, from_rx, to_tx, oc_tx).await.is_ok());
     }
 
     #[test]

@@ -85,6 +85,7 @@ pub async fn handle_channel<R, W>(
     writer: W,
     session_client: Option<SshSessionClient>,
     session_init: Option<SessionInit>,
+    open_channel_tx: Option<remoc::rch::mpsc::Sender<genmeta_ssh3_proto::session::OpenChannelRequest>>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -98,7 +99,7 @@ where
             let session_init = session_init.ok_or_else(|| {
                 io::Error::other("no session init available")
             })?;
-            handle_session_byte_bridge(header, reader, writer, session_client, session_init).await
+            handle_session_byte_bridge(header, reader, writer, session_client, session_init, open_channel_tx).await
         }
         _ => {
             // ALL non-session channels go through the unified byte bridge.
@@ -386,6 +387,7 @@ async fn handle_session_byte_bridge<R, W>(
     mut writer: W,
     session_client: SshSessionClient,
     init: SessionInit,
+    open_channel_tx: Option<remoc::rch::mpsc::Sender<genmeta_ssh3_proto::session::OpenChannelRequest>>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -395,12 +397,18 @@ where
     let (from_client_tx, from_client_rx) = remoc::rch::mpsc::channel(64);
     let (to_client_tx, to_client_rx) = remoc::rch::mpsc::channel(64);
 
-    // 2. Spawn the RTC call to the child (non-blocking)
-    let session_handle = tokio::spawn(async move {
-        session_client.run_session(init, from_client_rx, to_client_tx).await
+    // 2. Get or create the open_channel sender for the child
+    let oc_tx = open_channel_tx.unwrap_or_else(|| {
+        let (tx, _rx): (remoc::rch::mpsc::Sender<genmeta_ssh3_proto::session::OpenChannelRequest>, _) = remoc::rch::mpsc::channel(16);
+        tx
     });
 
-    // 3. Spawn byte bridge: QUIC reader → from_client_tx (raw bytes to child)
+    // 3. Spawn the RTC call to the child (non-blocking)
+    let session_handle = tokio::spawn(async move {
+        session_client.run_session(init, from_client_rx, to_client_tx, oc_tx).await
+    });
+
+    // 4. Spawn byte bridge: QUIC reader → from_client_tx (raw bytes to child)
     let bridge_to_child = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
@@ -413,7 +421,7 @@ where
         Ok::<(), io::Error>(())
     });
 
-    // 4. Spawn byte bridge: to_client_rx → QUIC writer (raw bytes from child)
+    // 5. Spawn byte bridge: to_client_rx → QUIC writer (raw bytes from child)
     let bridge_from_child = tokio::spawn(async move {
         let mut to_client_rx = to_client_rx;
         loop {
@@ -430,7 +438,7 @@ where
         Ok::<(), io::Error>(())
     });
 
-    // 5. Wait for all tasks
+    // 6. Wait for all tasks (open_channel_rx is returned for the caller to manage)
     let _ = tokio::try_join!(
         async { bridge_to_child.await.map_err(io::Error::other)? },
         async { bridge_from_child.await.map_err(io::Error::other)? },
@@ -523,6 +531,72 @@ where
     );
 
     Ok(())
+}
+
+/// Handle an `OpenChannelRequest` from the child process.
+///
+/// Opens a new QUIC bidirectional stream via `stream_factory`, writes the
+/// `header_bytes` as the initial channel opening, creates byte bridges,
+/// and returns remoc channel endpoints to the child.
+pub async fn handle_open_channel_request(
+    header_bytes: Vec<u8>,
+    stream_factory: &forward::StreamFactory,
+) -> Result<
+    (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+    genmeta_ssh3_proto::session::SessionError,
+> {
+    use genmeta_ssh3_proto::session::SessionError;
+
+    // 1. Open a new QUIC bidirectional stream.
+    let (quic_reader, mut quic_writer) = stream_factory()
+        .await
+        .map_err(|e| SessionError::new(e.to_string()))?;
+
+    // 2. Write header_bytes as the initial channel opening.
+    quic_writer
+        .write_all(&header_bytes)
+        .await
+        .map_err(|e| SessionError::new(e.to_string()))?;
+    quic_writer
+        .flush()
+        .await
+        .map_err(|e| SessionError::new(e.to_string()))?;
+
+    // 3. Create remoc byte channel pairs for the child.
+    let (from_remote_tx, from_remote_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) = remoc::rch::mpsc::channel(64);
+    let (to_remote_tx, to_remote_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) = remoc::rch::mpsc::channel(64);
+
+    // 4. Spawn byte bridge: QUIC reader → from_remote_tx
+    tokio::spawn(async move {
+        let mut quic_reader = quic_reader;
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = match quic_reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if from_remote_tx.send(buf[..n].to_vec()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // 5. Spawn byte bridge: to_remote_rx → QUIC writer
+    tokio::spawn(async move {
+        let mut to_remote_rx = to_remote_rx;
+        while let Ok(Some(data)) = to_remote_rx.recv().await {
+            if quic_writer.write_all(&data).await.is_err() {
+                break;
+            }
+            if quic_writer.flush().await.is_err() {
+                break;
+            }
+        }
+        let _ = quic_writer.shutdown().await;
+    });
+
+    // 6. Return remoc endpoints to child.
+    Ok((from_remote_rx, to_remote_tx))
 }
 
 /// Open a session channel, send confirmation, and return the event receiver
@@ -711,7 +785,7 @@ mod tests {
             max_message_size: 65536,
         };
 
-        handle_channel(header, server_reader, server_writer, None, None)
+        handle_channel(header, server_reader, server_writer, None, None, None)
             .await
             .unwrap();
 
@@ -913,7 +987,7 @@ mod tests {
                 max_message_size: 65536,
             };
 
-            let result = handle_channel(header, server_reader, server_writer, None, None).await;
+            let result = handle_channel(header, server_reader, server_writer, None, None, None).await;
             assert!(
                 result.is_ok(),
                 "forwarding type {channel_type} should return Ok()"
