@@ -578,67 +578,52 @@ impl ConversationHandle {
 /// Parent-process transport that bridges QUIC streams to remoc byte channels.
 ///
 /// Implements [`Ssh3Transport`] for use as the RTC server object provided to
-/// the child process. Incoming QUIC streams are received via `channel_rx`;
-/// outgoing streams are opened via `stream_factory`.
+/// the child process. Incoming QUIC streams are accepted from the
+/// [`ConversationHandle`]; outgoing streams are opened via its stream factory.
 ///
 /// Supports a **pending/attach** pattern: construct with [`new_pending`] before
-/// authentication completes, then call [`attach`] once the stream receiver is
-/// available. `accept_channel` will block until `attach` is called.
+/// authentication completes, then call [`attach_handle`] once the
+/// [`ConversationHandle`] is available. `accept_channel` will block until
+/// `attach_handle` is called.
 pub struct Ssh3TransportImpl {
-    channel_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<DispatchedStream>>>,
-    stream_factory: Option<forward::StreamFactory>,
+    handle: tokio::sync::Mutex<Option<ConversationHandle>>,
     attached: tokio::sync::watch::Receiver<bool>,
     attached_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl Ssh3TransportImpl {
-    /// Create a transport with a known receiver (backward-compat, used in tests).
-    pub fn new(
-        channel_rx: tokio::sync::mpsc::Receiver<DispatchedStream>,
-        stream_factory: Option<forward::StreamFactory>,
-    ) -> Self {
+    /// Create a transport with a known handle (used in tests and child.rs).
+    pub fn new(handle: ConversationHandle) -> Self {
         let (attached_tx, attached) = tokio::sync::watch::channel(true);
         Self {
-            channel_rx: tokio::sync::Mutex::new(Some(channel_rx)),
-            stream_factory,
+            handle: tokio::sync::Mutex::new(Some(handle)),
             attached,
             attached_tx,
         }
     }
 
-    /// Create a **pending** transport without a stream receiver.
+    /// Create a **pending** transport without a handle.
     ///
-    /// The transport is immediately usable for `open_channel` (outgoing streams),
-    /// but `accept_channel` will wait until [`attach`] is called.
-    pub fn new_pending(stream_factory: Option<forward::StreamFactory>) -> Self {
+    /// Neither `accept_channel` nor `open_channel` will work until
+    /// [`attach_handle`](Self::attach_handle) is called.
+    pub fn new_pending() -> Self {
         let (attached_tx, attached) = tokio::sync::watch::channel(false);
         Self {
-            channel_rx: tokio::sync::Mutex::new(None),
-            stream_factory,
+            handle: tokio::sync::Mutex::new(None),
             attached,
             attached_tx,
         }
     }
 
-    /// Attach the stream receiver, unblocking any waiting `accept_channel` call.
-    pub fn attach(&self, rx: tokio::sync::mpsc::Receiver<DispatchedStream>) {
+    /// Attach a [`ConversationHandle`] to this transport, unblocking
+    /// `accept_channel` and `open_channel`.
+    pub fn attach_handle(&self, handle: ConversationHandle) {
         {
-            let mut guard = self.channel_rx.try_lock()
-                .expect("attach called while channel_rx lock is held");
-            *guard = Some(rx);
+            let mut guard = self.handle.try_lock()
+                .expect("attach_handle called while handle lock is held");
+            *guard = Some(handle);
         }
         let _ = self.attached_tx.send(true);
-    }
-
-    /// Attach a [`ConversationHandle`] to this transport, unblocking `accept_channel`.
-    ///
-    /// This is a Phase 4 compatibility shim: it extracts the channel receiver
-    /// from the handle and calls [`attach()`]. Phase 5 will make the transport
-    /// consume the full handle directly.
-    pub fn attach_handle(&self, handle: ConversationHandle) {
-        // Destructure to extract channel_rx.
-        let ConversationHandle { channel_rx, .. } = handle;
-        self.attach(channel_rx);
     }
 }
 
@@ -647,7 +632,7 @@ impl Ssh3Transport for Ssh3TransportImpl {
         Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
         TransportError,
     > {
-        // Wait until the receiver is attached (no-op if already attached via `new`).
+        // Wait until the handle is attached (no-op if already attached via `new`).
         {
             let mut attached = self.attached.clone();
             // wait_for resolves immediately if already true.
@@ -655,12 +640,12 @@ impl Ssh3Transport for Ssh3TransportImpl {
         }
 
         let dispatched = {
-            let mut guard = self.channel_rx.lock().await;
-            let rx = match guard.as_mut() {
-                Some(rx) => rx,
+            let mut guard = self.handle.lock().await;
+            let handle = match guard.as_mut() {
+                Some(h) => h,
                 None => return Ok(None),
             };
-            rx.recv().await
+            handle.accept_channel().await
         };
 
         let (header, mut quic_reader, mut quic_writer) = match dispatched {
@@ -710,14 +695,14 @@ impl Ssh3Transport for Ssh3TransportImpl {
         (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
         TransportError,
     > {
-        let stream_factory = self.stream_factory.as_ref().ok_or_else(|| {
-            TransportError::OpenFailed("no stream factory available".into())
-        })?;
-
-        // Open a new QUIC bidirectional stream.
-        let (quic_reader, mut quic_writer) = stream_factory()
-            .await
-            .map_err(|e| TransportError::OpenFailed(e.to_string()))?;
+        let (quic_reader, mut quic_writer) = {
+            let guard = self.handle.lock().await;
+            let handle = guard.as_ref().ok_or_else(|| {
+                TransportError::OpenFailed("no handle attached".into())
+            })?;
+            handle.open_channel(None).await
+                .map_err(|e| TransportError::OpenFailed(e.to_string()))?
+        };
 
         // Write ChannelHeader if provided.
         if let Some(h) = &header {

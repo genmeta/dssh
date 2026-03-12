@@ -198,8 +198,9 @@ mod tests {
 
         // Build a real Ssh3TransportImpl with an empty channel (no QUIC streams).
         let (_dispatch_tx, dispatch_rx) = tokio::sync::mpsc::channel(1);
+        let handle = crate::channel::ConversationHandle::new(0, dispatch_rx, None);
         let transport_impl =
-            std::sync::Arc::new(crate::channel::Ssh3TransportImpl::new(dispatch_rx, None));
+            std::sync::Arc::new(crate::channel::Ssh3TransportImpl::new(handle));
 
         use genmeta_ssh3_proto::session::Ssh3TransportServerShared;
         use remoc::rtc::ServerShared;

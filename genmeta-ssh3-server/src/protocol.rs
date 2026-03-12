@@ -71,16 +71,11 @@ impl Ssh3Protocol {
     }
 
     /// Creates a new `Ssh3Protocol` with a pre-populated stream factory.
-    pub fn with_stream_factory(stream_factory: crate::forward::StreamFactory) -> Self {
+    pub(crate) fn with_stream_factory(stream_factory: crate::forward::StreamFactory) -> Self {
         Self {
             registry: Arc::new(Mutex::new(HashMap::new())),
             stream_factory: Mutex::new(Some(stream_factory)),
         }
-    }
-
-    /// Returns the stream factory, if one has been populated by `accept_bi`.
-    pub async fn get_stream_factory(&self) -> Option<crate::forward::StreamFactory> {
-        self.stream_factory.lock().await.clone()
     }
 
     /// Registers a conversation, returning a receiver for dispatched streams.
@@ -117,10 +112,12 @@ impl Ssh3Protocol {
     ) -> io::Result<ReservedConversation> {
         let conversation_id = stream_id.0.into_inner();
         let rx = self.register_conversation(conversation_id).await;
+        let stream_factory = self.stream_factory.lock().await.clone();
         Ok(ReservedConversation {
             conversation_id,
             registry: Some(Arc::clone(&self.registry)),
             rx: Some(rx),
+            stream_factory,
         })
     }
 
@@ -196,6 +193,7 @@ pub struct ReservedConversation {
     conversation_id: u64,
     registry: Option<Arc<Mutex<HashMap<u64, mpsc::Sender<DispatchedStream>>>>>,
     rx: Option<mpsc::Receiver<DispatchedStream>>,
+    stream_factory: Option<crate::forward::StreamFactory>,
 }
 
 impl ReservedConversation {
@@ -207,17 +205,17 @@ impl ReservedConversation {
     /// Activates the reservation, transitioning to the active state.
     ///
     /// Returns a [`ConversationHandle`](crate::channel::ConversationHandle)
-    /// that wraps the channel receiver and optional stream factory.
+    /// that wraps the channel receiver and embedded stream factory.
     /// After activation, the conversation remains registered and the caller
     /// is responsible for eventually calling
     /// [`Ssh3Protocol::unregister_conversation`].
-    pub fn activate(mut self, stream_factory: Option<crate::forward::StreamFactory>) -> crate::channel::ConversationHandle {
+    pub fn activate(mut self) -> crate::channel::ConversationHandle {
         // Take the registry to prevent Drop from unregistering.
         self.registry.take();
         crate::channel::ConversationHandle::new(
             self.conversation_id,
             self.rx.take().expect("ReservedConversation already consumed"),
-            stream_factory,
+            self.stream_factory.take(),
         )
     }
 }

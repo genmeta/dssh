@@ -213,8 +213,7 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                     // fails, `reserved` drops here and auto-unregisters.
 
                     // Create Ssh3TransportImpl in pending mode and RTC server.
-                    let stream_factory = protocol.get_stream_factory().await;
-                    let transport_impl = Ssh3TransportImpl::new_pending(stream_factory.clone());
+                    let transport_impl = Ssh3TransportImpl::new_pending();
                     let transport_impl = Arc::new(transport_impl);
                     let (transport_server, transport_client) =
                         Ssh3TransportServerShared::new(transport_impl.clone(), 16);
@@ -280,7 +279,7 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                             let protocols_for_cleanup = protocols.clone();
                             tokio::spawn(async move {
                                 // Activate reservation → get stream receiver.
-                                let handle = reserved.activate(stream_factory);
+                                let handle = reserved.activate();
                                 // Attach to pending transport so accept_channel unblocks.
                                 transport_impl.attach_handle(handle);
 
