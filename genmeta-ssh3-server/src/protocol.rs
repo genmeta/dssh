@@ -26,6 +26,7 @@ use h3x::{
     connection::StreamError,
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, ConnectionError},
+    stream_id::StreamId,
     varint::VarInt,
 };
 
@@ -48,7 +49,7 @@ pub type DispatchedStream = (ChannelHeader, BoxReader, BoxWriter);
 /// SSH3 channel streams (signal value `0xaf3627e6`) are dispatched to the
 /// appropriate conversation via mpsc. Other streams are passed through.
 pub struct Ssh3Protocol {
-    registry: Mutex<HashMap<u64, mpsc::Sender<DispatchedStream>>>,
+    registry: Arc<Mutex<HashMap<u64, mpsc::Sender<DispatchedStream>>>>,
     /// Factory for opening server-initiated QUIC bidirectional streams.
     /// Populated from the QUIC connection during `ProductProtocol::init`.
     stream_factory: Mutex<Option<crate::forward::StreamFactory>>,
@@ -64,7 +65,7 @@ impl Ssh3Protocol {
     /// Creates a new `Ssh3Protocol` with an empty conversation registry.
     pub fn new() -> Self {
         Self {
-            registry: Mutex::new(HashMap::new()),
+            registry: Arc::new(Mutex::new(HashMap::new())),
             stream_factory: Mutex::new(None),
         }
     }
@@ -72,7 +73,7 @@ impl Ssh3Protocol {
     /// Creates a new `Ssh3Protocol` with a pre-populated stream factory.
     pub fn with_stream_factory(stream_factory: crate::forward::StreamFactory) -> Self {
         Self {
-            registry: Mutex::new(HashMap::new()),
+            registry: Arc::new(Mutex::new(HashMap::new())),
             stream_factory: Mutex::new(Some(stream_factory)),
         }
     }
@@ -102,6 +103,25 @@ impl Ssh3Protocol {
     /// dropped.
     pub async fn unregister_conversation(&self, id: u64) {
         self.registry.lock().await.remove(&id);
+    }
+
+    /// Reserves a conversation slot for the given QUIC stream.
+    ///
+    /// Creates a channel in the registry keyed by the stream's ID (as `u64`).
+    /// Returns a [`ReservedConversation`] that holds the receiver and can be
+    /// activated to transition to the active state. If not activated, the
+    /// conversation is automatically unregistered on drop.
+    pub async fn reserve_conversation(
+        &self,
+        stream_id: StreamId,
+    ) -> io::Result<ReservedConversation> {
+        let conversation_id = stream_id.0.into_inner();
+        let rx = self.register_conversation(conversation_id).await;
+        Ok(ReservedConversation {
+            conversation_id,
+            registry: Some(Arc::clone(&self.registry)),
+            rx: Some(rx),
+        })
     }
 
     /// Core bidirectional stream accept logic.
@@ -163,6 +183,47 @@ impl Ssh3Protocol {
         }
 
         Ok(StreamVerdict::Accepted)
+    }
+}
+
+/// A reserved conversation slot in the [`Ssh3Protocol`] registry.
+///
+/// Created by [`Ssh3Protocol::reserve_conversation`]. Holds a receiver for
+/// dispatched streams but does not consume them until [`activate()`](Self::activate)
+/// is called. If dropped without being activated, the conversation is
+/// automatically unregistered to prevent resource leaks.
+pub struct ReservedConversation {
+    conversation_id: u64,
+    registry: Option<Arc<Mutex<HashMap<u64, mpsc::Sender<DispatchedStream>>>>>,
+    rx: Option<mpsc::Receiver<DispatchedStream>>,
+}
+
+impl ReservedConversation {
+    /// Returns the conversation ID (the `u64` extracted from the QUIC stream ID).
+    pub fn conversation_id(&self) -> u64 {
+        self.conversation_id
+    }
+
+    /// Activates the reservation, transitioning to the active state.
+    ///
+    /// Returns the receiver for dispatched streams. After activation, the
+    /// conversation remains registered and the caller is responsible for
+    /// eventually calling [`Ssh3Protocol::unregister_conversation`].
+    pub fn activate(mut self) -> mpsc::Receiver<DispatchedStream> {
+        // Take the registry to prevent Drop from unregistering.
+        self.registry.take();
+        self.rx.take().expect("ReservedConversation already consumed")
+    }
+}
+
+impl Drop for ReservedConversation {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.take() {
+            let id = self.conversation_id;
+            tokio::spawn(async move {
+                registry.lock().await.remove(&id);
+            });
+        }
     }
 }
 

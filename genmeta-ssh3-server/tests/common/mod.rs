@@ -147,7 +147,6 @@ pub fn get_server_authority<S>(servers: &H3Servers<S>) -> Authority {
 use std::{
     convert::Infallible,
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll},
 };
 
@@ -170,7 +169,6 @@ use http_body_util::{Empty, combinators::UnsyncBoxBody};
 /// a channel-dispatch loop that calls `handle_channel` for each stream.
 #[derive(Clone)]
 pub struct TestChannelService {
-    next_conversation_id: Arc<AtomicU64>,
     #[allow(dead_code)]
     pam_backend: Option<Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend>>,
 }
@@ -178,7 +176,6 @@ pub struct TestChannelService {
 impl TestChannelService {
     pub fn new(pam_backend: Option<Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend>>) -> Self {
         Self {
-            next_conversation_id: Arc::new(AtomicU64::new(0)),
             pam_backend,
         }
     }
@@ -199,7 +196,6 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
         &mut self,
         request: http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
     ) -> Self::Future {
-        let next_id = self.next_conversation_id.clone();
         let pam_backend = self.pam_backend.clone();
         Box::pin(async move {
             // Look up the SSH3 protocol from request extensions.
@@ -267,9 +263,11 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                 }
             }
 
-            // All checks passed — register conversation and KEEP rx alive.
-            let conversation_id = next_id.fetch_add(1, Ordering::Relaxed);
-            let mut rx = protocol.register_conversation(conversation_id).await;
+            // All checks passed — reserve conversation using StreamId from request extensions.
+            let stream_id = request.extensions().get::<h3x::stream_id::StreamId>().copied().expect("StreamId not injected by h3x");
+            let reserved = protocol.reserve_conversation(stream_id).await.expect("failed to reserve conversation");
+            let conversation_id = reserved.conversation_id();
+            let mut rx = reserved.activate();
             tracing::info!(conversation_id, "registered SSH3 conversation (test)");
 
             *response.status_mut() = StatusCode::OK;

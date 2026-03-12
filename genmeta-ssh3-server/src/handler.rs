@@ -8,10 +8,7 @@
 
 use std::{
     convert::Infallible,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -20,7 +17,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use h3x::message::stream::MessageStreamError;
 use h3x::qpack::field::Protocol;
-use h3x::varint::VarInt;
+use h3x::stream_id::StreamId;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Empty, combinators::UnsyncBoxBody};
 
@@ -109,18 +106,14 @@ fn evaluate_connect(
 /// Handler for SSH3 Extended CONNECT requests.
 ///
 /// Looks up the [`Ssh3Protocol`] from request extensions (via `Arc<Protocols>`).
-/// Uses an atomic counter for generating conversation IDs.
+/// Uses the QUIC [`StreamId`] from request extensions as the conversation ID.
 #[derive(Clone)]
-pub struct Ssh3ConnectHandler {
-    next_conversation_id: Arc<AtomicU64>,
-}
+pub struct Ssh3ConnectHandler;
 
 impl Ssh3ConnectHandler {
     /// Creates a new handler.
     pub fn new() -> Self {
-        Self {
-            next_conversation_id: Arc::new(AtomicU64::new(0)),
-        }
+        Self
     }
 }
 impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>>
@@ -138,12 +131,12 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
         &mut self,
         request: http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
     ) -> Self::Future {
-        let next_id = self.next_conversation_id.clone();
-
         Box::pin(async move {
             // Look up the SSH3 protocol from request extensions.
             let protocols = request.extensions().get::<Arc<Protocols>>().cloned().unwrap();
             let protocol = protocols.get::<Ssh3Protocol>().expect("Ssh3Protocol not registered");
+
+            let stream_id = request.extensions().get::<StreamId>().copied().expect("StreamId not injected by h3x");
 
             let method = request.method().clone();
             let proto_str = request
@@ -162,13 +155,15 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
 
             match decision {
                 ConnectDecision::Ok { version_header, credential } => {
-                    let conversation_id = request
-                        .extensions()
-                        .get::<VarInt>()
-                        .map(|v| v.into_inner())
-                        .unwrap_or_else(|| next_id.fetch_add(1, Ordering::Relaxed));
-
-                    let rx = protocol.register_conversation(conversation_id).await;
+                    let reserved = match protocol.reserve_conversation(stream_id).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!(%e, "failed to reserve conversation");
+                            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                            return Ok(response);
+                        }
+                    };
+                    let conversation_id = reserved.conversation_id();
                     tracing::info!(conversation_id, "registered SSH3 conversation");
 
                     // Locate ssh3-session binary.
@@ -211,6 +206,9 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                             return Ok(response);
                         }
                     };
+
+                    // Activate the reservation to get the stream receiver.
+                    let rx = reserved.activate();
 
                     // Create Ssh3TransportImpl and RTC server.
                     let stream_factory = protocol.get_stream_factory().await;
@@ -320,6 +318,7 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use h3x::varint::VarInt;
 
     fn headers_with_pairs(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -493,17 +492,14 @@ mod tests {
         }
     }
 
-    /// Conversation ID counter works correctly.
-    #[tokio::test]
-    async fn handler_conversation_id_counter() {
-        let handler = Ssh3ConnectHandler::new();
-
-        // First ID is 0.
-        let id0 = handler.next_conversation_id.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(id0, 0);
-
-        // Next ID increments.
-        let id1 = handler.next_conversation_id.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(id1, 1);
+    /// StreamId is used as conversation ID from request extensions.
+    #[test]
+    fn handler_uses_stream_id() {
+        // The handler struct no longer carries an atomic counter.
+        let _handler = Ssh3ConnectHandler::new();
+        // StreamId wraps a VarInt — verify the conversion to u64.
+        let stream_id = StreamId(VarInt::try_from(42u64).unwrap());
+        let conversation_id = stream_id.0.into_inner();
+        assert_eq!(conversation_id, 42);
     }
 }
