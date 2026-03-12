@@ -510,6 +510,68 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// ConversationHandle — raw QUIC-level handle for a fully-activated conversation
+// ---------------------------------------------------------------------------
+
+/// A fully-activated conversation handle.
+///
+/// Created by [`ReservedConversation::activate()`]. Encapsulates the
+/// conversation ID, the receiver for dispatched QUIC streams, and the
+/// optional stream factory for opening server-initiated streams.
+///
+/// This is the raw QUIC-level handle. The remoc bridging layer lives in
+/// [`Ssh3TransportImpl`], which will consume this handle in Phase 5.
+pub struct ConversationHandle {
+    conversation_id: u64,
+    channel_rx: mpsc::Receiver<DispatchedStream>,
+    stream_factory: Option<forward::StreamFactory>,
+}
+
+impl ConversationHandle {
+    pub(crate) fn new(
+        conversation_id: u64,
+        channel_rx: mpsc::Receiver<DispatchedStream>,
+        stream_factory: Option<forward::StreamFactory>,
+    ) -> Self {
+        Self { conversation_id, channel_rx, stream_factory }
+    }
+
+    /// Returns the conversation ID (u64 from the QUIC stream ID).
+    pub fn conversation_id(&self) -> u64 {
+        self.conversation_id
+    }
+
+    /// Accept the next dispatched channel stream from the remote peer.
+    ///
+    /// Returns `None` when the conversation is closed (sender dropped).
+    pub async fn accept_channel(&mut self) -> Option<DispatchedStream> {
+        self.channel_rx.recv().await
+    }
+
+    /// Open a new server-initiated QUIC bidirectional stream.
+    ///
+    /// Writes the `ChannelHeader` to the stream if provided.
+    /// Returns raw `AsyncRead`/`AsyncWrite` streams (no remoc bridging).
+    pub async fn open_channel(
+        &self,
+        header: Option<ChannelHeader>,
+    ) -> io::Result<(
+        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    )> {
+        let sf = self.stream_factory.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "no stream factory available")
+        })?;
+        let (reader, mut writer) = sf().await?;
+        if let Some(h) = &header {
+            h.encode_into(&mut writer).await?;
+            writer.flush().await?;
+        }
+        Ok((reader, writer))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ssh3TransportImpl — parent-process transport bridging QUIC ↔ remoc channels
 // ---------------------------------------------------------------------------
 
@@ -566,6 +628,17 @@ impl Ssh3TransportImpl {
             *guard = Some(rx);
         }
         let _ = self.attached_tx.send(true);
+    }
+
+    /// Attach a [`ConversationHandle`] to this transport, unblocking `accept_channel`.
+    ///
+    /// This is a Phase 4 compatibility shim: it extracts the channel receiver
+    /// from the handle and calls [`attach()`]. Phase 5 will make the transport
+    /// consume the full handle directly.
+    pub fn attach_handle(&self, handle: ConversationHandle) {
+        // Destructure to extract channel_rx.
+        let ConversationHandle { channel_rx, .. } = handle;
+        self.attach(channel_rx);
     }
 }
 
@@ -1082,5 +1155,34 @@ mod tests {
         assert_eq!(event, ChannelEvent::Close);
 
         client_handle.await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 10: ConversationHandle basic functionality
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn conversation_handle_accept_channel() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut handle = ConversationHandle::new(42, rx, None);
+        assert_eq!(handle.conversation_id(), 42);
+
+        // Drop sender — accept_channel should return None.
+        drop(tx);
+        assert!(handle.accept_channel().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn conversation_handle_open_channel_no_factory() {
+        let (_tx, rx) = mpsc::channel(8);
+        let handle = ConversationHandle::new(99, rx, None);
+        assert_eq!(handle.conversation_id(), 99);
+
+        // open_channel without a stream factory should fail.
+        let result = handle.open_channel(None).await;
+        match result {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotConnected),
+            Ok(_) => panic!("expected NotConnected error, got Ok"),
+        }
     }
 }

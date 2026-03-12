@@ -206,13 +206,19 @@ impl ReservedConversation {
 
     /// Activates the reservation, transitioning to the active state.
     ///
-    /// Returns the receiver for dispatched streams. After activation, the
-    /// conversation remains registered and the caller is responsible for
-    /// eventually calling [`Ssh3Protocol::unregister_conversation`].
-    pub fn activate(mut self) -> mpsc::Receiver<DispatchedStream> {
+    /// Returns a [`ConversationHandle`](crate::channel::ConversationHandle)
+    /// that wraps the channel receiver and optional stream factory.
+    /// After activation, the conversation remains registered and the caller
+    /// is responsible for eventually calling
+    /// [`Ssh3Protocol::unregister_conversation`].
+    pub fn activate(mut self, stream_factory: Option<crate::forward::StreamFactory>) -> crate::channel::ConversationHandle {
         // Take the registry to prevent Drop from unregistering.
         self.registry.take();
-        self.rx.take().expect("ReservedConversation already consumed")
+        crate::channel::ConversationHandle::new(
+            self.conversation_id,
+            self.rx.take().expect("ReservedConversation already consumed"),
+            stream_factory,
+        )
     }
 }
 

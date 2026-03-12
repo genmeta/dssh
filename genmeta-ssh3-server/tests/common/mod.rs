@@ -276,8 +276,8 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
 
             // Spawn upgrade supervisor: activate reservation + handle channels.
             tokio::spawn(async move {
-                let mut rx = reserved.activate();
-                while let Some((header, reader, writer)) = rx.recv().await {
+                let mut handle = reserved.activate(None);
+                while let Some((header, reader, writer)) = handle.accept_channel().await {
                     // Spawn each channel handler independently.
                     tokio::spawn(async move {
                         if let Err(e) = channel::handle_channel(header, reader, writer).await {
