@@ -208,14 +208,16 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                     };
 
                     // Activate the reservation to get the stream receiver.
-                    let rx = reserved.activate();
+                    // NOTE: We do NOT activate here; `reserved` stays alive until
+                    // the supervisor task activates it after auth success. If auth
+                    // fails, `reserved` drops here and auto-unregisters.
 
-                    // Create Ssh3TransportImpl and RTC server.
+                    // Create Ssh3TransportImpl in pending mode and RTC server.
                     let stream_factory = protocol.get_stream_factory().await;
-                    let transport_impl = Ssh3TransportImpl::new(rx, stream_factory);
+                    let transport_impl = Ssh3TransportImpl::new_pending(stream_factory);
                     let transport_impl = Arc::new(transport_impl);
                     let (transport_server, transport_client) =
-                        Ssh3TransportServerShared::new(transport_impl, 16);
+                        Ssh3TransportServerShared::new(transport_impl.clone(), 16);
                     tokio::spawn(async move { let _ = transport_server.serve(true).await; });
 
                     // Send ChildBootstrap to child.
@@ -273,9 +275,21 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                             *response.status_mut() = StatusCode::OK;
                             response.headers_mut().insert("ssh-version", version_header);
 
-                            // Monitor child lifetime.
+                            // Spawn upgrade supervisor: owns reservation, request,
+                            // transport, and child lifetime.
                             let protocols_for_cleanup = protocols.clone();
                             tokio::spawn(async move {
+                                // Activate reservation → get stream receiver.
+                                let rx = reserved.activate();
+                                // Attach to pending transport so accept_channel unblocks.
+                                transport_impl.attach(rx);
+
+                                // Hold CONNECT ReadStream/WriteStream for ownership
+                                // (actual data bridging comes in Phase 4).
+                                // ReadStream can be extracted from the request body.
+                                let _read_stream = h3x::message::stream::ReadStream::extract_from(request).await;
+
+                                // Monitor child lifetime.
                                 let mut child = child;
                                 match child.wait().await {
                                     Ok(status) => tracing::info!(?status, conversation_id, "child process exited"),

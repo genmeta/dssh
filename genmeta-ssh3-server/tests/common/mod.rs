@@ -267,7 +267,6 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
             let stream_id = request.extensions().get::<h3x::stream_id::StreamId>().copied().expect("StreamId not injected by h3x");
             let reserved = protocol.reserve_conversation(stream_id).await.expect("failed to reserve conversation");
             let conversation_id = reserved.conversation_id();
-            let mut rx = reserved.activate();
             tracing::info!(conversation_id, "registered SSH3 conversation (test)");
 
             *response.status_mut() = StatusCode::OK;
@@ -275,8 +274,9 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                 .headers_mut()
                 .insert("ssh-version", version::version_response_header(&version));
 
-            // Spawn a task that consumes dispatched channel streams.
+            // Spawn upgrade supervisor: activate reservation + handle channels.
             tokio::spawn(async move {
+                let mut rx = reserved.activate();
                 while let Some((header, reader, writer)) = rx.recv().await {
                     // Spawn each channel handler independently.
                     tokio::spawn(async move {

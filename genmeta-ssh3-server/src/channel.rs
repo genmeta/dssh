@@ -518,20 +518,54 @@ where
 /// Implements [`Ssh3Transport`] for use as the RTC server object provided to
 /// the child process. Incoming QUIC streams are received via `channel_rx`;
 /// outgoing streams are opened via `stream_factory`.
+///
+/// Supports a **pending/attach** pattern: construct with [`new_pending`] before
+/// authentication completes, then call [`attach`] once the stream receiver is
+/// available. `accept_channel` will block until `attach` is called.
 pub struct Ssh3TransportImpl {
-    channel_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<DispatchedStream>>,
+    channel_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<DispatchedStream>>>,
     stream_factory: Option<forward::StreamFactory>,
+    attached: tokio::sync::watch::Receiver<bool>,
+    attached_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl Ssh3TransportImpl {
+    /// Create a transport with a known receiver (backward-compat, used in tests).
     pub fn new(
         channel_rx: tokio::sync::mpsc::Receiver<DispatchedStream>,
         stream_factory: Option<forward::StreamFactory>,
     ) -> Self {
+        let (attached_tx, attached) = tokio::sync::watch::channel(true);
         Self {
-            channel_rx: tokio::sync::Mutex::new(channel_rx),
+            channel_rx: tokio::sync::Mutex::new(Some(channel_rx)),
             stream_factory,
+            attached,
+            attached_tx,
         }
+    }
+
+    /// Create a **pending** transport without a stream receiver.
+    ///
+    /// The transport is immediately usable for `open_channel` (outgoing streams),
+    /// but `accept_channel` will wait until [`attach`] is called.
+    pub fn new_pending(stream_factory: Option<forward::StreamFactory>) -> Self {
+        let (attached_tx, attached) = tokio::sync::watch::channel(false);
+        Self {
+            channel_rx: tokio::sync::Mutex::new(None),
+            stream_factory,
+            attached,
+            attached_tx,
+        }
+    }
+
+    /// Attach the stream receiver, unblocking any waiting `accept_channel` call.
+    pub fn attach(&self, rx: tokio::sync::mpsc::Receiver<DispatchedStream>) {
+        {
+            let mut guard = self.channel_rx.try_lock()
+                .expect("attach called while channel_rx lock is held");
+            *guard = Some(rx);
+        }
+        let _ = self.attached_tx.send(true);
     }
 }
 
@@ -540,8 +574,19 @@ impl Ssh3Transport for Ssh3TransportImpl {
         Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
         TransportError,
     > {
+        // Wait until the receiver is attached (no-op if already attached via `new`).
+        {
+            let mut attached = self.attached.clone();
+            // wait_for resolves immediately if already true.
+            let _ = attached.wait_for(|&v| v).await;
+        }
+
         let dispatched = {
-            let mut rx = self.channel_rx.lock().await;
+            let mut guard = self.channel_rx.lock().await;
+            let rx = match guard.as_mut() {
+                Some(rx) => rx,
+                None => return Ok(None),
+            };
             rx.recv().await
         };
 
