@@ -14,6 +14,8 @@ use gm_quic::{
     qinterface::component::route::QuicRouter,
 };
 use h3x::{
+    connection::ConnectionBuilder,
+    dhttp::settings::Settings,
     gm_quic::{H3Client, H3Servers},
     server::UnresolvedRequest,
 };
@@ -84,9 +86,13 @@ where
     S::Future: Send,
     S::Error: Into<Box<dyn Error + Send + Sync>>,
 {
+    let builder = ConnectionBuilder::new(Arc::new(Settings::default()))
+        .protocol(genmeta_ssh3_server::protocol::Ssh3ProtocolFactory);
+
     let mut servers = H3Servers::builder()
         .without_client_cert_verifier()
         .expect("failed to initialize server tls")
+        .with_builder(Arc::new(builder))
         .with_router(Arc::new(QuicRouter::new()))
         .listen()
         .expect("failed to listen");
@@ -154,6 +160,7 @@ use genmeta_ssh3_server::{
     version,
 };
 use h3x::message::stream::MessageStreamError;
+use h3x::protocol::Protocols;
 use h3x::qpack::field::Protocol;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::{Empty, combinators::UnsyncBoxBody};
@@ -163,16 +170,14 @@ use http_body_util::{Empty, combinators::UnsyncBoxBody};
 /// a channel-dispatch loop that calls `handle_channel` for each stream.
 #[derive(Clone)]
 pub struct TestChannelService {
-    protocol: Arc<Ssh3Protocol>,
     next_conversation_id: Arc<AtomicU64>,
     #[allow(dead_code)]
     pam_backend: Option<Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend>>,
 }
 
 impl TestChannelService {
-    pub fn new(protocol: Arc<Ssh3Protocol>, pam_backend: Option<Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend>>) -> Self {
+    pub fn new(pam_backend: Option<Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend>>) -> Self {
         Self {
-            protocol,
             next_conversation_id: Arc::new(AtomicU64::new(0)),
             pam_backend,
         }
@@ -194,10 +199,13 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
         &mut self,
         request: http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
     ) -> Self::Future {
-        let protocol = self.protocol.clone();
         let next_id = self.next_conversation_id.clone();
         let pam_backend = self.pam_backend.clone();
         Box::pin(async move {
+            // Look up the SSH3 protocol from request extensions.
+            let protocols = request.extensions().get::<Arc<Protocols>>().cloned().unwrap();
+            let protocol = protocols.get::<Ssh3Protocol>().expect("Ssh3Protocol not registered");
+
             let method = request.method().clone();
             let proto_str = request
                 .extensions()

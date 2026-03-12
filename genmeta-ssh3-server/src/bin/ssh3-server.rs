@@ -18,8 +18,13 @@ use gm_quic::{
     },
     qinterface::component::route::QuicRouter,
 };
-use genmeta_ssh3_server::{handler::Ssh3ConnectHandler, protocol::Ssh3Protocol};
-use h3x::{gm_quic::H3Servers, hyper::server::TowerService};
+use genmeta_ssh3_server::{handler::Ssh3ConnectHandler, protocol::Ssh3ProtocolFactory};
+use h3x::{
+    connection::ConnectionBuilder,
+    dhttp::settings::Settings,
+    gm_quic::H3Servers,
+    hyper::server::TowerService,
+};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{Layer, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
@@ -82,14 +87,18 @@ async fn main() {
     };
 
     // Build the SSH3 handler chain.
-    let protocol = Arc::new(Ssh3Protocol::default());
-    let handler = Ssh3ConnectHandler::new(protocol);
+    let handler = Ssh3ConnectHandler::new();
     let service = TowerService(handler);
 
-    // Build the H3/QUIC server using the same pattern as test infrastructure.
+    // Build with SSH3 protocol factory.
+    let builder = ConnectionBuilder::new(Arc::new(Settings::default()))
+        .protocol(Ssh3ProtocolFactory);
+
+    // Build the H3/QUIC server.
     let mut servers: H3Servers<_> = H3Servers::builder()
         .without_client_cert_verifier()
         .expect("failed to initialize server TLS")
+        .with_builder(Arc::new(builder))
         .with_router(Arc::new(QuicRouter::new()))
         .listen()
         .expect("failed to listen");

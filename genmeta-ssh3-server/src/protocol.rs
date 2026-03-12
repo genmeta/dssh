@@ -20,11 +20,12 @@ use tokio::sync::{Mutex, mpsc};
 use genmeta_ssh3_proto::codec::ChannelHeader;
 use h3x::{
     codec::{
-        BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, DecodeFrom, SinkWriter, StreamReader,
+        DecodeExt, DecodeFrom, ErasedPeekableBiStream, ErasedPeekableUniStream,
+        SinkWriter, StreamReader,
     },
     connection::StreamError,
-    protocol::{Protocol, StreamVerdict},
-    quic,
+    protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
+    quic::{self, ConnectionError},
     varint::VarInt,
 };
 
@@ -49,7 +50,7 @@ pub type DispatchedStream = (ChannelHeader, BoxReader, BoxWriter);
 pub struct Ssh3Protocol {
     registry: Mutex<HashMap<u64, mpsc::Sender<DispatchedStream>>>,
     /// Factory for opening server-initiated QUIC bidirectional streams.
-    /// Lazily populated from the QUIC connection on the first `accept_bi` call.
+    /// Populated from the QUIC connection during `ProductProtocol::init`.
     stream_factory: Mutex<Option<crate::forward::StreamFactory>>,
 }
 
@@ -65,6 +66,14 @@ impl Ssh3Protocol {
         Self {
             registry: Mutex::new(HashMap::new()),
             stream_factory: Mutex::new(None),
+        }
+    }
+
+    /// Creates a new `Ssh3Protocol` with a pre-populated stream factory.
+    pub fn with_stream_factory(stream_factory: crate::forward::StreamFactory) -> Self {
+        Self {
+            registry: Mutex::new(HashMap::new()),
+            stream_factory: Mutex::new(Some(stream_factory)),
         }
     }
 
@@ -100,10 +109,10 @@ impl Ssh3Protocol {
     /// Peeks the first varint. If it matches [`SSH3_SIGNAL_VALUE`], resets the
     /// peek cursor, decodes the full [`ChannelHeader`], and dispatches to the
     /// registered conversation. Otherwise, passes the stream through.
-    async fn accept_bi<C: quic::Connection + ?Sized>(
+    async fn accept_bi_inner(
         &self,
-        (mut reader, writer): BoxPeekableBiStream<C>,
-    ) -> Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError> {
+        (mut reader, writer): ErasedPeekableBiStream,
+    ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
         // Peek the first varint to determine if this is an SSH3 stream.
         let signal_value = match reader.decode_one::<VarInt>().await {
             Ok(v) => v,
@@ -123,11 +132,10 @@ impl Ssh3Protocol {
         // the signal_value as part of the full header.
         Pin::new(&mut reader).reset();
 
-        // Convert to type-erased streams.
-        let mut stream_reader = reader
-            .into_stream_reader()
-            .map_stream(|b| b as Pin<Box<dyn quic::ReadStream + Send>>);
-        let stream_writer = writer.map_sink(|b| b as Pin<Box<dyn quic::WriteStream + Send>>);
+        // With erased types, the reader is already PeekableStreamReader<BoxReadStream>
+        // and writer is already SinkWriter<BoxWriteStream> — no mapping needed.
+        let mut stream_reader = reader.into_stream_reader();
+        let stream_writer = writer;
 
         // Decode the full ChannelHeader from the reset reader.
         let header = match ChannelHeader::decode_from(&mut stream_reader).await {
@@ -164,45 +172,58 @@ impl Default for Ssh3Protocol {
     }
 }
 
-impl<C: quic::Connection + ?Sized> Protocol<C> for Ssh3Protocol {
+impl Protocol for Ssh3Protocol {
     fn accept_uni<'a>(
         &'a self,
-        _connection: &'a Arc<C>,
-        stream: BoxPeekableUniStream<C>,
-    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
+        stream: ErasedPeekableUniStream,
+    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
         // SSH3 does not use unidirectional streams — always pass through.
         Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
     }
 
     fn accept_bi<'a>(
         &'a self,
-        connection: &'a Arc<C>,
-        stream: BoxPeekableBiStream<C>,
-    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
-        // Lazily populate the stream factory from the QUIC connection.
-        let conn = connection.clone();
+        stream: ErasedPeekableBiStream,
+    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
         Box::pin(async move {
-            {
-                let mut factory = self.stream_factory.lock().await;
-                if factory.is_none() {
-                    let conn = conn.clone();
-                    *factory = Some(Arc::new(move || {
-                        let conn = conn.clone();
-                        Box::pin(async move {
-                            let (reader, writer) = conn.open_bi().await.map_err(|e| {
-                                io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string())
-                            })?;
-                            let async_reader = StreamReader::new(reader);
-                            let async_writer = SinkWriter::new(writer);
-                            Ok((
-                                Box::new(async_reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-                                Box::new(async_writer) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-                            ))
-                        }) as Pin<Box<dyn Future<Output = io::Result<(Box<dyn tokio::io::AsyncRead + Send + Unpin>, Box<dyn tokio::io::AsyncWrite + Send + Unpin>)>> + Send>>
-                    }));
-                }
-            }
-            self.accept_bi::<C>(stream).await
+            self.accept_bi_inner(stream).await
+        })
+    }
+}
+
+/// Factory for creating [`Ssh3Protocol`] instances per-connection.
+///
+/// Implements [`ProductProtocol`] to capture the QUIC connection's `open_bi`
+/// capability as an erased [`StreamFactory`](crate::forward::StreamFactory).
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Ssh3ProtocolFactory;
+
+impl<C: quic::Connection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
+    type Protocol = Ssh3Protocol;
+
+    fn init<'a>(
+        &'a self,
+        conn: &'a Arc<C>,
+        _layers: &'a Protocols,
+    ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
+        let conn = conn.clone();
+        Box::pin(async move {
+            // Capture connection's open_bi capability as an erased StreamFactory
+            let stream_factory: crate::forward::StreamFactory = Arc::new(move || {
+                let conn = conn.clone();
+                Box::pin(async move {
+                    let (reader, writer) = conn.open_bi().await.map_err(|e| {
+                        io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string())
+                    })?;
+                    let async_reader = StreamReader::new(reader);
+                    let async_writer = SinkWriter::new(writer);
+                    Ok((
+                        Box::new(async_reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                        Box::new(async_writer) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                    ))
+                }) as Pin<Box<dyn Future<Output = io::Result<(Box<dyn tokio::io::AsyncRead + Send + Unpin>, Box<dyn tokio::io::AsyncWrite + Send + Unpin>)>> + Send>>
+            });
+            Ok(Ssh3Protocol::with_stream_factory(stream_factory))
         })
     }
 }

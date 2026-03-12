@@ -8,7 +8,6 @@ use genmeta_ssh3_client::{
     Ssh3Client, Ssh3ClientConfig, SSH3_CONNECT_PATH, SSH_VERSION,
 };
 use genmeta_ssh3_server::handler::Ssh3ConnectHandler;
-use genmeta_ssh3_server::protocol::Ssh3Protocol;
 use h3x::hyper::server::TowerService;
 use h3x::qpack::field::Protocol;
 use http::{Method, StatusCode};
@@ -47,8 +46,7 @@ async fn setup_server_with_pam(pam_backend: Option<Arc<dyn genmeta_ssh3_server::
     AbortOnDropHandle<()>,
     http::uri::Authority,
 ) {
-    let protocol = Arc::new(Ssh3Protocol::default());
-    let service = TestChannelService::new(protocol, pam_backend);
+    let service = TestChannelService::new(pam_backend);
     let service = TowerService(service);
 
     let server = test_server(service).await;
@@ -65,8 +63,7 @@ async fn setup_server_with_pam(pam_backend: Option<Arc<dyn genmeta_ssh3_server::
 fn smoke_connect() {
     run("smoke_connect", async move {
         // 1. Build server with TestChannelService (inline auth, no child process)
-        let protocol = Arc::new(Ssh3Protocol::default());
-        let service = TestChannelService::new(protocol, None);
+    let service = TestChannelService::new(None);
         let service = TowerService(service);
 
         // 2. Start server
@@ -171,8 +168,7 @@ fn auth_failure_via_client() {
         // Build a server that rejects auth by not having any auth header
         // — but we need to send one that's invalid.
         // The server rejects Bearer tokens and malformed headers.
-        let protocol = Arc::new(Ssh3Protocol::default());
-        let handler = Ssh3ConnectHandler::new(protocol);
+    let handler = Ssh3ConnectHandler::new();
         let service = TowerService(handler);
         let server = test_server(service).await;
         let authority = get_server_authority(&server);
@@ -1672,8 +1668,7 @@ fn test_pam_auth_success() {
             shell: PathBuf::from("/bin/bash"),
         }));
 
-        let protocol = Arc::new(Ssh3Protocol::default());
-        let service = TestChannelService::new(protocol, Some(pam));
+    let service = TestChannelService::new(Some(pam));
         let service = TowerService(service);
 
         let server = test_server(service).await;
@@ -1716,8 +1711,7 @@ fn test_pam_auth_failure() {
     run("test_pam_auth_failure", async move {
         let pam: Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend> = Arc::new(TestPamBackend::failure("invalid credentials"));
 
-        let protocol = Arc::new(Ssh3Protocol::default());
-        let service = TestChannelService::new(protocol, Some(pam));
+    let service = TestChannelService::new(Some(pam));
         let service = TowerService(service);
 
         let server = test_server(service).await;

@@ -27,6 +27,7 @@ use http_body_util::{Empty, combinators::UnsyncBoxBody};
 use crate::{auth, channel::Ssh3TransportImpl, child::ChildProcess, protocol::Ssh3Protocol, version};
 use genmeta_ssh3_proto::auth::AuthCredential;
 use genmeta_ssh3_proto::session::{AuthResult, ChildBootstrap, Ssh3TransportServerShared};
+use h3x::protocol::Protocols;
 use remoc::rtc::ServerShared;
 /// Result of validating the SSH3 Extended CONNECT request at the HTTP layer.
 ///
@@ -107,19 +108,17 @@ fn evaluate_connect(
 
 /// Handler for SSH3 Extended CONNECT requests.
 ///
-/// Holds a reference to the [`Ssh3Protocol`] for conversation registration
-/// and an atomic counter for generating conversation IDs.
+/// Looks up the [`Ssh3Protocol`] from request extensions (via `Arc<Protocols>`).
+/// Uses an atomic counter for generating conversation IDs.
 #[derive(Clone)]
 pub struct Ssh3ConnectHandler {
-    protocol: Arc<Ssh3Protocol>,
     next_conversation_id: Arc<AtomicU64>,
 }
 
 impl Ssh3ConnectHandler {
-    /// Creates a new handler backed by the given protocol instance.
-    pub fn new(protocol: Arc<Ssh3Protocol>) -> Self {
+    /// Creates a new handler.
+    pub fn new() -> Self {
         Self {
-            protocol,
             next_conversation_id: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -139,10 +138,13 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
         &mut self,
         request: http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
     ) -> Self::Future {
-        let protocol = self.protocol.clone();
         let next_id = self.next_conversation_id.clone();
 
         Box::pin(async move {
+            // Look up the SSH3 protocol from request extensions.
+            let protocols = request.extensions().get::<Arc<Protocols>>().cloned().unwrap();
+            let protocol = protocols.get::<Ssh3Protocol>().expect("Ssh3Protocol not registered");
+
             let method = request.method().clone();
             let proto_str = request
                 .extensions()
@@ -274,14 +276,15 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                             response.headers_mut().insert("ssh-version", version_header);
 
                             // Monitor child lifetime.
-                            let protocol_for_cleanup = protocol.clone();
+                            let protocols_for_cleanup = protocols.clone();
                             tokio::spawn(async move {
                                 let mut child = child;
                                 match child.wait().await {
                                     Ok(status) => tracing::info!(?status, conversation_id, "child process exited"),
                                     Err(e) => tracing::warn!(%e, conversation_id, "error waiting for child"),
                                 }
-                                protocol_for_cleanup.unregister_conversation(conversation_id).await;
+                                let protocol = protocols_for_cleanup.get::<Ssh3Protocol>().expect("Ssh3Protocol not registered");
+                                protocol.unregister_conversation(conversation_id).await;
                             });
                         }
                         AuthResult::Failure { reason } => {
@@ -490,21 +493,17 @@ mod tests {
         }
     }
 
-    /// Conversation registration works end-to-end with the handler struct.
+    /// Conversation ID counter works correctly.
     #[tokio::test]
-    async fn handler_registers_conversation() {
-        let protocol = Arc::new(Ssh3Protocol::new());
-        let handler = Ssh3ConnectHandler::new(protocol.clone());
+    async fn handler_conversation_id_counter() {
+        let handler = Ssh3ConnectHandler::new();
 
-        // Simulate what the handler would do on success.
-        let conversation_id = handler.next_conversation_id.fetch_add(1, Ordering::Relaxed);
-        let _rx = protocol.register_conversation(conversation_id).await;
-
-        // Verify conversation was registered.
-        assert_eq!(conversation_id, 0);
+        // First ID is 0.
+        let id0 = handler.next_conversation_id.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(id0, 0);
 
         // Next ID increments.
-        let next = handler.next_conversation_id.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(next, 1);
+        let id1 = handler.next_conversation_id.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(id1, 1);
     }
 }
