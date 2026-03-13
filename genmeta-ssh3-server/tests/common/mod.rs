@@ -266,7 +266,7 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
             let stream_id = request.extensions().get::<h3x::stream_id::StreamId>().copied().expect("StreamId not injected by h3x");
             let reserved = protocol.reserve_conversation(stream_id).await.expect("failed to reserve conversation");
             let conversation_id = reserved.conversation_id();
-            tracing::info!(conversation_id, "registered SSH3 conversation (test)");
+            tracing::info!(%conversation_id, "registered SSH3 conversation (test)");
 
             *response.status_mut() = StatusCode::OK;
             response

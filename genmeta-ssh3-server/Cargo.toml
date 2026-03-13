@@ -12,6 +12,7 @@ tracing = "0.1"
 futures = "0.3"
 remoc = { version = "0.18", default-features = false, features = ["remoc_macro", "rtc", "serde", "default-codec-json"] }
 http = "1"
+http-body = "1"
 tower-service = "0.3"
 http-body-util = "0.1"
 bytes = "1"

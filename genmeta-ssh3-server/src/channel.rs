@@ -12,6 +12,7 @@ use std::{future::Future, os::fd::AsRawFd, pin::Pin, sync::Arc};
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
 use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient, TransportError};
 use h3x::codec::{DecodeFrom, EncodeInto};
+use h3x::stream_id::StreamId;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
@@ -39,7 +40,7 @@ pub struct GlobalRequestContext {
     /// Parent transport client used to open server-initiated channels.
     pub transport: Ssh3TransportClient,
     /// Conversation ID for opened channels.
-    pub conversation_id: u64,
+    pub conversation_id: StreamId,
 }
 // ---------------------------------------------------------------------------
 // Channel events dispatched via mpsc
@@ -461,14 +462,14 @@ where
 }
 
 pub struct ConversationEndpoint {
-    conversation_id: u64,
+    conversation_id: StreamId,
     channel_rx: Option<mpsc::Receiver<DispatchedStream>>,
     opener: OpenBiFactory,
 }
 
 impl ConversationEndpoint {
     pub(crate) fn new(
-        conversation_id: u64,
+        conversation_id: StreamId,
         channel_rx: mpsc::Receiver<DispatchedStream>,
         opener: OpenBiFactory,
     ) -> Self {
@@ -479,7 +480,7 @@ impl ConversationEndpoint {
         }
     }
 
-    pub(crate) fn pending(conversation_id: u64, opener: OpenBiFactory) -> Self {
+    pub(crate) fn pending(conversation_id: StreamId, opener: OpenBiFactory) -> Self {
         Self {
             conversation_id,
             channel_rx: None,
@@ -488,7 +489,7 @@ impl ConversationEndpoint {
     }
 
     /// Returns the conversation ID (u64 from the QUIC stream ID).
-    pub fn conversation_id(&self) -> u64 {
+    pub fn conversation_id(&self) -> StreamId {
         self.conversation_id
     }
 
@@ -542,7 +543,7 @@ impl Ssh3TransportImpl {
         }
     }
 
-    pub fn new_pending(conversation_id: u64, opener: OpenBiFactory) -> Self {
+    pub fn new_pending(conversation_id: StreamId, opener: OpenBiFactory) -> Self {
         let endpoint = ConversationEndpoint::pending(conversation_id, opener);
         Self::new_pending_with_endpoint(endpoint)
     }
@@ -713,6 +714,7 @@ impl Ssh3Transport for Ssh3TransportImpl {
 mod tests {
     use super::*;
     use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
+    use h3x::stream_id::StreamId;
     use tokio::io::duplex;
 
     /// Helper: encode messages into writer half, then drop to signal EOF.
@@ -1107,8 +1109,8 @@ mod tests {
                 Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
             })
         });
-        let mut endpoint = ConversationEndpoint::new(42, rx, opener);
-        assert_eq!(endpoint.conversation_id(), 42);
+        let mut endpoint = ConversationEndpoint::new(StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()), rx, opener);
+        assert_eq!(endpoint.conversation_id(), StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()));
 
         // Drop sender — accept_channel should return None.
         drop(tx);
@@ -1122,7 +1124,7 @@ mod tests {
                 Err(io::Error::new(io::ErrorKind::ConnectionRefused, "test opener failed"))
             })
         });
-        let transport = Ssh3TransportImpl::new_pending(7, opener);
+        let transport = Ssh3TransportImpl::new_pending(StreamId(h3x::varint::VarInt::try_from(7u64).unwrap()), opener);
         let result = transport.open_channel(None).await;
         assert!(matches!(result, Err(TransportError::OpenFailed(_))));
     }

@@ -34,6 +34,7 @@ use std::sync::Arc;
 use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
 use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient};
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeInto};
+use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -220,7 +221,7 @@ impl ReverseStreamlocalForwarder {
         &self,
         socket_path: &str,
         transport: Ssh3TransportClient,
-        conversation_id: u64,
+        conversation_id: StreamId,
     ) -> io::Result<()> {
         let listener = UnixListener::bind(socket_path)?;
 
@@ -318,7 +319,7 @@ pub async fn handle_forwarded_streamlocal_channel<R, W>(
     mut writer: W,
     unix_stream: UnixStream,
     socket_path: &str,
-    conversation_id: u64,
+    conversation_id: StreamId,
 ) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -327,7 +328,7 @@ where
     // 1. Write ChannelHeader.
     let header = ChannelHeader {
         signal_value: CHANNEL_SIGNAL_VALUE,
-        conversation_id,
+        conversation_id: conversation_id.into_inner(),
         channel_type: "forwarded-streamlocal@openssh.com".to_string(),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
@@ -644,7 +645,14 @@ mod tests {
         let sock_path = test_sock_path("fwd-startstop");
 
         // Start listening.
-        forwarder.start_listening(&sock_path, test_transport_client(), 1).await.unwrap();
+        forwarder
+            .start_listening(
+                &sock_path,
+                test_transport_client(),
+                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(1u64).unwrap()),
+            )
+            .await
+            .unwrap();
 
         // Verify the listener is active by checking internal state.
         {
@@ -705,7 +713,7 @@ mod tests {
                 server_writer,
                 unix_stream,
                 &fwd_sock_path,
-                42,
+                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
             )
             .await
             .unwrap();

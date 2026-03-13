@@ -22,6 +22,7 @@ use genmeta_ssh3_server::forward::direct_tcp::handle_direct_tcp;
 use genmeta_ssh3_server::session::request::{encode_exit_status, handle_request, run_exec};
 use genmeta_ssh3_proto::codec::SshString;
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
+use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
 use tokio::io::{self, duplex, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -1221,7 +1222,7 @@ fn test_global_request_tcpip_forward() {
             tcp_forwarder: tcp_forwarder.clone(),
             streamlocal_forwarder: streamlocal_forwarder.clone(),
             transport,
-            conversation_id: 1,
+            conversation_id: StreamId::try_from(1u64).unwrap(),
         });
 
         let (client_writer, server_reader) = duplex(65536);
@@ -1288,7 +1289,7 @@ fn test_global_request_cancel_tcpip_forward() {
                     tcp_forwarder: tcp.clone(),
                     streamlocal_forwarder: sl.clone(),
                     transport,
-                    conversation_id: 1,
+                    conversation_id: StreamId::try_from(1u64).unwrap(),
                 })
             }
         };
@@ -1441,7 +1442,7 @@ fn test_reverse_tcp_forwarded_channel() {
             tcp_forwarder: tcp_forwarder.clone(),
             streamlocal_forwarder: streamlocal_forwarder.clone(),
             transport,
-            conversation_id: 1,
+            conversation_id: StreamId::try_from(1u64).unwrap(),
         });
 
         // Step 1: Start tcpip-forward → get allocated_port.
@@ -1532,7 +1533,7 @@ fn test_global_request_unknown_type() {
             tcp_forwarder,
             streamlocal_forwarder,
             transport,
-            conversation_id: 1,
+            conversation_id: StreamId::try_from(1u64).unwrap(),
         });
 
         let (client_writer, server_reader) = duplex(65536);
@@ -1579,7 +1580,7 @@ fn test_global_request_streamlocal_forward() {
             tcp_forwarder,
             streamlocal_forwarder: streamlocal_forwarder.clone(),
             transport,
-            conversation_id: 1,
+            conversation_id: StreamId::try_from(1u64).unwrap(),
         });
 
         // Use a unique socket path to avoid collisions.

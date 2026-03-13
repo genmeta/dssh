@@ -106,7 +106,8 @@ impl Drop for ChildProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+use super::*;
+    use h3x::stream_id::StreamId;
     use std::path::PathBuf;
 
     /// Locate the `ssh3-session` binary built by cargo.
@@ -206,7 +207,11 @@ mod tests {
                 ))
             })
         });
-        let endpoint = crate::channel::ConversationEndpoint::new(0, dispatch_rx, opener);
+        let endpoint = crate::channel::ConversationEndpoint::new(
+            StreamId(h3x::varint::VarInt::try_from(0u64).unwrap()),
+            dispatch_rx,
+            opener,
+        );
         let transport_impl =
             std::sync::Arc::new(crate::channel::Ssh3TransportImpl::new(endpoint));
 
@@ -223,7 +228,7 @@ mod tests {
                 username: "testuser".into(),
                 password: "testpass".into(),
             },
-            conversation_id: 42,
+            conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
         };
 
         bootstrap_tx

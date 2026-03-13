@@ -15,6 +15,7 @@ use std::sync::Arc;
 use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
 use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient};
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
+use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -194,7 +195,7 @@ impl ReverseTcpForwarder {
         bind_address: &str,
         bind_port: u16,
         transport: Ssh3TransportClient,
-        conversation_id: u64,
+        conversation_id: StreamId,
     ) -> io::Result<u16> {
         let addr = format!("{}:{}", bind_address, bind_port);
         let listener = TcpListener::bind(&addr).await?;
@@ -297,19 +298,19 @@ pub async fn handle_forwarded_tcpip_channel<R, W>(
     connected_port: u16,
     originator_addr: &str,
     originator_port: u16,
-    conversation_id: u64,
+    conversation_id: StreamId,
 ) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // 1. Write ChannelHeader.
-    let header = ChannelHeader {
-        signal_value: CHANNEL_SIGNAL_VALUE,
-        conversation_id,
-        channel_type: "forwarded-tcpip".to_string(),
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-    };
+        let header = ChannelHeader {
+            signal_value: CHANNEL_SIGNAL_VALUE,
+            conversation_id: conversation_id.into_inner(),
+            channel_type: "forwarded-tcpip".to_string(),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        };
     header.encode_into(&mut writer).await?;
 
     // 2. Write request_data fields.
@@ -477,7 +478,12 @@ mod tests {
 
         // Start listening on an ephemeral port.
         let port = forwarder
-            .start_listening("127.0.0.1", 0, test_transport_client(), 1)
+            .start_listening(
+                "127.0.0.1",
+                0,
+                test_transport_client(),
+                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(1u64).unwrap()),
+            )
             .await
             .unwrap();
         assert!(port > 0, "allocated port should be > 0");
@@ -513,11 +519,21 @@ mod tests {
 
         // Bind with port 0 twice — should get different ports.
         let port1 = forwarder
-            .start_listening("127.0.0.1", 0, test_transport_client(), 1)
+            .start_listening(
+                "127.0.0.1",
+                0,
+                test_transport_client(),
+                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(1u64).unwrap()),
+            )
             .await
             .unwrap();
         let port2 = forwarder
-            .start_listening("127.0.0.1", 0, test_transport_client(), 2)
+            .start_listening(
+                "127.0.0.1",
+                0,
+                test_transport_client(),
+                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(2u64).unwrap()),
+            )
             .await
             .unwrap();
 
@@ -566,7 +582,7 @@ mod tests {
                 80,
                 "10.0.0.1",
                 54321,
-                42,
+                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
             )
             .await
             .unwrap();
@@ -646,7 +662,7 @@ mod tests {
                 80,
                 "10.0.0.1",
                 54321,
-                42,
+                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
             )
             .await
             .unwrap();

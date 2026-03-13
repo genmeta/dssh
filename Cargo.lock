@@ -713,6 +713,7 @@ dependencies = [
  "gm-quic",
  "h3x",
  "http",
+ "http-body",
  "http-body-util",
  "libc",
  "nix 0.29.0",

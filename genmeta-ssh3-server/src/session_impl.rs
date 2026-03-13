@@ -226,6 +226,7 @@ impl Default for Ssh3SessionImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use h3x::stream_id::StreamId;
     use genmeta_ssh3_proto::session::TransportError;
     use h3x::codec::DecodeFrom;
     use std::path::PathBuf;
@@ -306,7 +307,7 @@ mod tests {
 
     fn sample_init() -> SessionInit {
         SessionInit {
-            conversation_id: 42,
+            conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
             username: "alice".into(),
             uid: 1000,
             gid: 1000,
@@ -328,14 +329,14 @@ mod tests {
     async fn run_session_fields_accessible() {
         let session = Ssh3SessionImpl::new();
         let init = SessionInit {
-            conversation_id: 99,
+            conversation_id: StreamId(h3x::varint::VarInt::try_from(99u64).unwrap()),
             username: "bob".into(),
             uid: 2000,
             gid: 2000,
             home: PathBuf::from("/home/bob"),
             shell: PathBuf::from("/bin/zsh"),
         };
-        assert_eq!(init.conversation_id, 99);
+        assert_eq!(init.conversation_id, StreamId(h3x::varint::VarInt::try_from(99u64).unwrap()));
         assert_eq!(init.username, "bob");
         assert_eq!(init.uid, 2000);
         assert_eq!(init.gid, 2000);
@@ -528,7 +529,7 @@ mod tests {
             tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
             streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
             transport: mock_transport_client(),
-            conversation_id: 42,
+            conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
         });
 
         let result = Ssh3SessionImpl::handle_channel_inner(header, from_rx, to_tx, ctx).await;
@@ -558,7 +559,7 @@ mod tests {
             tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
             streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
             transport: mock_transport_client(),
-            conversation_id: 42,
+            conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
         });
 
         let result = Ssh3SessionImpl::handle_channel_inner(header, from_rx, to_tx, ctx).await;
@@ -593,7 +594,7 @@ mod tests {
             tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
             streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
             transport: mock_transport_client(),
-            conversation_id: 42,
+            conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
         });
 
         // With context provided, handle_channel_inner dispatches to global-request handler.

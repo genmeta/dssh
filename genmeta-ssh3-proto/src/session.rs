@@ -10,13 +10,19 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use h3x::stream_id::StreamId;
+use h3x::varint::VarInt;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Information needed to initialize an SSH3 session in the child process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInit {
     /// Unique conversation identifier for this session.
-    pub conversation_id: u64,
+    #[serde(
+        serialize_with = "serialize_stream_id",
+        deserialize_with = "deserialize_stream_id"
+    )]
+    pub conversation_id: StreamId,
     /// Authenticated username.
     pub username: String,
     /// POSIX user ID.
@@ -56,7 +62,27 @@ pub enum AuthResult {
 pub struct ChildBootstrap {
     pub transport: Ssh3TransportClient,
     pub credential: crate::auth::AuthCredential,
-    pub conversation_id: u64,
+    #[serde(
+        serialize_with = "serialize_stream_id",
+        deserialize_with = "deserialize_stream_id"
+    )]
+    pub conversation_id: StreamId,
+}
+
+fn serialize_stream_id<S>(stream_id: &StreamId, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_u64(stream_id.into_inner())
+}
+
+fn deserialize_stream_id<'de, D>(deserializer: D) -> Result<StreamId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = u64::deserialize(deserializer)?;
+    let varint = VarInt::try_from(raw).map_err(serde::de::Error::custom)?;
+    Ok(StreamId(varint))
 }
 
 /// Serializable error type for RTC method returns.
@@ -155,7 +181,7 @@ mod tests {
     #[test]
     fn session_init_roundtrip() {
         let init = SessionInit {
-            conversation_id: 42,
+            conversation_id: StreamId::try_from(42u64).unwrap(),
             username: "alice".into(),
             uid: 1000,
             gid: 1000,
@@ -164,7 +190,7 @@ mod tests {
         };
         let json = serde_json::to_string(&init).unwrap();
         let decoded: SessionInit = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.conversation_id, 42);
+        assert_eq!(decoded.conversation_id, StreamId::try_from(42u64).unwrap());
         assert_eq!(decoded.username, "alice");
         assert_eq!(decoded.uid, 1000);
         assert_eq!(decoded.gid, 1000);
