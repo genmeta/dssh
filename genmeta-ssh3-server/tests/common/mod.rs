@@ -278,7 +278,9 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
             tokio::spawn(async move {
                 // Transition through required states.
                 reserved.transition_to_authenticating().expect("state transition failed");
-                let (_lease, mut endpoint) = reserved.handoff_to_supervisor(opener);
+                let Ok((_lease, mut endpoint)) = reserved.handoff_to_supervisor(opener) else {
+                    panic!("state transition failed");
+                };
                 _lease.transition_to_active().expect("state transition failed");
                 while let Some((header, reader, writer)) = endpoint.accept_channel().await {
                     // Spawn each channel handler independently.

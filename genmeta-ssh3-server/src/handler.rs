@@ -3,7 +3,7 @@
 //! Implements [`tower_service::Service`] for `http::Request`, receiving an
 //! Extended CONNECT request with `:protocol = ssh3`, validating the SSH
 //! version, extracting authentication credentials, spawning a child process,
-//! creating an [`Ssh3TransportImpl`] + RTC server, and waiting for
+//! creating an SSH3 transport server, and waiting for
 //! [`AuthResult`] from the child before returning 200 OK or 401.
 
 use std::{
@@ -17,12 +17,12 @@ use futures::future::BoxFuture;
 use h3x::qpack::field::Protocol;
 use h3x::stream_id::StreamId;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
-use http_body::Body;
 use http_body_util::Empty;
+use snafu::Report;
 
-use crate::{auth, channel::Ssh3TransportImpl, child::ChildProcess, protocol::Ssh3Protocol, version};
+use crate::{auth, child::ChildProcess, error::ServerError, protocol::Ssh3Protocol, version};
 use genmeta_ssh3_proto::auth::AuthCredential;
-use genmeta_ssh3_proto::session::{AuthResult, ChildBootstrap, Ssh3TransportServerShared};
+use genmeta_ssh3_proto::session::{AuthResult, ChildBootstrap};
 use h3x::protocol::Protocols;
 use remoc::rtc::ServerShared;
 /// Result of validating the SSH3 Extended CONNECT request at the HTTP layer.
@@ -120,13 +120,22 @@ impl Ssh3ConnectHandler {
         request: http::Request<B>,
     ) -> http::Response<Empty<bytes::Bytes>>
     where
-        B: Body + Send + Unpin + 'static,
+        B: http_body::Body + Send + Unpin + 'static,
         B::Data: Send,
         B::Error: Send,
     {
-        let protocols = request.extensions().get::<Arc<Protocols>>().cloned().unwrap();
-        let protocol = protocols.get::<Ssh3Protocol>().expect("Ssh3Protocol not registered");
-        let stream_id = request.extensions().get::<StreamId>().copied().expect("StreamId not injected by h3x");
+        let Some(protocols) = request.extensions().get::<Arc<Protocols>>().cloned() else {
+            tracing::error!(error = %Report::from_error(ServerError::MissingProtocols), "failed to handle SSH3 CONNECT");
+            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        let Some(protocol) = protocols.get::<Ssh3Protocol>() else {
+            tracing::error!(error = %Report::from_error(ServerError::MissingSsh3Protocol), "failed to handle SSH3 CONNECT");
+            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        let Some(stream_id) = request.extensions().get::<StreamId>().copied() else {
+            tracing::error!(error = %Report::from_error(ServerError::MissingStreamId), "failed to handle SSH3 CONNECT");
+            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
+        };
 
         let method = request.method().clone();
         let proto_str = request
@@ -157,14 +166,14 @@ impl Ssh3ConnectHandler {
         credential: Option<AuthCredential>,
     ) -> http::Response<Empty<bytes::Bytes>>
     where
-        B: Body + Send + Unpin + 'static,
+        B: http_body::Body + Send + Unpin + 'static,
         B::Data: Send,
         B::Error: Send,
     {
-        let reserved = match protocol.reserve_conversation(stream_id).await {
-            Ok(r) => r,
+        let (reserved, transport_server, transport_client) = match protocol.create_transport(stream_id, 16).await {
+            Ok(bundle) => bundle,
             Err(e) => {
-                tracing::error!(%e, "failed to reserve conversation");
+                tracing::error!(error = %Report::from_error(e), "failed to initialize SSH3 conversation");
                 return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
             }
         };
@@ -174,11 +183,11 @@ impl Ssh3ConnectHandler {
         let session_bin = match ssh3_session_binary() {
             Ok(path) if path.exists() => path,
             Ok(path) => {
-                tracing::error!(path = %path.display(), "ssh3-session binary not found");
+                tracing::error!(error = %Report::from_error(ServerError::MissingSessionBinary { path: path.display().to_string() }), "ssh3-session binary not found");
                 return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
             }
             Err(e) => {
-                tracing::error!(%e, "cannot determine executable path");
+                tracing::error!(error = %Report::from_error(ServerError::ResolveSessionBinary { source: e }), "cannot determine executable path");
                 return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
             }
         };
@@ -186,17 +195,11 @@ impl Ssh3ConnectHandler {
         let (child, mut child_bootstrap_tx, mut child_auth_rx) = match ChildProcess::spawn(&session_bin).await {
             Ok(tuple) => tuple,
             Err(e) => {
-                tracing::error!(%e, "failed to spawn child process");
+                tracing::error!(error = %Report::from_error(ServerError::SpawnChild { source: e }), "failed to spawn child process");
                 return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
             }
         };
 
-        let transport_impl = Arc::new(Ssh3TransportImpl::new_pending(
-            conversation_id,
-            protocol.open_bi_factory(),
-        ));
-        let (transport_server, transport_client) =
-            Ssh3TransportServerShared::new(transport_impl.clone(), 16);
         let transport_server_handle = tokio::spawn(async move { let _ = transport_server.serve(true).await; });
 
         let bootstrap = ChildBootstrap {
@@ -207,10 +210,13 @@ impl Ssh3ConnectHandler {
             }),
             conversation_id,
         };
-        reserved.transition_to_authenticating().expect("failed to transition to Authenticating");
+        if let Err(e) = reserved.transition_to_authenticating() {
+            tracing::error!(error = %Report::from_error(e), %conversation_id, "failed to transition conversation to Authenticating");
+            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
+        }
 
         if let Err(e) = child_bootstrap_tx.send(bootstrap).await {
-            tracing::error!(%e, "failed to send ChildBootstrap to child");
+            tracing::error!(error = %Report::from_error(ServerError::SendBootstrap { message: e.to_string() }), %conversation_id, "failed to send ChildBootstrap to child");
             return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
         }
 
@@ -218,42 +224,34 @@ impl Ssh3ConnectHandler {
             AuthOutcome::Success => {
                 let mut response = response_with_status(StatusCode::OK);
                 response.headers_mut().insert("ssh-version", version_header);
-
-                let opener = protocol.open_bi_factory();
                 tokio::spawn(async move {
-                    let lease = {
-                        let (lease, endpoint) = reserved.handoff_to_supervisor(opener);
-
-                        let Some((_connect_reader, _connect_writer)) = h3x::hyper::upgrade::on(request).await else {
-                            tracing::warn!(%conversation_id, "CONNECT upgrade takeover failed");
-                            return;
-                        };
-
-                        if transport_impl.try_attach_endpoint(endpoint).is_err() {
-                            tracing::warn!(%conversation_id, "transport endpoint already attached");
+                    let lease = match reserved.consume_into_lease() {
+                        Ok(lease) => lease,
+                        Err(e) => {
+                            tracing::warn!(error = %Report::from_error(e), %conversation_id, "failed to hand off reserved conversation to supervisor");
                             return;
                         }
-
-                        if let Err(state) = lease.transition_to_active() {
-                            tracing::warn!(%conversation_id, ?state, "failed to transition to Active");
-                            return;
-                        }
-
-                        lease
                     };
+
+                    if let Err(e) = lease.transition_to_active() {
+                        tracing::warn!(error = %Report::from_error(e), %conversation_id, "failed to transition to Active");
+                        return;
+                    }
+
+                    drop(request);
 
                     let mut child = child;
                     tokio::select! {
                         status = child.wait() => {
                             match status {
                                 Ok(status) => tracing::info!(?status, %conversation_id, "child process exited"),
-                                Err(e) => tracing::warn!(%e, %conversation_id, "error waiting for child"),
+                                Err(e) => tracing::warn!(error = %Report::from_error(e), %conversation_id, "error waiting for child"),
                             }
                         }
                         result = transport_server_handle => {
                             match result {
                                 Ok(_) => tracing::info!(%conversation_id, "transport server exited"),
-                                Err(e) => tracing::warn!(%e, %conversation_id, "transport server task panicked"),
+                                Err(e) => tracing::warn!(error = %Report::from_error(e), %conversation_id, "transport server task panicked"),
                             }
                         }
                     }
@@ -275,7 +273,7 @@ impl Default for Ssh3ConnectHandler {
 }
 impl<B> tower_service::Service<http::Request<B>> for Ssh3ConnectHandler
 where
-    B: Body + Send + Unpin + 'static,
+        B: http_body::Body + Send + Unpin + 'static,
     B::Data: Send,
     B::Error: Send,
 {
@@ -321,7 +319,7 @@ async fn receive_auth_result(
             AuthOutcome::Unauthorized
         }
         Ok(Err(e)) => {
-            tracing::warn!(%e, %conversation_id, "error receiving AuthResult from child");
+            tracing::warn!(error = %Report::from_error(e), %conversation_id, "error receiving AuthResult from child");
             AuthOutcome::Unauthorized
         }
         Err(_) => {

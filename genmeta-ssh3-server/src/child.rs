@@ -197,7 +197,6 @@ use super::*;
             .await
             .expect("failed to spawn ssh3-session");
 
-        // Build a real Ssh3TransportImpl with an empty channel (no QUIC streams).
         let (_dispatch_tx, dispatch_rx) = tokio::sync::mpsc::channel(1);
         let opener: crate::channel::OpenBiFactory = std::sync::Arc::new(|| {
             Box::pin(async {
@@ -212,12 +211,12 @@ use super::*;
             dispatch_rx,
             opener,
         );
-        let transport_impl =
-            std::sync::Arc::new(crate::channel::Ssh3TransportImpl::new(endpoint));
+        let transport =
+            std::sync::Arc::new(crate::channel::Ssh3Transport::new(endpoint));
 
         use genmeta_ssh3_proto::session::Ssh3TransportServerShared;
         use remoc::rtc::ServerShared;
-        let (server, client) = Ssh3TransportServerShared::new(transport_impl, 16);
+        let (server, client) = Ssh3TransportServerShared::new(transport, 16);
         tokio::spawn(async move {
             let _ = server.serve(true).await;
         });

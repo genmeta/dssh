@@ -10,7 +10,7 @@
 use std::{future::Future, os::fd::AsRawFd, pin::Pin, sync::Arc};
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
-use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient, TransportError};
+use genmeta_ssh3_proto::session::{Ssh3Transport as RemoteSsh3Transport, Ssh3TransportClient, TransportError};
 use h3x::codec::{DecodeFrom, EncodeInto};
 use h3x::stream_id::StreamId;
 use tokio::{
@@ -463,7 +463,7 @@ where
 
 pub struct ConversationEndpoint {
     conversation_id: StreamId,
-    channel_rx: Option<mpsc::Receiver<DispatchedStream>>,
+    channel_rx: mpsc::Receiver<DispatchedStream>,
     opener: OpenBiFactory,
 }
 
@@ -475,15 +475,7 @@ impl ConversationEndpoint {
     ) -> Self {
         Self {
             conversation_id,
-            channel_rx: Some(channel_rx),
-            opener,
-        }
-    }
-
-    pub(crate) fn pending(conversation_id: StreamId, opener: OpenBiFactory) -> Self {
-        Self {
-            conversation_id,
-            channel_rx: None,
+            channel_rx,
             opener,
         }
     }
@@ -497,10 +489,7 @@ impl ConversationEndpoint {
     ///
     /// Returns `None` when the conversation is closed (sender dropped).
     pub async fn accept_channel(&mut self) -> Option<DispatchedStream> {
-        match self.channel_rx.as_mut() {
-            Some(channel_rx) => channel_rx.recv().await,
-            None => None,
-        }
+        self.channel_rx.recv().await
     }
 
     pub async fn open_stream(
@@ -522,82 +511,27 @@ pub type OpenBiFactory = Arc<
     + Send + Sync,
 >;
 
-// ---------------------------------------------------------------------------
-// Ssh3TransportImpl — parent-process transport bridging QUIC ↔ remoc channels
-// ---------------------------------------------------------------------------
-
-pub struct Ssh3TransportImpl {
-    endpoint: tokio::sync::Mutex<Option<ConversationEndpoint>>,
-    attached: tokio::sync::watch::Receiver<bool>,
-    attached_tx: tokio::sync::watch::Sender<bool>,
+pub struct Ssh3Transport {
+    endpoint: tokio::sync::Mutex<ConversationEndpoint>,
 }
 
-impl Ssh3TransportImpl {
-    /// Create a transport with a known handle (used in tests and child.rs).
+impl Ssh3Transport {
+    /// Create a transport with a known endpoint.
     pub fn new(endpoint: ConversationEndpoint) -> Self {
-        let (attached_tx, attached) = tokio::sync::watch::channel(true);
         Self {
-            endpoint: tokio::sync::Mutex::new(Some(endpoint)),
-            attached,
-            attached_tx,
+            endpoint: tokio::sync::Mutex::new(endpoint),
         }
     }
-
-    pub fn new_pending(conversation_id: StreamId, opener: OpenBiFactory) -> Self {
-        let endpoint = ConversationEndpoint::pending(conversation_id, opener);
-        Self::new_pending_with_endpoint(endpoint)
-    }
-
-    pub fn new_pending_with_endpoint(endpoint: ConversationEndpoint) -> Self {
-        let (attached_tx, attached) = tokio::sync::watch::channel(false);
-        Self {
-            endpoint: tokio::sync::Mutex::new(Some(endpoint)),
-            attached,
-            attached_tx,
-        }
-    }
-
-    pub fn try_attach_endpoint(&self, endpoint: ConversationEndpoint) -> Result<(), ConversationEndpoint> {
-        {
-            let mut guard = self.endpoint.try_lock()
-                .expect("try_attach_endpoint called while endpoint lock is held");
-            let current = match guard.as_ref() {
-                Some(endpoint) => endpoint,
-                None => return Err(endpoint),
-            };
-            if current.channel_rx.is_some() {
-                return Err(endpoint);
-            }
-            if current.conversation_id() != endpoint.conversation_id() {
-                return Err(endpoint);
-            }
-            *guard = Some(endpoint);
-        }
-        let _ = self.attached_tx.send(true);
-        Ok(())
-    }
-
 }
 
-impl Ssh3Transport for Ssh3TransportImpl {
+impl RemoteSsh3Transport for Ssh3Transport {
     async fn accept_channel(&self) -> Result<
         Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
         TransportError,
     > {
-        // Wait until the handle is attached (no-op if already attached via `new`).
-        {
-            let mut attached = self.attached.clone();
-            // wait_for resolves immediately if already true.
-            let _ = attached.wait_for(|&v| v).await;
-        }
-
         let dispatched = {
             let mut guard = self.endpoint.lock().await;
-            let endpoint = match guard.as_mut() {
-                Some(endpoint) => endpoint,
-                None => return Ok(None),
-            };
-            endpoint.accept_channel().await
+            guard.accept_channel().await
         };
 
         let (header, mut quic_reader, mut quic_writer) = match dispatched {
@@ -605,11 +539,9 @@ impl Ssh3Transport for Ssh3TransportImpl {
             None => return Ok(None),
         };
 
-        // Create remoc byte channel pairs for the child process.
         let (from_client_tx, from_client_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) = remoc::rch::mpsc::channel(64);
         let (to_client_tx, to_client_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) = remoc::rch::mpsc::channel(64);
 
-        // Bridge: QUIC reader → from_client_tx (raw bytes to child)
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
             loop {
@@ -623,7 +555,6 @@ impl Ssh3Transport for Ssh3TransportImpl {
             }
         });
 
-        // Bridge: to_client_rx → QUIC writer (raw bytes from child)
         tokio::spawn(async move {
             let mut to_client_rx = to_client_rx;
             while let Ok(Some(data)) = to_client_rx.recv().await {
@@ -649,16 +580,12 @@ impl Ssh3Transport for Ssh3TransportImpl {
     > {
         let (quic_reader, mut quic_writer) = {
             let guard = self.endpoint.lock().await;
-            let endpoint = guard.as_ref().ok_or_else(|| {
-                TransportError::OpenFailed("conversation endpoint missing".into())
-            })?;
-            endpoint
+            guard
                 .open_stream()
                 .await
                 .map_err(|e| TransportError::OpenFailed(e.to_string()))?
         };
 
-        // Write ChannelHeader if provided.
         if let Some(h) = &header {
             h.encode_into(&mut quic_writer)
                 .await
@@ -669,11 +596,9 @@ impl Ssh3Transport for Ssh3TransportImpl {
                 .map_err(|e| TransportError::OpenFailed(e.to_string()))?;
         }
 
-        // Create remoc byte channel pairs for the child.
         let (from_remote_tx, from_remote_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) = remoc::rch::mpsc::channel(64);
         let (to_remote_tx, to_remote_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) = remoc::rch::mpsc::channel(64);
 
-        // Bridge: QUIC reader → from_remote_tx
         tokio::spawn(async move {
             let mut quic_reader = quic_reader;
             let mut buf = vec![0u8; 8192];
@@ -688,7 +613,6 @@ impl Ssh3Transport for Ssh3TransportImpl {
             }
         });
 
-        // Bridge: to_remote_rx → QUIC writer
         tokio::spawn(async move {
             let mut to_remote_rx = to_remote_rx;
             while let Ok(Some(data)) = to_remote_rx.recv().await {
@@ -1119,12 +1043,14 @@ mod tests {
 
     #[tokio::test]
     async fn transport_open_channel_without_working_opener_fails() {
+        let (_tx, rx) = mpsc::channel(8);
         let opener: OpenBiFactory = Arc::new(|| {
             Box::pin(async {
                 Err(io::Error::new(io::ErrorKind::ConnectionRefused, "test opener failed"))
             })
         });
-        let transport = Ssh3TransportImpl::new_pending(StreamId(h3x::varint::VarInt::try_from(7u64).unwrap()), opener);
+        let endpoint = ConversationEndpoint::new(StreamId(h3x::varint::VarInt::try_from(7u64).unwrap()), rx, opener);
+        let transport = Ssh3Transport::new(endpoint);
         let result = transport.open_channel(None).await;
         assert!(matches!(result, Err(TransportError::OpenFailed(_))));
     }
