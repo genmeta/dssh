@@ -205,7 +205,7 @@ pub async fn accept_forwarded_channel<W: AsyncWrite + Send + Unpin>(
     writer: &mut W,
 ) -> io::Result<()> {
     let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
     };
     confirm.encode_into(writer).await
 }
@@ -214,7 +214,7 @@ pub async fn accept_forwarded_channel<W: AsyncWrite + Send + Unpin>(
 /// `ChannelOpenFailure(92)`.
 pub async fn reject_forwarded_channel<W: AsyncWrite + Send + Unpin>(
     writer: &mut W,
-    reason_code: u64,
+    reason_code: VarInt,
     description: &str,
 ) -> io::Result<()> {
     let failure = SshMessage::ChannelOpenFailure {
@@ -439,13 +439,13 @@ mod tests {
         SshString("192.168.1.100".into()).encode_into(&mut buf)
             .await
             .unwrap();
-        buf.encode_one(VarInt::try_from(80u64).unwrap())
+        buf.encode_one(VarInt::from(80u8))
             .await
             .unwrap();
         SshString("10.0.0.1".into()).encode_into(&mut buf)
             .await
             .unwrap();
-        buf.encode_one(VarInt::try_from(54321u64).unwrap())
+        buf.encode_one(VarInt::from(54321u16))
             .await
             .unwrap();
 
@@ -471,7 +471,7 @@ mod tests {
         let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
+                assert_eq!(max_message_size, VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32));
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -484,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn reject_forwarded_channel_message() {
         let (mut writer, mut reader) = duplex(8192);
-        reject_forwarded_channel(&mut writer, 1, "administratively prohibited")
+        reject_forwarded_channel(&mut writer, VarInt::from(1u8), "administratively prohibited")
             .await
             .unwrap();
         drop(writer);
@@ -495,7 +495,7 @@ mod tests {
                 reason_code,
                 description,
             } => {
-                assert_eq!(reason_code, 1);
+                assert_eq!(reason_code, VarInt::from(1u8));
                 assert_eq!(description, "administratively prohibited");
             }
             other => panic!("expected ChannelOpenFailure, got {other:?}"),

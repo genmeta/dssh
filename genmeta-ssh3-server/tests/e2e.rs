@@ -586,7 +586,8 @@ fn test_exec_with_stderr() {
         // Verify ChannelExtendedData(95) with data_type=1 (stderr) containing "stderr_msg".
         let has_stderr = messages.iter().any(|m| match m {
             SshMessage::ChannelExtendedData { data_type, data } => {
-                *data_type == 1 && String::from_utf8_lossy(data).contains("stderr_msg")
+                *data_type == VarInt::from(1u8)
+                    && String::from_utf8_lossy(data).contains("stderr_msg")
             }
             _ => false,
         });
@@ -641,7 +642,7 @@ fn test_direct_tcp_forward() {
         SshString("127.0.0.1".into()).encode_into(&mut request_data).await.unwrap();
         request_data.encode_one(VarInt::try_from(addr.port() as u64).unwrap()).await.unwrap();
         SshString("127.0.0.1".into()).encode_into(&mut request_data).await.unwrap();
-        request_data.encode_one(VarInt::try_from(12345u64).unwrap()).await.unwrap();
+        request_data.encode_one(VarInt::from(12345u16)).await.unwrap();
 
         let header = ChannelHeader {
             signal_value: 0xaf3627e6,
@@ -1501,7 +1502,9 @@ fn test_reverse_tcp_forwarded_channel() {
         let _originator_port: VarInt = client_end_reader.decode_one().await.unwrap();
 
         // Send ChannelOpenConfirmation to accept the channel.
-        SshMessage::ChannelOpenConfirmation { max_message_size: 1 << 20 }
+        SshMessage::ChannelOpenConfirmation {
+            max_message_size: VarInt::from((1 << 20) as u32),
+        }
             .encode_into(&mut client_end_writer)
             .await
             .unwrap();

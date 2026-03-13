@@ -13,6 +13,19 @@ use tokio::io::{self, AsyncRead, AsyncWrite};
 
 use crate::codec::{SshBool, SshBytes, SshString};
 
+const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
+const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
+const SSH_MSG_REQUEST_FAILURE: VarInt = VarInt::from_u32(82);
+const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: VarInt = VarInt::from_u32(91);
+const SSH_MSG_CHANNEL_OPEN_FAILURE: VarInt = VarInt::from_u32(92);
+const SSH_MSG_CHANNEL_DATA: VarInt = VarInt::from_u32(94);
+const SSH_MSG_CHANNEL_EXTENDED_DATA: VarInt = VarInt::from_u32(95);
+const SSH_MSG_CHANNEL_EOF: VarInt = VarInt::from_u32(96);
+const SSH_MSG_CHANNEL_CLOSE: VarInt = VarInt::from_u32(97);
+const SSH_MSG_CHANNEL_REQUEST: VarInt = VarInt::from_u32(98);
+const SSH_MSG_CHANNEL_SUCCESS: VarInt = VarInt::from_u32(99);
+const SSH_MSG_CHANNEL_FAILURE: VarInt = VarInt::from_u32(100);
+
 /// All SSH3 message types carried on channel streams and the conversation stream.
 ///
 /// SSH3 omits `SSH_MSG_CHANNEL_OPEN` (90) and `SSH_MSG_CHANNEL_WINDOW_ADJUST` (93)
@@ -31,16 +44,16 @@ pub enum SshMessage {
     /// SSH_MSG_REQUEST_FAILURE = 82
     RequestFailure,
     /// SSH_MSG_CHANNEL_OPEN_CONFIRMATION = 91
-    ChannelOpenConfirmation { max_message_size: u64 },
+    ChannelOpenConfirmation { max_message_size: VarInt },
     /// SSH_MSG_CHANNEL_OPEN_FAILURE = 92
     ChannelOpenFailure {
-        reason_code: u64,
+        reason_code: VarInt,
         description: String,
     },
     /// SSH_MSG_CHANNEL_DATA = 94
     ChannelData { data: Vec<u8> },
     /// SSH_MSG_CHANNEL_EXTENDED_DATA = 95
-    ChannelExtendedData { data_type: u64, data: Vec<u8> },
+    ChannelExtendedData { data_type: VarInt, data: Vec<u8> },
     /// SSH_MSG_CHANNEL_EOF = 96
     ChannelEof,
     /// SSH_MSG_CHANNEL_CLOSE = 97
@@ -69,10 +82,7 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &SshMessage {
                 want_reply,
                 data,
             } => {
-                VarInt::try_from(80u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
+                SSH_MSG_GLOBAL_REQUEST.encode_into(&mut stream).await?;
                 SshString(request_type.clone())
                     .encode_into(&mut stream)
                     .await?;
@@ -84,27 +94,17 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &SshMessage {
                     .await?;
             }
             SshMessage::RequestSuccess { data } => {
-                VarInt::try_from(81u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
+                SSH_MSG_REQUEST_SUCCESS.encode_into(&mut stream).await?;
                 SshBytes(data.clone())
                     .encode_into(&mut stream)
                     .await?;
             }
             SshMessage::RequestFailure => {
-                VarInt::try_from(82u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
+                SSH_MSG_REQUEST_FAILURE.encode_into(&mut stream).await?;
             }
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                VarInt::try_from(91u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
-                VarInt::try_from(*max_message_size)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+                SSH_MSG_CHANNEL_OPEN_CONFIRMATION.encode_into(&mut stream).await?;
+                max_message_size
                     .encode_into(&mut stream)
                     .await?;
             }
@@ -112,12 +112,8 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &SshMessage {
                 reason_code,
                 description,
             } => {
-                VarInt::try_from(92u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
-                VarInt::try_from(*reason_code)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+                SSH_MSG_CHANNEL_OPEN_FAILURE.encode_into(&mut stream).await?;
+                reason_code
                     .encode_into(&mut stream)
                     .await?;
                 SshString(description.clone())
@@ -125,21 +121,14 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &SshMessage {
                     .await?;
             }
             SshMessage::ChannelData { data } => {
-                VarInt::try_from(94u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
+                SSH_MSG_CHANNEL_DATA.encode_into(&mut stream).await?;
                 SshBytes(data.clone())
                     .encode_into(&mut stream)
                     .await?;
             }
             SshMessage::ChannelExtendedData { data_type, data } => {
-                VarInt::try_from(95u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
-                VarInt::try_from(*data_type)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+                SSH_MSG_CHANNEL_EXTENDED_DATA.encode_into(&mut stream).await?;
+                data_type
                     .encode_into(&mut stream)
                     .await?;
                 SshBytes(data.clone())
@@ -147,26 +136,17 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &SshMessage {
                     .await?;
             }
             SshMessage::ChannelEof => {
-                VarInt::try_from(96u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
+                SSH_MSG_CHANNEL_EOF.encode_into(&mut stream).await?;
             }
             SshMessage::ChannelClose => {
-                VarInt::try_from(97u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
+                SSH_MSG_CHANNEL_CLOSE.encode_into(&mut stream).await?;
             }
             SshMessage::ChannelRequest {
                 request_type,
                 want_reply,
                 request_data,
             } => {
-                VarInt::try_from(98u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
+                SSH_MSG_CHANNEL_REQUEST.encode_into(&mut stream).await?;
                 SshString(request_type.clone())
                     .encode_into(&mut stream)
                     .await?;
@@ -178,16 +158,10 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &SshMessage {
                     .await?;
             }
             SshMessage::ChannelSuccess => {
-                VarInt::try_from(99u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
+                SSH_MSG_CHANNEL_SUCCESS.encode_into(&mut stream).await?;
             }
             SshMessage::ChannelFailure => {
-                VarInt::try_from(100u64)
-                    .unwrap()
-                    .encode_into(&mut stream)
-                    .await?;
+                SSH_MSG_CHANNEL_FAILURE.encode_into(&mut stream).await?;
             }
         }
         Ok(())
@@ -219,14 +193,14 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshMessage {
             91 => {
                 let max_message_size = VarInt::decode_from(&mut stream).await?;
                 Ok(SshMessage::ChannelOpenConfirmation {
-                    max_message_size: max_message_size.into_inner(),
+                    max_message_size,
                 })
             }
             92 => {
                 let reason_code = VarInt::decode_from(&mut stream).await?;
                 let description = SshString::decode_from(&mut stream).await?.0;
                 Ok(SshMessage::ChannelOpenFailure {
-                    reason_code: reason_code.into_inner(),
+                    reason_code,
                     description,
                 })
             }
@@ -238,7 +212,7 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshMessage {
                 let data_type = VarInt::decode_from(&mut stream).await?;
                 let data = SshBytes::decode_from(&mut stream).await?.0;
                 Ok(SshMessage::ChannelExtendedData {
-                    data_type: data_type.into_inner(),
+                    data_type,
                     data,
                 })
             }
@@ -305,17 +279,17 @@ mod tests {
             },
             SshMessage::RequestFailure,
             SshMessage::ChannelOpenConfirmation {
-                max_message_size: 65536,
+                max_message_size: VarInt::from(65536u32),
             },
             SshMessage::ChannelOpenFailure {
-                reason_code: 1,
+                reason_code: VarInt::from(1u8),
                 description: "administratively prohibited".into(),
             },
             SshMessage::ChannelData {
                 data: vec![0xde, 0xad, 0xbe, 0xef],
             },
             SshMessage::ChannelExtendedData {
-                data_type: 1,
+                data_type: VarInt::from(1u8),
                 data: vec![0xff],
             },
             SshMessage::ChannelEof,
@@ -391,14 +365,14 @@ mod tests {
 
         // ChannelOpenConfirmation(91): 0x405b
         let bytes = encode_to_bytes(&SshMessage::ChannelOpenConfirmation {
-            max_message_size: 0,
+            max_message_size: VarInt::from(0u8),
         })
         .await;
         assert_eq!(&bytes[..2], &[0x40, 0x5b]);
 
         // ChannelOpenFailure(92): 0x405c
         let bytes = encode_to_bytes(&SshMessage::ChannelOpenFailure {
-            reason_code: 0,
+            reason_code: VarInt::from(0u8),
             description: String::new(),
         })
         .await;
@@ -406,7 +380,7 @@ mod tests {
 
         // ChannelExtendedData(95): 0x405f
         let bytes = encode_to_bytes(&SshMessage::ChannelExtendedData {
-            data_type: 0,
+            data_type: VarInt::from(0u8),
             data: vec![],
         })
         .await;
@@ -484,20 +458,21 @@ mod tests {
     async fn no_channel_open_or_window_adjust() {
         // Types 90 (ChannelOpen) and 93 (WindowAdjust) must not exist in SSH3.
         // Attempting to decode them should return an error.
-        for msg_type in [90u64, 93u64] {
+        for msg_type in [VarInt::from(90u8), VarInt::from(93u8)] {
             let (mut writer, mut reader) = duplex(1024);
             writer
-                .encode_one(VarInt::try_from(msg_type).unwrap())
+                .encode_one(msg_type)
                 .await
                 .unwrap();
             drop(writer);
             let result = SshMessage::decode_from(&mut reader).await;
-            assert!(result.is_err(), "type {msg_type} should not be decodable");
+            assert!(result.is_err(), "type {} should not be decodable", msg_type.into_inner());
             let err = result.unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert!(
-                err.to_string().contains(&format!("{msg_type}")),
-                "error should mention type {msg_type}"
+                err.to_string().contains(&format!("{}", msg_type.into_inner())),
+                "error should mention type {}",
+                msg_type.into_inner()
             );
         }
     }
@@ -510,7 +485,7 @@ mod tests {
     async fn unknown_message_type_error() {
         let (mut writer, mut reader) = duplex(1024);
         writer
-            .encode_one(VarInt::try_from(255u64).unwrap())
+            .encode_one(VarInt::from(255u8))
             .await
             .unwrap();
         drop(writer);
@@ -536,7 +511,7 @@ mod tests {
             SshMessage::RequestSuccess { data: vec![] },
             SshMessage::ChannelData { data: vec![] },
             SshMessage::ChannelExtendedData {
-                data_type: 0,
+                data_type: VarInt::from(0u8),
                 data: vec![],
             },
             SshMessage::ChannelRequest {
@@ -560,14 +535,14 @@ mod tests {
     async fn channel_extended_data_stderr() {
         // data_type=1 is SSH_EXTENDED_DATA_STDERR
         let msg = SshMessage::ChannelExtendedData {
-            data_type: 1,
+            data_type: VarInt::from(1u8),
             data: b"error output".to_vec(),
         };
         let decoded = roundtrip(&msg).await;
         assert_eq!(decoded, msg);
         match decoded {
             SshMessage::ChannelExtendedData { data_type, data } => {
-                assert_eq!(data_type, 1, "data_type should be 1 (stderr)");
+                assert_eq!(data_type, VarInt::from(1u8), "data_type should be 1 (stderr)");
                 assert_eq!(data, b"error output");
             }
             other => panic!("expected ChannelExtendedData, got {other:?}"),

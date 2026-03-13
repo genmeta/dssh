@@ -205,11 +205,11 @@ pub async fn message_to_session_event(msg: SshMessage) -> io::Result<Option<Sess
     match msg {
         SshMessage::ChannelData { data } => Ok(Some(SessionEvent::Stdout(data))),
         SshMessage::ChannelExtendedData { data_type, data } => {
-            if data_type == 1 {
+            if data_type == VarInt::from(1u8) {
                 Ok(Some(SessionEvent::Stderr(data)))
             } else {
                 // Unknown extended data type — ignore.
-                tracing::warn!(data_type, "ignoring unknown extended data type");
+                tracing::warn!(%data_type, "ignoring unknown extended data type");
                 Ok(None)
             }
         }
@@ -393,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn stderr_via_extended_data() {
         let msg = SshMessage::ChannelExtendedData {
-            data_type: 1,
+            data_type: VarInt::from(1u8),
             data: b"error output".to_vec(),
         };
         let event = message_to_session_event(msg).await.unwrap();
@@ -642,7 +642,7 @@ mod tests {
         .await
         .unwrap();
         SshMessage::ChannelExtendedData {
-            data_type: 1,
+            data_type: VarInt::from(1u8),
             data: b"stderr data".to_vec(),
         }.encode_into(&mut server_writer)
         .await

@@ -62,7 +62,7 @@ where
                 "direct-tcpip connect failed"
             );
             let failure = SshMessage::ChannelOpenFailure {
-                reason_code: SSH_OPEN_CONNECT_FAILED,
+                reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                 description: format!("connect failed: {e}"),
             };
             failure.encode_into(&mut writer).await?;
@@ -72,7 +72,7 @@ where
 
     // Send ChannelOpenConfirmation(91).
     let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
     };
     confirm.encode_into(&mut writer).await?;
 
@@ -117,13 +117,13 @@ mod tests {
         SshString(dest_host.to_owned()).encode_into(&mut buf)
             .await
             .unwrap();
-        buf.encode_one(VarInt::try_from(dest_port as u64).unwrap())
+        buf.encode_one(VarInt::from(dest_port))
             .await
             .unwrap();
         SshString(originator_host.to_owned()).encode_into(&mut buf)
             .await
             .unwrap();
-        buf.encode_one(VarInt::try_from(originator_port as u64).unwrap())
+        buf.encode_one(VarInt::from(originator_port))
             .await
             .unwrap();
         buf
@@ -227,7 +227,7 @@ mod tests {
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
+                assert_eq!(max_message_size, VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32));
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -278,7 +278,7 @@ mod tests {
                 description,
             } => {
                 assert_eq!(
-                    reason_code, SSH_OPEN_CONNECT_FAILED,
+                    reason_code, VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                     "reason_code should be 2 (SSH_OPEN_CONNECT_FAILED)"
                 );
                 assert!(

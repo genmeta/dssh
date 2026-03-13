@@ -49,7 +49,7 @@ impl TcpipForwardRequest {
         SshString(self.bind_address.clone()).encode_into(&mut buf)
             .await
             .expect("vec write cannot fail");
-        buf.encode_one(VarInt::try_from(self.bind_port as u64).unwrap())
+        buf.encode_one(VarInt::from(self.bind_port))
             .await
             .expect("vec write cannot fail");
         buf
@@ -81,7 +81,7 @@ impl CancelTcpipForwardRequest {
         SshString(self.bind_address.clone()).encode_into(&mut buf)
             .await
             .expect("vec write cannot fail");
-        buf.encode_one(VarInt::try_from(self.bind_port as u64).unwrap())
+        buf.encode_one(VarInt::from(self.bind_port))
             .await
             .expect("vec write cannot fail");
         buf
@@ -109,7 +109,7 @@ impl TcpipForwardReply {
     /// Encode into wire format: VarInt(allocated_port).
     pub async fn encode_to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.encode_one(VarInt::try_from(self.allocated_port as u64).unwrap())
+        buf.encode_one(VarInt::from(self.allocated_port))
             .await
             .expect("vec write cannot fail");
         buf
@@ -490,7 +490,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 test_transport_client(),
-                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(1u64).unwrap()),
+                h3x::stream_id::StreamId(VarInt::from(1u8)),
             )
             .await
             .unwrap();
@@ -531,7 +531,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 test_transport_client(),
-                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(1u64).unwrap()),
+                h3x::stream_id::StreamId(VarInt::from(1u8)),
             )
             .await
             .unwrap();
@@ -540,7 +540,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 test_transport_client(),
-                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(2u64).unwrap()),
+                h3x::stream_id::StreamId(VarInt::from(2u8)),
             )
             .await
             .unwrap();
@@ -590,7 +590,7 @@ mod tests {
                 80,
                 "10.0.0.1",
                 54321,
-                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
+                h3x::stream_id::StreamId(VarInt::from(42u8)),
             )
             .await
             .unwrap();
@@ -618,7 +618,7 @@ mod tests {
         let client_handle = tokio::spawn(async move {
             let mut client_writer = client_writer;
             let confirm = SshMessage::ChannelOpenConfirmation {
-                max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+                max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
             };
             confirm.encode_into(&mut client_writer).await.unwrap();
 
@@ -670,7 +670,7 @@ mod tests {
                 80,
                 "10.0.0.1",
                 54321,
-                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
+                h3x::stream_id::StreamId(VarInt::from(42u8)),
             )
             .await
             .unwrap();
@@ -685,7 +685,7 @@ mod tests {
 
         // Client side: send ChannelOpenFailure to reject the channel.
         let failure = SshMessage::ChannelOpenFailure {
-            reason_code: 1,
+            reason_code: VarInt::from(1u8),
             description: "administratively prohibited".into(),
         };
         failure.encode_into(&mut client_writer).await.unwrap();

@@ -396,7 +396,7 @@ mod tests {
 
         // Send ChannelOpenConfirmation.
         SshMessage::ChannelOpenConfirmation {
-            max_message_size: TEST_MAX_MESSAGE_SIZE,
+            max_message_size: h3x::varint::VarInt::from(TEST_MAX_MESSAGE_SIZE as u32),
         }.encode_into(&mut server_writer)
         .await
         .unwrap();
@@ -427,7 +427,7 @@ mod tests {
 
         // Send ChannelOpenFailure.
         SshMessage::ChannelOpenFailure {
-            reason_code: 2, // SSH_OPEN_CONNECT_FAILED
+            reason_code: h3x::varint::VarInt::from(2u8), // SSH_OPEN_CONNECT_FAILED
             description: "connection refused by server".to_string(),
         }.encode_into(&mut server_writer)
         .await

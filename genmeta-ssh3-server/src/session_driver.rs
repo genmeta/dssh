@@ -330,7 +330,7 @@ mod tests {
 
     fn sample_init() -> SessionInit {
         SessionInit {
-            conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
+            conversation_id: StreamId(h3x::varint::VarInt::from(42u8)),
             username: "alice".into(),
             uid: 1000,
             gid: 1000,
@@ -351,14 +351,14 @@ mod tests {
     #[tokio::test]
     async fn run_session_fields_accessible() {
         let init = SessionInit {
-            conversation_id: StreamId(h3x::varint::VarInt::try_from(99u64).unwrap()),
+            conversation_id: StreamId(h3x::varint::VarInt::from(99u8)),
             username: "bob".into(),
             uid: 2000,
             gid: 2000,
             home: PathBuf::from("/home/bob"),
             shell: PathBuf::from("/bin/zsh"),
         };
-        assert_eq!(init.conversation_id, StreamId(h3x::varint::VarInt::try_from(99u64).unwrap()));
+        assert_eq!(init.conversation_id, StreamId(h3x::varint::VarInt::from(99u8)));
         assert_eq!(init.username, "bob");
         assert_eq!(init.uid, 2000);
         assert_eq!(init.gid, 2000);
@@ -639,7 +639,7 @@ mod tests {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
                 assert_eq!(
                     max_message_size,
-                    DEFAULT_MAX_MESSAGE_SIZE,
+                    h3x::varint::VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
                     "max_message_size should match DEFAULT_MAX_MESSAGE_SIZE"
                 );
             }

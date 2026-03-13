@@ -372,7 +372,7 @@ where
     let stderr_data = stderr_result?;
     if !stderr_data.is_empty() {
         SshMessage::ChannelExtendedData {
-            data_type: 1,
+            data_type: VarInt::from(1u8),
             data: stderr_data,
         }.encode_into(&mut *writer)
         .await?;
@@ -1192,7 +1192,8 @@ mod tests {
         // Find ChannelExtendedData with stderr
         let has_stderr = messages.iter().any(|m| match m {
             SshMessage::ChannelExtendedData { data_type, data } => {
-                *data_type == 1 && String::from_utf8_lossy(data).contains("stderr_msg")
+                *data_type == VarInt::from(1u8)
+                    && String::from_utf8_lossy(data).contains("stderr_msg")
             }
             _ => false,
         });

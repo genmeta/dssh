@@ -208,7 +208,7 @@ use super::*;
             })
         });
         let endpoint = crate::channel::ConversationEndpoint::new(
-            StreamId(h3x::varint::VarInt::try_from(0u64).unwrap()),
+            StreamId(h3x::varint::VarInt::from(0u8)),
             dispatch_rx,
             opener,
         );
@@ -228,7 +228,7 @@ use super::*;
                 username: "testuser".into(),
                 password: "testpass".into(),
             },
-            conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
+            conversation_id: StreamId(h3x::varint::VarInt::from(42u8)),
         };
 
         bootstrap_tx

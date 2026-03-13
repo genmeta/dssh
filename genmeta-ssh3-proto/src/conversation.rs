@@ -24,9 +24,9 @@ use crate::codec::{ChannelHeader, SshBool, SshBytes, SshString};
 // SSH message type constants (subset used by conversation)
 // ---------------------------------------------------------------------------
 
-const SSH_MSG_GLOBAL_REQUEST: u64 = 80;
-const SSH_MSG_REQUEST_SUCCESS: u64 = 81;
-const SSH_MSG_REQUEST_FAILURE: u64 = 82;
+const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
+const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
+const SSH_MSG_REQUEST_FAILURE: VarInt = VarInt::from_u32(82);
 
 type OpenBiFuture<R, W> = Pin<Box<dyn Future<Output = io::Result<(R, W)>> + Send>>;
 type OpenBiOpener<R, W> = dyn Fn() -> OpenBiFuture<R, W> + Send + Sync;
@@ -99,9 +99,7 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &GlobalRequest {
     /// Encode SSH_MSG_GLOBAL_REQUEST(80) onto a stream.
     async fn encode_into(self, stream: S) -> Result<(), io::Error> {
         let mut stream = std::pin::pin!(stream);
-        let msg_type = VarInt::try_from(SSH_MSG_GLOBAL_REQUEST)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        msg_type.encode_into(&mut stream).await?;
+        SSH_MSG_GLOBAL_REQUEST.encode_into(&mut stream).await?;
         SshString(self.request_type.clone())
             .encode_into(&mut stream)
             .await?;
@@ -142,9 +140,7 @@ pub(crate) async fn encode_request_success<S: AsyncWrite + Send + Unpin>(
     stream: &mut S,
     data: &[u8],
 ) -> Result<(), io::Error> {
-    let msg_type = VarInt::try_from(SSH_MSG_REQUEST_SUCCESS)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    msg_type.encode_into(&mut *stream).await?;
+    SSH_MSG_REQUEST_SUCCESS.encode_into(&mut *stream).await?;
     SshBytes(data.to_vec()).encode_into(&mut *stream).await?;
     Ok(())
 }
@@ -153,9 +149,7 @@ pub(crate) async fn encode_request_success<S: AsyncWrite + Send + Unpin>(
 pub(crate) async fn encode_request_failure<S: AsyncWrite + Send + Unpin>(
     stream: &mut S,
 ) -> Result<(), io::Error> {
-    let msg_type = VarInt::try_from(SSH_MSG_REQUEST_FAILURE)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    msg_type.encode_into(&mut *stream).await?;
+    SSH_MSG_REQUEST_FAILURE.encode_into(&mut *stream).await?;
     Ok(())
 }
 
@@ -269,11 +263,11 @@ where
         let msg_type = msg_type.into_inner();
 
         match msg_type {
-            SSH_MSG_REQUEST_SUCCESS => {
+            v if v == SSH_MSG_REQUEST_SUCCESS.into_inner() => {
                 let payload = SshBytes::decode_from(&mut *reader).await?;
                 Ok(Some(payload.0))
             }
-            SSH_MSG_REQUEST_FAILURE => Err(io::Error::new(
+            v if v == SSH_MSG_REQUEST_FAILURE.into_inner() => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "global request rejected",
             )),
@@ -289,7 +283,7 @@ where
         let msg_type: VarInt = reader.deref_mut().decode_one().await?;
         let msg_type = msg_type.into_inner();
 
-        if msg_type != SSH_MSG_GLOBAL_REQUEST {
+        if msg_type != SSH_MSG_GLOBAL_REQUEST.into_inner() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -436,7 +430,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             // Read the global request
             let msg_type: VarInt = remote_read.decode_one().await.unwrap();
-            assert_eq!(msg_type.into_inner(), SSH_MSG_GLOBAL_REQUEST);
+            assert_eq!(msg_type, SSH_MSG_GLOBAL_REQUEST);
 
             let req = GlobalRequest::decode_body(&mut remote_read).await.unwrap();
             assert_eq!(req.request_type, "tcpip-forward");
@@ -473,7 +467,7 @@ mod tests {
 
         // Verify the message was written correctly
         let msg_type: VarInt = remote_read.decode_one().await.unwrap();
-        assert_eq!(msg_type.into_inner(), SSH_MSG_GLOBAL_REQUEST);
+        assert_eq!(msg_type, SSH_MSG_GLOBAL_REQUEST);
 
         let req = GlobalRequest::decode_body(&mut remote_read).await.unwrap();
         assert_eq!(req.request_type, "keepalive");
@@ -487,7 +481,7 @@ mod tests {
         // Spawn a task to drain the request and reply with failure
         let handle = tokio::spawn(async move {
             let msg_type: VarInt = remote_read.decode_one().await.unwrap();
-            assert_eq!(msg_type.into_inner(), SSH_MSG_GLOBAL_REQUEST);
+            assert_eq!(msg_type, SSH_MSG_GLOBAL_REQUEST);
             let _req = GlobalRequest::decode_body(&mut remote_read).await.unwrap();
 
             // Reply with failure

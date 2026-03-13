@@ -87,7 +87,7 @@ where
                 "direct-streamlocal connect failed"
             );
             let failure = SshMessage::ChannelOpenFailure {
-                reason_code: SSH_OPEN_CONNECT_FAILED,
+                reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                 description: format!("connect failed: {e}"),
             };
             failure.encode_into(&mut writer).await?;
@@ -97,7 +97,7 @@ where
 
     // Send ChannelOpenConfirmation(91).
     let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
     };
     confirm.encode_into(&mut writer).await?;
 
@@ -458,7 +458,7 @@ mod tests {
         SshString(reserved_string.to_owned()).encode_into(&mut buf)
             .await
             .unwrap();
-        buf.encode_one(VarInt::try_from(reserved_uint32 as u64).unwrap())
+        buf.encode_one(VarInt::from(reserved_uint32))
             .await
             .unwrap();
         buf
@@ -550,7 +550,7 @@ mod tests {
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
+                assert_eq!(max_message_size, VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32));
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -606,7 +606,7 @@ mod tests {
                 description,
             } => {
                 assert_eq!(
-                    reason_code, SSH_OPEN_CONNECT_FAILED,
+                    reason_code, VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                     "reason_code should be 2 (SSH_OPEN_CONNECT_FAILED)"
                 );
                 assert!(
@@ -664,7 +664,7 @@ mod tests {
             .start_listening(
                 &sock_path,
                 test_transport_client(),
-                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(1u64).unwrap()),
+                h3x::stream_id::StreamId(VarInt::from(1u8)),
             )
             .await
             .unwrap();
@@ -728,7 +728,7 @@ mod tests {
                 server_writer,
                 unix_stream,
                 &fwd_sock_path,
-                h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
+                h3x::stream_id::StreamId(VarInt::from(42u8)),
             )
             .await
             .unwrap();
@@ -752,7 +752,7 @@ mod tests {
         let client_handle = tokio::spawn(async move {
             let mut client_writer = client_writer;
             let confirm = SshMessage::ChannelOpenConfirmation {
-                max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+                max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
             };
             confirm.encode_into(&mut client_writer).await.unwrap();
 

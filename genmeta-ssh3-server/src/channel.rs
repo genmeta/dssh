@@ -13,6 +13,7 @@ use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
 use genmeta_ssh3_proto::session::{Ssh3Transport as RemoteSsh3Transport, Ssh3TransportClient, TransportError};
 use h3x::codec::{DecodeFrom, EncodeInto};
 use h3x::stream_id::StreamId;
+use h3x::varint::VarInt;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
@@ -53,7 +54,7 @@ pub enum ChannelEvent {
     /// ChannelData(94) — standard channel data.
     Data(Vec<u8>),
     /// ChannelExtendedData(95) — extended data (e.g., stderr when data_type=1).
-    ExtendedData { data_type: u64, data: Vec<u8> },
+    ExtendedData { data_type: VarInt, data: Vec<u8> },
     /// ChannelRequest(98) — channel request with type and opaque payload.
     Request {
         request_type: String,
@@ -100,7 +101,7 @@ where
     W: AsyncWrite + Send + Unpin,
 {
     let failure = SshMessage::ChannelOpenFailure {
-        reason_code: 3,
+        reason_code: VarInt::from(3u8),
         description: "unknown channel type".into(),
     };
     failure.encode_into(&mut writer).await?;
@@ -283,7 +284,7 @@ where
 {
     // Send ChannelOpenConfirmation(91).
     let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
     };
     confirm.encode_into(&mut writer).await?;
 
@@ -387,7 +388,7 @@ where
 {
     // Send ChannelOpenConfirmation(91).
     let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
     };
     confirm.encode_into(&mut writer).await?;
 
@@ -689,7 +690,7 @@ mod tests {
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
+                assert_eq!(max_message_size, VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32));
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -725,7 +726,7 @@ mod tests {
                 reason_code,
                 description,
             } => {
-                assert_eq!(reason_code, 3, "reason_code should be 3 (unknown channel type)");
+                assert_eq!(reason_code, VarInt::from(3u8), "reason_code should be 3 (unknown channel type)");
                 assert_eq!(description, "unknown channel type");
             }
             other => panic!("expected ChannelOpenFailure, got {other:?}"),
@@ -925,7 +926,7 @@ mod tests {
             // Should receive ChannelOpenFailure since no session_client.
             let failure = SshMessage::decode_from(&mut client_reader).await.unwrap();
             assert!(
-                matches!(failure, SshMessage::ChannelOpenFailure { reason_code: 3, .. }),
+                matches!(failure, SshMessage::ChannelOpenFailure { reason_code, .. } if reason_code == VarInt::from(3u8)),
                 "expected ChannelOpenFailure for {channel_type}, got {failure:?}"
             );
         }
@@ -942,7 +943,7 @@ mod tests {
 
         let client_handle = tokio::spawn(async move {
             SshMessage::ChannelExtendedData {
-                data_type: 1, // stderr
+                data_type: VarInt::from(1u8), // stderr
                 data: b"error output".to_vec(),
             }.encode_into(&mut client_writer)
             .await
@@ -966,7 +967,7 @@ mod tests {
         assert_eq!(
             event,
             ChannelEvent::ExtendedData {
-                data_type: 1,
+                data_type: VarInt::from(1u8),
                 data: b"error output".to_vec(),
             }
         );
@@ -1034,8 +1035,8 @@ mod tests {
                 Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
             })
         });
-        let mut endpoint = ConversationEndpoint::new(StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()), rx, opener);
-        assert_eq!(endpoint.conversation_id(), StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()));
+        let mut endpoint = ConversationEndpoint::new(StreamId(VarInt::from(42u8)), rx, opener);
+        assert_eq!(endpoint.conversation_id(), StreamId(VarInt::from(42u8)));
 
         // Drop sender — accept_channel should return None.
         drop(tx);
@@ -1050,7 +1051,7 @@ mod tests {
                 Err(io::Error::new(io::ErrorKind::ConnectionRefused, "test opener failed"))
             })
         });
-        let endpoint = ConversationEndpoint::new(StreamId(h3x::varint::VarInt::try_from(7u64).unwrap()), rx, opener);
+        let endpoint = ConversationEndpoint::new(StreamId(VarInt::from(7u8)), rx, opener);
         let transport = Ssh3Transport::new(endpoint);
         let result = transport.open_channel(None).await;
         assert!(matches!(result, Err(TransportError::OpenFailed(_))));
