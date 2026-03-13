@@ -15,6 +15,7 @@ use std::process::ExitStatus;
 
 use genmeta_ssh3_proto::session::{AuthResult, ChildBootstrap};
 use tokio::process::{Child, Command};
+use tracing::Instrument;
 
 /// Handle to a spawned `ssh3-session` child process.
 ///
@@ -81,7 +82,7 @@ impl ChildProcess {
         ) = remoc::Connect::io(remoc::Cfg::default(), child_stdout, child_stdin)
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
-        tokio::spawn(conn);
+        tokio::spawn(conn.in_current_span());
 
         Ok((Self { child }, base_tx, base_rx))
     }

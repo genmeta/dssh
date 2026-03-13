@@ -17,6 +17,7 @@ use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
+use tracing::Instrument;
 
 use crate::forward::reverse_tcp::ReverseTcpForwarder;
 use crate::forward::streamlocal::ReverseStreamlocalForwarder;
@@ -290,7 +291,7 @@ where
     let (event_tx, mut event_rx) = mpsc::channel(64);
     tokio::spawn(async move {
         let _ = run_message_loop_with_sender(reader, event_tx).await;
-    });
+    }.in_current_span());
 
     // Dispatch loop: consume events until an exec/shell request arrives.
     // Tracks PTY allocation state: None (idle) or Some(PtyPair) (PTY allocated).
@@ -393,7 +394,7 @@ where
     let (event_tx, event_rx) = mpsc::channel(64);
     tokio::spawn(async move {
         let _ = run_message_loop_with_sender(reader, event_tx).await;
-    });
+    }.in_current_span());
     Ok((event_rx, writer))
 }
 
@@ -553,7 +554,7 @@ impl RemoteSsh3Transport for Ssh3Transport {
                     break;
                 }
             }
-        });
+        }.in_current_span());
 
         tokio::spawn(async move {
             let mut to_client_rx = to_client_rx;
@@ -566,7 +567,7 @@ impl RemoteSsh3Transport for Ssh3Transport {
                 }
             }
             let _ = quic_writer.shutdown().await;
-        });
+        }.in_current_span());
 
         Ok(Some((header, from_client_rx, to_client_tx)))
     }
@@ -611,7 +612,7 @@ impl RemoteSsh3Transport for Ssh3Transport {
                     break;
                 }
             }
-        });
+        }.in_current_span());
 
         tokio::spawn(async move {
             let mut to_remote_rx = to_remote_rx;
@@ -624,7 +625,7 @@ impl RemoteSsh3Transport for Ssh3Transport {
                 }
             }
             let _ = quic_writer.shutdown().await;
-        });
+        }.in_current_span());
 
         Ok((from_remote_rx, to_remote_tx))
     }

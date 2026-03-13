@@ -20,6 +20,7 @@ use h3x::varint::VarInt;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use crate::byte_channel::{ChannelReader, ChannelWriter};
 
@@ -233,7 +234,7 @@ impl ReverseTcpForwarder {
                                     tracing::warn!(%e, "failed to open transport channel for forwarded-tcpip");
                                 }
                             }
-                        });
+                        }.in_current_span());
                     }
                     Err(e) => {
                         tracing::warn!(%e, "reverse-tcp accept error");
@@ -241,7 +242,7 @@ impl ReverseTcpForwarder {
                     }
                 }
             }
-        });
+        }.in_current_span());
 
         let mut listeners = self.listeners.lock().await;
         // If there was already a listener on this key, abort the old one.

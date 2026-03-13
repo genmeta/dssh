@@ -38,6 +38,7 @@ use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixListener;
+use tracing::Instrument;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
@@ -255,7 +256,7 @@ impl ReverseStreamlocalForwarder {
                                     tracing::warn!(%e, "failed to open transport channel for forwarded-streamlocal");
                                 }
                             }
-                        });
+                        }.in_current_span());
                     }
                     Err(e) => {
                         tracing::warn!(%e, "reverse-streamlocal accept error");
@@ -263,7 +264,7 @@ impl ReverseStreamlocalForwarder {
                     }
                 }
             }
-        });
+        }.in_current_span());
 
         let mut listeners = self.listeners.lock().await;
         // If there was already a listener on this key, abort the old one.

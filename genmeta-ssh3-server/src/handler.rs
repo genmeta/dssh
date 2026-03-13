@@ -19,6 +19,7 @@ use h3x::stream_id::StreamId;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::Empty;
 use snafu::Report;
+use tracing::Instrument;
 
 use crate::{auth, child::ChildProcess, error::ServerError, protocol::Ssh3Protocol, version};
 use genmeta_ssh3_proto::auth::AuthCredential;
@@ -200,7 +201,10 @@ impl Ssh3ConnectHandler {
             }
         };
 
-        let transport_server_handle = tokio::spawn(async move { let _ = transport_server.serve(true).await; });
+        let transport_server_handle = tokio::spawn(
+            async move { let _ = transport_server.serve(true).await; }
+                .instrument(tracing::info_span!("ssh3_transport_server", %conversation_id))
+        );
 
         let bootstrap = ChildBootstrap {
             transport: transport_client,
@@ -257,7 +261,8 @@ impl Ssh3ConnectHandler {
                     }
 
                     drop(lease);
-                });
+                }
+                .instrument(tracing::info_span!("ssh3_connection_supervisor", %conversation_id)));
 
                 response
             }

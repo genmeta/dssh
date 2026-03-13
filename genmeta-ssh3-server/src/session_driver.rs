@@ -1,12 +1,13 @@
 //! SSH3 session implementation for the ssh3-session child process.
 //!
-//! This module provides [`Ssh3SessionImpl`], which drives the session lifecycle
+//! This module provides [`Ssh3Session`], which drives the session lifecycle
 //! by pulling channels from an [`Ssh3TransportClient`]. The child process
 //! performs privilege dropping (setgid/setuid) and runs the session dispatch
 //! loop (PTY, shell, exec) over byte-channel adapters bridging remoc channels
 //! to `AsyncRead`/`AsyncWrite`.
 
 use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use genmeta_ssh3_proto::codec::ChannelHeader;
@@ -14,10 +15,11 @@ use genmeta_ssh3_proto::message::SshMessage;
 use genmeta_ssh3_proto::session::{SessionError, SessionInit, Ssh3Transport, Ssh3TransportClient};
 use h3x::codec::EncodeInto;
 use snafu::Report;
-use tokio::sync::mpsc;
+use tokio::{io::AsyncWrite, sync::mpsc, task::JoinSet};
+use tracing::Instrument;
 
 use crate::byte_channel::{ChannelReader, ChannelWriter};
-use crate::channel::{run_message_loop_with_sender, ChannelEvent, GlobalRequestContext, DEFAULT_MAX_MESSAGE_SIZE};
+use crate::channel::{open_session_channel, ChannelEvent, GlobalRequestContext};
 use crate::forward::reverse_tcp::ReverseTcpForwarder;
 use crate::forward::streamlocal::ReverseStreamlocalForwarder;
 use crate::session::pty::{allocate_pty, set_window_size, PtyPair};
@@ -55,12 +57,12 @@ fn drop_privileges(_uid: u32, _gid: u32) -> Result<(), SessionError> {
 
 /// SSH3 session driver that pulls channels from a transport client.
 ///
-/// The child process creates one `Ssh3SessionImpl`, then calls [`run()`] with
+/// The child process creates one `Ssh3Session`, then calls [`run()`] with
 /// the transport client received from the parent. The `run()` method consumes
 /// `self` since each child process runs exactly one session.
-pub struct Ssh3SessionImpl;
+pub struct Ssh3Session;
 
-impl Ssh3SessionImpl {
+impl Ssh3Session {
     pub fn new() -> Self {
         Self
     }
@@ -78,109 +80,159 @@ impl Ssh3SessionImpl {
             transport: transport.clone(),
             conversation_id: init.conversation_id,
         });
+        let mut channel_tasks = JoinSet::new();
+        let shell = init.shell;
 
-        // Channel accept loop — pull channels from transport until connection closes.
         while let Ok(Some((header, from_client_rx, to_client_tx))) = transport.accept_channel().await {
-            let channel_type = header.channel_type.clone();
-            if channel_type == "session" {
-                // Session channel: inline session lifecycle.
-                let reader = ChannelReader::new(from_client_rx);
-                let mut writer = ChannelWriter::new(to_client_tx);
+            Self::spawn_channel_task(
+                &mut channel_tasks,
+                header,
+                from_client_rx,
+                to_client_tx,
+                Arc::clone(&global_ctx),
+                shell.clone(),
+            );
+        }
 
-                let confirm = SshMessage::ChannelOpenConfirmation {
-                    max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-                };
-                confirm
-                    .encode_into(&mut writer)
-                    .await
-                    .map_err(|e| SessionError::new(e.to_string()))?;
-
-                let (event_tx, mut event_rx) = mpsc::channel(64);
-                tokio::spawn(async move {
-                    let _ = run_message_loop_with_sender(reader, event_tx).await;
-                });
-
-                let mut pty_pair: Option<PtyPair> = None;
-
-                while let Some(event) = event_rx.recv().await {
-                    match event {
-                        ChannelEvent::Request { .. } => {
-                            match handle_request(&event, &mut writer)
-                                .await
-                                .map_err(|e| SessionError::new(e.to_string()))?
-                            {
-                                Some(RequestAction::Exec(cmd)) => {
-                                    run_exec(&cmd, &mut writer, event_rx, pty_pair.take())
-                                        .await
-                                        .map_err(|e| SessionError::new(e.to_string()))?;
-                                    return Ok(());
-                                }
-                                Some(RequestAction::Shell) => {
-                                    let shell = init.shell.to_string_lossy();
-                                    run_shell(&shell, &mut writer, event_rx, pty_pair.take())
-                                        .await
-                                        .map_err(|e| SessionError::new(e.to_string()))?;
-                                    return Ok(());
-                                }
-                                Some(RequestAction::AllocatePty(req)) => match allocate_pty(&req) {
-                                    Ok(pair) => {
-                                        pty_pair = Some(pair);
-                                        tracing::info!(term = %req.term_type, "PTY allocated");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(error = %Report::from_error(e), "PTY allocation failed");
-                                        // PTY failure is non-fatal — exec/shell will use piped stdio
-                                    }
-                                },
-                                Some(RequestAction::WindowChange(req)) => {
-                                    if let Some(ref pair) = pty_pair {
-                                        let _ = set_window_size(pair.master.as_raw_fd(), &req);
-                                    }
-                                }
-                                Some(RequestAction::Signal(_)) => {
-                                    // Signal before exec/shell — no process to signal yet
-                                    tracing::debug!("ignoring signal before exec/shell");
-                                }
-                                None => { /* unrecognized request, continue loop */ }
-                            }
-                        }
-                        ChannelEvent::Eof => {
-                            SshMessage::ChannelEof
-                                .encode_into(&mut writer)
-                                .await
-                                .map_err(|e| SessionError::new(e.to_string()))?;
-                            tokio::io::AsyncWriteExt::shutdown(&mut writer)
-                                .await
-                                .map_err(|e| SessionError::new(e.to_string()))?;
-                            break;
-                        }
-                        ChannelEvent::Close => {
-                            SshMessage::ChannelClose
-                                .encode_into(&mut writer)
-                                .await
-                                .map_err(|e| SessionError::new(e.to_string()))?;
-                            break;
-                        }
-                        ChannelEvent::Data(_) | ChannelEvent::ExtendedData { .. } => {
-                            // No exec/shell running yet — data before a request is meaningless.
-                        }
-                    }
-                }
-            } else {
-                // Non-session channels: spawn in background.
-                let ctx = global_ctx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = Self::handle_channel_inner(header, from_client_rx, to_client_tx, ctx).await {
-                        tracing::warn!(error = %Report::from_error(e), "channel handling failed");
-                    }
-                });
+        while let Some(result) = channel_tasks.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!(error = %Report::from_error(error), "channel task panicked");
             }
         }
         Ok(())
     }
 
+    fn spawn_channel_task(
+        channel_tasks: &mut JoinSet<()>,
+        header: ChannelHeader,
+        from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
+        to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
+        ctx: Arc<GlobalRequestContext>,
+        shell: PathBuf,
+    ) {
+        let channel_type = header.channel_type.clone();
+        let conversation_id = ctx.conversation_id;
+        let span = tracing::info_span!(
+            "ssh3_channel",
+            %conversation_id,
+            channel_type = %channel_type,
+        );
+        channel_tasks.spawn(
+            async move {
+                if let Err(error) = Self::handle_channel(header, from_client, to_client, ctx, &shell).await {
+                    tracing::warn!(
+                        error = %Report::from_error(error),
+                        %conversation_id,
+                        channel_type = %channel_type,
+                        "channel handling failed"
+                    );
+                }
+            }
+            .instrument(span),
+        );
+    }
+
+    async fn handle_channel(
+        header: ChannelHeader,
+        from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
+        to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
+        ctx: Arc<GlobalRequestContext>,
+        shell: &Path,
+    ) -> Result<(), SessionError> {
+        if header.channel_type == "session" {
+            return Self::handle_session_channel(from_client, to_client, shell).await;
+        }
+
+        Self::handle_non_session_channel(header, from_client, to_client, ctx).await
+    }
+
+    async fn handle_session_channel(
+        from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
+        to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
+        shell: &Path,
+    ) -> Result<(), SessionError> {
+        let reader = ChannelReader::new(from_client);
+        let writer = ChannelWriter::new(to_client);
+        let (event_rx, writer) = open_session_channel(reader, writer)
+            .await
+            .map_err(SessionError::new)?;
+        Self::run_session_requests(event_rx, writer, shell).await
+    }
+
+    async fn run_session_requests<W>(
+        mut event_rx: mpsc::Receiver<ChannelEvent>,
+        mut writer: W,
+        shell: &Path,
+    ) -> Result<(), SessionError>
+    where
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let shell = shell.to_string_lossy().into_owned();
+        let mut pty_pair: Option<PtyPair> = None;
+
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                ChannelEvent::Request { .. } => match handle_request(&event, &mut writer)
+                    .await
+                    .map_err(SessionError::new)?
+                {
+                    Some(RequestAction::Exec(cmd)) => {
+                        run_exec(&cmd, &mut writer, event_rx, pty_pair.take())
+                            .await
+                            .map_err(SessionError::new)?;
+                        return Ok(());
+                    }
+                    Some(RequestAction::Shell) => {
+                        run_shell(&shell, &mut writer, event_rx, pty_pair.take())
+                            .await
+                            .map_err(SessionError::new)?;
+                        return Ok(());
+                    }
+                    Some(RequestAction::AllocatePty(req)) => match allocate_pty(&req) {
+                        Ok(pair) => {
+                            pty_pair = Some(pair);
+                            tracing::info!(term = %req.term_type, "PTY allocated");
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %Report::from_error(error), "PTY allocation failed");
+                        }
+                    },
+                    Some(RequestAction::WindowChange(req)) => {
+                        if let Some(ref pair) = pty_pair {
+                            let _ = set_window_size(pair.master.as_raw_fd(), &req);
+                        }
+                    }
+                    Some(RequestAction::Signal(_)) => {
+                        tracing::debug!("ignoring signal before exec/shell");
+                    }
+                    None => {}
+                },
+                ChannelEvent::Eof => {
+                    SshMessage::ChannelEof
+                        .encode_into(&mut writer)
+                        .await
+                        .map_err(SessionError::new)?;
+                    tokio::io::AsyncWriteExt::shutdown(&mut writer)
+                        .await
+                        .map_err(SessionError::new)?;
+                    break;
+                }
+                ChannelEvent::Close => {
+                    SshMessage::ChannelClose
+                        .encode_into(&mut writer)
+                        .await
+                        .map_err(SessionError::new)?;
+                    break;
+                }
+                ChannelEvent::Data(_) | ChannelEvent::ExtendedData { .. } => {}
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handle a non-session channel dispatched from the transport.
-    async fn handle_channel_inner(
+    async fn handle_non_session_channel(
         header: ChannelHeader,
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
@@ -193,22 +245,22 @@ impl Ssh3SessionImpl {
             "direct-tcpip" => {
                 crate::forward::direct_tcp::handle_direct_tcp(header, reader, writer)
                     .await
-                    .map_err(|e| SessionError::new(e.to_string()))
+                    .map_err(SessionError::new)
             }
             "direct-streamlocal@openssh.com" => {
                 crate::forward::streamlocal::handle_direct_streamlocal(header, reader, writer)
                     .await
-                    .map_err(|e| SessionError::new(e.to_string()))
+                    .map_err(SessionError::new)
             }
             "socks5" => {
                 crate::forward::socks5::handle_socks5(header, reader, writer)
                     .await
-                    .map_err(|e| SessionError::new(e.to_string()))
+                    .map_err(SessionError::new)
             }
             "global-request" => {
                 crate::channel::handle_global_request_channel(reader, writer, Some(ctx))
                     .await
-                    .map_err(|e| SessionError::new(e.to_string()))
+                    .map_err(SessionError::new)
             }
             other => {
                 tracing::warn!(channel_type = %other, "unknown channel type in child");
@@ -218,7 +270,7 @@ impl Ssh3SessionImpl {
     }
 }
 
-impl Default for Ssh3SessionImpl {
+impl Default for Ssh3Session {
     fn default() -> Self {
         Self::new()
     }
@@ -231,6 +283,7 @@ mod tests {
     use genmeta_ssh3_proto::session::TransportError;
     use h3x::codec::DecodeFrom;
     use std::path::PathBuf;
+    use crate::channel::DEFAULT_MAX_MESSAGE_SIZE;
 
     struct MockSsh3Transport;
 
@@ -319,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_session_happy_path() {
-        let session = Ssh3SessionImpl::new();
+        let session = Ssh3Session::new();
         let transport = mock_transport_client();
         // Transport returns Ok(None) immediately, so run() completes.
         let result = session.run(transport, sample_init()).await;
@@ -328,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_session_fields_accessible() {
-        let session = Ssh3SessionImpl::new();
+        let session = Ssh3Session::new();
         let init = SessionInit {
             conversation_id: StreamId(h3x::varint::VarInt::try_from(99u64).unwrap()),
             username: "bob".into(),
@@ -348,7 +401,7 @@ mod tests {
     #[test]
     fn impl_type_is_sync_send() {
         fn assert_sync_send<T: Sync + Send>() {}
-        assert_sync_send::<Ssh3SessionImpl>();
+        assert_sync_send::<Ssh3Session>();
     }
 
     // -----------------------------------------------------------------------
@@ -409,7 +462,7 @@ mod tests {
     ///   ChannelOpenConfirmation → ChannelSuccess → ChannelData → exit-status → EOF → Close
     #[tokio::test]
     async fn byte_bridge_session_echo() {
-        let session = Ssh3SessionImpl::new();
+        let session = Ssh3Session::new();
 
         // Create remoc channel pairs for the session channel.
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
@@ -512,7 +565,6 @@ mod tests {
         assert!(result.unwrap().is_ok(), "session task panicked");
     }
 
-    /// `handle_channel_inner` rejects unknown channel types.
     #[tokio::test]
     async fn handle_channel_rejects_unknown_type() {
         let header = ChannelHeader {
@@ -533,7 +585,7 @@ mod tests {
             conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
         });
 
-        let result = Ssh3SessionImpl::handle_channel_inner(header, from_rx, to_tx, ctx).await;
+        let result = Ssh3Session::handle_non_session_channel(header, from_rx, to_tx, ctx).await;
         assert!(result.is_err(), "expected error for unknown channel type");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -542,7 +594,6 @@ mod tests {
         );
     }
 
-    /// `handle_channel_inner` dispatches `direct-tcpip` correctly.
     #[tokio::test]
     async fn handle_channel_dispatches_direct_tcpip() {
         let header = ChannelHeader {
@@ -563,8 +614,7 @@ mod tests {
             conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
         });
 
-        let result = Ssh3SessionImpl::handle_channel_inner(header, from_rx, to_tx, ctx).await;
-        // Should NOT be "unknown channel type" — it was dispatched correctly.
+        let result = Ssh3Session::handle_non_session_channel(header, from_rx, to_tx, ctx).await;
         match result {
             Ok(()) => { /* handler may succeed with empty body in some cases */ }
             Err(e) => {
@@ -577,7 +627,6 @@ mod tests {
         }
     }
 
-    /// `handle_channel_inner` dispatches `global-request` with context.
     #[tokio::test]
     async fn handle_channel_global_request_needs_context() {
         let header = ChannelHeader {
@@ -598,10 +647,7 @@ mod tests {
             conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
         });
 
-        // With context provided, handle_channel_inner dispatches to global-request handler.
-        // It will fail parsing since we close the channel immediately, but the error
-        // won't be about missing context.
-        let result = Ssh3SessionImpl::handle_channel_inner(header, from_rx, to_tx, ctx).await;
+        let result = Ssh3Session::handle_non_session_channel(header, from_rx, to_tx, ctx).await;
         match result {
             Ok(()) => { /* handler may succeed with empty global-request channel */ }
             Err(e) => {
@@ -617,7 +663,7 @@ mod tests {
     /// `run()` sends ChannelOpenConfirmation as the first message on a session channel.
     #[tokio::test]
     async fn run_session_sends_confirmation_first() {
-        let session = Ssh3SessionImpl::new();
+        let session = Ssh3Session::new();
 
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);

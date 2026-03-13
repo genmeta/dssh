@@ -21,6 +21,7 @@ use h3x::{
 use snafu::Report;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use crate::channel::ChannelEvent;
 use crate::session::pty::{
@@ -354,7 +355,7 @@ where
             }
         }
         drop(stdin); // Close stdin to signal EOF to child
-    });
+    }.in_current_span());
 
     // Read stdout and stderr concurrently, sending as channel messages.
     let (stdout_result, stderr_result) = tokio::join!(
@@ -491,7 +492,7 @@ where
             }
         }
         drop(master_writer);
-    });
+    }.in_current_span());
 
     // Read from PTY master → ChannelData (PTY combines stdout+stderr).
     let stdout_result = copy_stream_to_channel_data(&mut master_reader, writer).await;

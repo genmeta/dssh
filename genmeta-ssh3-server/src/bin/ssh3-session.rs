@@ -17,7 +17,8 @@ use genmeta_ssh3_proto::auth::AuthCredential;
 use genmeta_ssh3_proto::session::{AuthResult, ChildBootstrap};
 #[cfg(feature = "pam")]
 use genmeta_ssh3_server::auth::pam::{pam_authenticate, SystemPam};
-use genmeta_ssh3_server::session_impl::Ssh3SessionImpl;
+use genmeta_ssh3_server::session_driver::Ssh3Session;
+use tracing::Instrument;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -37,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         remoc::rch::base::Sender<AuthResult>,
         remoc::rch::base::Receiver<ChildBootstrap>,
     ) = remoc::Connect::io(remoc::Cfg::default(), stdin, stdout).await?;
-    tokio::spawn(conn);
+    tokio::spawn(conn.in_current_span());
 
     tracing::debug!("remoc connection established");
 
@@ -86,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shell,
         };
 
-        let session = Ssh3SessionImpl::new();
+        let session = Ssh3Session::new();
         session.run(bootstrap.transport, init).await?;
     }
 
