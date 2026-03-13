@@ -27,9 +27,40 @@ use tokio::io::{self, duplex, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use genmeta_ssh3_server::channel::GlobalRequestContext;
-use genmeta_ssh3_server::forward::StreamFactory;
 use genmeta_ssh3_server::forward::reverse_tcp::{ReverseTcpForwarder, TcpipForwardRequest, CancelTcpipForwardRequest, TcpipForwardReply};
 use genmeta_ssh3_server::forward::streamlocal::{ReverseStreamlocalForwarder, StreamlocalForwardRequest};
+use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
+use remoc::rtc::ServerShared;
+
+struct TestTransport;
+
+impl Ssh3Transport for TestTransport {
+    async fn accept_channel(&self) -> Result<
+        Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+        TransportError,
+    > {
+        Ok(None)
+    }
+
+    async fn open_channel(
+        &self,
+        _header: Option<ChannelHeader>,
+    ) -> Result<
+        (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+        TransportError,
+    > {
+        let (tx, rx) = remoc::rch::mpsc::channel(16);
+        Ok((rx, tx))
+    }
+}
+
+fn test_transport_client() -> Ssh3TransportClient {
+    let (server, client) = Ssh3TransportServerShared::new(Arc::new(TestTransport), 16);
+    tokio::spawn(async move {
+        let _ = server.serve(true).await;
+    });
+    client
+}
 
 // ---------------------------------------------------------------------------
 // Helper: build the standard SSH3 server (handler wrapped in TowerService).
@@ -1185,20 +1216,11 @@ fn test_global_request_tcpip_forward() {
     run("test_global_request_tcpip_forward", async move {
         let tcp_forwarder = Arc::new(ReverseTcpForwarder::new());
         let streamlocal_forwarder = Arc::new(ReverseStreamlocalForwarder::new());
-        let stream_factory: StreamFactory = Arc::new(|| {
-            Box::pin(async {
-                let (a, _b) = tokio::io::duplex(8192);
-                let (ar, aw) = tokio::io::split(a);
-                Ok((
-                    Box::new(ar) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-                    Box::new(aw) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-                ))
-            })
-        });
+        let transport = test_transport_client();
         let ctx = Arc::new(GlobalRequestContext {
             tcp_forwarder: tcp_forwarder.clone(),
             streamlocal_forwarder: streamlocal_forwarder.clone(),
-            stream_factory,
+            transport,
             conversation_id: 1,
         });
 
@@ -1261,20 +1283,11 @@ fn test_global_request_cancel_tcpip_forward() {
             let tcp = tcp_forwarder.clone();
             let sl = streamlocal_forwarder.clone();
             move || {
-                let stream_factory: StreamFactory = Arc::new(|| {
-                    Box::pin(async {
-                        let (a, _b) = tokio::io::duplex(8192);
-                        let (ar, aw) = tokio::io::split(a);
-                        Ok((
-                            Box::new(ar) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-                            Box::new(aw) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-                        ))
-                    })
-                });
+                let transport = test_transport_client();
                 Arc::new(GlobalRequestContext {
                     tcp_forwarder: tcp.clone(),
                     streamlocal_forwarder: sl.clone(),
-                    stream_factory,
+                    transport,
                     conversation_id: 1,
                 })
             }
@@ -1368,24 +1381,66 @@ fn test_reverse_tcp_forwarded_channel() {
         let tcp_forwarder = Arc::new(ReverseTcpForwarder::new());
         let streamlocal_forwarder = Arc::new(ReverseStreamlocalForwarder::new());
 
-        // stream_factory that captures the client end via mpsc channel.
+        // transport that captures the client end via mpsc channel.
         let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<tokio::io::DuplexStream>();
-        let stream_factory: StreamFactory = Arc::new(move || {
-            let tx = stream_tx.clone();
-            Box::pin(async move {
+        struct CapturingTransport {
+            tx: mpsc::UnboundedSender<tokio::io::DuplexStream>,
+        }
+        impl Ssh3Transport for CapturingTransport {
+            async fn accept_channel(&self) -> Result<
+                Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+                TransportError,
+            > { Ok(None) }
+            async fn open_channel(
+                &self,
+                _header: Option<ChannelHeader>,
+            ) -> Result<
+                (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+                TransportError,
+            > {
                 let (server_end, client_end) = tokio::io::duplex(65536);
-                let _ = tx.send(client_end);
-                let (r, w) = tokio::io::split(server_end);
-                Ok((
-                    Box::new(r) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-                    Box::new(w) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-                ))
-            })
+                let _ = self.tx.send(client_end);
+                let (server_read, server_write) = tokio::io::split(server_end);
+                let (to_client_tx, to_client_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) =
+                    remoc::rch::mpsc::channel(64);
+                let (from_client_tx, from_client_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) =
+                    remoc::rch::mpsc::channel(64);
+                tokio::spawn(async move {
+                    let mut reader = server_read;
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        let n = match reader.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if to_client_tx.send(buf[..n].to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    let mut writer = server_write;
+                    let mut rx = from_client_rx;
+                    while let Ok(Some(data)) = rx.recv().await {
+                        if writer.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok((to_client_rx, from_client_tx))
+            }
+        }
+        let (server, transport) = Ssh3TransportServerShared::new(
+            Arc::new(CapturingTransport { tx: stream_tx.clone() }),
+            16,
+        );
+        tokio::spawn(async move {
+            let _ = server.serve(true).await;
         });
         let ctx = Arc::new(GlobalRequestContext {
             tcp_forwarder: tcp_forwarder.clone(),
             streamlocal_forwarder: streamlocal_forwarder.clone(),
-            stream_factory,
+            transport,
             conversation_id: 1,
         });
 
@@ -1422,15 +1477,12 @@ fn test_reverse_tcp_forwarded_channel() {
             .await
             .expect("should connect to forwarded port");
 
-        // Step 3: The forwarder's accept loop calls stream_factory, giving us
-        // the client_end via the mpsc channel. Read ChannelHeader + request_data
-        // from it, then send confirmation and bridge data.
         let client_end = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             stream_rx.recv(),
         )
         .await
-        .expect("timeout waiting for stream_factory")
+        .expect("timeout waiting for transport open_channel")
         .expect("stream_rx closed");
 
         let (mut client_end_reader, mut client_end_writer) = tokio::io::split(client_end);
@@ -1452,18 +1504,16 @@ fn test_reverse_tcp_forwarded_channel() {
             .encode_into(&mut client_end_writer)
             .await
             .unwrap();
+        drop(client_end_writer);
 
         // Step 4: Bidirectional data — write from TCP, read from client_end and vice versa.
         tcp_stream.write_all(b"hello-from-tcp").await.unwrap();
         tcp_stream.shutdown().await.unwrap();
 
-        // Read data from the QUIC side (relayed from TCP).
-        let mut buf = Vec::new();
-        client_end_reader.read_to_end(&mut buf).await.unwrap();
+        let mut buf = vec![0u8; b"hello-from-tcp".len()];
+        client_end_reader.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, b"hello-from-tcp", "data from TCP should arrive on QUIC side");
 
-        // Clean up.
-        drop(client_end_writer);
         tcp_forwarder.stop_listening("127.0.0.1", allocated_port as u16).await;
     })
 }
@@ -1477,20 +1527,11 @@ fn test_global_request_unknown_type() {
     run("test_global_request_unknown_type", async move {
         let tcp_forwarder = Arc::new(ReverseTcpForwarder::new());
         let streamlocal_forwarder = Arc::new(ReverseStreamlocalForwarder::new());
-        let stream_factory: StreamFactory = Arc::new(|| {
-            Box::pin(async {
-                let (a, _b) = tokio::io::duplex(8192);
-                let (ar, aw) = tokio::io::split(a);
-                Ok((
-                    Box::new(ar) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-                    Box::new(aw) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-                ))
-            })
-        });
+        let transport = test_transport_client();
         let ctx = Arc::new(GlobalRequestContext {
             tcp_forwarder,
             streamlocal_forwarder,
-            stream_factory,
+            transport,
             conversation_id: 1,
         });
 
@@ -1533,20 +1574,11 @@ fn test_global_request_streamlocal_forward() {
     run("test_global_request_streamlocal_forward", async move {
         let tcp_forwarder = Arc::new(ReverseTcpForwarder::new());
         let streamlocal_forwarder = Arc::new(ReverseStreamlocalForwarder::new());
-        let stream_factory: StreamFactory = Arc::new(|| {
-            Box::pin(async {
-                let (a, _b) = tokio::io::duplex(8192);
-                let (ar, aw) = tokio::io::split(a);
-                Ok((
-                    Box::new(ar) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-                    Box::new(aw) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-                ))
-            })
-        });
+        let transport = test_transport_client();
         let ctx = Arc::new(GlobalRequestContext {
             tcp_forwarder,
             streamlocal_forwarder: streamlocal_forwarder.clone(),
-            stream_factory,
+            transport,
             conversation_id: 1,
         });
 

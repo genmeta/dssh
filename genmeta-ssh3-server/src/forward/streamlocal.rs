@@ -32,12 +32,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
+use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient};
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeInto};
 use h3x::varint::VarInt;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+
+use crate::byte_channel::{ChannelReader, ChannelWriter};
 
 /// Default maximum message size advertised in ChannelOpenConfirmation.
 const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
@@ -216,7 +219,7 @@ impl ReverseStreamlocalForwarder {
     pub async fn start_listening(
         &self,
         socket_path: &str,
-        stream_factory: super::StreamFactory,
+        transport: Ssh3TransportClient,
         conversation_id: u64,
     ) -> io::Result<()> {
         let listener = UnixListener::bind(socket_path)?;
@@ -231,12 +234,14 @@ impl ReverseStreamlocalForwarder {
             loop {
                 match listener.accept().await {
                     Ok((unix_stream, _peer_addr)) => {
-                        let factory = stream_factory.clone();
+                        let transport = transport.clone();
                         let path = socket_path_clone.clone();
                         let conv_id = conversation_id;
                         tokio::spawn(async move {
-                            match factory().await {
-                                Ok((reader, writer)) => {
+                            match transport.open_channel(None).await {
+                                Ok((from_remote_rx, to_remote_tx)) => {
+                                    let reader = ChannelReader::new(from_remote_rx);
+                                    let writer = ChannelWriter::new(to_remote_tx);
                                     if let Err(e) = handle_forwarded_streamlocal_channel(
                                         reader, writer, unix_stream,
                                         &path,
@@ -246,7 +251,7 @@ impl ReverseStreamlocalForwarder {
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!(%e, "failed to open QUIC stream for forwarded-streamlocal");
+                                    tracing::warn!(%e, "failed to open transport channel for forwarded-streamlocal");
                                 }
                             }
                         });
@@ -378,18 +383,41 @@ where
 mod tests {
     use super::*;
     use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
+    use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
     use h3x::codec::{DecodeExt, EncodeExt};
     use h3x::varint::VarInt;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use remoc::rtc::ServerShared;
 
-    fn test_stream_factory() -> crate::forward::StreamFactory {
-        Arc::new(|| Box::pin(async {
-            let (client, _server) = tokio::io::duplex(8192);
-            let (cr, cw) = tokio::io::split(client);
-            Ok((Box::new(cr) as Box<dyn AsyncRead + Send + Unpin>,
-                Box::new(cw) as Box<dyn AsyncWrite + Send + Unpin>))
-        }))
+    struct TestTransport;
+
+    impl Ssh3Transport for TestTransport {
+        async fn accept_channel(&self) -> Result<
+            Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+            TransportError,
+        > {
+            Ok(None)
+        }
+
+        async fn open_channel(
+            &self,
+            _header: Option<ChannelHeader>,
+        ) -> Result<
+            (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            TransportError,
+        > {
+            let (tx, rx) = remoc::rch::mpsc::channel(16);
+            Ok((rx, tx))
+        }
+    }
+
+    fn test_transport_client() -> Ssh3TransportClient {
+        let (server, client) = Ssh3TransportServerShared::new(Arc::new(TestTransport), 16);
+        tokio::spawn(async move {
+            let _ = server.serve(true).await;
+        });
+        client
     }
     /// Atomic counter for unique test socket paths.
     static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -616,7 +644,7 @@ mod tests {
         let sock_path = test_sock_path("fwd-startstop");
 
         // Start listening.
-        forwarder.start_listening(&sock_path, test_stream_factory(), 1).await.unwrap();
+        forwarder.start_listening(&sock_path, test_transport_client(), 1).await.unwrap();
 
         // Verify the listener is active by checking internal state.
         {

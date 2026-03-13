@@ -6,7 +6,6 @@
 //! loop (PTY, shell, exec) over byte-channel adapters bridging remoc channels
 //! to `AsyncRead`/`AsyncWrite`.
 
-use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
@@ -14,12 +13,10 @@ use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::message::SshMessage;
 use genmeta_ssh3_proto::session::{SessionError, SessionInit, Ssh3Transport, Ssh3TransportClient};
 use h3x::codec::EncodeInto;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::byte_channel::{ChannelReader, ChannelWriter};
 use crate::channel::{run_message_loop_with_sender, ChannelEvent, GlobalRequestContext, DEFAULT_MAX_MESSAGE_SIZE};
-use crate::forward;
 use crate::forward::reverse_tcp::ReverseTcpForwarder;
 use crate::forward::streamlocal::ReverseStreamlocalForwarder;
 use crate::session::pty::{allocate_pty, set_window_size, PtyPair};
@@ -70,17 +67,14 @@ impl Ssh3SessionImpl {
     /// Run the session by pulling channels from the transport.
     ///
     /// 1. Drops privileges to the authenticated user.
-    /// 2. Builds a `StreamFactory` from the transport for reverse forwarding.
     /// 3. Enters the channel-accept loop, dispatching session and non-session channels.
     pub async fn run(self, transport: Ssh3TransportClient, init: SessionInit) -> Result<(), SessionError> {
         drop_privileges(init.uid, init.gid)?;
 
-        let stream_factory = build_stream_factory_from_transport(transport.clone());
-
         let global_ctx = Arc::new(GlobalRequestContext {
             tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
             streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
-            stream_factory,
+            transport: transport.clone(),
             conversation_id: init.conversation_id,
         });
 
@@ -227,27 +221,6 @@ impl Default for Ssh3SessionImpl {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Build a [`StreamFactory`] backed by the transport client's `open_channel`.
-fn build_stream_factory_from_transport(
-    transport: Ssh3TransportClient,
-) -> forward::StreamFactory {
-    Arc::new(move || {
-        let caller = transport.clone();
-        Box::pin(async move {
-            let (from_remote_rx, to_remote_tx) = caller
-                .open_channel(None)
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))?;
-
-            let reader = Box::new(ChannelReader::new(from_remote_rx))
-                as Box<dyn AsyncRead + Send + Unpin>;
-            let writer = Box::new(ChannelWriter::new(to_remote_tx))
-                as Box<dyn AsyncWrite + Send + Unpin>;
-            Ok((reader, writer))
-        })
-    })
 }
 
 #[cfg(test)]
@@ -554,7 +527,7 @@ mod tests {
         let ctx = Arc::new(GlobalRequestContext {
             tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
             streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
-            stream_factory: build_stream_factory_from_transport(mock_transport_client()),
+            transport: mock_transport_client(),
             conversation_id: 42,
         });
 
@@ -584,7 +557,7 @@ mod tests {
         let ctx = Arc::new(GlobalRequestContext {
             tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
             streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
-            stream_factory: build_stream_factory_from_transport(mock_transport_client()),
+            transport: mock_transport_client(),
             conversation_id: 42,
         });
 
@@ -619,7 +592,7 @@ mod tests {
         let ctx = Arc::new(GlobalRequestContext {
             tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
             streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
-            stream_factory: build_stream_factory_from_transport(mock_transport_client()),
+            transport: mock_transport_client(),
             conversation_id: 42,
         });
 
