@@ -303,7 +303,9 @@ where
             ChannelEvent::Request { .. } => {
                 match handle_request(&event, &mut writer).await? {
                     Some(RequestAction::Exec(cmd)) => {
-                        run_exec(&cmd, &mut writer, event_rx, pty_pair.take()).await?;
+                        let shell = std::env::var_os("SHELL")
+                            .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"));
+                        run_exec(shell.as_os_str(), &cmd, &mut writer, event_rx, pty_pair.take()).await?;
                         return Ok(());
                     }
                     Some(RequestAction::Shell) => {

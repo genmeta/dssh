@@ -475,7 +475,9 @@ fn test_basic_exec() {
 
         // Server: run the exec command.
         let (_, rx) = mpsc::channel(1);
-        run_exec("echo hello", &mut server_writer, rx, None).await.expect("run_exec failed");
+        run_exec(std::ffi::OsStr::new("/bin/sh"), "echo hello", &mut server_writer, rx, None)
+            .await
+            .expect("run_exec failed");
         drop(server_writer);
 
         // Client: collect all remaining messages from server.
@@ -570,7 +572,9 @@ fn test_exec_with_stderr() {
 
         // Server: run the exec command (produces stderr).
         let (_, rx) = mpsc::channel(1);
-        run_exec("echo stderr_msg >&2", &mut server_writer, rx, None).await.expect("run_exec failed");
+        run_exec(std::ffi::OsStr::new("/bin/sh"), "echo stderr_msg >&2", &mut server_writer, rx, None)
+            .await
+            .expect("run_exec failed");
         drop(server_writer);
 
         // Client: collect all messages.
@@ -729,7 +733,9 @@ fn test_multiple_channels() {
 
                 // Run exec and collect results.
         let (_, rx) = mpsc::channel(1);
-                run_exec(&cmd, &mut server_writer, rx, None).await.expect("run_exec failed");
+                run_exec(std::ffi::OsStr::new("/bin/sh"), &cmd, &mut server_writer, rx, None)
+                    .await
+                    .expect("run_exec failed");
                 drop(server_writer);
 
                 let mut messages = Vec::new();
@@ -1845,7 +1851,7 @@ fn test_session_exec_flow() {
 
         // Server: execute the command.
         let (_, rx) = mpsc::channel(1);
-        run_exec("echo session_flow_test", &mut server_writer, rx, None)
+        run_exec(std::ffi::OsStr::new("/bin/sh"), "echo session_flow_test", &mut server_writer, rx, None)
             .await
             .expect("run_exec failed");
         drop(server_writer);

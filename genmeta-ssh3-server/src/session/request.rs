@@ -14,10 +14,6 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::ffi::OsStr;
 use std::process::Stdio;
 
-fn default_shell() -> &'static OsStr {
-    OsStr::new("/bin/sh")
-}
-
 use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
 use h3x::{
     codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
@@ -165,6 +161,11 @@ pub fn encode_exit_status(exit_code: u32) -> Vec<u8> {
     }
 }
 
+#[cfg(test)]
+fn default_shell() -> &'static OsStr {
+    OsStr::new("/bin/sh")
+}
+
 /// Encode exit-signal request_data.
 pub async fn encode_exit_signal_data(
     signal_name: &str,
@@ -273,12 +274,13 @@ where
 // Exec/Shell/Subsystem handlers
 // ---------------------------------------------------------------------------
 
-/// Spawn `/bin/sh -c <command>`, copy stdout → ChannelData, stderr →
+/// Spawn `<shell> -c <command>`, copy stdout → ChannelData, stderr →
 /// ChannelExtendedData, then send exit-status + EOF + Close.
 ///
 /// When `pty` is `Some`, the child process uses the PTY slave as stdin/stdout/stderr,
 /// and the PTY master is used for I/O relay.
 pub async fn run_exec<W>(
+    shell_path: &OsStr,
     command: &str,
     writer: &mut W,
     event_rx: mpsc::Receiver<ChannelEvent>,
@@ -288,9 +290,9 @@ where
     W: AsyncWrite + Send + Unpin,
 {
     if let Some(pty_pair) = pty {
-        run_command_with_pty(default_shell(), &["-c", command], writer, event_rx, pty_pair).await
+        run_command_with_pty(shell_path, &["-c", command], writer, event_rx, pty_pair).await
     } else {
-        run_command_piped(default_shell(), &["-c", command], writer, event_rx).await
+        run_command_piped(shell_path, &["-c", command], writer, event_rx).await
     }
 }
 
@@ -694,7 +696,7 @@ mod tests {
 
         // Run "echo hello" and capture all output.
         let (_, rx) = mpsc::channel(1);
-        run_exec("echo hello", &mut server_writer, rx, None).await.unwrap();
+        run_exec(default_shell(), "echo hello", &mut server_writer, rx, None).await.unwrap();
         drop(server_writer);
 
         // Collect all messages sent to the client.
@@ -785,7 +787,7 @@ mod tests {
 
         // Run a command that will fail (nonexistent binary).
         let (_, rx) = mpsc::channel(1);
-        run_exec("__nonexistent_command_xyz_2024__", &mut server_writer, rx, None)
+        run_exec(default_shell(), "__nonexistent_command_xyz_2024__", &mut server_writer, rx, None)
             .await
             .unwrap();
         drop(server_writer);
@@ -1174,7 +1176,7 @@ mod tests {
         let mut server_writer = server_writer;
 
         let (_, rx) = mpsc::channel(1);
-        run_exec("echo stderr_msg >&2", &mut server_writer, rx, None)
+        run_exec(default_shell(), "echo stderr_msg >&2", &mut server_writer, rx, None)
             .await
             .unwrap();
         drop(server_writer);
