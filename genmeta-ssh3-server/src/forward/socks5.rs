@@ -534,11 +534,6 @@ mod tests {
 
     #[tokio::test]
     async fn socks5_connect_refused() {
-        // Bind then drop to get a port that's not listening.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
         let (mut client_writer, server_reader) = duplex(8192);
         let (server_writer, mut client_reader) = duplex(8192);
 
@@ -548,7 +543,7 @@ mod tests {
                 .await
                 .unwrap();
             client_writer
-                .write_all(&socks5_connect_ipv4([127, 0, 0, 1], port))
+                .write_all(&socks5_connect_ipv4([127, 0, 0, 1], 1))
                 .await
                 .unwrap();
             drop(client_writer);

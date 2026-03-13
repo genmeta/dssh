@@ -243,13 +243,8 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_connect_failure() {
-        // Bind then immediately drop to get a port that's not listening.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
         let request_data =
-            encode_request_data("127.0.0.1", port as u32, "127.0.0.1", 11111).await;
+            encode_request_data("127.0.0.1", 1, "127.0.0.1", 11111).await;
 
         let header = ChannelHeader {
             signal_value: 0xaf3627e6,
