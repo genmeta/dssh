@@ -7,7 +7,7 @@
 //! conversation stream plus an mpsc receiver for dispatched channel streams.
 #![allow(dead_code)]
 
-use std::{future::Future, ops::DerefMut, pin::Pin};
+use std::{future::Future, ops::DerefMut, pin::Pin, sync::Arc};
 
 use h3x::{
     codec::{DecodeExt, DecodeFrom, EncodeInto},
@@ -28,23 +28,8 @@ const SSH_MSG_GLOBAL_REQUEST: u64 = 80;
 const SSH_MSG_REQUEST_SUCCESS: u64 = 81;
 const SSH_MSG_REQUEST_FAILURE: u64 = 82;
 
-// ---------------------------------------------------------------------------
-// StreamFactory — abstraction for opening new bidirectional streams
-// ---------------------------------------------------------------------------
-
-/// Creates new bidirectional stream pairs.
-///
-/// In production this maps to QUIC `open_bi()`.  In tests a
-#[allow(clippy::type_complexity)]
-/// `tokio::io::duplex()` pair is returned instead.
-pub(crate) trait StreamFactory: Send + Sync {
-    type Read: AsyncRead + Send + Unpin;
-    type Write: AsyncWrite + Send + Unpin;
-
-    fn open_bi(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = io::Result<(Self::Read, Self::Write)>> + Send + '_>>;
-}
+type OpenBiFuture<R, W> = Pin<Box<dyn Future<Output = io::Result<(R, W)>> + Send>>;
+type OpenBiOpener<R, W> = dyn Fn() -> OpenBiFuture<R, W> + Send + Sync;
 
 // ---------------------------------------------------------------------------
 // Conversation trait
@@ -181,33 +166,43 @@ pub(crate) async fn encode_request_failure<S: AsyncWrite + Send + Unpin>(
 /// Server-side conversation backed by a CONNECT stream and an mpsc dispatch
 /// queue for inbound channels.
 #[allow(clippy::type_complexity)]
-pub(crate) struct LocalConversation<F: StreamFactory> {
+pub(crate) struct LocalConversation<R, W>
+where
+    R: AsyncRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin,
+{
     conversation_id: u64,
     /// Read half of the conversation (CONNECT) stream.
-    conversation_reader: tokio::sync::Mutex<F::Read>,
+    conversation_reader: tokio::sync::Mutex<R>,
     /// Write half of the conversation (CONNECT) stream.
-    conversation_writer: tokio::sync::Mutex<F::Write>,
+    conversation_writer: tokio::sync::Mutex<W>,
     /// Receiver for dispatched channel streams.
-    channel_rx: tokio::sync::Mutex<mpsc::Receiver<(ChannelHeader, F::Read, F::Write)>>,
-    /// Factory to create new outbound streams.
-    stream_factory: F,
+    channel_rx: tokio::sync::Mutex<mpsc::Receiver<(ChannelHeader, R, W)>>,
+    opener: Arc<OpenBiOpener<R, W>>,
 }
 
-impl<F: StreamFactory> LocalConversation<F> {
+impl<R, W> LocalConversation<R, W>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
     /// Create a new `LocalConversation`.
-    pub fn new(
+    pub fn new<O>(
         conversation_id: u64,
-        conversation_reader: F::Read,
-        conversation_writer: F::Write,
-        channel_rx: mpsc::Receiver<(ChannelHeader, F::Read, F::Write)>,
-        stream_factory: F,
-    ) -> Self {
+        conversation_reader: R,
+        conversation_writer: W,
+        channel_rx: mpsc::Receiver<(ChannelHeader, R, W)>,
+        opener: O,
+    ) -> Self
+    where
+        O: Fn() -> OpenBiFuture<R, W> + Send + Sync + 'static,
+    {
         Self {
             conversation_id,
             conversation_reader: tokio::sync::Mutex::new(conversation_reader),
             conversation_writer: tokio::sync::Mutex::new(conversation_writer),
             channel_rx: tokio::sync::Mutex::new(channel_rx),
-            stream_factory,
+            opener: Arc::new(opener),
         }
     }
 }
@@ -215,21 +210,20 @@ impl<F: StreamFactory> LocalConversation<F> {
 /// Signal value for channel headers written by `open_channel`.
 const CHANNEL_SIGNAL_VALUE: u32 = 0xaf3627e6;
 
-impl<F> Conversation for LocalConversation<F>
+impl<R, W> Conversation for LocalConversation<R, W>
 where
-    F: StreamFactory + Send + Sync,
-    F::Read: 'static,
-    F::Write: 'static,
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
 {
-    type Read = F::Read;
-    type Write = F::Write;
+    type Read = R;
+    type Write = W;
 
     async fn open_channel(
         &self,
         channel_type: &str,
         max_message_size: u64,
     ) -> io::Result<(Self::Read, Self::Write)> {
-        let (read, mut write) = self.stream_factory.open_bi().await?;
+        let (read, mut write) = (self.opener.as_ref())().await?;
 
         let header = ChannelHeader {
             signal_value: CHANNEL_SIGNAL_VALUE,
@@ -322,39 +316,6 @@ mod tests {
     use super::*;
     use tokio::io::{duplex, DuplexStream};
 
-    // -- ChannelStreamFactory: test factory backed by mpsc channel --
-
-    /// A [`StreamFactory`] that returns pre-loaded stream pairs from an mpsc
-    /// channel, giving the test full control over which streams are used.
-    struct ChannelStreamFactory {
-        rx: tokio::sync::Mutex<mpsc::Receiver<(DuplexStream, DuplexStream)>>,
-    }
-
-    impl ChannelStreamFactory {
-        fn new(rx: mpsc::Receiver<(DuplexStream, DuplexStream)>) -> Self {
-            Self {
-                rx: tokio::sync::Mutex::new(rx),
-            }
-        }
-    }
-
-    impl StreamFactory for ChannelStreamFactory {
-        type Read = DuplexStream;
-        type Write = DuplexStream;
-
-        fn open_bi(
-            &self,
-        ) -> Pin<Box<dyn Future<Output = io::Result<(Self::Read, Self::Write)>> + Send + '_>>
-        {
-            Box::pin(async {
-                let mut rx = self.rx.lock().await;
-                rx.recv().await.ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "stream factory closed")
-                })
-            })
-        }
-    }
-
     /// Helper: build a [`LocalConversation`] wired to duplex streams.
     ///
     /// Returns:
@@ -362,10 +323,9 @@ mod tests {
     /// - remote write half (writes arrive at conversation reader)
     /// - remote read half (reads from conversation writer)
     /// - channel dispatch sender
-    /// - stream factory sender (pre-load streams for `open_channel`)
     #[allow(clippy::type_complexity)]
     fn make_conversation() -> (
-        LocalConversation<ChannelStreamFactory>,
+        LocalConversation<DuplexStream, DuplexStream>,
         DuplexStream,
         DuplexStream,
         mpsc::Sender<(ChannelHeader, DuplexStream, DuplexStream)>,
@@ -377,14 +337,23 @@ mod tests {
 
         let (ch_tx, ch_rx) = mpsc::channel(16);
         let (stream_tx, stream_rx) = mpsc::channel(16);
-        let factory = ChannelStreamFactory::new(stream_rx);
+        let stream_rx = Arc::new(tokio::sync::Mutex::new(stream_rx));
+        let stream_rx_for_opener = Arc::clone(&stream_rx);
 
         let conv = LocalConversation::new(
             42,
             conv_local_read,
             conv_local_write,
             ch_rx,
-            factory,
+            move || {
+                let stream_rx = Arc::clone(&stream_rx_for_opener);
+                Box::pin(async move {
+                    let mut rx = stream_rx.lock().await;
+                    rx.recv().await.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "open stream source closed")
+                    })
+                })
+            },
         );
 
         (conv, conv_remote_write, conv_remote_read, ch_tx, stream_tx)
