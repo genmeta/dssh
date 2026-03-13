@@ -198,9 +198,17 @@ mod tests {
 
         // Build a real Ssh3TransportImpl with an empty channel (no QUIC streams).
         let (_dispatch_tx, dispatch_rx) = tokio::sync::mpsc::channel(1);
-        let handle = crate::channel::ConversationHandle::new(0, dispatch_rx, None);
+        let opener: crate::channel::OpenBiFactory = std::sync::Arc::new(|| {
+            Box::pin(async {
+                Err(tokio::io::Error::new(
+                    tokio::io::ErrorKind::Unsupported,
+                    "child test transport does not open streams",
+                ))
+            })
+        });
+        let endpoint = crate::channel::ConversationEndpoint::new(0, dispatch_rx, opener);
         let transport_impl =
-            std::sync::Arc::new(crate::channel::Ssh3TransportImpl::new(handle));
+            std::sync::Arc::new(crate::channel::Ssh3TransportImpl::new(endpoint));
 
         use genmeta_ssh3_proto::session::Ssh3TransportServerShared;
         use remoc::rtc::ServerShared;
@@ -215,6 +223,7 @@ mod tests {
                 username: "testuser".into(),
                 password: "testpass".into(),
             },
+            conversation_id: 42,
         };
 
         bootstrap_tx

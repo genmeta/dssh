@@ -7,18 +7,16 @@
 //! - Sending `ChannelOpenConfirmation(91)` or `ChannelOpenFailure(92)`
 //! - Running the session channel message loop (data, requests, EOF, close)
 
-use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::{future::Future, os::fd::AsRawFd, pin::Pin, sync::Arc};
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
-use genmeta_ssh3_proto::session::{Ssh3Transport, TransportError};
+use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient, TransportError};
 use h3x::codec::{DecodeFrom, EncodeInto};
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
 
-use crate::forward;
 use crate::forward::reverse_tcp::ReverseTcpForwarder;
 use crate::forward::streamlocal::ReverseStreamlocalForwarder;
 use crate::session::pty::{PtyPair, allocate_pty, set_window_size};
@@ -38,8 +36,8 @@ pub struct GlobalRequestContext {
     pub tcp_forwarder: Arc<ReverseTcpForwarder>,
     /// Reverse streamlocal forwarder (manages `streamlocal-forward@openssh.com` listeners).
     pub streamlocal_forwarder: Arc<ReverseStreamlocalForwarder>,
-    /// Factory for opening server-initiated QUIC bidirectional streams.
-    pub stream_factory: forward::StreamFactory,
+    /// Parent transport client used to open server-initiated channels.
+    pub transport: Ssh3TransportClient,
     /// Conversation ID for opened channels.
     pub conversation_id: u64,
 }
@@ -164,7 +162,7 @@ where
             match ctx.tcp_forwarder.start_listening(
                 &req.bind_address,
                 req.bind_port as u16,
-                ctx.stream_factory.clone(),
+                ctx.transport.clone(),
                 ctx.conversation_id,
             ).await {
                 Ok(actual_port) => {
@@ -216,7 +214,7 @@ where
             );
             match ctx.streamlocal_forwarder.start_listening(
                 &req.socket_path,
-                ctx.stream_factory.clone(),
+                ctx.transport.clone(),
                 ctx.conversation_id,
             ).await {
                 Ok(()) => {
@@ -355,68 +353,21 @@ where
 
 /// Handle an open-channel request from the child process.
 ///
-/// Opens a new QUIC bidirectional stream via `stream_factory`, optionally
-/// writes the `ChannelHeader`, creates byte bridges, and returns remoc
+/// Opens a new channel via transport and returns remoc
 /// channel endpoints to the child.
 pub async fn handle_open_channel_request(
     header: Option<ChannelHeader>,
-    stream_factory: &forward::StreamFactory,
+    transport: &Ssh3TransportClient,
 ) -> Result<
     (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
     genmeta_ssh3_proto::session::SessionError,
 > {
     use genmeta_ssh3_proto::session::SessionError;
 
-    // 1. Open a new QUIC bidirectional stream.
-    let (quic_reader, mut quic_writer) = stream_factory()
+    let (from_remote_rx, to_remote_tx) = transport
+        .open_channel(header)
         .await
         .map_err(|e| SessionError::new(e.to_string()))?;
-
-    // 2. Write ChannelHeader if provided; skip if None (caller writes its own data).
-    if let Some(h) = &header {
-        h.encode_into(&mut quic_writer)
-            .await
-            .map_err(|e| SessionError::new(e.to_string()))?;
-        quic_writer
-            .flush()
-            .await
-            .map_err(|e| SessionError::new(e.to_string()))?;
-    }
-
-    // 3. Create remoc byte channel pairs for the child.
-    let (from_remote_tx, from_remote_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) = remoc::rch::mpsc::channel(64);
-    let (to_remote_tx, to_remote_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) = remoc::rch::mpsc::channel(64);
-
-    // 4. Spawn byte bridge: QUIC reader → from_remote_tx
-    tokio::spawn(async move {
-        let mut quic_reader = quic_reader;
-        let mut buf = vec![0u8; 8192];
-        loop {
-            let n = match quic_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            if from_remote_tx.send(buf[..n].to_vec()).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // 5. Spawn byte bridge: to_remote_rx → QUIC writer
-    tokio::spawn(async move {
-        let mut to_remote_rx = to_remote_rx;
-        while let Ok(Some(data)) = to_remote_rx.recv().await {
-            if quic_writer.write_all(&data).await.is_err() {
-                break;
-            }
-            if quic_writer.flush().await.is_err() {
-                break;
-            }
-        }
-        let _ = quic_writer.shutdown().await;
-    });
-
-    // 6. Return remoc endpoints to child.
     Ok((from_remote_rx, to_remote_tx))
 }
 
@@ -509,31 +460,31 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// ConversationHandle — raw QUIC-level handle for a fully-activated conversation
-// ---------------------------------------------------------------------------
-
-/// A fully-activated conversation handle.
-///
-/// Created by [`ReservedConversation::activate()`]. Encapsulates the
-/// conversation ID, the receiver for dispatched QUIC streams, and the
-/// optional stream factory for opening server-initiated streams.
-///
-/// This is the raw QUIC-level handle. The remoc bridging layer lives in
-/// [`Ssh3TransportImpl`], which will consume this handle in Phase 5.
-pub struct ConversationHandle {
+pub struct ConversationEndpoint {
     conversation_id: u64,
-    channel_rx: mpsc::Receiver<DispatchedStream>,
-    stream_factory: Option<forward::StreamFactory>,
+    channel_rx: Option<mpsc::Receiver<DispatchedStream>>,
+    opener: OpenBiFactory,
 }
 
-impl ConversationHandle {
+impl ConversationEndpoint {
     pub(crate) fn new(
         conversation_id: u64,
         channel_rx: mpsc::Receiver<DispatchedStream>,
-        stream_factory: Option<forward::StreamFactory>,
+        opener: OpenBiFactory,
     ) -> Self {
-        Self { conversation_id, channel_rx, stream_factory }
+        Self {
+            conversation_id,
+            channel_rx: Some(channel_rx),
+            opener,
+        }
+    }
+
+    pub(crate) fn pending(conversation_id: u64, opener: OpenBiFactory) -> Self {
+        Self {
+            conversation_id,
+            channel_rx: None,
+            opener,
+        }
     }
 
     /// Returns the conversation ID (u64 from the QUIC stream ID).
@@ -545,86 +496,86 @@ impl ConversationHandle {
     ///
     /// Returns `None` when the conversation is closed (sender dropped).
     pub async fn accept_channel(&mut self) -> Option<DispatchedStream> {
-        self.channel_rx.recv().await
+        match self.channel_rx.as_mut() {
+            Some(channel_rx) => channel_rx.recv().await,
+            None => None,
+        }
     }
 
-    /// Open a new server-initiated QUIC bidirectional stream.
-    ///
-    /// Writes the `ChannelHeader` to the stream if provided.
-    /// Returns raw `AsyncRead`/`AsyncWrite` streams (no remoc bridging).
-    pub async fn open_channel(
+    pub async fn open_stream(
         &self,
-        header: Option<ChannelHeader>,
     ) -> io::Result<(
         Box<dyn tokio::io::AsyncRead + Send + Unpin>,
         Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     )> {
-        let sf = self.stream_factory.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "no stream factory available")
-        })?;
-        let (reader, mut writer) = sf().await?;
-        if let Some(h) = &header {
-            h.encode_into(&mut writer).await?;
-            writer.flush().await?;
-        }
-        Ok((reader, writer))
+        (self.opener)().await
     }
+
 }
+
+pub type OpenBiFactory = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = io::Result<(
+        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    )>> + Send>>
+    + Send + Sync,
+>;
 
 // ---------------------------------------------------------------------------
 // Ssh3TransportImpl — parent-process transport bridging QUIC ↔ remoc channels
 // ---------------------------------------------------------------------------
 
-/// Parent-process transport that bridges QUIC streams to remoc byte channels.
-///
-/// Implements [`Ssh3Transport`] for use as the RTC server object provided to
-/// the child process. Incoming QUIC streams are accepted from the
-/// [`ConversationHandle`]; outgoing streams are opened via its stream factory.
-///
-/// Supports a **pending/attach** pattern: construct with [`new_pending`] before
-/// authentication completes, then call [`attach_handle`] once the
-/// [`ConversationHandle`] is available. `accept_channel` will block until
-/// `attach_handle` is called.
 pub struct Ssh3TransportImpl {
-    handle: tokio::sync::Mutex<Option<ConversationHandle>>,
+    endpoint: tokio::sync::Mutex<Option<ConversationEndpoint>>,
     attached: tokio::sync::watch::Receiver<bool>,
     attached_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl Ssh3TransportImpl {
     /// Create a transport with a known handle (used in tests and child.rs).
-    pub fn new(handle: ConversationHandle) -> Self {
+    pub fn new(endpoint: ConversationEndpoint) -> Self {
         let (attached_tx, attached) = tokio::sync::watch::channel(true);
         Self {
-            handle: tokio::sync::Mutex::new(Some(handle)),
+            endpoint: tokio::sync::Mutex::new(Some(endpoint)),
             attached,
             attached_tx,
         }
     }
 
-    /// Create a **pending** transport without a handle.
-    ///
-    /// Neither `accept_channel` nor `open_channel` will work until
-    /// [`attach_handle`](Self::attach_handle) is called.
-    pub fn new_pending() -> Self {
+    pub fn new_pending(conversation_id: u64, opener: OpenBiFactory) -> Self {
+        let endpoint = ConversationEndpoint::pending(conversation_id, opener);
+        Self::new_pending_with_endpoint(endpoint)
+    }
+
+    pub fn new_pending_with_endpoint(endpoint: ConversationEndpoint) -> Self {
         let (attached_tx, attached) = tokio::sync::watch::channel(false);
         Self {
-            handle: tokio::sync::Mutex::new(None),
+            endpoint: tokio::sync::Mutex::new(Some(endpoint)),
             attached,
             attached_tx,
         }
     }
 
-    /// Attach a [`ConversationHandle`] to this transport, unblocking
-    /// `accept_channel` and `open_channel`.
-    pub fn attach_handle(&self, handle: ConversationHandle) {
+    pub fn try_attach_endpoint(&self, endpoint: ConversationEndpoint) -> Result<(), ConversationEndpoint> {
         {
-            let mut guard = self.handle.try_lock()
-                .expect("attach_handle called while handle lock is held");
-            *guard = Some(handle);
+            let mut guard = self.endpoint.try_lock()
+                .expect("try_attach_endpoint called while endpoint lock is held");
+            let current = match guard.as_ref() {
+                Some(endpoint) => endpoint,
+                None => return Err(endpoint),
+            };
+            if current.channel_rx.is_some() {
+                return Err(endpoint);
+            }
+            if current.conversation_id() != endpoint.conversation_id() {
+                return Err(endpoint);
+            }
+            *guard = Some(endpoint);
         }
         let _ = self.attached_tx.send(true);
+        Ok(())
     }
+
 }
 
 impl Ssh3Transport for Ssh3TransportImpl {
@@ -640,12 +591,12 @@ impl Ssh3Transport for Ssh3TransportImpl {
         }
 
         let dispatched = {
-            let mut guard = self.handle.lock().await;
-            let handle = match guard.as_mut() {
-                Some(h) => h,
+            let mut guard = self.endpoint.lock().await;
+            let endpoint = match guard.as_mut() {
+                Some(endpoint) => endpoint,
                 None => return Ok(None),
             };
-            handle.accept_channel().await
+            endpoint.accept_channel().await
         };
 
         let (header, mut quic_reader, mut quic_writer) = match dispatched {
@@ -696,11 +647,13 @@ impl Ssh3Transport for Ssh3TransportImpl {
         TransportError,
     > {
         let (quic_reader, mut quic_writer) = {
-            let guard = self.handle.lock().await;
-            let handle = guard.as_ref().ok_or_else(|| {
-                TransportError::OpenFailed("no handle attached".into())
+            let guard = self.endpoint.lock().await;
+            let endpoint = guard.as_ref().ok_or_else(|| {
+                TransportError::OpenFailed("conversation endpoint missing".into())
             })?;
-            handle.open_channel(None).await
+            endpoint
+                .open_stream()
+                .await
                 .map_err(|e| TransportError::OpenFailed(e.to_string()))?
         };
 
@@ -1143,31 +1096,34 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 10: ConversationHandle basic functionality
+    // Test 10: ConversationEndpoint basic functionality
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn conversation_handle_accept_channel() {
+    async fn conversation_endpoint_accept_channel() {
         let (tx, rx) = mpsc::channel(8);
-        let mut handle = ConversationHandle::new(42, rx, None);
-        assert_eq!(handle.conversation_id(), 42);
+        let opener: OpenBiFactory = Arc::new(|| {
+            Box::pin(async {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
+            })
+        });
+        let mut endpoint = ConversationEndpoint::new(42, rx, opener);
+        assert_eq!(endpoint.conversation_id(), 42);
 
         // Drop sender — accept_channel should return None.
         drop(tx);
-        assert!(handle.accept_channel().await.is_none());
+        assert!(endpoint.accept_channel().await.is_none());
     }
 
     #[tokio::test]
-    async fn conversation_handle_open_channel_no_factory() {
-        let (_tx, rx) = mpsc::channel(8);
-        let handle = ConversationHandle::new(99, rx, None);
-        assert_eq!(handle.conversation_id(), 99);
-
-        // open_channel without a stream factory should fail.
-        let result = handle.open_channel(None).await;
-        match result {
-            Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotConnected),
-            Ok(_) => panic!("expected NotConnected error, got Ok"),
-        }
+    async fn transport_open_channel_without_working_opener_fails() {
+        let opener: OpenBiFactory = Arc::new(|| {
+            Box::pin(async {
+                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "test opener failed"))
+            })
+        });
+        let transport = Ssh3TransportImpl::new_pending(7, opener);
+        let result = transport.open_channel(None).await;
+        assert!(matches!(result, Err(TransportError::OpenFailed(_))));
     }
 }
