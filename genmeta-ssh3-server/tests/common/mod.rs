@@ -240,15 +240,14 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                 Ok(credential) => {
                     // If a PAM backend is configured, verify credentials through it.
                     if let Some(ref pam) = pam_backend {
-                        if let genmeta_ssh3_proto::auth::AuthCredential::Basic { ref username, ref password } = credential {
-                            if let Err(_) = pam.authenticate("ssh3", username, password) {
-                                *response.status_mut() = StatusCode::UNAUTHORIZED;
-                                response.headers_mut().insert(
-                                    http::header::WWW_AUTHENTICATE,
-                                    HeaderValue::from_static("Basic"),
-                                );
-                                return Ok(response);
-                            }
+                        let genmeta_ssh3_proto::auth::AuthCredential::Basic { ref username, ref password } = credential;
+                        if let Err(_) = pam.authenticate("ssh3", username, password) {
+                            *response.status_mut() = StatusCode::UNAUTHORIZED;
+                            response.headers_mut().insert(
+                                http::header::WWW_AUTHENTICATE,
+                                HeaderValue::from_static("Basic"),
+                            );
+                            return Ok(response);
                         }
                     }
                 }
@@ -274,10 +273,14 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                 .headers_mut()
                 .insert("ssh-version", version::version_response_header(&version));
 
-            // Spawn upgrade supervisor: activate reservation + handle channels.
+            // Spawn upgrade supervisor: handoff reservation + handle channels.
+            let opener = protocol.open_bi_factory();
             tokio::spawn(async move {
-                let mut handle = reserved.activate();
-                while let Some((header, reader, writer)) = handle.accept_channel().await {
+                // Transition through required states.
+                reserved.transition_to_authenticating().expect("state transition failed");
+                let (_lease, mut endpoint) = reserved.handoff_to_supervisor(opener);
+                _lease.transition_to_active().expect("state transition failed");
+                while let Some((header, reader, writer)) = endpoint.accept_channel().await {
                     // Spawn each channel handler independently.
                     tokio::spawn(async move {
                         if let Err(e) = channel::handle_channel(header, reader, writer).await {

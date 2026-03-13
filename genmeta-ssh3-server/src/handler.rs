@@ -116,6 +116,12 @@ impl Ssh3ConnectHandler {
         Self
     }
 }
+
+impl Default for Ssh3ConnectHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>>
     for Ssh3ConnectHandler
 {
@@ -213,11 +219,14 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                     // fails, `reserved` drops here and auto-unregisters.
 
                     // Create Ssh3TransportImpl in pending mode and RTC server.
-                    let transport_impl = Ssh3TransportImpl::new_pending();
+                    let transport_impl = Ssh3TransportImpl::new_pending(
+                        conversation_id,
+                        protocol.open_bi_factory(),
+                    );
                     let transport_impl = Arc::new(transport_impl);
                     let (transport_server, transport_client) =
                         Ssh3TransportServerShared::new(transport_impl.clone(), 16);
-                    tokio::spawn(async move { let _ = transport_server.serve(true).await; });
+                    let transport_server_handle = tokio::spawn(async move { let _ = transport_server.serve(true).await; });
 
                     // Send ChildBootstrap to child.
                     let bootstrap = ChildBootstrap {
@@ -226,7 +235,11 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                             username: String::new(),
                             password: String::new(),
                         }),
+                        conversation_id,
                     };
+                    // Transition to authenticating before sending bootstrap.
+                    reserved.transition_to_authenticating().expect("failed to transition to Authenticating");
+
                     if let Err(e) = child_bootstrap_tx.send(bootstrap).await {
                         tracing::error!(%e, "failed to send ChildBootstrap to child");
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
@@ -274,28 +287,55 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                             *response.status_mut() = StatusCode::OK;
                             response.headers_mut().insert("ssh-version", version_header);
 
-                            // Spawn upgrade supervisor: owns reservation, request,
+                            // Spawn upgrade supervisor: owns lease, request,
                             // transport, and child lifetime.
-                            let protocols_for_cleanup = protocols.clone();
+                            let opener = protocol.open_bi_factory();
                             tokio::spawn(async move {
-                                // Activate reservation → get stream receiver.
-                                let handle = reserved.activate();
-                                // Attach to pending transport so accept_channel unblocks.
-                                transport_impl.attach_handle(handle);
+                                // Handoff reservation → get lease + stream handle.
+                                let lease = {
+                                    let (lease, endpoint) = reserved.handoff_to_supervisor(opener);
 
-                                // Hold CONNECT ReadStream/WriteStream for ownership
-                                // (actual data bridging comes in Phase 4).
-                                // ReadStream can be extracted from the request body.
-                                let _read_stream = h3x::message::stream::ReadStream::extract_from(request).await;
+                                    let Some((_connect_reader, _connect_writer)) =
+                                        h3x::hyper::upgrade::on(request).await
+                                    else {
+                                        tracing::warn!(conversation_id, "CONNECT upgrade takeover failed");
+                                        return;
+                                    };
 
-                                // Monitor child lifetime.
+                                    // Attach to pending transport so accept_channel unblocks.
+                                    if transport_impl.try_attach_endpoint(endpoint).is_err() {
+                                        tracing::warn!(conversation_id, "transport endpoint already attached");
+                                        return;
+                                    }
+
+                                    if let Err(state) = lease.transition_to_active() {
+                                        tracing::warn!(conversation_id, ?state, "failed to transition to Active");
+                                        return;
+                                    }
+
+                                    lease
+                                };
+
+                                // Supervisor: monitor child, transport server, and read-stream.
                                 let mut child = child;
-                                match child.wait().await {
-                                    Ok(status) => tracing::info!(?status, conversation_id, "child process exited"),
-                                    Err(e) => tracing::warn!(%e, conversation_id, "error waiting for child"),
+                                tokio::select! {
+                                    status = child.wait() => {
+                                        match status {
+                                            Ok(status) => tracing::info!(?status, conversation_id, "child process exited"),
+                                            Err(e) => tracing::warn!(%e, conversation_id, "error waiting for child"),
+                                        }
+                                    }
+                                    result = transport_server_handle => {
+                                        match result {
+                                            Ok(_) => tracing::info!(conversation_id, "transport server exited"),
+                                            Err(e) => tracing::warn!(%e, conversation_id, "transport server task panicked"),
+                                        }
+                                    }
                                 }
-                                let protocol = protocols_for_cleanup.get::<Ssh3Protocol>().expect("Ssh3Protocol not registered");
-                                protocol.unregister_conversation(conversation_id).await;
+
+                                // ConversationLease drop handles cleanup automatically.
+                                // No explicit unregister_conversation needed.
+                                drop(lease);
                             });
                         }
                         AuthResult::Failure { reason } => {

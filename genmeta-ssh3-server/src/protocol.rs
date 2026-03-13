@@ -8,14 +8,13 @@
 use std::{
     collections::HashMap,
     fmt::Debug,
-    future::Future,
     pin::Pin,
     sync::Arc,
 };
 
 use futures::future::BoxFuture;
 use tokio::io;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 use genmeta_ssh3_proto::codec::ChannelHeader;
 use h3x::{
@@ -43,16 +42,74 @@ pub type BoxWriter = SinkWriter<Pin<Box<dyn quic::WriteStream + Send>>>;
 /// type-erased reader/writer streams.
 pub type DispatchedStream = (ChannelHeader, BoxReader, BoxWriter);
 
+// ---------------------------------------------------------------------------
+// ConversationState — one-way lifecycle transitions
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state for a conversation slot. Transitions are one-way only:
+/// `Reserved → Authenticating → Upgrading → Active → Closed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationState {
+    Reserved,
+    Authenticating,
+    Upgrading,
+    Active,
+    Closed,
+}
+
+// ---------------------------------------------------------------------------
+// ConversationSlot — registry entry replacing bare mpsc::Sender
+// ---------------------------------------------------------------------------
+
+/// A conversation slot in the registry. Holds the lifecycle state and the
+/// mpsc sender for dispatching QUIC streams to this conversation.
+pub(crate) struct ConversationSlot {
+    state: std::sync::Mutex<ConversationState>,
+    sender: mpsc::Sender<DispatchedStream>,
+}
+
+impl ConversationSlot {
+    fn new(sender: mpsc::Sender<DispatchedStream>) -> Self {
+        Self {
+            state: std::sync::Mutex::new(ConversationState::Reserved),
+            sender,
+        }
+    }
+
+    /// Returns the current state.
+    fn state(&self) -> ConversationState {
+        *self.state.lock().unwrap()
+    }
+
+    /// Attempt a one-way state transition. Returns `Err` with the current
+    /// state if the transition is invalid.
+    fn transition(&self, from: ConversationState, to: ConversationState) -> Result<(), ConversationState> {
+        let mut guard = self.state.lock().unwrap();
+        if *guard != from {
+            return Err(*guard);
+        }
+        *guard = to;
+        Ok(())
+    }
+
+    /// Force-transition to Closed (used by Drop cleanup paths).
+    fn close(&self) {
+        let mut guard = self.state.lock().unwrap();
+        *guard = ConversationState::Closed;
+    }
+}
+
+/// Type alias for the registry (std::sync::Mutex for synchronous Drop cleanup).
+type Registry = Arc<std::sync::Mutex<HashMap<u64, Arc<ConversationSlot>>>>;
+
 /// SSH3 protocol layer for QUIC stream routing.
 ///
 /// Routes incoming bidirectional QUIC streams by peeking the first varint.
 /// SSH3 channel streams (signal value `0xaf3627e6`) are dispatched to the
 /// appropriate conversation via mpsc. Other streams are passed through.
 pub struct Ssh3Protocol {
-    registry: Arc<Mutex<HashMap<u64, mpsc::Sender<DispatchedStream>>>>,
-    /// Factory for opening server-initiated QUIC bidirectional streams.
-    /// Populated from the QUIC connection during `ProductProtocol::init`.
-    stream_factory: Mutex<Option<crate::forward::StreamFactory>>,
+    registry: Registry,
+    opener: crate::channel::OpenBiFactory,
 }
 
 impl Debug for Ssh3Protocol {
@@ -62,20 +119,15 @@ impl Debug for Ssh3Protocol {
 }
 
 impl Ssh3Protocol {
-    /// Creates a new `Ssh3Protocol` with an empty conversation registry.
-    pub fn new() -> Self {
+    pub(crate) fn new(opener: crate::channel::OpenBiFactory) -> Self {
         Self {
-            registry: Arc::new(Mutex::new(HashMap::new())),
-            stream_factory: Mutex::new(None),
+            registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            opener,
         }
     }
 
-    /// Creates a new `Ssh3Protocol` with a pre-populated stream factory.
-    pub(crate) fn with_stream_factory(stream_factory: crate::forward::StreamFactory) -> Self {
-        Self {
-            registry: Arc::new(Mutex::new(HashMap::new())),
-            stream_factory: Mutex::new(Some(stream_factory)),
-        }
+    pub fn open_bi_factory(&self) -> crate::channel::OpenBiFactory {
+        self.opener.clone()
     }
 
     /// Registers a conversation, returning a receiver for dispatched streams.
@@ -86,10 +138,12 @@ impl Ssh3Protocol {
     pub async fn register_conversation(
         &self,
         id: u64,
-    ) -> mpsc::Receiver<DispatchedStream> {
+    ) -> crate::channel::ConversationEndpoint {
         let (tx, rx) = mpsc::channel(8);
-        self.registry.lock().await.insert(id, tx);
-        rx
+        let slot = Arc::new(ConversationSlot::new(tx));
+        let _ = slot.transition(ConversationState::Reserved, ConversationState::Active);
+        self.registry.lock().unwrap().insert(id, slot);
+        crate::channel::ConversationEndpoint::new(id, rx, self.open_bi_factory())
     }
 
     /// Unregisters a conversation, dropping its sender.
@@ -97,27 +151,29 @@ impl Ssh3Protocol {
     /// Any subsequent streams for this `conversation_id` will be logged and
     /// dropped.
     pub async fn unregister_conversation(&self, id: u64) {
-        self.registry.lock().await.remove(&id);
+        self.registry.lock().unwrap().remove(&id);
     }
 
     /// Reserves a conversation slot for the given QUIC stream.
     ///
     /// Creates a channel in the registry keyed by the stream's ID (as `u64`).
     /// Returns a [`ReservedConversation`] that holds the receiver and can be
-    /// activated to transition to the active state. If not activated, the
-    /// conversation is automatically unregistered on drop.
+    /// handed off to a supervisor via [`handoff_to_supervisor`](ReservedConversation::handoff_to_supervisor).
+    /// If dropped without being handed off, the conversation is
+    /// automatically unregistered to prevent resource leaks.
     pub async fn reserve_conversation(
         &self,
         stream_id: StreamId,
     ) -> io::Result<ReservedConversation> {
         let conversation_id = stream_id.0.into_inner();
-        let rx = self.register_conversation(conversation_id).await;
-        let stream_factory = self.stream_factory.lock().await.clone();
+        let (tx, rx) = mpsc::channel(8);
+        let slot = Arc::new(ConversationSlot::new(tx));
+        self.registry.lock().unwrap().insert(conversation_id, Arc::clone(&slot));
         Ok(ReservedConversation {
             conversation_id,
+            slot: Some(slot),
             registry: Some(Arc::clone(&self.registry)),
             rx: Some(rx),
-            stream_factory,
         })
     }
 
@@ -163,10 +219,18 @@ impl Ssh3Protocol {
             }
         };
 
-        // Look up the conversation and dispatch.
+        // Look up the conversation slot and dispatch.
+        // Clone the sender while holding the lock, then drop the lock before awaiting.
         let sender = {
-            let registry = self.registry.lock().await;
-            registry.get(&header.conversation_id).cloned()
+            let registry = self.registry.lock().unwrap();
+            registry.get(&header.conversation_id).and_then(|slot| {
+                let state = slot.state();
+                if state != ConversationState::Active {
+                    None
+                } else {
+                    Some(slot.sender.clone())
+                }
+            })
         };
         if let Some(sender) = sender {
             if let Err(e) = sender.send((header, stream_reader, stream_writer)).await {
@@ -186,14 +250,15 @@ impl Ssh3Protocol {
 /// A reserved conversation slot in the [`Ssh3Protocol`] registry.
 ///
 /// Created by [`Ssh3Protocol::reserve_conversation`]. Holds a receiver for
-/// dispatched streams but does not consume them until [`activate()`](Self::activate)
-/// is called. If dropped without being activated, the conversation is
+/// dispatched streams but does not consume them until
+/// [`handoff_to_supervisor()`](Self::handoff_to_supervisor) is called.
+/// If dropped without being handed off, the conversation is
 /// automatically unregistered to prevent resource leaks.
 pub struct ReservedConversation {
     conversation_id: u64,
-    registry: Option<Arc<Mutex<HashMap<u64, mpsc::Sender<DispatchedStream>>>>>,
+    slot: Option<Arc<ConversationSlot>>,
+    registry: Option<Registry>,
     rx: Option<mpsc::Receiver<DispatchedStream>>,
-    stream_factory: Option<crate::forward::StreamFactory>,
 }
 
 impl ReservedConversation {
@@ -202,38 +267,104 @@ impl ReservedConversation {
         self.conversation_id
     }
 
-    /// Activates the reservation, transitioning to the active state.
+    /// Transition from `Reserved` to `Authenticating`.
     ///
-    /// Returns a [`ConversationHandle`](crate::channel::ConversationHandle)
-    /// that wraps the channel receiver and embedded stream factory.
-    /// After activation, the conversation remains registered and the caller
-    /// is responsible for eventually calling
-    /// [`Ssh3Protocol::unregister_conversation`].
-    pub fn activate(mut self) -> crate::channel::ConversationHandle {
-        // Take the registry to prevent Drop from unregistering.
-        self.registry.take();
-        crate::channel::ConversationHandle::new(
+    /// Called after the bootstrap is sent to the child process, before
+    /// waiting for auth result.
+    pub fn transition_to_authenticating(&self) -> Result<(), ConversationState> {
+        self.slot.as_ref().unwrap().transition(
+            ConversationState::Reserved,
+            ConversationState::Authenticating,
+        )
+    }
+
+    /// Hands off the reservation to a supervisor task.
+    ///
+    /// Transitions from `Authenticating` to `Upgrading`, then returns a
+    /// [`ConversationLease`] (which owns cleanup) and a
+    /// This **replaces** the old `activate()` method.
+    pub fn handoff_to_supervisor(
+        mut self,
+        opener: crate::channel::OpenBiFactory,
+    ) -> (ConversationLease, crate::channel::ConversationEndpoint) {
+        let slot = self.slot.as_ref().unwrap();
+        slot.transition(
+            ConversationState::Authenticating,
+            ConversationState::Upgrading,
+        )
+        .expect("handoff_to_supervisor: expected Authenticating state");
+
+        let slot = self.slot.take().unwrap();
+        let registry = self.registry.take().unwrap();
+
+        let endpoint = crate::channel::ConversationEndpoint::new(
             self.conversation_id,
             self.rx.take().expect("ReservedConversation already consumed"),
-            self.stream_factory.take(),
-        )
+            opener,
+        );
+
+        let lease = ConversationLease {
+            conversation_id: self.conversation_id,
+            slot,
+            registry,
+        };
+
+        (lease, endpoint)
     }
 }
 
 impl Drop for ReservedConversation {
     fn drop(&mut self) {
-        if let Some(registry) = self.registry.take() {
+        if let (Some(slot), Some(registry)) = (self.slot.take(), self.registry.take()) {
             let id = self.conversation_id;
-            tokio::spawn(async move {
-                registry.lock().await.remove(&id);
-            });
+            // Synchronous cleanup — std::sync::Mutex, no tokio::spawn needed.
+            slot.close();
+            let mut reg = registry.lock().unwrap();
+            // Only remove if the slot in the registry is still ours (pointer identity).
+            if let Some(existing) = reg.get(&id)
+                && Arc::ptr_eq(existing, &slot) {
+                reg.remove(&id);
+            }
         }
     }
 }
 
-impl Default for Ssh3Protocol {
-    fn default() -> Self {
-        Self::new()
+/// RAII lease for a conversation after auth success.
+///
+/// Owns cleanup responsibility after [`ReservedConversation::handoff_to_supervisor`].
+/// When dropped, transitions the slot to `Closed` and removes it from the
+/// registry (if still present with the same `Arc` identity).
+pub struct ConversationLease {
+    conversation_id: u64,
+    slot: Arc<ConversationSlot>,
+    registry: Registry,
+}
+
+impl ConversationLease {
+    /// Transition from `Upgrading` to `Active`.
+    ///
+    pub fn transition_to_active(&self) -> Result<(), ConversationState> {
+        self.slot.transition(
+            ConversationState::Upgrading,
+            ConversationState::Active,
+        )
+    }
+
+    /// Returns the conversation ID.
+    pub fn conversation_id(&self) -> u64 {
+        self.conversation_id
+    }
+}
+
+impl Drop for ConversationLease {
+    fn drop(&mut self) {
+        // Synchronous cleanup — transition to Closed and remove from registry.
+        self.slot.close();
+        let mut reg = self.registry.lock().unwrap();
+        if let Some(existing) = reg.get(&self.conversation_id)
+            && Arc::ptr_eq(existing, &self.slot) {
+            reg.remove(&self.conversation_id);
+        }
     }
 }
 
@@ -257,9 +388,6 @@ impl Protocol for Ssh3Protocol {
 }
 
 /// Factory for creating [`Ssh3Protocol`] instances per-connection.
-///
-/// Implements [`ProductProtocol`] to capture the QUIC connection's `open_bi`
-/// capability as an erased [`StreamFactory`](crate::forward::StreamFactory).
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ssh3ProtocolFactory;
 
@@ -273,8 +401,7 @@ impl<C: quic::Connection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
         let conn = conn.clone();
         Box::pin(async move {
-            // Capture connection's open_bi capability as an erased StreamFactory
-            let stream_factory: crate::forward::StreamFactory = Arc::new(move || {
+            let opener: crate::channel::OpenBiFactory = Arc::new(move || {
                 let conn = conn.clone();
                 Box::pin(async move {
                     let (reader, writer) = conn.open_bi().await.map_err(|e| {
@@ -286,9 +413,9 @@ impl<C: quic::Connection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
                         Box::new(async_reader) as Box<dyn tokio::io::AsyncRead + Send + Unpin>,
                         Box::new(async_writer) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
                     ))
-                }) as Pin<Box<dyn Future<Output = io::Result<(Box<dyn tokio::io::AsyncRead + Send + Unpin>, Box<dyn tokio::io::AsyncWrite + Send + Unpin>)>> + Send>>
+                })
             });
-            Ok(Ssh3Protocol::with_stream_factory(stream_factory))
+            Ok(Ssh3Protocol::new(opener))
         })
     }
 }
@@ -298,6 +425,17 @@ mod tests {
     use super::*;
     use h3x::codec::{EncodeExt, EncodeInto};
     use tokio::io::{AsyncReadExt, duplex};
+
+    fn test_open_bi_factory() -> crate::channel::OpenBiFactory {
+        Arc::new(|| {
+            Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "test protocol does not open streams",
+                ))
+            })
+        })
+    }
 
     /// Helper: encode a ChannelHeader into raw bytes.
     async fn encode_channel_header(header: &ChannelHeader) -> Vec<u8> {
@@ -326,20 +464,20 @@ mod tests {
         protocol: &Ssh3Protocol,
         header: &ChannelHeader,
     ) -> bool {
-        let registry = protocol.registry.lock().await;
+        let registry = protocol.registry.lock().unwrap();
         registry.contains_key(&header.conversation_id)
     }
 
     #[tokio::test]
     async fn register_and_unregister_conversation() {
-        let proto = Ssh3Protocol::new();
+        let proto = Ssh3Protocol::new(test_open_bi_factory());
 
         // Register a conversation.
-        let mut rx = proto.register_conversation(42).await;
+        let mut endpoint = proto.register_conversation(42).await;
 
         // Verify the sender exists.
         {
-            let registry = proto.registry.lock().await;
+            let registry = proto.registry.lock().unwrap();
             assert!(registry.contains_key(&42));
         }
 
@@ -348,30 +486,30 @@ mod tests {
 
         // Verify removed.
         {
-            let registry = proto.registry.lock().await;
+            let registry = proto.registry.lock().unwrap();
             assert!(!registry.contains_key(&42));
         }
 
         // Receiver should be closed after sender is dropped.
-        assert!(rx.try_recv().is_err());
+        assert!(endpoint.accept_channel().await.is_none());
     }
 
     #[tokio::test]
     async fn unregister_drops_sender() {
-        let proto = Ssh3Protocol::new();
-        let mut rx = proto.register_conversation(99).await;
+        let proto = Ssh3Protocol::new(test_open_bi_factory());
+        let mut endpoint = proto.register_conversation(99).await;
 
         // Unregister drops the sender.
         proto.unregister_conversation(99).await;
 
         // recv should return None (channel closed).
-        assert!(rx.recv().await.is_none());
+        assert!(endpoint.accept_channel().await.is_none());
     }
 
     #[tokio::test]
     async fn conversation_dispatch_via_registry() {
-        let proto = Ssh3Protocol::new();
-        let _rx = proto.register_conversation(12345).await;
+        let proto = Ssh3Protocol::new(test_open_bi_factory());
+        let _endpoint = proto.register_conversation(12345).await;
 
         let header = ChannelHeader {
             signal_value: SSH3_SIGNAL_VALUE,
@@ -400,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn unregistered_conversation_no_panic() {
-        let proto = Ssh3Protocol::new();
+        let proto = Ssh3Protocol::new(test_open_bi_factory());
         // No conversation registered for id 9999.
 
         let header = ChannelHeader {
@@ -430,13 +568,13 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_conversations_isolated() {
-        let proto = Ssh3Protocol::new();
-        let _rx1 = proto.register_conversation(100).await;
-        let _rx2 = proto.register_conversation(200).await;
+        let proto = Ssh3Protocol::new(test_open_bi_factory());
+        let _endpoint1 = proto.register_conversation(100).await;
+        let _endpoint2 = proto.register_conversation(200).await;
 
         // Both conversations should be registered.
         {
-            let registry = proto.registry.lock().await;
+            let registry = proto.registry.lock().unwrap();
             assert!(registry.contains_key(&100));
             assert!(registry.contains_key(&200));
             assert!(!registry.contains_key(&300));
@@ -445,7 +583,7 @@ mod tests {
         // Unregister one, verify the other remains.
         proto.unregister_conversation(100).await;
         {
-            let registry = proto.registry.lock().await;
+            let registry = proto.registry.lock().unwrap();
             assert!(!registry.contains_key(&100));
             assert!(registry.contains_key(&200));
         }
@@ -453,21 +591,17 @@ mod tests {
 
     #[tokio::test]
     async fn re_register_conversation() {
-        let proto = Ssh3Protocol::new();
-        let mut rx1 = proto.register_conversation(42).await;
+        let proto = Ssh3Protocol::new(test_open_bi_factory());
+        let mut endpoint1 = proto.register_conversation(42).await;
 
         // Re-register with the same id replaces the sender.
-        let mut rx2 = proto.register_conversation(42).await;
+        let endpoint2 = proto.register_conversation(42).await;
 
         // Old receiver should be closed (old sender was dropped when replaced).
-        assert!(rx1.recv().await.is_none());
+        assert!(endpoint1.accept_channel().await.is_none());
 
-        // New receiver should still be open.
-        // Verify by checking that try_recv returns Empty (not Disconnected).
-        match rx2.try_recv() {
-            Err(mpsc::error::TryRecvError::Empty) => { /* expected */ }
-            _ => panic!("expected Empty from try_recv"),
-        }
+        let open_result = endpoint2.open_stream().await;
+        assert!(open_result.is_err());
     }
 
     #[tokio::test]
@@ -495,8 +629,26 @@ mod tests {
 
     #[tokio::test]
     async fn default_creates_empty_protocol() {
-        let proto = Ssh3Protocol::default();
-        let registry = proto.registry.lock().await;
+        let proto = Ssh3Protocol::new(test_open_bi_factory());
+        let registry = proto.registry.lock().unwrap();
         assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserve_conversation_starts_non_active() {
+        use h3x::varint::VarInt;
+
+        let proto = Ssh3Protocol::new(test_open_bi_factory());
+        let stream_id = StreamId(VarInt::try_from(77u64).unwrap());
+        let reserved = proto.reserve_conversation(stream_id).await.unwrap();
+
+        let slot_state = {
+            let reg = proto.registry.lock().unwrap();
+            let slot = reg.get(&77).expect("slot should exist");
+            slot.state()
+        };
+
+        assert_eq!(slot_state, ConversationState::Reserved);
+        drop(reserved);
     }
 }
