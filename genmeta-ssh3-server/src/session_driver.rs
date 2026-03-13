@@ -117,7 +117,7 @@ impl Ssh3Session {
         let span = tracing::info_span!(
             "ssh3_channel",
             %conversation_id,
-            channel_type = %channel_type,
+            %channel_type,
         );
         channel_tasks.spawn(
             async move {
@@ -125,7 +125,7 @@ impl Ssh3Session {
                     tracing::warn!(
                         error = %Report::from_error(error),
                         %conversation_id,
-                        channel_type = %channel_type,
+                        %channel_type,
                         "channel handling failed"
                     );
                 }
