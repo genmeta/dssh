@@ -7,7 +7,6 @@
 //! to `AsyncRead`/`AsyncWrite`.
 
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use genmeta_ssh3_proto::codec::ChannelHeader;
@@ -55,42 +54,45 @@ fn drop_privileges(_uid: u32, _gid: u32) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// SSH3 session driver that pulls channels from a transport client.
-///
-/// The child process creates one `Ssh3Session`, then calls [`run()`] with
-/// the transport client received from the parent. The `run()` method consumes
-/// `self` since each child process runs exactly one session.
-pub struct Ssh3Session;
+#[derive(Clone)]
+pub struct Ssh3Session {
+    transport: Ssh3TransportClient,
+    init: SessionInit,
+    global_requests: Arc<GlobalRequestContext>,
+}
 
 impl Ssh3Session {
-    pub fn new() -> Self {
-        Self
+    pub fn new(transport: Ssh3TransportClient, init: SessionInit) -> Self {
+        let global_requests = Arc::new(GlobalRequestContext {
+            tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
+            streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
+            transport: transport.clone(),
+            conversation_id: init.conversation_id,
+        });
+
+        Self {
+            transport,
+            init,
+            global_requests,
+        }
     }
 
     /// Run the session by pulling channels from the transport.
     ///
     /// 1. Drops privileges to the authenticated user.
     /// 3. Enters the channel-accept loop, dispatching session and non-session channels.
-    pub async fn run(self, transport: Ssh3TransportClient, init: SessionInit) -> Result<(), SessionError> {
-        drop_privileges(init.uid, init.gid)?;
+    pub async fn run(self) -> Result<(), SessionError> {
+        drop_privileges(self.init.uid, self.init.gid)?;
 
-        let global_ctx = Arc::new(GlobalRequestContext {
-            tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
-            streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
-            transport: transport.clone(),
-            conversation_id: init.conversation_id,
-        });
         let mut channel_tasks = JoinSet::new();
-        let shell = init.shell;
+        let transport = self.transport.clone();
 
         while let Ok(Some((header, from_client_rx, to_client_tx))) = transport.accept_channel().await {
-            Self::spawn_channel_task(
+            self.spawn_channel_task(
                 &mut channel_tasks,
                 header,
                 from_client_rx,
                 to_client_tx,
-                Arc::clone(&global_ctx),
-                shell.clone(),
             );
         }
 
@@ -103,15 +105,15 @@ impl Ssh3Session {
     }
 
     fn spawn_channel_task(
+        &self,
         channel_tasks: &mut JoinSet<()>,
         header: ChannelHeader,
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
-        ctx: Arc<GlobalRequestContext>,
-        shell: PathBuf,
     ) {
         let channel_type = header.channel_type.clone();
-        let conversation_id = ctx.conversation_id;
+        let conversation_id = self.init.conversation_id;
+        let session = self.clone();
         let span = tracing::info_span!(
             "ssh3_channel",
             %conversation_id,
@@ -119,7 +121,7 @@ impl Ssh3Session {
         );
         channel_tasks.spawn(
             async move {
-                if let Err(error) = Self::handle_channel(header, from_client, to_client, ctx, &shell).await {
+                if let Err(error) = session.handle_channel(header, from_client, to_client).await {
                     tracing::warn!(
                         error = %Report::from_error(error),
                         %conversation_id,
@@ -133,41 +135,53 @@ impl Ssh3Session {
     }
 
     async fn handle_channel(
+        &self,
         header: ChannelHeader,
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
-        ctx: Arc<GlobalRequestContext>,
-        shell: &Path,
-    ) -> Result<(), SessionError> {
-        if header.channel_type == "session" {
-            return Self::handle_session_channel(from_client, to_client, shell).await;
-        }
-
-        Self::handle_non_session_channel(header, from_client, to_client, ctx).await
-    }
-
-    async fn handle_session_channel(
-        from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
-        to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
-        shell: &Path,
     ) -> Result<(), SessionError> {
         let reader = ChannelReader::new(from_client);
         let writer = ChannelWriter::new(to_client);
-        let (event_rx, writer) = open_session_channel(reader, writer)
-            .await
-            .map_err(SessionError::new)?;
-        Self::run_session_requests(event_rx, writer, shell).await
+
+        match header.channel_type.as_str() {
+            "session" => {
+                let (event_rx, writer) = open_session_channel(reader, writer)
+                    .await
+                    .map_err(SessionError::new)?;
+                self.run_session_requests(event_rx, writer).await
+            }
+            "direct-tcpip" => crate::forward::direct_tcp::handle_direct_tcp(header, reader, writer)
+                .await
+                .map_err(SessionError::new),
+            "direct-streamlocal@openssh.com" => {
+                crate::forward::streamlocal::handle_direct_streamlocal(header, reader, writer)
+                    .await
+                    .map_err(SessionError::new)
+            }
+            "socks5" => crate::forward::socks5::handle_socks5(header, reader, writer)
+                .await
+                .map_err(SessionError::new),
+            "global-request" => {
+                crate::channel::handle_global_request_channel(
+                    reader,
+                    writer,
+                    Some(Arc::clone(&self.global_requests)),
+                )
+                .await
+                .map_err(SessionError::new)
+            }
+            other => {
+                tracing::warn!(channel_type = %other, "unknown channel type in child");
+                Err(SessionError::new(format!("unknown channel type: {other}")))
+            }
+        }
     }
 
-    async fn run_session_requests<W>(
-        mut event_rx: mpsc::Receiver<ChannelEvent>,
-        mut writer: W,
-        shell: &Path,
-    ) -> Result<(), SessionError>
+    async fn run_session_requests<W>(&self, mut event_rx: mpsc::Receiver<ChannelEvent>, mut writer: W) -> Result<(), SessionError>
     where
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let shell = shell.to_string_lossy().into_owned();
+        let shell = self.init.shell.to_string_lossy().into_owned();
         let mut pty_pair: Option<PtyPair> = None;
 
         while let Some(event) = event_rx.recv().await {
@@ -229,50 +243,6 @@ impl Ssh3Session {
         }
 
         Ok(())
-    }
-
-    /// Handle a non-session channel dispatched from the transport.
-    async fn handle_non_session_channel(
-        header: ChannelHeader,
-        from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
-        to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
-        ctx: Arc<GlobalRequestContext>,
-    ) -> Result<(), SessionError> {
-        let reader = ChannelReader::new(from_client);
-        let writer = ChannelWriter::new(to_client);
-
-        match header.channel_type.as_str() {
-            "direct-tcpip" => {
-                crate::forward::direct_tcp::handle_direct_tcp(header, reader, writer)
-                    .await
-                    .map_err(SessionError::new)
-            }
-            "direct-streamlocal@openssh.com" => {
-                crate::forward::streamlocal::handle_direct_streamlocal(header, reader, writer)
-                    .await
-                    .map_err(SessionError::new)
-            }
-            "socks5" => {
-                crate::forward::socks5::handle_socks5(header, reader, writer)
-                    .await
-                    .map_err(SessionError::new)
-            }
-            "global-request" => {
-                crate::channel::handle_global_request_channel(reader, writer, Some(ctx))
-                    .await
-                    .map_err(SessionError::new)
-            }
-            other => {
-                tracing::warn!(channel_type = %other, "unknown channel type in child");
-                Err(SessionError::new(format!("unknown channel type: {other}")))
-            }
-        }
-    }
-}
-
-impl Default for Ssh3Session {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -372,16 +342,15 @@ mod tests {
 
     #[tokio::test]
     async fn run_session_happy_path() {
-        let session = Ssh3Session::new();
         let transport = mock_transport_client();
+        let session = Ssh3Session::new(transport, sample_init());
         // Transport returns Ok(None) immediately, so run() completes.
-        let result = session.run(transport, sample_init()).await;
+        let result = session.run().await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn run_session_fields_accessible() {
-        let session = Ssh3Session::new();
         let init = SessionInit {
             conversation_id: StreamId(h3x::varint::VarInt::try_from(99u64).unwrap()),
             username: "bob".into(),
@@ -394,14 +363,18 @@ mod tests {
         assert_eq!(init.username, "bob");
         assert_eq!(init.uid, 2000);
         assert_eq!(init.gid, 2000);
-        let transport = mock_transport_client();
-        assert!(session.run(transport, init).await.is_ok());
+        let session = Ssh3Session::new(mock_transport_client(), init);
+        assert!(session.run().await.is_ok());
     }
 
     #[test]
     fn impl_type_is_sync_send() {
         fn assert_sync_send<T: Sync + Send>() {}
         assert_sync_send::<Ssh3Session>();
+    }
+
+    fn sample_session() -> Ssh3Session {
+        Ssh3Session::new(mock_transport_client(), sample_init())
     }
 
     // -----------------------------------------------------------------------
@@ -462,8 +435,6 @@ mod tests {
     ///   ChannelOpenConfirmation → ChannelSuccess → ChannelData → exit-status → EOF → Close
     #[tokio::test]
     async fn byte_bridge_session_echo() {
-        let session = Ssh3Session::new();
-
         // Create remoc channel pairs for the session channel.
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);
@@ -475,10 +446,10 @@ mod tests {
             max_message_size: 1 << 20,
         };
 
-        let transport = mock_feeding_transport_client(header, from_rx, to_tx);
+        let session = Ssh3Session::new(mock_feeding_transport_client(header, from_rx, to_tx), sample_init());
 
         let handle = tokio::spawn(async move {
-            session.run(transport, sample_init()).await
+            session.run().await
         });
 
         tokio::task::yield_now().await;
@@ -578,14 +549,8 @@ mod tests {
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
         drop(from_tx);
 
-        let ctx = Arc::new(GlobalRequestContext {
-            tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
-            streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
-            transport: mock_transport_client(),
-            conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
-        });
-
-        let result = Ssh3Session::handle_non_session_channel(header, from_rx, to_tx, ctx).await;
+        let session = sample_session();
+        let result = session.handle_channel(header, from_rx, to_tx).await;
         assert!(result.is_err(), "expected error for unknown channel type");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -607,14 +572,8 @@ mod tests {
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
         drop(from_tx);
 
-        let ctx = Arc::new(GlobalRequestContext {
-            tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
-            streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
-            transport: mock_transport_client(),
-            conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
-        });
-
-        let result = Ssh3Session::handle_non_session_channel(header, from_rx, to_tx, ctx).await;
+        let session = sample_session();
+        let result = session.handle_channel(header, from_rx, to_tx).await;
         match result {
             Ok(()) => { /* handler may succeed with empty body in some cases */ }
             Err(e) => {
@@ -640,14 +599,8 @@ mod tests {
         let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
         drop(from_tx);
 
-        let ctx = Arc::new(GlobalRequestContext {
-            tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
-            streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
-            transport: mock_transport_client(),
-            conversation_id: StreamId(h3x::varint::VarInt::try_from(42u64).unwrap()),
-        });
-
-        let result = Ssh3Session::handle_non_session_channel(header, from_rx, to_tx, ctx).await;
+        let session = sample_session();
+        let result = session.handle_channel(header, from_rx, to_tx).await;
         match result {
             Ok(()) => { /* handler may succeed with empty global-request channel */ }
             Err(e) => {
@@ -663,8 +616,6 @@ mod tests {
     /// `run()` sends ChannelOpenConfirmation as the first message on a session channel.
     #[tokio::test]
     async fn run_session_sends_confirmation_first() {
-        let session = Ssh3Session::new();
-
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
         let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);
 
@@ -675,10 +626,10 @@ mod tests {
             max_message_size: 1 << 20,
         };
 
-        let transport = mock_feeding_transport_client(header, from_rx, to_tx);
+        let session = Ssh3Session::new(mock_feeding_transport_client(header, from_rx, to_tx), sample_init());
 
         let handle = tokio::spawn(async move {
-            session.run(transport, sample_init()).await
+            session.run().await
         });
         drop(from_tx);
 

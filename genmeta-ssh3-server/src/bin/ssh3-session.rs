@@ -87,8 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shell,
         };
 
-        let session = Ssh3Session::new();
-        session.run(bootstrap.transport, init).await?;
+        let session = Ssh3Session::new(bootstrap.transport, init);
+        session.run().await?;
     }
 
     tracing::info!("ssh3-session child process exiting");
