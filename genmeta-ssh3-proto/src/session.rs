@@ -56,6 +56,7 @@ pub enum AuthResult {
 pub struct ChildBootstrap {
     pub transport: Ssh3TransportClient,
     pub credential: crate::auth::AuthCredential,
+    pub conversation_id: u64,
 }
 
 /// Serializable error type for RTC method returns.

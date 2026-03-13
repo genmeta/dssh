@@ -52,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Extract username and password from credential.
     let AuthCredential::Basic { username, password } = bootstrap.credential;
+    let conversation_id = bootstrap.conversation_id;
 
     // Perform PAM authentication BEFORE session.run() (must run as root).
     let auth_result = run_pam_auth(&username, &password).await;
@@ -77,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } = auth_result
     {
         let init = genmeta_ssh3_proto::session::SessionInit {
-            conversation_id: 0, // Will be set by handler.rs in future tasks
+            conversation_id,
             username,
             uid,
             gid,
