@@ -450,7 +450,7 @@ fn test_basic_exec() {
         );
 
         // Client: send exec request for "echo hello".
-        genmeta_ssh3_client::session::send_exec_request(&mut client_writer, "echo hello", true)
+        genmeta_ssh3_client::session::send_exec_request(&mut client_writer, b"echo hello", true)
             .await
             .unwrap();
         // Send EOF + Close to signal we're done sending.
@@ -466,7 +466,7 @@ fn test_basic_exec() {
             .expect("expected Some(RequestAction::Exec)");
         assert_eq!(
             action,
-            genmeta_ssh3_server::session::request::RequestAction::Exec("echo hello".into())
+            genmeta_ssh3_server::session::request::RequestAction::Exec(b"echo hello".to_vec())
         );
 
         // Client: read ChannelSuccess (reply to want_reply=true).
@@ -475,7 +475,7 @@ fn test_basic_exec() {
 
         // Server: run the exec command.
         let (_, rx) = mpsc::channel(1);
-        run_exec(std::ffi::OsStr::new("/bin/sh"), "echo hello", &mut server_writer, rx, None)
+        run_exec(std::ffi::OsStr::new("/bin/sh"), b"echo hello", &mut server_writer, rx, None)
             .await
             .expect("run_exec failed");
         drop(server_writer);
@@ -550,7 +550,7 @@ fn test_exec_with_stderr() {
         // Client: send exec request that writes to stderr.
         genmeta_ssh3_client::session::send_exec_request(
             &mut client_writer,
-            "echo stderr_msg >&2",
+            b"echo stderr_msg >&2",
             true,
         )
         .await
@@ -572,7 +572,7 @@ fn test_exec_with_stderr() {
 
         // Server: run the exec command (produces stderr).
         let (_, rx) = mpsc::channel(1);
-        run_exec(std::ffi::OsStr::new("/bin/sh"), "echo stderr_msg >&2", &mut server_writer, rx, None)
+        run_exec(std::ffi::OsStr::new("/bin/sh"), b"echo stderr_msg >&2", &mut server_writer, rx, None)
             .await
             .expect("run_exec failed");
         drop(server_writer);
@@ -733,7 +733,7 @@ fn test_multiple_channels() {
 
                 // Run exec and collect results.
         let (_, rx) = mpsc::channel(1);
-                run_exec(std::ffi::OsStr::new("/bin/sh"), &cmd, &mut server_writer, rx, None)
+                run_exec(std::ffi::OsStr::new("/bin/sh"), cmd.as_bytes(), &mut server_writer, rx, None)
                     .await
                     .expect("run_exec failed");
                 drop(server_writer);
@@ -830,7 +830,7 @@ fn test_production_exec_with_stdin() {
         );
 
         // 2. Send exec request: "cat" (reads stdin and echoes to stdout).
-        genmeta_ssh3_client::session::send_exec_request(&mut writer, "cat", true)
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, b"cat", true)
             .await
             .unwrap();
 
@@ -926,7 +926,7 @@ fn test_production_exec_stdin_echo() {
         assert!(matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }));
 
         // Send exec request: "echo hello".
-        genmeta_ssh3_client::session::send_exec_request(&mut writer, "echo hello", true)
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, b"echo hello", true)
             .await
             .unwrap();
 
@@ -1040,7 +1040,7 @@ fn test_pty_shell_session() {
         //    Using exec over a PTY exercises the same code path as shell+PTY
         //    (run_command_with_pty) but is deterministic: no interactive prompt,
         //    no shell startup files.
-        genmeta_ssh3_client::session::send_exec_request(&mut writer, "echo pty_test_marker", true)
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, b"echo pty_test_marker", true)
             .await
             .unwrap();
 
@@ -1159,7 +1159,7 @@ fn test_window_change_signal() {
         // No reply expected for window-change (want_reply=false per RFC 4254 §6.7).
 
         // 3. Send exec request (simpler than shell for testing).
-        genmeta_ssh3_client::session::send_exec_request(&mut writer, "echo wc_test_ok", true)
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, b"echo wc_test_ok", true)
             .await
             .unwrap();
 
@@ -1816,7 +1816,7 @@ fn test_session_exec_flow() {
         // Client: send exec request for "echo session_flow_test".
         genmeta_ssh3_client::session::send_exec_request(
             &mut client_writer,
-            "echo session_flow_test",
+            b"echo session_flow_test",
             true,
         )
         .await
@@ -1841,7 +1841,7 @@ fn test_session_exec_flow() {
         assert_eq!(
             action,
             genmeta_ssh3_server::session::request::RequestAction::Exec(
-                "echo session_flow_test".into(),
+                b"echo session_flow_test".to_vec(),
             )
         );
 
@@ -1851,7 +1851,7 @@ fn test_session_exec_flow() {
 
         // Server: execute the command.
         let (_, rx) = mpsc::channel(1);
-        run_exec(std::ffi::OsStr::new("/bin/sh"), "echo session_flow_test", &mut server_writer, rx, None)
+        run_exec(std::ffi::OsStr::new("/bin/sh"), b"echo session_flow_test", &mut server_writer, rx, None)
             .await
             .expect("run_exec failed");
         drop(server_writer);

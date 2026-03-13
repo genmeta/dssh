@@ -19,12 +19,12 @@ use tokio::io::{self, AsyncWrite, AsyncWriteExt};
 // Session request_data encoders
 // ---------------------------------------------------------------------------
 
-/// Encode an exec request_data: `SshString(command)`.
-///
-/// The server will parse this with `parse_exec_command` (Task 16).
-pub async fn encode_exec_request_data(command: &str) -> io::Result<Vec<u8>> {
+pub async fn encode_exec_request_data(command: &[u8]) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    SshString(command.to_owned()).encode_into(&mut buf).await?;
+    let len = VarInt::try_from(command.len() as u64)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    len.encode_into(&mut buf).await?;
+    buf.write_all(command).await?;
     Ok(buf)
 }
 
@@ -96,7 +96,7 @@ pub async fn encode_window_change_request_data(
 /// Send a ChannelRequest with request_type="exec" and the given command.
 pub async fn send_exec_request<W: AsyncWrite + Send + Unpin>(
     writer: &mut W,
-    command: &str,
+    command: &[u8],
     want_reply: bool,
 ) -> io::Result<()> {
     let request_data = encode_exec_request_data(command).await?;
@@ -249,7 +249,7 @@ mod tests {
         encode_exit_status, encode_exit_status_data, parse_exec_command,
     };
     use genmeta_ssh3_server::session::pty::{parse_pty_request, parse_window_change};
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncReadExt};
 
     // -------------------------------------------------------------------
     // Test 1: exec request encoding verified against server's parser
@@ -257,10 +257,10 @@ mod tests {
 
     #[tokio::test]
     async fn exec_request_data_roundtrip() {
-        let data = encode_exec_request_data("echo hello").await.unwrap();
+        let data = encode_exec_request_data(b"echo hello").await.unwrap();
         // The server parses this with parse_exec_command
         let cmd = parse_exec_command(&data).await.unwrap();
-        assert_eq!(cmd, "echo hello");
+        assert_eq!(cmd, b"echo hello");
     }
 
     // -------------------------------------------------------------------
@@ -269,7 +269,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_request_data_hex_dump() {
-        let data = encode_exec_request_data("hi").await.unwrap();
+        let data = encode_exec_request_data(b"hi").await.unwrap();
         // "hi": varint(2)=0x02, b"hi"=[0x68, 0x69]
         assert_eq!(data, vec![0x02, 0x68, 0x69]);
     }
@@ -281,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn exec_remote_command() {
         let (mut writer, mut reader) = duplex(8192);
-        send_exec_request(&mut writer, "echo hello", true)
+        send_exec_request(&mut writer, b"echo hello", true)
             .await
             .unwrap();
         drop(writer);
@@ -297,10 +297,23 @@ mod tests {
                 assert!(want_reply);
                 // Verify request_data decodes to "echo hello"
                 let cmd = parse_exec_command(&request_data).await.unwrap();
-                assert_eq!(cmd, "echo hello");
+                assert_eq!(cmd, b"echo hello");
             }
             other => panic!("expected ChannelRequest, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn exec_request_data_allows_non_utf8_bytes() {
+        let data = encode_exec_request_data(&[0x66, 0x6f, 0xff]).await.unwrap();
+
+        let mut reader = data.as_slice();
+        let len = VarInt::decode_from(&mut reader).await.unwrap();
+        assert_eq!(len.into_inner(), 3);
+
+        let mut payload = Vec::new();
+        reader.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload, vec![0x66, 0x6f, 0xff]);
     }
 
     // -------------------------------------------------------------------

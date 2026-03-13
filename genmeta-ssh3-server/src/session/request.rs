@@ -10,8 +10,9 @@
 //! - `exit-status` — process exit code (server→client direction)
 //! - `exit-signal` — process killed by signal (server→client direction)
 
+use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
-use std::ffi::OsStr;
+use std::os::unix::ffi::OsStringExt;
 use std::process::Stdio;
 
 use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
@@ -33,10 +34,9 @@ use crate::session::pty::{
 // Parsed request types
 // ---------------------------------------------------------------------------
 
-/// Parsed exec request: a command string to execute via `/bin/sh -c`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecRequest {
-    pub command: String,
+    pub command: Vec<u8>,
 }
 
 /// Parsed subsystem request: the subsystem name.
@@ -64,7 +64,7 @@ pub struct ExitSignalRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestAction {
     /// Run `exec` with the given command string.
-    Exec(String),
+    Exec(Vec<u8>),
     /// Launch an interactive shell.
     Shell,
     /// Allocate a PTY with the given parameters.
@@ -79,13 +79,12 @@ pub enum RequestAction {
 // Request data parsing
 // ---------------------------------------------------------------------------
 
-/// Parse an exec command from request_data bytes.
-///
-/// The command is encoded as an `SshString` (varint length prefix + UTF-8 bytes).
-pub async fn parse_exec_command(request_data: &[u8]) -> io::Result<String> {
+pub async fn parse_exec_command(request_data: &[u8]) -> io::Result<Vec<u8>> {
     let mut reader = request_data;
-    let ssh_string = SshString::decode_from(&mut reader).await?;
-    Ok(ssh_string.0)
+    let len: VarInt = reader.decode_one().await?;
+    let mut command = vec![0u8; len.into_inner() as usize];
+    reader.read_exact(&mut command).await?;
+    Ok(command)
 }
 
 /// Parse a subsystem name from request_data bytes.
@@ -281,7 +280,7 @@ where
 /// and the PTY master is used for I/O relay.
 pub async fn run_exec<W>(
     shell_path: &OsStr,
-    command: &str,
+    command: &[u8],
     writer: &mut W,
     event_rx: mpsc::Receiver<ChannelEvent>,
     pty: Option<PtyPair>,
@@ -289,10 +288,18 @@ pub async fn run_exec<W>(
 where
     W: AsyncWrite + Send + Unpin,
 {
+    let command = OsString::from_vec(command.to_vec());
     if let Some(pty_pair) = pty {
-        run_command_with_pty(shell_path, &["-c", command], writer, event_rx, pty_pair).await
+        run_command_with_pty(
+            shell_path,
+            &[OsString::from("-c"), command],
+            writer,
+            event_rx,
+            pty_pair,
+        )
+        .await
     } else {
-        run_command_piped(shell_path, &["-c", command], writer, event_rx).await
+        run_command_piped(shell_path, &[OsString::from("-c"), command], writer, event_rx).await
     }
 }
 
@@ -320,7 +327,7 @@ where
 /// Run a command with piped stdio (no PTY).
 async fn run_command_piped<W>(
     program: &OsStr,
-    args: &[&str],
+    args: &[OsString],
     writer: &mut W,
     event_rx: mpsc::Receiver<ChannelEvent>,
 ) -> io::Result<()>
@@ -405,7 +412,7 @@ where
 /// master is used for I/O relay.
 async fn run_command_with_pty<W>(
     program: &OsStr,
-    args: &[&str],
+    args: &[OsString],
     writer: &mut W,
     event_rx: mpsc::Receiver<ChannelEvent>,
     pty_pair: PtyPair,
@@ -631,7 +638,7 @@ mod tests {
         reader.read_to_end(&mut buf).await.unwrap();
 
         let cmd = parse_exec_command(&buf).await.unwrap();
-        assert_eq!(cmd, "echo hello");
+        assert_eq!(cmd, b"echo hello");
     }
 
     #[tokio::test]
@@ -645,7 +652,15 @@ mod tests {
         reader.read_to_end(&mut buf).await.unwrap();
 
         let cmd = parse_exec_command(&buf).await.unwrap();
-        assert_eq!(cmd, "");
+        assert_eq!(cmd, b"");
+    }
+
+    #[tokio::test]
+    async fn parse_exec_command_non_utf8() {
+        let request_data = vec![0x03, 0x66, 0x6f, 0xff];
+
+        let cmd = parse_exec_command(&request_data).await.unwrap();
+        assert_eq!(cmd, vec![0x66, 0x6f, 0xff]);
     }
 
     // -------------------------------------------------------------------
@@ -696,7 +711,7 @@ mod tests {
 
         // Run "echo hello" and capture all output.
         let (_, rx) = mpsc::channel(1);
-        run_exec(default_shell(), "echo hello", &mut server_writer, rx, None).await.unwrap();
+        run_exec(default_shell(), b"echo hello", &mut server_writer, rx, None).await.unwrap();
         drop(server_writer);
 
         // Collect all messages sent to the client.
@@ -787,7 +802,7 @@ mod tests {
 
         // Run a command that will fail (nonexistent binary).
         let (_, rx) = mpsc::channel(1);
-        run_exec(default_shell(), "__nonexistent_command_xyz_2024__", &mut server_writer, rx, None)
+        run_exec(default_shell(), b"__nonexistent_command_xyz_2024__", &mut server_writer, rx, None)
             .await
             .unwrap();
         drop(server_writer);
@@ -884,7 +899,7 @@ mod tests {
         };
 
         let result = handle_request(&event, &mut server_writer).await.unwrap();
-        assert_eq!(result, Some(RequestAction::Exec("ls -la".into())));
+        assert_eq!(result, Some(RequestAction::Exec(b"ls -la".to_vec())));
 
         drop(server_writer);
 
@@ -1176,7 +1191,7 @@ mod tests {
         let mut server_writer = server_writer;
 
         let (_, rx) = mpsc::channel(1);
-        run_exec(default_shell(), "echo stderr_msg >&2", &mut server_writer, rx, None)
+        run_exec(default_shell(), b"echo stderr_msg >&2", &mut server_writer, rx, None)
             .await
             .unwrap();
         drop(server_writer);

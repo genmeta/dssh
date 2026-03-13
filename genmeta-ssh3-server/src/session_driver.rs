@@ -189,8 +189,8 @@ impl Ssh3Session {
                     .await
                     .map_err(SessionError::new)?
                 {
-                    Some(RequestAction::Exec(cmd)) => {
-                        run_exec(self.init.shell.as_os_str(), &cmd, &mut writer, event_rx, pty_pair.take())
+                    Some(RequestAction::Exec(command)) => {
+                        run_exec(self.init.shell.as_os_str(), &command, &mut writer, event_rx, pty_pair.take())
                             .await
                             .map_err(SessionError::new)?;
                         return Ok(());
