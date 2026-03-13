@@ -18,6 +18,7 @@ use h3x::{
     codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
     varint::VarInt,
 };
+use snafu::Report;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -327,7 +328,7 @@ where
     {
         Ok(child) => child,
         Err(e) => {
-            tracing::error!(%e, "failed to spawn command");
+            tracing::error!(error = %Report::from_error(&e), "failed to spawn command");
             SshMessage::ChannelFailure.encode_into(writer).await?;
             return Err(e);
         }
@@ -425,7 +426,7 @@ where
     {
         Ok(child) => child,
         Err(e) => {
-            tracing::error!(%e, "failed to spawn command with PTY");
+            tracing::error!(error = %Report::from_error(&e), "failed to spawn command with PTY");
             SshMessage::ChannelFailure.encode_into(writer).await?;
             return Err(e);
         }

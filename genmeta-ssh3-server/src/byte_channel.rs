@@ -13,6 +13,17 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+fn missing_receiver_error() -> io::Error {
+    io::Error::other("ChannelReader missing receiver without active recv future")
+}
+
+fn broken_pipe_error<E>(error: E) -> io::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    io::Error::new(io::ErrorKind::BrokenPipe, error)
+}
+
 // ---------------------------------------------------------------------------
 // ChannelReader
 // ---------------------------------------------------------------------------
@@ -86,10 +97,9 @@ impl AsyncRead for ChannelReader {
         // Buffer exhausted — poll for the next chunk.
         // Create the recv future if we don't have one yet.
         if this.recv_fut.is_none() {
-            let mut rx = this
-                .rx
-                .take()
-                .expect("ChannelReader: receiver missing without active future");
+            let Some(mut rx) = this.rx.take() else {
+                return Poll::Ready(Err(missing_receiver_error()));
+            };
             this.recv_fut = Some(Box::pin(async move {
                 let result = rx.recv().await;
                 (rx, result)
@@ -97,7 +107,9 @@ impl AsyncRead for ChannelReader {
         }
 
         // Poll the in-flight recv future.
-        let fut = this.recv_fut.as_mut().unwrap();
+        let Some(fut) = this.recv_fut.as_mut() else {
+            return Poll::Ready(Err(missing_receiver_error()));
+        };
         match fut.as_mut().poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready((rx, result)) => {
@@ -126,10 +138,7 @@ impl AsyncRead for ChannelReader {
                         this.eof = true;
                         Poll::Ready(Ok(()))
                     }
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("remoc recv error: {e}"),
-                    ))),
+                    Err(e) => Poll::Ready(Err(broken_pipe_error(e))),
                 }
             }
         }
@@ -198,7 +207,11 @@ impl AsyncWrite for ChannelWriter {
         }));
 
         // Poll the future we just created — it might complete immediately.
-        let fut = this.send_fut.as_mut().unwrap();
+        let Some(fut) = this.send_fut.as_mut() else {
+            return Poll::Ready(Err(io::Error::other(
+                "ChannelWriter missing send future after initialization",
+            )));
+        };
         match fut.as_mut().poll(cx) {
             Poll::Pending => {
                 // The send is in flight. We report the bytes as written because

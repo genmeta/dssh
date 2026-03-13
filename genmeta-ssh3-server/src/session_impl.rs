@@ -13,6 +13,7 @@ use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::message::SshMessage;
 use genmeta_ssh3_proto::session::{SessionError, SessionInit, Ssh3Transport, Ssh3TransportClient};
 use h3x::codec::EncodeInto;
+use snafu::Report;
 use tokio::sync::mpsc;
 
 use crate::byte_channel::{ChannelReader, ChannelWriter};
@@ -127,7 +128,7 @@ impl Ssh3SessionImpl {
                                         tracing::info!(term = %req.term_type, "PTY allocated");
                                     }
                                     Err(e) => {
-                                        tracing::error!(%e, "PTY allocation failed");
+                                        tracing::error!(error = %Report::from_error(e), "PTY allocation failed");
                                         // PTY failure is non-fatal — exec/shell will use piped stdio
                                     }
                                 },
@@ -170,7 +171,7 @@ impl Ssh3SessionImpl {
                 let ctx = global_ctx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = Self::handle_channel_inner(header, from_client_rx, to_client_tx, ctx).await {
-                        tracing::warn!(%e, "channel handling failed");
+                        tracing::warn!(error = %Report::from_error(e), "channel handling failed");
                     }
                 });
             }
