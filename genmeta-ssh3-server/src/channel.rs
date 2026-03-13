@@ -306,9 +306,9 @@ where
                         return Ok(());
                     }
                     Some(RequestAction::Shell) => {
-                        let shell = std::env::var("SHELL")
-                            .unwrap_or_else(|_| "/bin/sh".to_string());
-                        run_shell(&shell, &mut writer, event_rx, pty_pair.take()).await?;
+                        let shell = std::env::var_os("SHELL")
+                            .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"));
+                        run_shell(shell.as_os_str(), &mut writer, event_rx, pty_pair.take()).await?;
                         return Ok(());
                     }
                     Some(RequestAction::AllocatePty(req)) => {

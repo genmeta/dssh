@@ -11,7 +11,12 @@
 //! - `exit-signal` — process killed by signal (server→client direction)
 
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::ffi::OsStr;
 use std::process::Stdio;
+
+fn default_shell() -> &'static OsStr {
+    OsStr::new("/bin/sh")
+}
 
 use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
 use h3x::{
@@ -283,9 +288,9 @@ where
     W: AsyncWrite + Send + Unpin,
 {
     if let Some(pty_pair) = pty {
-        run_command_with_pty("/bin/sh", &["-c", command], writer, event_rx, pty_pair).await
+        run_command_with_pty(default_shell(), &["-c", command], writer, event_rx, pty_pair).await
     } else {
-        run_command_piped("/bin/sh", &["-c", command], writer, event_rx).await
+        run_command_piped(default_shell(), &["-c", command], writer, event_rx).await
     }
 }
 
@@ -295,7 +300,7 @@ where
 /// When `pty` is `Some`, the child process uses the PTY slave as stdin/stdout/stderr,
 /// and the PTY master is used for I/O relay.
 pub async fn run_shell<W>(
-    shell_path: &str,
+    shell_path: &OsStr,
     writer: &mut W,
     event_rx: mpsc::Receiver<ChannelEvent>,
     pty: Option<PtyPair>,
@@ -312,7 +317,7 @@ where
 
 /// Run a command with piped stdio (no PTY).
 async fn run_command_piped<W>(
-    program: &str,
+    program: &OsStr,
     args: &[&str],
     writer: &mut W,
     event_rx: mpsc::Receiver<ChannelEvent>,
@@ -397,7 +402,7 @@ where
 /// Run a command with PTY: child uses slave as stdin/stdout/stderr,
 /// master is used for I/O relay.
 async fn run_command_with_pty<W>(
-    program: &str,
+    program: &OsStr,
     args: &[&str],
     writer: &mut W,
     event_rx: mpsc::Receiver<ChannelEvent>,
@@ -1132,7 +1137,7 @@ mod tests {
 
         // Shell with no stdin will immediately hit EOF and exit.
         let (_, rx) = mpsc::channel(1);
-        run_shell("/bin/sh", &mut server_writer, rx, None).await.unwrap();
+        run_shell(default_shell(), &mut server_writer, rx, None).await.unwrap();
         drop(server_writer);
 
         // Should eventually get exit-status, EOF, Close

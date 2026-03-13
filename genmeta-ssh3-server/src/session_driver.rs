@@ -181,7 +181,6 @@ impl Ssh3Session {
     where
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let shell = self.init.shell.to_string_lossy().into_owned();
         let mut pty_pair: Option<PtyPair> = None;
 
         while let Some(event) = event_rx.recv().await {
@@ -197,7 +196,7 @@ impl Ssh3Session {
                         return Ok(());
                     }
                     Some(RequestAction::Shell) => {
-                        run_shell(&shell, &mut writer, event_rx, pty_pair.take())
+                        run_shell(self.init.shell.as_os_str(), &mut writer, event_rx, pty_pair.take())
                             .await
                             .map_err(SessionError::new)?;
                         return Ok(());
