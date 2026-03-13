@@ -36,6 +36,7 @@ use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient};
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeInto};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
+use snafu::Report;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tracing::Instrument;
@@ -80,7 +81,11 @@ where
     let unix_stream = match UnixStream::connect(&socket_path.0).await {
         Ok(stream) => stream,
         Err(e) => {
-            tracing::warn!(path = %socket_path.0, %e, "direct-streamlocal connect failed");
+            tracing::warn!(
+                path = %socket_path.0,
+                error = %Report::from_error(&e),
+                "direct-streamlocal connect failed"
+            );
             let failure = SshMessage::ChannelOpenFailure {
                 reason_code: SSH_OPEN_CONNECT_FAILED,
                 description: format!("connect failed: {e}"),
@@ -105,10 +110,10 @@ where
     // Wait for both directions, handle errors.
     let (r1, r2) = tokio::join!(q2u, u2q);
     if let Ok(Err(e)) = r1 {
-        tracing::warn!("relay quic→unix error: {e}");
+        tracing::warn!(error = %Report::from_error(&e), "relay quic→unix error");
     }
     if let Ok(Err(e)) = r2 {
-        tracing::warn!("relay unix→quic error: {e}");
+        tracing::warn!(error = %Report::from_error(&e), "relay unix→quic error");
     }
 
     Ok(())
@@ -249,17 +254,26 @@ impl ReverseStreamlocalForwarder {
                                         &path,
                                         conv_id,
                                     ).await {
-                                        tracing::warn!(%e, "forwarded-streamlocal channel error");
+                                        tracing::warn!(
+                                            error = %Report::from_error(&e),
+                                            "forwarded-streamlocal channel error"
+                                        );
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!(%e, "failed to open transport channel for forwarded-streamlocal");
+                                    tracing::warn!(
+                                        error = %Report::from_error(&e),
+                                        "failed to open transport channel for forwarded-streamlocal"
+                                    );
                                 }
                             }
                         }.in_current_span());
                     }
                     Err(e) => {
-                        tracing::warn!(%e, "reverse-streamlocal accept error");
+                        tracing::warn!(
+                            error = %Report::from_error(&e),
+                            "reverse-streamlocal accept error"
+                        );
                         break;
                     }
                 }
@@ -368,10 +382,10 @@ where
     // Wait for both directions, handle errors.
     let (r1, r2) = tokio::join!(q2u, u2q);
     if let Ok(Err(e)) = r1 {
-        tracing::warn!("relay quic→unix error: {e}");
+        tracing::warn!(error = %Report::from_error(&e), "relay quic→unix error");
     }
     if let Ok(Err(e)) = r2 {
-        tracing::warn!("relay unix→quic error: {e}");
+        tracing::warn!(error = %Report::from_error(&e), "relay unix→quic error");
     }
 
     Ok(())

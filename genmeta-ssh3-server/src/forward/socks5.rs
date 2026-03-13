@@ -12,6 +12,7 @@
 //!    bidirectionally between the QUIC stream and the TCP socket.
 
 use genmeta_ssh3_proto::codec::ChannelHeader;
+use snafu::Report;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -139,7 +140,11 @@ where
     let tcp_stream = match TcpStream::connect(&addr).await {
         Ok(stream) => stream,
         Err(e) => {
-            tracing::warn!(%addr, %e, "socks5 connect failed");
+            tracing::warn!(
+                %addr,
+                error = %Report::from_error(&e),
+                "socks5 connect failed"
+            );
             send_reply(&mut writer, REP_CONNECTION_REFUSED, atyp, &dest_atyp_bytes, dest_port)
                 .await?;
             writer.shutdown().await?;
@@ -160,10 +165,10 @@ where
     // Wait for both directions, handle errors.
     let (r1, r2) = tokio::join!(q2t, t2q);
     if let Ok(Err(e)) = r1 {
-        tracing::warn!("relay quic→socks error: {e}");
+        tracing::warn!(error = %Report::from_error(&e), "relay quic→socks error");
     }
     if let Ok(Err(e)) = r2 {
-        tracing::warn!("relay socks→quic error: {e}");
+        tracing::warn!(error = %Report::from_error(&e), "relay socks→quic error");
     }
 
     Ok(())

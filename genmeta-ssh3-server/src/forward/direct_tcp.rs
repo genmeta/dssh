@@ -19,6 +19,7 @@
 use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeInto};
 use h3x::varint::VarInt;
+use snafu::Report;
 use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
@@ -55,7 +56,11 @@ where
     let tcp_stream = match TcpStream::connect(&addr).await {
         Ok(stream) => stream,
         Err(e) => {
-            tracing::warn!(%addr, %e, "direct-tcpip connect failed");
+            tracing::warn!(
+                %addr,
+                error = %Report::from_error(&e),
+                "direct-tcpip connect failed"
+            );
             let failure = SshMessage::ChannelOpenFailure {
                 reason_code: SSH_OPEN_CONNECT_FAILED,
                 description: format!("connect failed: {e}"),
@@ -82,10 +87,10 @@ where
     // Wait for both directions, handle errors.
     let (r1, r2) = tokio::join!(q2t, t2q);
     if let Ok(Err(e)) = r1 {
-        tracing::warn!("relay quic→tcp error: {e}");
+        tracing::warn!(error = %Report::from_error(&e), "relay quic→tcp error");
     }
     if let Ok(Err(e)) = r2 {
-        tracing::warn!("relay tcp→quic error: {e}");
+        tracing::warn!(error = %Report::from_error(&e), "relay tcp→quic error");
     }
 
     Ok(())

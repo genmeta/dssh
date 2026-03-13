@@ -17,6 +17,7 @@ use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient};
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
+use snafu::Report;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -227,17 +228,23 @@ impl ReverseTcpForwarder {
                                         &peer_addr.ip().to_string(), peer_addr.port(),
                                         conv_id,
                                     ).await {
-                                        tracing::warn!(%e, "forwarded-tcpip channel error");
+                                        tracing::warn!(
+                                            error = %Report::from_error(&e),
+                                            "forwarded-tcpip channel error"
+                                        );
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!(%e, "failed to open transport channel for forwarded-tcpip");
+                                    tracing::warn!(
+                                        error = %Report::from_error(&e),
+                                        "failed to open transport channel for forwarded-tcpip"
+                                    );
                                 }
                             }
                         }.in_current_span());
                     }
                     Err(e) => {
-                        tracing::warn!(%e, "reverse-tcp accept error");
+                        tracing::warn!(error = %Report::from_error(&e), "reverse-tcp accept error");
                         break;
                     }
                 }
@@ -352,10 +359,10 @@ where
     // Wait for both directions, handle errors.
     let (r1, r2) = tokio::join!(q2t, t2q);
     if let Ok(Err(e)) = r1 {
-        tracing::warn!("relay quic→tcp error: {e}");
+        tracing::warn!(error = %Report::from_error(&e), "relay quic→tcp error");
     }
     if let Ok(Err(e)) = r2 {
-        tracing::warn!("relay tcp→quic error: {e}");
+        tracing::warn!(error = %Report::from_error(&e), "relay tcp→quic error");
     }
 
     Ok(())
