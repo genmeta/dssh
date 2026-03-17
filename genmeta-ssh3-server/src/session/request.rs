@@ -10,6 +10,7 @@
 //! - `exit-status` — process exit code (server→client direction)
 //! - `exit-signal` — process killed by signal (server→client direction)
 
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStringExt;
@@ -28,8 +29,8 @@ use tracing::Instrument;
 
 use crate::channel::ChannelEvent;
 use crate::session::pty::{
-    PtyPair, PtyRequest, SignalRequest, WindowChangeRequest,
-    parse_pty_request, parse_signal, parse_window_change, set_window_size,
+    PtyPair, PtyRequest, SignalRequest, WindowChangeRequest, parse_pty_request, parse_signal,
+    parse_window_change, set_window_size,
 };
 // ---------------------------------------------------------------------------
 // Parsed request types
@@ -176,10 +177,16 @@ pub async fn encode_exit_signal_data(
     language_tag: &str,
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    SshString(signal_name.to_owned()).encode_into(&mut buf).await?;
+    SshString(signal_name.to_owned())
+        .encode_into(&mut buf)
+        .await?;
     buf.write_u8(if core_dumped { 0x01 } else { 0x00 }).await?;
-    SshString(error_message.to_owned()).encode_into(&mut buf).await?;
-    SshString(language_tag.to_owned()).encode_into(&mut buf).await?;
+    SshString(error_message.to_owned())
+        .encode_into(&mut buf)
+        .await?;
+    SshString(language_tag.to_owned())
+        .encode_into(&mut buf)
+        .await?;
     Ok(buf)
 }
 
@@ -301,7 +308,13 @@ where
         )
         .await
     } else {
-        run_command_piped(shell_path, &[OsString::from("-c"), command], writer, event_rx).await
+        run_command_piped(
+            shell_path,
+            &[OsString::from("-c"), command],
+            writer,
+            event_rx,
+        )
+        .await
     }
 }
 
@@ -405,7 +418,8 @@ where
         SshMessage::ChannelExtendedData {
             data_type: VarInt::from(1u8),
             data: stderr_data,
-        }.encode_into(&mut *writer)
+        }
+        .encode_into(&mut *writer)
         .await?;
     }
 
@@ -414,11 +428,11 @@ where
     // Wait for process to exit.
     let status = child.wait().await?;
     if let Some(signal_number) = status.signal() {
-        let signal_name = signal_number_name(signal_number).unwrap_or("TERM");
+        let signal_name = exit_signal_name(signal_number);
         send_exit_signal(
-            signal_name,
+            signal_name.as_ref(),
             status.core_dumped(),
-            "terminated by signal",
+            "",
             "",
             writer,
         )
@@ -546,11 +560,11 @@ where
     // Wait for process to exit — use the same signal-aware split as non-PTY.
     let status = child.wait().await?;
     if let Some(signal_number) = status.signal() {
-        let signal_name = signal_number_name(signal_number).unwrap_or("TERM");
+        let signal_name = exit_signal_name(signal_number);
         send_exit_signal(
-            signal_name,
+            signal_name.as_ref(),
             status.core_dumped(),
-            "terminated by signal",
+            "",
             "",
             writer,
         )
@@ -586,7 +600,8 @@ where
         request_type: "exit-status".into(),
         want_reply: false,
         request_data,
-    }.encode_into(writer)
+    }
+    .encode_into(writer)
     .await
 }
 
@@ -607,7 +622,8 @@ where
         request_type: "exit-signal".into(),
         want_reply: false,
         request_data,
-    }.encode_into(writer)
+    }
+    .encode_into(writer)
     .await
 }
 
@@ -632,7 +648,8 @@ where
         }
         SshMessage::ChannelData {
             data: buf[..n].to_vec(),
-        }.encode_into(&mut *writer)
+        }
+        .encode_into(&mut *writer)
         .await?;
     }
     Ok(())
@@ -663,15 +680,27 @@ fn signal_number(signal_name: &str) -> Option<i32> {
 
 fn signal_number_name(signal_number: i32) -> Option<&'static str> {
     match signal_number {
+        libc::SIGABRT => Some("ABRT"),
+        libc::SIGALRM => Some("ALRM"),
+        libc::SIGFPE => Some("FPE"),
         libc::SIGHUP => Some("HUP"),
+        libc::SIGILL => Some("ILL"),
         libc::SIGINT => Some("INT"),
         libc::SIGQUIT => Some("QUIT"),
         libc::SIGKILL => Some("KILL"),
+        libc::SIGPIPE => Some("PIPE"),
+        libc::SIGSEGV => Some("SEGV"),
         libc::SIGTERM => Some("TERM"),
         libc::SIGUSR1 => Some("USR1"),
         libc::SIGUSR2 => Some("USR2"),
         _ => None,
     }
+}
+
+fn exit_signal_name(signal_number: i32) -> Cow<'static, str> {
+    signal_number_name(signal_number)
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Owned(format!("signal-{signal_number}@genmeta-ssh3")))
 }
 
 async fn deliver_signal_request(child_pid: i32, request_data: &[u8]) -> io::Result<()> {
@@ -720,7 +749,10 @@ mod tests {
     async fn parse_exec_command_simple() {
         // Encode "echo hello" as SshString
         let (mut writer, mut reader) = duplex(4096);
-        SshString("echo hello".into()).encode_into(&mut writer).await.unwrap();
+        SshString("echo hello".into())
+            .encode_into(&mut writer)
+            .await
+            .unwrap();
         drop(writer);
 
         let mut buf = Vec::new();
@@ -734,7 +766,10 @@ mod tests {
     async fn parse_exec_command_empty() {
         // Encode empty string as SshString
         let (mut writer, mut reader) = duplex(4096);
-        SshString(String::new()).encode_into(&mut writer).await.unwrap();
+        SshString(String::new())
+            .encode_into(&mut writer)
+            .await
+            .unwrap();
         drop(writer);
 
         let mut buf = Vec::new();
@@ -800,7 +835,9 @@ mod tests {
 
         // Run "echo hello" and capture all output.
         let (_, rx) = mpsc::channel(1);
-        run_exec(default_shell(), b"echo hello", &mut server_writer, rx, None).await.unwrap();
+        run_exec(default_shell(), b"echo hello", &mut server_writer, rx, None)
+            .await
+            .unwrap();
         drop(server_writer);
 
         // Collect all messages sent to the client.
@@ -822,12 +859,13 @@ mod tests {
 
         // Find the ChannelData containing "hello"
         let has_hello = messages.iter().any(|m| match m {
-            SshMessage::ChannelData { data } => {
-                String::from_utf8_lossy(data).contains("hello")
-            }
+            SshMessage::ChannelData { data } => String::from_utf8_lossy(data).contains("hello"),
             _ => false,
         });
-        assert!(has_hello, "expected ChannelData containing 'hello', got: {messages:?}");
+        assert!(
+            has_hello,
+            "expected ChannelData containing 'hello', got: {messages:?}"
+        );
 
         // Check exit-status request
         let has_exit_status = messages.iter().any(|m| match m {
@@ -853,7 +891,9 @@ mod tests {
             "expected ChannelEof"
         );
         assert!(
-            messages.iter().any(|m| matches!(m, SshMessage::ChannelClose)),
+            messages
+                .iter()
+                .any(|m| matches!(m, SshMessage::ChannelClose)),
             "expected ChannelClose"
         );
 
@@ -870,14 +910,8 @@ mod tests {
             .iter()
             .position(|m| matches!(m, SshMessage::ChannelClose))
             .unwrap();
-        assert!(
-            exit_pos < eof_pos,
-            "exit-status should come before EOF"
-        );
-        assert!(
-            eof_pos < close_pos,
-            "EOF should come before Close"
-        );
+        assert!(exit_pos < eof_pos, "exit-status should come before EOF");
+        assert!(eof_pos < close_pos, "EOF should come before Close");
     }
 
     // -------------------------------------------------------------------
@@ -891,9 +925,15 @@ mod tests {
 
         // Run a command that will fail (nonexistent binary).
         let (_, rx) = mpsc::channel(1);
-        run_exec(default_shell(), b"__nonexistent_command_xyz_2024__", &mut server_writer, rx, None)
-            .await
-            .unwrap();
+        run_exec(
+            default_shell(),
+            b"__nonexistent_command_xyz_2024__",
+            &mut server_writer,
+            rx,
+            None,
+        )
+        .await
+        .unwrap();
         drop(server_writer);
 
         // Collect all messages.
@@ -929,7 +969,9 @@ mod tests {
             "expected ChannelEof"
         );
         assert!(
-            messages.iter().any(|m| matches!(m, SshMessage::ChannelClose)),
+            messages
+                .iter()
+                .any(|m| matches!(m, SshMessage::ChannelClose)),
             "expected ChannelClose"
         );
     }
@@ -945,7 +987,8 @@ mod tests {
 
         // Build SshString-encoded subsystem name for request_data
         let mut request_data_buf = Vec::new();
-        SshString("sftp".into()).encode_into(&mut request_data_buf)
+        SshString("sftp".into())
+            .encode_into(&mut request_data_buf)
             .await
             .unwrap();
 
@@ -976,7 +1019,10 @@ mod tests {
 
         // Build request_data containing SshString("ls -la")
         let (mut enc_writer, mut enc_reader) = duplex(4096);
-        SshString("ls -la".into()).encode_into(&mut enc_writer).await.unwrap();
+        SshString("ls -la".into())
+            .encode_into(&mut enc_writer)
+            .await
+            .unwrap();
         drop(enc_writer);
         let mut request_data = Vec::new();
         enc_reader.read_to_end(&mut request_data).await.unwrap();
@@ -1102,8 +1148,9 @@ mod tests {
 
     #[tokio::test]
     async fn parse_exit_signal_roundtrip() {
-        let data =
-            encode_exit_signal_data("KILL", true, "killed by signal", "en").await.unwrap();
+        let data = encode_exit_signal_data("KILL", true, "killed by signal", "en")
+            .await
+            .unwrap();
         let req = parse_exit_signal_request(&data).await.unwrap();
         assert_eq!(req.signal_name, "KILL");
         assert!(req.core_dumped);
@@ -1113,8 +1160,9 @@ mod tests {
 
     #[tokio::test]
     async fn parse_exit_signal_no_core_dump() {
-        let data =
-            encode_exit_signal_data("TERM", false, "terminated", "").await.unwrap();
+        let data = encode_exit_signal_data("TERM", false, "terminated", "")
+            .await
+            .unwrap();
         let req = parse_exit_signal_request(&data).await.unwrap();
         assert_eq!(req.signal_name, "TERM");
         assert!(!req.core_dumped);
@@ -1186,7 +1234,10 @@ mod tests {
     #[tokio::test]
     async fn parse_subsystem_name() {
         let mut buf = Vec::new();
-        SshString("sftp".into()).encode_into(&mut buf).await.unwrap();
+        SshString("sftp".into())
+            .encode_into(&mut buf)
+            .await
+            .unwrap();
         let req = parse_subsystem_request(&buf).await.unwrap();
         assert_eq!(req.subsystem_name, "sftp");
     }
@@ -1208,7 +1259,10 @@ mod tests {
         };
 
         let result = handle_request(&event, &mut server_writer).await.unwrap();
-        assert_eq!(result, None, "exit-status should return None (server→client)");
+        assert_eq!(
+            result, None,
+            "exit-status should return None (server→client)"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1220,8 +1274,9 @@ mod tests {
         let (server_writer, _client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        let request_data =
-            encode_exit_signal_data("KILL", true, "killed", "en").await.unwrap();
+        let request_data = encode_exit_signal_data("KILL", true, "killed", "en")
+            .await
+            .unwrap();
         let event = ChannelEvent::Request {
             request_type: "exit-signal".into(),
             want_reply: false,
@@ -1229,7 +1284,10 @@ mod tests {
         };
 
         let result = handle_request(&event, &mut server_writer).await.unwrap();
-        assert_eq!(result, None, "exit-signal should return None (server→client)");
+        assert_eq!(
+            result, None,
+            "exit-signal should return None (server→client)"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1243,7 +1301,9 @@ mod tests {
 
         // Shell with no stdin will immediately hit EOF and exit.
         let (_, rx) = mpsc::channel(1);
-        run_shell(default_shell(), &mut server_writer, rx, None).await.unwrap();
+        run_shell(default_shell(), &mut server_writer, rx, None)
+            .await
+            .unwrap();
         drop(server_writer);
 
         // Should eventually get exit-status, EOF, Close
@@ -1257,7 +1317,9 @@ mod tests {
                 Err(e) => panic!("unexpected error: {e}"),
             };
             match &msg {
-                SshMessage::ChannelRequest { request_type, .. } if request_type == "exit-status" => {
+                SshMessage::ChannelRequest { request_type, .. }
+                    if request_type == "exit-status" =>
+                {
                     found_exit_status = true;
                 }
                 SshMessage::ChannelEof => found_eof = true,
@@ -1280,9 +1342,15 @@ mod tests {
         let mut server_writer = server_writer;
 
         let (_, rx) = mpsc::channel(1);
-        run_exec(default_shell(), b"echo stderr_msg >&2", &mut server_writer, rx, None)
-            .await
-            .unwrap();
+        run_exec(
+            default_shell(),
+            b"echo stderr_msg >&2",
+            &mut server_writer,
+            rx,
+            None,
+        )
+        .await
+        .unwrap();
         drop(server_writer);
 
         // Collect all messages
@@ -1303,7 +1371,10 @@ mod tests {
             }
             _ => false,
         });
-        assert!(has_stderr, "expected ChannelExtendedData with stderr_msg, got: {messages:?}");
+        assert!(
+            has_stderr,
+            "expected ChannelExtendedData with stderr_msg, got: {messages:?}"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1312,7 +1383,7 @@ mod tests {
 
     #[tokio::test]
     async fn pty_signal_emits_exit_signal_instead_of_exit_status() {
-        use crate::session::pty::{allocate_pty, PtyRequest};
+        use crate::session::pty::{PtyRequest, allocate_pty};
 
         let pty_req = PtyRequest {
             term_type: "xterm".into(),
@@ -1377,12 +1448,14 @@ mod tests {
                 }) if request_type == "exit-signal" => {
                     let req = parse_exit_signal_request(&request_data).await.unwrap();
                     assert_eq!(req.signal_name, "TERM");
+                    assert_eq!(req.error_message, "");
+                    assert_eq!(req.language_tag, "");
                     assert!(!want_reply, "exit-signal must have want_reply=false");
                     saw_exit_signal = true;
                 }
-                Ok(SshMessage::ChannelRequest {
-                    request_type, ..
-                }) if request_type == "exit-status" => {
+                Ok(SshMessage::ChannelRequest { request_type, .. })
+                    if request_type == "exit-status" =>
+                {
                     saw_exit_status = true;
                 }
                 Ok(_) => {}
@@ -1407,7 +1480,7 @@ mod tests {
 
     #[tokio::test]
     async fn pty_numeric_exit_emits_exit_status() {
-        use crate::session::pty::{allocate_pty, PtyRequest};
+        use crate::session::pty::{PtyRequest, allocate_pty};
 
         let pty_req = PtyRequest {
             term_type: "xterm".into(),
@@ -1449,9 +1522,9 @@ mod tests {
                     assert_eq!(req.exit_status, 42);
                     saw_exit_status = true;
                 }
-                Ok(SshMessage::ChannelRequest {
-                    request_type, ..
-                }) if request_type == "exit-signal" => {
+                Ok(SshMessage::ChannelRequest { request_type, .. })
+                    if request_type == "exit-signal" =>
+                {
                     saw_exit_signal = true;
                 }
                 Ok(_) => {}
@@ -1460,10 +1533,7 @@ mod tests {
             }
         }
 
-        assert!(
-            saw_exit_status,
-            "PTY numeric exit should emit exit-status"
-        );
+        assert!(saw_exit_status, "PTY numeric exit should emit exit-status");
         assert!(
             !saw_exit_signal,
             "PTY numeric exit should not emit exit-signal"
@@ -1490,7 +1560,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let mut request_data = Vec::new();
-        SshString("TERM".into()).encode_into(&mut request_data).await.unwrap();
+        SshString("TERM".into())
+            .encode_into(&mut request_data)
+            .await
+            .unwrap();
         event_tx
             .send(ChannelEvent::Request {
                 request_type: "signal".into(),
@@ -1517,9 +1590,13 @@ mod tests {
                 }) if request_type == "exit-signal" => {
                     let req = parse_exit_signal_request(&request_data).await.unwrap();
                     assert_eq!(req.signal_name, "TERM");
+                    assert_eq!(req.error_message, "");
+                    assert_eq!(req.language_tag, "");
                     saw_exit_signal = true;
                 }
-                Ok(SshMessage::ChannelRequest { request_type, .. }) if request_type == "exit-status" => {
+                Ok(SshMessage::ChannelRequest { request_type, .. })
+                    if request_type == "exit-status" =>
+                {
                     saw_exit_status = true;
                 }
                 Ok(_) => {}
@@ -1528,8 +1605,26 @@ mod tests {
             }
         }
 
-        assert!(saw_exit_signal, "expected exit-signal after non-PTY signal termination");
-        assert!(!saw_exit_status, "non-PTY signal termination should not emit exit-status");
+        assert!(
+            saw_exit_signal,
+            "expected exit-signal after non-PTY signal termination"
+        );
+        assert!(
+            !saw_exit_status,
+            "non-PTY signal termination should not emit exit-status"
+        );
+    }
+
+    #[test]
+    fn exit_signal_name_maps_extended_rfc_signal_set() {
+        assert_eq!(exit_signal_name(libc::SIGPIPE), "PIPE");
+        assert_eq!(exit_signal_name(libc::SIGABRT), "ABRT");
+        assert_eq!(exit_signal_name(libc::SIGSEGV), "SEGV");
+    }
+
+    #[test]
+    fn exit_signal_name_preserves_unknown_signal_without_fabricating_term() {
+        assert_eq!(exit_signal_name(9999), "signal-9999@genmeta-ssh3");
     }
 
     // -------------------------------------------------------------------
@@ -1539,7 +1634,10 @@ mod tests {
     #[tokio::test]
     async fn handle_request_pty_req_no_premature_reply() {
         let mut request_data = Vec::new();
-        SshString("xterm".into()).encode_into(&mut request_data).await.unwrap();
+        SshString("xterm".into())
+            .encode_into(&mut request_data)
+            .await
+            .unwrap();
         let zero = VarInt::try_from(80u64).unwrap();
         request_data.encode_one(zero).await.unwrap();
         let zero = VarInt::try_from(24u64).unwrap();
@@ -1582,7 +1680,10 @@ mod tests {
     #[tokio::test]
     async fn handle_request_pty_req_returns_want_reply() {
         let mut request_data = Vec::new();
-        SshString("vt100".into()).encode_into(&mut request_data).await.unwrap();
+        SshString("vt100".into())
+            .encode_into(&mut request_data)
+            .await
+            .unwrap();
         for &val in &[80u64, 24, 0, 0, 0] {
             let v = VarInt::try_from(val).unwrap();
             request_data.encode_one(v).await.unwrap();
