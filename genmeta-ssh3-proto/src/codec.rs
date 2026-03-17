@@ -21,7 +21,7 @@ pub(crate) struct SshBytes(pub Vec<u8>);
 
 /// A boolean encoded as a single byte: `0x00` for false, `0x01` for true.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SshBool(pub bool);
+pub struct SshBool(pub bool);
 
 /// SSH3 channel header, encoded field-by-field using QUIC varints and SSH strings.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
