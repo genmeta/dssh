@@ -29,6 +29,15 @@ const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
 /// SSH_OPEN_CONNECT_FAILED reason code (RFC 4254 §5.1).
 const SSH_OPEN_CONNECT_FAILED: u64 = 2;
 
+fn validate_port(raw_port: u64, field_name: &str) -> io::Result<u16> {
+    u16::try_from(raw_port).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{field_name} {raw_port} is out of range for a TCP port"),
+        )
+    })
+}
+
 /// Handle a `direct-tcpip` channel.
 ///
 /// Reads the forwarding request fields from `reader`, attempts a TCP
@@ -49,7 +58,17 @@ where
     let _originator_host = SshString::decode_from(&mut reader).await?;
     let _originator_port: VarInt = reader.decode_one().await?;
 
-    let dest_port = dest_port.into_inner() as u16;
+    let dest_port = match validate_port(dest_port.into_inner(), "destination port") {
+        Ok(port) => port,
+        Err(error) => {
+            let failure = SshMessage::ChannelOpenFailure {
+                reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
+                description: error.to_string(),
+            };
+            failure.encode_into(&mut writer).await?;
+            return Ok(());
+        }
+    };
     let addr = format!("{}:{}", dest_host.0, dest_port);
 
     // Attempt TCP connection.
@@ -287,6 +306,43 @@ mod tests {
                 );
             }
             other => panic!("expected ChannelOpenFailure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_range_port_is_rejected_instead_of_truncated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let overflow_port = listener.local_addr().unwrap().port() as u32 + (u16::MAX as u32) + 1;
+
+        let request_data = encode_request_data("127.0.0.1", overflow_port, "127.0.0.1", 11111).await;
+
+        let header = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "direct-tcpip".into(),
+            max_message_size: 1 << 20,
+        };
+
+        let (mut client_writer, server_reader) = duplex(8192);
+        let (server_writer, mut client_reader) = duplex(8192);
+
+        client_writer.write_all(&request_data).await.unwrap();
+        drop(client_writer);
+
+        handle_direct_tcp(header, server_reader, server_writer)
+            .await
+            .unwrap();
+
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        match msg {
+            SshMessage::ChannelOpenFailure {
+                reason_code,
+                description,
+            } => {
+                assert_eq!(reason_code, VarInt::from(SSH_OPEN_CONNECT_FAILED as u8));
+                assert!(description.contains("out of range"), "unexpected description: {description}");
+            }
+            other => panic!("expected ChannelOpenFailure for out-of-range port, got {other:?}"),
         }
     }
 

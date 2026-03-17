@@ -1215,8 +1215,101 @@ fn test_window_change_signal() {
     })
 }
 
+#[test]
+fn test_non_pty_signal_exit_signal() {
+    run("test_non_pty_signal_exit_signal", async move {
+        let (client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+
+        let header = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "session".into(),
+            max_message_size: 1 << 20,
+        };
+
+        let server_task = tokio::spawn(async move {
+            handle_session_channel(header, server_reader, server_writer)
+                .await
+                .expect("handle_channel failed");
+        });
+
+        let mut writer = client_writer;
+
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }));
+
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, b"sleep 30", true)
+            .await
+            .unwrap();
+
+        let success = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert_eq!(success, SshMessage::ChannelSuccess);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut request_data = Vec::new();
+        SshString("TERM".into()).encode_into(&mut request_data).await.unwrap();
+        SshMessage::ChannelRequest {
+            request_type: "signal".into(),
+            want_reply: false,
+            request_data,
+        }
+        .encode_into(&mut writer)
+        .await
+        .unwrap();
+        drop(writer);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_exit_signal = false;
+        let mut saw_exit_status = false;
+        let mut saw_eof = false;
+        let mut saw_close = false;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, SshMessage::decode_from(&mut client_reader)).await {
+                Ok(Ok(SshMessage::ChannelRequest {
+                    request_type,
+                    request_data,
+                    ..
+                })) if request_type == "exit-signal" => {
+                    let req = genmeta_ssh3_server::session::request::parse_exit_signal_request(&request_data)
+                        .await
+                        .unwrap();
+                    assert_eq!(req.signal_name, "TERM");
+                    saw_exit_signal = true;
+                }
+                Ok(Ok(SshMessage::ChannelRequest { request_type, .. })) if request_type == "exit-status" => {
+                    saw_exit_status = true;
+                }
+                Ok(Ok(SshMessage::ChannelEof)) => saw_eof = true,
+                Ok(Ok(SshMessage::ChannelClose)) => {
+                    saw_close = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Ok(Err(e)) => panic!("unexpected decode error: {e}"),
+                Err(_) => break,
+            }
+        }
+
+        assert!(saw_exit_signal, "expected exit-signal after non-PTY signal termination");
+        assert!(!saw_exit_status, "non-PTY signal termination should not emit exit-status");
+        assert!(saw_eof, "expected ChannelEof after signal termination");
+        assert!(saw_close, "expected ChannelClose after signal termination");
+
+        server_task.await.unwrap();
+    })
+}
+
 // ---------------------------------------------------------------------------
-// 18. Global request E2E: tcpip-forward → RequestSuccess with allocated_port.
+// 19. Global request E2E: tcpip-forward → RequestSuccess with allocated_port.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1277,7 +1370,7 @@ fn test_global_request_tcpip_forward() {
 }
 
 // ---------------------------------------------------------------------------
-// 19. Global request E2E: cancel-tcpip-forward — forward then cancel.
+// 20. Global request E2E: cancel-tcpip-forward — forward then cancel.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1380,7 +1473,7 @@ fn test_global_request_cancel_tcpip_forward() {
 }
 
 // ---------------------------------------------------------------------------
-// 20. Global request E2E: reverse TCP forwarded channel — full data path.
+// 21. Global request E2E: reverse TCP forwarded channel — full data path.
 // ---------------------------------------------------------------------------
 
 #[test]

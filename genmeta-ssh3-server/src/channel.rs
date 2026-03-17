@@ -14,6 +14,7 @@ use genmeta_ssh3_proto::session::{Ssh3Transport as RemoteSsh3Transport, Ssh3Tran
 use h3x::codec::{DecodeFrom, EncodeInto};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
+use snafu::Report;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
@@ -43,6 +44,15 @@ pub struct GlobalRequestContext {
     pub transport: Ssh3TransportClient,
     /// Conversation ID for opened channels.
     pub conversation_id: StreamId,
+}
+
+fn validate_global_request_port(bind_port: u32) -> io::Result<u16> {
+    u16::try_from(bind_port).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("bind port {bind_port} is out of range for a TCP port"),
+        )
+    })
 }
 // ---------------------------------------------------------------------------
 // Channel events dispatched via mpsc
@@ -162,9 +172,20 @@ where
                 bind_port = req.bind_port,
                 "tcpip-forward request"
             );
+            let bind_port = match validate_global_request_port(req.bind_port) {
+                Ok(port) => port,
+                Err(error) => {
+                    tracing::warn!(error = %Report::from_error(&error), bind_port = req.bind_port, "tcpip-forward bind rejected");
+                    if want_reply {
+                        SshMessage::RequestFailure.encode_into(&mut writer).await?;
+                    }
+                    return Ok(());
+                }
+            };
+
             match ctx.tcp_forwarder.start_listening(
                 &req.bind_address,
-                req.bind_port as u16,
+                bind_port,
                 ctx.transport.clone(),
                 ctx.conversation_id,
             ).await {
@@ -195,9 +216,20 @@ where
                 bind_port = req.bind_port,
                 "cancel-tcpip-forward request"
             );
+            let bind_port = match validate_global_request_port(req.bind_port) {
+                Ok(port) => port,
+                Err(error) => {
+                    tracing::warn!(error = %Report::from_error(&error), bind_port = req.bind_port, "cancel-tcpip-forward rejected");
+                    if want_reply {
+                        SshMessage::RequestFailure.encode_into(&mut writer).await?;
+                    }
+                    return Ok(());
+                }
+            };
+
             let stopped = ctx.tcp_forwarder.stop_listening(
                 &req.bind_address,
-                req.bind_port as u16,
+                bind_port,
             ).await;
             if want_reply {
                 if stopped {
@@ -641,8 +673,13 @@ impl RemoteSsh3Transport for Ssh3Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forward::reverse_tcp::{CancelTcpipForwardRequest, ReverseTcpForwarder, TcpipForwardRequest};
+    use crate::forward::streamlocal::ReverseStreamlocalForwarder;
     use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
+    use genmeta_ssh3_proto::session::{Ssh3Transport as RemoteSessionTransport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
     use h3x::stream_id::StreamId;
+    use remoc::rtc::ServerShared;
+    use std::sync::Arc;
     use tokio::io::duplex;
 
     /// Helper: encode messages into writer half, then drop to signal EOF.
@@ -1057,5 +1094,114 @@ mod tests {
         let transport = Ssh3Transport::new(endpoint);
         let result = transport.open_channel(None).await;
         assert!(matches!(result, Err(TransportError::OpenFailed(_))));
+    }
+
+    struct TestTransport;
+
+    impl RemoteSessionTransport for TestTransport {
+        async fn accept_channel(&self) -> Result<
+            Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+            TransportError,
+        > {
+            Ok(None)
+        }
+
+        async fn open_channel(
+            &self,
+            _header: Option<ChannelHeader>,
+        ) -> Result<
+            (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            TransportError,
+        > {
+            let (tx, rx) = remoc::rch::mpsc::channel(16);
+            Ok((rx, tx))
+        }
+    }
+
+    fn test_transport_client() -> Ssh3TransportClient {
+        let (server, client) = Ssh3TransportServerShared::new(Arc::new(TestTransport), 16);
+        tokio::spawn(async move {
+            let _ = server.serve(true).await;
+        });
+        client
+    }
+
+    fn global_request_context() -> Arc<GlobalRequestContext> {
+        Arc::new(GlobalRequestContext {
+            tcp_forwarder: Arc::new(ReverseTcpForwarder::new()),
+            streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::new()),
+            transport: test_transport_client(),
+            conversation_id: StreamId::try_from(1u64).unwrap(),
+        })
+    }
+
+    #[tokio::test]
+    async fn global_request_tcpip_forward_rejects_out_of_range_port() {
+        let (client_writer, server_reader) = duplex(8192);
+        let (server_writer, mut client_reader) = duplex(8192);
+        let ctx = global_request_context();
+
+        let server_handle = tokio::spawn(async move {
+            handle_global_request_channel(server_reader, server_writer, Some(ctx))
+                .await
+                .unwrap();
+        });
+
+        let mut client_writer = client_writer;
+        let request_data = TcpipForwardRequest {
+            bind_address: "127.0.0.1".into(),
+            bind_port: u16::MAX as u32 + 1,
+        }
+        .encode_to_bytes()
+        .await;
+        SshMessage::GlobalRequest {
+            request_type: "tcpip-forward".into(),
+            want_reply: true,
+            data: request_data,
+        }
+        .encode_into(&mut client_writer)
+        .await
+        .unwrap();
+        drop(client_writer);
+
+        let reply = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(matches!(reply, SshMessage::RequestFailure));
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_request_cancel_tcpip_forward_rejects_out_of_range_port() {
+        let (client_writer, server_reader) = duplex(8192);
+        let (server_writer, mut client_reader) = duplex(8192);
+        let ctx = global_request_context();
+
+        let server_handle = tokio::spawn(async move {
+            handle_global_request_channel(server_reader, server_writer, Some(ctx))
+                .await
+                .unwrap();
+        });
+
+        let mut client_writer = client_writer;
+        let request_data = CancelTcpipForwardRequest {
+            bind_address: "127.0.0.1".into(),
+            bind_port: u16::MAX as u32 + 1,
+        }
+        .encode_to_bytes()
+        .await;
+        SshMessage::GlobalRequest {
+            request_type: "cancel-tcpip-forward".into(),
+            want_reply: true,
+            data: request_data,
+        }
+        .encode_into(&mut client_writer)
+        .await
+        .unwrap();
+        drop(client_writer);
+
+        let reply = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(matches!(reply, SshMessage::RequestFailure));
+
+        server_handle.await.unwrap();
     }
 }

@@ -13,6 +13,7 @@
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 
 use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
@@ -334,13 +335,23 @@ async fn run_command_piped<W>(
 where
     W: AsyncWrite + Send + Unpin,
 {
-    let mut child = match tokio::process::Command::new(program)
+    let mut command = tokio::process::Command::new(program);
+    command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::piped())
-        .spawn()
-    {
+        .stdin(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             tracing::error!(error = %Report::from_error(&e), "failed to spawn command");
@@ -352,6 +363,7 @@ where
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let stdin = child.stdin.take().unwrap();
+    let child_pid = child.id().unwrap_or(0) as i32;
 
     // Spawn a stdin relay task: reads ChannelEvent::Data from event_rx -> writes to stdin.
     let stdin_task = tokio::spawn(async move {
@@ -363,6 +375,15 @@ where
                     if stdin.write_all(&data).await.is_err() =>
                 {
                     break;
+                }
+                ChannelEvent::Request {
+                    request_type,
+                    request_data,
+                    ..
+                } if request_type == "signal" => {
+                    if let Err(error) = deliver_signal_request(child_pid, &request_data).await {
+                        tracing::warn!(error = %Report::from_error(&error), child_pid, "failed to deliver signal to non-PTY child");
+                    }
                 }
                 ChannelEvent::Eof => break,
                 _ => {}
@@ -391,10 +412,20 @@ where
 
     // Wait for process to exit.
     let status = child.wait().await?;
-    let exit_code = status.code().unwrap_or(255) as u32;
-
-    // Send exit-status request.
-    send_exit_status(exit_code, writer).await?;
+    if let Some(signal_number) = status.signal() {
+        let signal_name = signal_number_name(signal_number).unwrap_or("TERM");
+        send_exit_signal(
+            signal_name,
+            status.core_dumped(),
+            "terminated by signal",
+            "",
+            writer,
+        )
+        .await?;
+    } else {
+        let exit_code = status.code().unwrap_or(255) as u32;
+        send_exit_status(exit_code, writer).await?;
+    }
 
     // Send EOF + Close.
     SshMessage::ChannelEof.encode_into(&mut *writer).await?;
@@ -611,6 +642,60 @@ where
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).await?;
     Ok(buf)
+}
+
+fn signal_number(signal_name: &str) -> Option<i32> {
+    match signal_name {
+        "HUP" => Some(libc::SIGHUP),
+        "INT" => Some(libc::SIGINT),
+        "QUIT" => Some(libc::SIGQUIT),
+        "KILL" => Some(libc::SIGKILL),
+        "TERM" => Some(libc::SIGTERM),
+        "USR1" => Some(libc::SIGUSR1),
+        "USR2" => Some(libc::SIGUSR2),
+        _ => None,
+    }
+}
+
+fn signal_number_name(signal_number: i32) -> Option<&'static str> {
+    match signal_number {
+        libc::SIGHUP => Some("HUP"),
+        libc::SIGINT => Some("INT"),
+        libc::SIGQUIT => Some("QUIT"),
+        libc::SIGKILL => Some("KILL"),
+        libc::SIGTERM => Some("TERM"),
+        libc::SIGUSR1 => Some("USR1"),
+        libc::SIGUSR2 => Some("USR2"),
+        _ => None,
+    }
+}
+
+async fn deliver_signal_request(child_pid: i32, request_data: &[u8]) -> io::Result<()> {
+    if child_pid <= 0 {
+        return Ok(());
+    }
+
+    let req = parse_signal(request_data).await?;
+    let Some(signal_number) = signal_number(req.signal_name.as_str()) else {
+        return Ok(());
+    };
+
+    let result = unsafe { libc::kill(-child_pid, signal_number) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            let fallback = unsafe { libc::kill(child_pid, signal_number) };
+            if fallback == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        } else {
+            Err(error)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,5 +1300,63 @@ mod tests {
             _ => false,
         });
         assert!(has_stderr, "expected ChannelExtendedData with stderr_msg, got: {messages:?}");
+    }
+
+    #[tokio::test]
+    async fn non_pty_signal_emits_exit_signal_instead_of_exit_status() {
+        let (server_writer, mut client_reader) = duplex(65536);
+        let mut server_writer = server_writer;
+
+        let (event_tx, rx) = mpsc::channel(8);
+        let run_handle = tokio::spawn(async move {
+            run_exec(default_shell(), b"sleep 30", &mut server_writer, rx, None)
+                .await
+                .unwrap();
+            drop(server_writer);
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut request_data = Vec::new();
+        SshString("TERM".into()).encode_into(&mut request_data).await.unwrap();
+        event_tx
+            .send(ChannelEvent::Request {
+                request_type: "signal".into(),
+                want_reply: false,
+                request_data,
+            })
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("signaled non-PTY command should terminate promptly")
+            .unwrap();
+
+        let mut saw_exit_signal = false;
+        let mut saw_exit_status = false;
+        loop {
+            match SshMessage::decode_from(&mut client_reader).await {
+                Ok(SshMessage::ChannelRequest {
+                    request_type,
+                    request_data,
+                    ..
+                }) if request_type == "exit-signal" => {
+                    let req = parse_exit_signal_request(&request_data).await.unwrap();
+                    assert_eq!(req.signal_name, "TERM");
+                    saw_exit_signal = true;
+                }
+                Ok(SshMessage::ChannelRequest { request_type, .. }) if request_type == "exit-status" => {
+                    saw_exit_status = true;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert!(saw_exit_signal, "expected exit-signal after non-PTY signal termination");
+        assert!(!saw_exit_status, "non-PTY signal termination should not emit exit-status");
     }
 }
