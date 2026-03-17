@@ -1539,12 +1539,14 @@ fn test_global_request_tcpip_forward() {
         let mut writer = client_writer;
 
         // Send tcpip-forward request with ephemeral port.
-        let req_data = TcpipForwardRequest {
+        let mut req_data = Vec::new();
+        req_data
+            .encode_one(&TcpipForwardRequest {
             bind_address: "127.0.0.1".into(),
             bind_port: 0,
-        }
-        .encode_to_bytes()
-        .await;
+            })
+            .await
+            .unwrap();
         SshMessage::GlobalRequest {
             request_type: "tcpip-forward".into(),
             want_reply: true,
@@ -1559,7 +1561,7 @@ fn test_global_request_tcpip_forward() {
         let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match msg {
             SshMessage::RequestSuccess { data } => {
-                let reply = TcpipForwardReply::decode_from_bytes(&data).await.unwrap();
+                let reply: TcpipForwardReply = data.as_slice().decode_one().await.unwrap();
                 assert!(reply.allocated_port > 0, "allocated_port should be > 0, got {}", reply.allocated_port);
                 // Clean up: stop the listener.
                 tcp_forwarder
@@ -1610,10 +1612,11 @@ fn test_global_request_cancel_tcpip_forward() {
             handle_global_request_channel(sr1, sw1, Some(ctx1)).await.unwrap();
         });
         let mut w1 = cw1;
-        let req_data = TcpipForwardRequest {
+        let mut req_data = Vec::new();
+        req_data.encode_one(&TcpipForwardRequest {
             bind_address: "127.0.0.1".into(),
             bind_port: 0,
-        }.encode_to_bytes().await;
+        }).await.unwrap();
         SshMessage::GlobalRequest {
             request_type: "tcpip-forward".into(),
             want_reply: true,
@@ -1624,7 +1627,7 @@ fn test_global_request_cancel_tcpip_forward() {
         let msg = SshMessage::decode_from(&mut cr1).await.unwrap();
         let allocated_port = match msg {
             SshMessage::RequestSuccess { data } => {
-                let reply = TcpipForwardReply::decode_from_bytes(&data).await.unwrap();
+                let reply: TcpipForwardReply = data.as_slice().decode_one().await.unwrap();
                 assert!(reply.allocated_port > 0);
                 reply.allocated_port
             }
@@ -1640,10 +1643,11 @@ fn test_global_request_cancel_tcpip_forward() {
             handle_global_request_channel(sr2, sw2, Some(ctx2)).await.unwrap();
         });
         let mut w2 = cw2;
-        let cancel_data = CancelTcpipForwardRequest {
+        let mut cancel_data = Vec::new();
+        cancel_data.encode_one(&CancelTcpipForwardRequest {
             bind_address: "127.0.0.1".into(),
             bind_port: allocated_port,
-        }.encode_to_bytes().await;
+        }).await.unwrap();
         SshMessage::GlobalRequest {
             request_type: "cancel-tcpip-forward".into(),
             want_reply: true,
@@ -1663,10 +1667,11 @@ fn test_global_request_cancel_tcpip_forward() {
             handle_global_request_channel(sr3, sw3, Some(ctx3)).await.unwrap();
         });
         let mut w3 = cw3;
-        let cancel_data2 = CancelTcpipForwardRequest {
+        let mut cancel_data2 = Vec::new();
+        cancel_data2.encode_one(&CancelTcpipForwardRequest {
             bind_address: "127.0.0.1".into(),
             bind_port: allocated_port,
-        }.encode_to_bytes().await;
+        }).await.unwrap();
         SshMessage::GlobalRequest {
             request_type: "cancel-tcpip-forward".into(),
             want_reply: true,
@@ -1765,10 +1770,11 @@ fn test_reverse_tcp_forwarded_channel() {
             handle_global_request_channel(sr, sw, Some(ctx)).await.unwrap();
         });
         let mut w = cw;
-        let req_data = TcpipForwardRequest {
+        let mut req_data = Vec::new();
+        req_data.encode_one(&TcpipForwardRequest {
             bind_address: "127.0.0.1".into(),
             bind_port: 0,
-        }.encode_to_bytes().await;
+        }).await.unwrap();
         SshMessage::GlobalRequest {
             request_type: "tcpip-forward".into(),
             want_reply: true,
@@ -1779,7 +1785,7 @@ fn test_reverse_tcp_forwarded_channel() {
         let msg = SshMessage::decode_from(&mut cr).await.unwrap();
         let allocated_port = match msg {
             SshMessage::RequestSuccess { data } => {
-                TcpipForwardReply::decode_from_bytes(&data).await.unwrap().allocated_port
+                data.as_slice().decode_one::<TcpipForwardReply>().await.unwrap().allocated_port
             }
             other => panic!("expected RequestSuccess for tcpip-forward, got {other:?}"),
         };
@@ -1919,11 +1925,13 @@ fn test_global_request_streamlocal_forward() {
         let mut writer = client_writer;
 
         // Send streamlocal-forward request.
-        let req_data = StreamlocalForwardRequest {
+        let mut req_data = Vec::new();
+        req_data
+            .encode_one(&StreamlocalForwardRequest {
             socket_path: socket_path.clone(),
-        }
-        .encode_to_bytes()
-        .await;
+            })
+            .await
+            .unwrap();
         SshMessage::GlobalRequest {
             request_type: "streamlocal-forward@openssh.com".into(),
             want_reply: true,
