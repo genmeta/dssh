@@ -9,8 +9,6 @@
 #[cfg(not(test))]
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
-
 use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::message::SshMessage;
 use genmeta_ssh3_proto::session::{SessionError, SessionInit, Ssh3Transport, Ssh3TransportClient};
@@ -20,9 +18,7 @@ use tokio::{io::AsyncWrite, sync::mpsc, task::JoinSet};
 use tracing::Instrument;
 
 use crate::byte_channel::{ChannelReader, ChannelWriter};
-use crate::channel::{open_session_channel, ChannelEvent, GlobalRequestContext};
-use crate::forward::reverse_tcp::ReverseTcpForwarder;
-use crate::forward::streamlocal::ReverseStreamlocalForwarder;
+use crate::channel::{open_session_channel, reject_legacy_global_request_channel, ChannelEvent};
 use crate::session::pty::{allocate_pty, set_window_size, PtyPair};
 use crate::session::request::{handle_request, run_exec, run_shell, RequestAction};
 
@@ -109,22 +105,13 @@ fn apply_privilege_transition(
 pub struct Ssh3Session {
     transport: Ssh3TransportClient,
     init: SessionInit,
-    global_requests: Arc<GlobalRequestContext>,
 }
 
 impl Ssh3Session {
     pub fn new(transport: Ssh3TransportClient, init: SessionInit) -> Self {
-        let global_requests = Arc::new(GlobalRequestContext {
-            tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
-            streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
-            transport: transport.clone(),
-            conversation_id: init.conversation_id,
-        });
-
         Self {
             transport,
             init,
-            global_requests,
         }
     }
 
@@ -156,16 +143,6 @@ impl Ssh3Session {
                 tracing::warn!(error = %Report::from_error(error), "channel task panicked");
             }
         }
-
-        self.global_requests
-            .tcp_forwarder
-            .cleanup_for_owner(self.init.conversation_id)
-            .await;
-        self.global_requests
-            .streamlocal_forwarder
-            .cleanup_for_owner(self.init.conversation_id)
-            .await;
-
         Ok(())
     }
 
@@ -227,13 +204,9 @@ impl Ssh3Session {
                 .await
                 .map_err(SessionError::new),
             "global-request" => {
-                crate::channel::handle_global_request_channel(
-                    reader,
-                    writer,
-                    Some(Arc::clone(&self.global_requests)),
-                )
-                .await
-                .map_err(SessionError::new)
+                reject_legacy_global_request_channel(writer)
+                    .await
+                    .map_err(SessionError::new)
             }
             other => {
                 tracing::warn!(channel_type = %other, "unknown channel type in child");
@@ -556,72 +529,6 @@ mod tests {
         Ssh3Session::new(mock_transport_client(), sample_init())
     }
 
-    async fn assert_tcp_port_eventually_closes(port: u16, context: &str) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{context}"));
-    }
-
-    #[tokio::test]
-    async fn session_run_cleans_up_owned_forwarders_on_exit() {
-        let session = sample_session();
-        let owner = session.init.conversation_id;
-
-        let tcp_port = session
-            .global_requests
-            .tcp_forwarder
-            .start_listening(
-                "127.0.0.1",
-                0,
-                session.global_requests.transport.clone(),
-                owner,
-            )
-            .await
-            .unwrap();
-
-        let socket_path = format!(
-            "/tmp/test-ssh3-session-cleanup-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        session
-            .global_requests
-            .streamlocal_forwarder
-            .start_listening(
-                &socket_path,
-                session.global_requests.transport.clone(),
-                owner,
-            )
-            .await
-            .unwrap();
-
-        session.run().await.unwrap();
-
-        assert!(
-            !std::path::Path::new(&socket_path).exists(),
-            "owned streamlocal socket should be removed when session exits"
-        );
-
-        assert_tcp_port_eventually_closes(
-            tcp_port,
-            "owned TCP listener should be closed within timeout when session exits",
-        )
-        .await;
-    }
-
     // -----------------------------------------------------------------------
     // Byte bridge integration tests
     // -----------------------------------------------------------------------
@@ -832,7 +739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_channel_global_request_needs_context() {
+    async fn handle_channel_global_request_is_explicitly_rejected() {
         let header = ChannelHeader {
             signal_value: 0,
             conversation_id: 42,
@@ -841,20 +748,23 @@ mod tests {
         };
 
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
-        let (to_tx, _to_rx) = remoc::rch::mpsc::channel(16);
+        let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);
         drop(from_tx);
 
         let session = sample_session();
-        let result = session.handle_channel(header, from_rx, to_tx).await;
-        match result {
-            Ok(()) => { /* handler may succeed with empty global-request channel */ }
-            Err(e) => {
-                let err_msg = e.to_string();
-                assert!(
-                    !err_msg.contains("unknown channel type"),
-                    "global-request should not produce 'unknown channel type' error, got: {err_msg}"
-                );
+        session.handle_channel(header, from_rx, to_tx).await.unwrap();
+
+        let mut leftover = Vec::new();
+        let msg = recv_message(&mut to_rx, &mut leftover).await;
+        match msg {
+            SshMessage::ChannelOpenFailure {
+                reason_code,
+                description,
+            } => {
+                assert_eq!(reason_code, h3x::varint::VarInt::from(3u8));
+                assert!(description.contains("control stream"));
             }
+            other => panic!("expected ChannelOpenFailure, got {other:?}"),
         }
     }
 

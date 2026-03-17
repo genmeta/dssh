@@ -8,7 +8,9 @@
 
 use std::{
     convert::Infallible,
+    io,
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
     time::Duration,
 };
@@ -22,8 +24,12 @@ use snafu::Report;
 use tracing::Instrument;
 
 use crate::{auth, child::ChildProcess, error::ServerError, protocol::Ssh3Protocol, version};
+use crate::channel::{GlobalRequestContext, serve_control_stream_global_requests};
+use crate::forward::reverse_tcp::ReverseTcpForwarder;
+use crate::forward::streamlocal::ReverseStreamlocalForwarder;
 use genmeta_ssh3_proto::auth::AuthCredential;
 use genmeta_ssh3_proto::session::{AuthResult, ChildBootstrap};
+use h3x::hyper::upgrade;
 use h3x::protocol::Protocols;
 use remoc::rtc::ServerShared;
 /// Result of validating the SSH3 Extended CONNECT request at the HTTP layer.
@@ -179,6 +185,13 @@ impl Ssh3ConnectHandler {
             }
         };
         let conversation_id = reserved.conversation_id();
+        let readiness = Arc::new(AtomicBool::new(false));
+        let global_requests = Arc::new(GlobalRequestContext {
+            tcp_forwarder: Arc::new(ReverseTcpForwarder::default()),
+            streamlocal_forwarder: Arc::new(ReverseStreamlocalForwarder::default()),
+            transport: transport_client.clone(),
+            conversation_id,
+        });
         tracing::info!(%conversation_id, "registered SSH3 conversation");
 
         let session_bin = match ssh3_session_binary() {
@@ -228,6 +241,8 @@ impl Ssh3ConnectHandler {
             AuthOutcome::Success => {
                 let mut response = response_with_status(StatusCode::OK);
                 response.headers_mut().insert("ssh-version", version_header);
+                let readiness_for_supervisor = Arc::clone(&readiness);
+                let global_requests_for_supervisor = Arc::clone(&global_requests);
                 tokio::spawn(async move {
                     let lease = match reserved.consume_into_lease() {
                         Ok(lease) => lease,
@@ -237,14 +252,49 @@ impl Ssh3ConnectHandler {
                         }
                     };
 
+                    let control_stream_start = tokio::sync::oneshot::channel::<io::Result<()>>();
+                    let (control_stream_started_tx, control_stream_started_rx) = control_stream_start;
+                    let mut control_stream_handle = tokio::spawn(
+                        async move {
+                            let (reader, writer) = upgrade::on(request)
+                                .await
+                                .map_err(|error| io::Error::other(format!("failed to take over SSH3 CONNECT stream: {error:?}")))?;
+                            let _ = control_stream_started_tx.send(Ok(()));
+                            serve_control_stream_global_requests(
+                                reader,
+                                writer,
+                                readiness_for_supervisor,
+                                Some(global_requests_for_supervisor),
+                            )
+                            .await
+                        }
+                        .instrument(tracing::info_span!("ssh3_control_stream", %conversation_id)),
+                    );
+
                     if let Err(e) = lease.transition_to_active() {
                         tracing::warn!(error = %Report::from_error(e), %conversation_id, "failed to transition to Active");
+                        control_stream_handle.abort();
                         return;
                     }
 
-                    drop(request);
+                    match control_stream_started_rx.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(error = %Report::from_error(&error), %conversation_id, "control stream failed before readiness");
+                            control_stream_handle.abort();
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %Report::from_error(error), %conversation_id, "control stream start signal dropped before readiness");
+                            control_stream_handle.abort();
+                            return;
+                        }
+                    }
+
+                    readiness.store(true, Ordering::SeqCst);
 
                     let mut child = child;
+                    let mut transport_server_handle = transport_server_handle;
                     tokio::select! {
                         status = child.wait() => {
                             match status {
@@ -252,13 +302,39 @@ impl Ssh3ConnectHandler {
                                 Err(e) => tracing::warn!(error = %Report::from_error(e), %conversation_id, "error waiting for child"),
                             }
                         }
-                        result = transport_server_handle => {
+                        result = &mut transport_server_handle => {
                             match result {
                                 Ok(_) => tracing::info!(%conversation_id, "transport server exited"),
                                 Err(e) => tracing::warn!(error = %Report::from_error(e), %conversation_id, "transport server task panicked"),
                             }
                         }
+                        result = &mut control_stream_handle => {
+                            match result {
+                                Ok(Ok(())) => tracing::info!(%conversation_id, "control stream handler exited"),
+                                Ok(Err(e)) => tracing::warn!(error = %Report::from_error(e), %conversation_id, "control stream handler failed"),
+                                Err(e) => tracing::warn!(error = %Report::from_error(e), %conversation_id, "control stream task panicked"),
+                            }
+                        }
                     }
+
+                    readiness.store(false, Ordering::SeqCst);
+                    if !transport_server_handle.is_finished() {
+                        transport_server_handle.abort();
+                    }
+                    if !control_stream_handle.is_finished() {
+                        control_stream_handle.abort();
+                    }
+                    if let Err(e) = child.kill() {
+                        tracing::debug!(error = %Report::from_error(e), %conversation_id, "child already stopped during supervisor cleanup");
+                    }
+                    global_requests
+                        .tcp_forwarder
+                        .cleanup_for_owner(conversation_id)
+                        .await;
+                    global_requests
+                        .streamlocal_forwarder
+                        .cleanup_for_owner(conversation_id)
+                        .await;
 
                     drop(lease);
                 }

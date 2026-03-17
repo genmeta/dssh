@@ -20,6 +20,7 @@ use tokio::{
     sync::mpsc,
 };
 use tracing::Instrument;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc as StdArc};
 
 use crate::forward::reverse_tcp::ReverseTcpForwarder;
 use crate::forward::streamlocal::ReverseStreamlocalForwarder;
@@ -44,6 +45,17 @@ pub struct GlobalRequestContext {
     pub transport: Ssh3TransportClient,
     /// Conversation ID for opened channels.
     pub conversation_id: StreamId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalRequestReply {
+    Success(Vec<u8>),
+    Failure,
+}
+
+enum ControlStreamAction {
+    Reply { want_reply: bool, reply: GlobalRequestReply },
+    Close,
 }
 
 fn validate_global_request_port(bind_port: u32) -> io::Result<u16> {
@@ -137,9 +149,6 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    use crate::forward::reverse_tcp::{TcpipForwardRequest, CancelTcpipForwardRequest, TcpipForwardReply};
-    use crate::forward::streamlocal::{StreamlocalForwardRequest, CancelStreamlocalForwardRequest};
-
     // Read a single GlobalRequest from the stream.
     let msg = SshMessage::decode_from(&mut reader).await?;
 
@@ -153,150 +162,265 @@ where
         return Ok(());
     };
 
+    let reply = process_global_request(&request_type, &data, global_ctx).await?;
+    if want_reply {
+        write_global_request_reply(&mut writer, reply).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn process_global_request(
+    request_type: &str,
+    data: &[u8],
+    global_ctx: Option<Arc<GlobalRequestContext>>,
+) -> io::Result<GlobalRequestReply> {
+    use crate::forward::reverse_tcp::{CancelTcpipForwardRequest, TcpipForwardReply, TcpipForwardRequest};
+    use crate::forward::streamlocal::{CancelStreamlocalForwardRequest, StreamlocalForwardRequest};
+
     let ctx = match global_ctx {
         Some(ctx) => ctx,
         None => {
-            tracing::warn!("global-request channel received but no GlobalRequestContext");
-            if want_reply {
-                SshMessage::RequestFailure.encode_into(&mut writer).await?;
-            }
-            return Ok(());
+            tracing::warn!("global request received but no GlobalRequestContext");
+            return Ok(GlobalRequestReply::Failure);
         }
     };
 
-    match request_type.as_str() {
+    match request_type {
         "tcpip-forward" => {
-            let req = TcpipForwardRequest::decode_from_bytes(&data).await?;
-            tracing::info!(
-                bind_address = %req.bind_address,
-                bind_port = req.bind_port,
-                "tcpip-forward request"
-            );
+            let req = TcpipForwardRequest::decode_from_bytes(data).await?;
+            tracing::info!(bind_address = %req.bind_address, bind_port = req.bind_port, "tcpip-forward request");
             let bind_port = match validate_global_request_port(req.bind_port) {
                 Ok(port) => port,
                 Err(error) => {
                     tracing::warn!(error = %Report::from_error(&error), bind_port = req.bind_port, "tcpip-forward bind rejected");
-                    if want_reply {
-                        SshMessage::RequestFailure.encode_into(&mut writer).await?;
-                    }
-                    return Ok(());
+                    return Ok(GlobalRequestReply::Failure);
                 }
             };
 
-            match ctx.tcp_forwarder.start_listening(
-                &req.bind_address,
-                bind_port,
-                ctx.transport.clone(),
-                ctx.conversation_id,
-            ).await {
+            match ctx
+                .tcp_forwarder
+                .start_listening(&req.bind_address, bind_port, ctx.transport.clone(), ctx.conversation_id)
+                .await
+            {
                 Ok(actual_port) => {
-                    if want_reply {
-                        let reply_data = TcpipForwardReply {
-                            allocated_port: actual_port as u32,
-                        }
-                        .encode_to_bytes()
-                        .await;
-                        SshMessage::RequestSuccess { data: reply_data }
-                            .encode_into(&mut writer)
-                            .await?;
+                    let reply_data = TcpipForwardReply {
+                        allocated_port: actual_port as u32,
                     }
+                    .encode_to_bytes()
+                    .await;
+                    Ok(GlobalRequestReply::Success(reply_data))
                 }
                 Err(e) => {
                     tracing::warn!(%e, "tcpip-forward bind failed");
-                    if want_reply {
-                        SshMessage::RequestFailure.encode_into(&mut writer).await?;
-                    }
+                    Ok(GlobalRequestReply::Failure)
                 }
             }
         }
         "cancel-tcpip-forward" => {
-            let req = CancelTcpipForwardRequest::decode_from_bytes(&data).await?;
-            tracing::info!(
-                bind_address = %req.bind_address,
-                bind_port = req.bind_port,
-                "cancel-tcpip-forward request"
-            );
+            let req = CancelTcpipForwardRequest::decode_from_bytes(data).await?;
+            tracing::info!(bind_address = %req.bind_address, bind_port = req.bind_port, "cancel-tcpip-forward request");
             let bind_port = match validate_global_request_port(req.bind_port) {
                 Ok(port) => port,
                 Err(error) => {
                     tracing::warn!(error = %Report::from_error(&error), bind_port = req.bind_port, "cancel-tcpip-forward rejected");
-                    if want_reply {
-                        SshMessage::RequestFailure.encode_into(&mut writer).await?;
-                    }
-                    return Ok(());
+                    return Ok(GlobalRequestReply::Failure);
                 }
             };
 
-            let stopped = ctx.tcp_forwarder.stop_listening(
-                &req.bind_address,
-                bind_port,
-                ctx.conversation_id,
-            ).await;
-            if want_reply {
-                if stopped {
-                    SshMessage::RequestSuccess { data: vec![] }
-                        .encode_into(&mut writer)
-                        .await?;
-                } else {
-                    SshMessage::RequestFailure.encode_into(&mut writer).await?;
-                }
+            let stopped = ctx
+                .tcp_forwarder
+                .stop_listening(&req.bind_address, bind_port, ctx.conversation_id)
+                .await;
+            if stopped {
+                Ok(GlobalRequestReply::Success(vec![]))
+            } else {
+                Ok(GlobalRequestReply::Failure)
             }
         }
         "streamlocal-forward@openssh.com" => {
-            let req = StreamlocalForwardRequest::decode_from_bytes(&data).await?;
-            tracing::info!(
-                socket_path = %req.socket_path,
-                "streamlocal-forward request"
-            );
-            match ctx.streamlocal_forwarder.start_listening(
-                &req.socket_path,
-                ctx.transport.clone(),
-                ctx.conversation_id,
-            ).await {
-                Ok(()) => {
-                    if want_reply {
-                        SshMessage::RequestSuccess { data: vec![] }
-                            .encode_into(&mut writer)
-                            .await?;
-                    }
-                }
+            let req = StreamlocalForwardRequest::decode_from_bytes(data).await?;
+            tracing::info!(socket_path = %req.socket_path, "streamlocal-forward request");
+            match ctx
+                .streamlocal_forwarder
+                .start_listening(&req.socket_path, ctx.transport.clone(), ctx.conversation_id)
+                .await
+            {
+                Ok(()) => Ok(GlobalRequestReply::Success(vec![])),
                 Err(e) => {
                     tracing::warn!(%e, "streamlocal-forward bind failed");
-                    if want_reply {
-                        SshMessage::RequestFailure.encode_into(&mut writer).await?;
-                    }
+                    Ok(GlobalRequestReply::Failure)
                 }
             }
         }
         "cancel-streamlocal-forward@openssh.com" => {
-            let req = CancelStreamlocalForwardRequest::decode_from_bytes(&data).await?;
-            tracing::info!(
-                socket_path = %req.socket_path,
-                "cancel-streamlocal-forward request"
-            );
-            let stopped = ctx.streamlocal_forwarder.stop_listening(
-                &req.socket_path,
-                ctx.conversation_id,
-            ).await;
-            if want_reply {
-                if stopped {
-                    SshMessage::RequestSuccess { data: vec![] }
-                        .encode_into(&mut writer)
-                        .await?;
-                } else {
-                    SshMessage::RequestFailure.encode_into(&mut writer).await?;
-                }
+            let req = CancelStreamlocalForwardRequest::decode_from_bytes(data).await?;
+            tracing::info!(socket_path = %req.socket_path, "cancel-streamlocal-forward request");
+            let stopped = ctx
+                .streamlocal_forwarder
+                .stop_listening(&req.socket_path, ctx.conversation_id)
+                .await;
+            if stopped {
+                Ok(GlobalRequestReply::Success(vec![]))
+            } else {
+                Ok(GlobalRequestReply::Failure)
             }
         }
         _ => {
             tracing::warn!(request_type, "unknown global request type");
-            if want_reply {
-                SshMessage::RequestFailure.encode_into(&mut writer).await?;
-            }
+            Ok(GlobalRequestReply::Failure)
         }
     }
+}
 
-    Ok(())
+pub async fn write_global_request_reply<W: AsyncWrite + Send + Unpin>(
+    writer: &mut W,
+    reply: GlobalRequestReply,
+) -> io::Result<()> {
+    match reply {
+        GlobalRequestReply::Success(data) => {
+            SshMessage::RequestSuccess { data }.encode_into(&mut *writer).await?
+        }
+        GlobalRequestReply::Failure => SshMessage::RequestFailure.encode_into(&mut *writer).await?,
+    }
+    writer.flush().await
+}
+
+pub async fn reject_legacy_global_request_channel<W>(mut writer: W) -> io::Result<()>
+where
+    W: AsyncWrite + Send + Unpin,
+{
+    let failure = SshMessage::ChannelOpenFailure {
+        reason_code: VarInt::from(3u8),
+        description: "legacy global-request channel path rejected; use control stream".into(),
+    };
+    failure.encode_into(&mut writer).await?;
+    writer.flush().await
+}
+
+pub async fn serve_control_stream_global_requests<R, W>(
+    mut reader: R,
+    writer: W,
+    readiness: StdArc<AtomicBool>,
+    global_ctx: Option<Arc<GlobalRequestContext>>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    serve_control_stream_global_requests_with_handler(
+        &mut reader,
+        writer,
+        readiness,
+        global_ctx,
+        |request_type, data, global_ctx| async move {
+            process_global_request(&request_type, &data, global_ctx).await
+        },
+    )
+    .await
+}
+
+pub async fn serve_control_stream_global_requests_with_handler<R, W, H, Fut>(
+    reader: &mut R,
+    writer: W,
+    readiness: StdArc<AtomicBool>,
+    global_ctx: Option<Arc<GlobalRequestContext>>,
+    handler: H,
+) -> io::Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+    H: Fn(String, Vec<u8>, Option<Arc<GlobalRequestContext>>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = io::Result<GlobalRequestReply>> + Send + 'static,
+{
+    let handler = StdArc::new(handler);
+    let (action_tx, mut action_rx) = mpsc::channel::<ControlStreamAction>(16);
+    let in_flight = StdArc::new(AtomicBool::new(false));
+
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(action) = action_rx.recv().await {
+            match action {
+                ControlStreamAction::Reply { want_reply, reply } => {
+                    if want_reply {
+                        write_global_request_reply(&mut writer, reply).await?;
+                    }
+                }
+                ControlStreamAction::Close => {
+                    writer.shutdown().await?;
+                    break;
+                }
+            }
+        }
+        Ok::<(), io::Error>(())
+    });
+
+    loop {
+        let msg = match SshMessage::decode_from(&mut *reader).await {
+            Ok(msg) => msg,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => {
+                drop(action_tx);
+                let _ = writer_task.await;
+                return Err(error);
+            }
+        };
+
+        let SshMessage::GlobalRequest {
+            request_type,
+            want_reply,
+            data,
+        } = msg
+        else {
+            let _ = action_tx.send(ControlStreamAction::Close).await;
+            break;
+        };
+
+        if !readiness.load(Ordering::SeqCst) {
+            let _ = action_tx
+                .send(ControlStreamAction::Reply {
+                    want_reply,
+                    reply: GlobalRequestReply::Failure,
+                })
+                .await;
+            continue;
+        }
+
+        if in_flight.swap(true, Ordering::SeqCst) {
+            let _ = action_tx
+                .send(ControlStreamAction::Reply {
+                    want_reply,
+                    reply: GlobalRequestReply::Failure,
+                })
+                .await;
+            continue;
+        }
+
+        let handler = StdArc::clone(&handler);
+        let action_tx = action_tx.clone();
+        let in_flight = StdArc::clone(&in_flight);
+        let global_ctx = global_ctx.clone();
+        tokio::spawn(async move {
+            let reply = match handler(request_type, data, global_ctx).await {
+                Ok(reply) => reply,
+                Err(error) => {
+                    tracing::warn!(error = %Report::from_error(&error), "global request handling failed");
+                    GlobalRequestReply::Failure
+                }
+            };
+
+            let _ = action_tx
+                .send(ControlStreamAction::Reply { want_reply, reply })
+                .await;
+            in_flight.store(false, Ordering::SeqCst);
+        });
+    }
+
+    drop(action_tx);
+    match writer_task.await {
+        Ok(result) => result,
+        Err(error) => Err(io::Error::other(format!("control stream writer task failed: {error}"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -681,7 +805,7 @@ mod tests {
     use genmeta_ssh3_proto::session::{Ssh3Transport as RemoteSessionTransport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
     use h3x::stream_id::StreamId;
     use remoc::rtc::ServerShared;
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering as AtomicOrdering}};
     use tokio::io::duplex;
 
     /// Helper: encode messages into writer half, then drop to signal EOF.
@@ -1205,5 +1329,228 @@ mod tests {
         assert!(matches!(reply, SshMessage::RequestFailure));
 
         server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_request_control_stream_pre_readiness_rejects_without_handler_dispatch() {
+        let (mut client_writer, mut server_reader) = duplex(8192);
+        let (server_writer, mut client_reader) = duplex(8192);
+        let readiness = StdArc::new(AtomicBool::new(false));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls_for_handler = Arc::clone(&handler_calls);
+        let handler = move |_request_type, _data, _global_ctx| {
+            let handler_calls = Arc::clone(&handler_calls_for_handler);
+            async move {
+                handler_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(GlobalRequestReply::Success(b"ok".to_vec()))
+            }
+        };
+
+        let readiness_for_server = StdArc::clone(&readiness);
+        let server_task = tokio::spawn(async move {
+            serve_control_stream_global_requests_with_handler(
+                &mut server_reader,
+                server_writer,
+                readiness_for_server,
+                None,
+                handler,
+            )
+            .await
+            .unwrap();
+        });
+
+        SshMessage::GlobalRequest {
+            request_type: "tcpip-forward".into(),
+            want_reply: true,
+            data: vec![],
+        }
+        .encode_into(&mut client_writer)
+        .await
+        .unwrap();
+
+        let rejected = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            SshMessage::decode_from(&mut client_reader),
+        )
+        .await
+        .expect("pre-readiness rejection should arrive before deadline")
+        .unwrap();
+        assert!(matches!(rejected, SshMessage::RequestFailure));
+        assert_eq!(handler_calls.load(AtomicOrdering::SeqCst), 0);
+
+        readiness.store(true, Ordering::SeqCst);
+        SshMessage::GlobalRequest {
+            request_type: "tcpip-forward".into(),
+            want_reply: true,
+            data: vec![],
+        }
+        .encode_into(&mut client_writer)
+        .await
+        .unwrap();
+        client_writer.shutdown().await.unwrap();
+
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            SshMessage::decode_from(&mut client_reader),
+        )
+        .await
+        .expect("post-readiness reply should arrive before deadline")
+        .unwrap();
+        assert_eq!(accepted, SshMessage::RequestSuccess { data: b"ok".to_vec() });
+        assert_eq!(handler_calls.load(AtomicOrdering::SeqCst), 1);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_request_control_stream_sequential_requests_preserve_reply_order() {
+        let (mut client_writer, mut server_reader) = duplex(8192);
+        let (server_writer, mut client_reader) = duplex(8192);
+        let readiness = StdArc::new(AtomicBool::new(true));
+        let handler = move |request_type: String, _data: Vec<u8>, _global_ctx: Option<Arc<GlobalRequestContext>>| async move {
+            Ok(GlobalRequestReply::Success(request_type.into_bytes()))
+        };
+
+        let server_task = tokio::spawn(async move {
+            serve_control_stream_global_requests_with_handler(
+                &mut server_reader,
+                server_writer,
+                readiness,
+                None,
+                handler,
+            )
+            .await
+            .unwrap();
+        });
+
+        for request_type in ["first", "second"] {
+            SshMessage::GlobalRequest {
+                request_type: request_type.into(),
+                want_reply: true,
+                data: vec![],
+            }
+            .encode_into(&mut client_writer)
+            .await
+            .unwrap();
+
+            let reply = SshMessage::decode_from(&mut client_reader).await.unwrap();
+            assert_eq!(
+                reply,
+                SshMessage::RequestSuccess {
+                    data: request_type.as_bytes().to_vec(),
+                }
+            );
+        }
+
+        client_writer.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_request_control_stream_second_in_flight_request_rejected_before_handler_runs() {
+        let (mut client_writer, mut server_reader) = duplex(8192);
+        let (server_writer, mut client_reader) = duplex(8192);
+        let readiness = StdArc::new(AtomicBool::new(true));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let release_rx_for_handler = Arc::clone(&release_rx);
+        let handler_calls_for_handler = Arc::clone(&handler_calls);
+        let handler = move |request_type: String, _data: Vec<u8>, _global_ctx: Option<Arc<GlobalRequestContext>>| {
+            let release_rx = Arc::clone(&release_rx_for_handler);
+            let handler_calls = Arc::clone(&handler_calls_for_handler);
+            async move {
+                handler_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                if request_type == "first" {
+                    if let Some(rx) = release_rx.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                }
+                Ok(GlobalRequestReply::Success(request_type.into_bytes()))
+            }
+        };
+
+        let server_task = tokio::spawn(async move {
+            serve_control_stream_global_requests_with_handler(
+                &mut server_reader,
+                server_writer,
+                readiness,
+                None,
+                handler,
+            )
+            .await
+            .unwrap();
+        });
+
+        SshMessage::GlobalRequest {
+            request_type: "first".into(),
+            want_reply: true,
+            data: vec![],
+        }
+        .encode_into(&mut client_writer)
+        .await
+        .unwrap();
+        SshMessage::GlobalRequest {
+            request_type: "second".into(),
+            want_reply: true,
+            data: vec![],
+        }
+        .encode_into(&mut client_writer)
+        .await
+        .unwrap();
+
+        let rejected = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            SshMessage::decode_from(&mut client_reader),
+        )
+        .await
+        .expect("second in-flight request should be rejected before deadline")
+        .unwrap();
+        assert!(matches!(rejected, SshMessage::RequestFailure));
+        assert_eq!(handler_calls.load(AtomicOrdering::SeqCst), 1);
+
+        release_tx.send(()).unwrap();
+
+        let first_reply = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            SshMessage::decode_from(&mut client_reader),
+        )
+        .await
+        .expect("first request should eventually complete")
+        .unwrap();
+        assert_eq!(
+            first_reply,
+            SshMessage::RequestSuccess {
+                data: b"first".to_vec(),
+            }
+        );
+
+        client_writer.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_request_legacy_channel_rejection_is_explicit() {
+        let (_client_writer, server_reader) = duplex(8192);
+        let (server_writer, mut client_reader) = duplex(8192);
+
+        let server_task = tokio::spawn(async move {
+            reject_legacy_global_request_channel(server_writer).await.unwrap();
+            drop(server_reader);
+        });
+
+        let reply = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        match reply {
+            SshMessage::ChannelOpenFailure {
+                reason_code,
+                description,
+            } => {
+                assert_eq!(reason_code, VarInt::from(3u8));
+                assert!(description.contains("control stream"));
+            }
+            other => panic!("expected ChannelOpenFailure, got {other:?}"),
+        }
+
+        server_task.await.unwrap();
     }
 }

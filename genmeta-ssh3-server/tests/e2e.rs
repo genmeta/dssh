@@ -7,6 +7,9 @@ use bytes::Bytes;
 use genmeta_ssh3_client::{
     Ssh3Client, Ssh3ClientConfig, SSH3_CONNECT_PATH, SSH_VERSION,
 };
+use genmeta_ssh3_client::forward::{
+    parse_tcpip_forward_reply, send_cancel_tcpip_forward_request, send_tcpip_forward_request,
+};
 use genmeta_ssh3_server::handler::Ssh3ConnectHandler;
 use h3x::hyper::server::TowerService;
 use h3x::qpack::field::Protocol;
@@ -15,7 +18,10 @@ use http_body_util::Empty;
 use tokio_util::task::AbortOnDropHandle;
 use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::message::SshMessage;
-use genmeta_ssh3_server::channel::open_session_channel;
+use genmeta_ssh3_server::channel::{
+    open_session_channel, reject_legacy_global_request_channel,
+    serve_control_stream_global_requests,
+};
 use genmeta_ssh3_server::channel::handle_global_request_channel;
 use genmeta_ssh3_server::channel::handle_session_channel;
 use genmeta_ssh3_server::forward::direct_tcp::handle_direct_tcp;
@@ -1748,6 +1754,180 @@ fn test_global_request_streamlocal_forward() {
             .stop_listening(&socket_path, StreamId::try_from(1u64).unwrap())
             .await;
         let _ = std::fs::remove_file(&socket_path);
+    })
+}
+
+#[test]
+fn test_global_request_e2e_control_stream_client_forward_flow() {
+    run("test_global_request_e2e_control_stream_client_forward_flow", async move {
+        let tcp_forwarder = Arc::new(ReverseTcpForwarder::new());
+        let streamlocal_forwarder = Arc::new(ReverseStreamlocalForwarder::new());
+
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<tokio::io::DuplexStream>();
+        struct CapturingTransport {
+            tx: mpsc::UnboundedSender<tokio::io::DuplexStream>,
+        }
+        impl Ssh3Transport for CapturingTransport {
+            async fn accept_channel(&self) -> Result<
+                Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+                TransportError,
+            > { Ok(None) }
+
+            async fn open_channel(
+                &self,
+                header: Option<ChannelHeader>,
+            ) -> Result<
+                (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+                TransportError,
+            > {
+                let (server_end, client_end) = tokio::io::duplex(65536);
+                let _ = self.tx.send(client_end);
+                let (server_read, server_write) = tokio::io::split(server_end);
+                let (to_client_tx, to_client_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) =
+                    remoc::rch::mpsc::channel(64);
+                let (from_client_tx, from_client_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) =
+                    remoc::rch::mpsc::channel(64);
+                tokio::spawn(async move {
+                    let mut reader = server_read;
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        let n = match reader.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if to_client_tx.send(buf[..n].to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    let mut writer = server_write;
+                    if let Some(header) = header {
+                        if header.encode_into(&mut writer).await.is_err() {
+                            return;
+                        }
+                    }
+                    let mut rx = from_client_rx;
+                    while let Ok(Some(data)) = rx.recv().await {
+                        if writer.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok((to_client_rx, from_client_tx))
+            }
+        }
+
+        let (server, transport) = Ssh3TransportServerShared::new(
+            Arc::new(CapturingTransport { tx: stream_tx.clone() }),
+            16,
+        );
+        tokio::spawn(async move {
+            let _ = server.serve(true).await;
+        });
+
+        let ctx = Arc::new(GlobalRequestContext {
+            tcp_forwarder: tcp_forwarder.clone(),
+            streamlocal_forwarder,
+            transport,
+            conversation_id: StreamId::try_from(1u64).unwrap(),
+        });
+
+        let (mut client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+        let readiness = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let server_task = tokio::spawn(async move {
+            serve_control_stream_global_requests(
+                server_reader,
+                server_writer,
+                readiness,
+                Some(ctx),
+            )
+            .await
+            .unwrap();
+        });
+
+        send_tcpip_forward_request(&mut client_writer, "127.0.0.1", 0)
+            .await
+            .unwrap();
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        let allocated_port = match msg {
+            SshMessage::RequestSuccess { data } => {
+                parse_tcpip_forward_reply(&data, 0).await.unwrap()
+            }
+            other => panic!("expected RequestSuccess for tcpip-forward, got {other:?}"),
+        };
+        assert!(allocated_port > 0);
+
+        let mut tcp_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{allocated_port}"))
+            .await
+            .expect("should connect to forwarded port");
+
+        let client_end = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream_rx.recv(),
+        )
+        .await
+        .expect("timeout waiting for control-stream initiated forwarded channel")
+        .expect("stream_rx closed");
+
+        let (mut client_end_reader, mut client_end_writer) = tokio::io::split(client_end);
+        let fwd_header = ChannelHeader::decode_from(&mut client_end_reader).await.unwrap();
+        assert_eq!(fwd_header.channel_type, "forwarded-tcpip");
+        assert_eq!(fwd_header.conversation_id, 1);
+
+        let connected_addr = SshString::decode_from(&mut client_end_reader).await.unwrap();
+        assert_eq!(connected_addr.0, "127.0.0.1");
+        let _connected_port: VarInt = client_end_reader.decode_one().await.unwrap();
+        let _originator_addr = SshString::decode_from(&mut client_end_reader).await.unwrap();
+        let _originator_port: VarInt = client_end_reader.decode_one().await.unwrap();
+
+        SshMessage::ChannelOpenConfirmation {
+            max_message_size: VarInt::from((1 << 20) as u32),
+        }
+        .encode_into(&mut client_end_writer)
+        .await
+        .unwrap();
+        drop(client_end_writer);
+
+        tcp_stream.write_all(b"hello-from-control-stream").await.unwrap();
+        tcp_stream.shutdown().await.unwrap();
+        let mut buf = vec![0u8; b"hello-from-control-stream".len()];
+        client_end_reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, b"hello-from-control-stream");
+
+        send_cancel_tcpip_forward_request(&mut client_writer, "127.0.0.1", allocated_port)
+            .await
+            .unwrap();
+        let cancel_reply = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(matches!(cancel_reply, SshMessage::RequestSuccess { .. }));
+
+        client_writer.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    })
+}
+
+#[test]
+fn test_global_request_e2e_control_stream_legacy_path_rejected() {
+    run("test_global_request_e2e_control_stream_legacy_path_rejected", async move {
+        let (_client_writer, server_reader) = duplex(8192);
+        let (server_writer, mut client_reader) = duplex(8192);
+
+        let server_task = tokio::spawn(async move {
+            reject_legacy_global_request_channel(server_writer).await.unwrap();
+            drop(server_reader);
+        });
+
+        let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        match msg {
+            SshMessage::ChannelOpenFailure { reason_code, .. } => {
+                assert_eq!(reason_code, VarInt::from(3u8));
+            }
+            other => panic!("expected ChannelOpenFailure, got {other:?}"),
+        }
+
+        server_task.await.unwrap();
     })
 }
 
