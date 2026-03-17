@@ -1,5 +1,6 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use std::fmt;
 
 use crate::error::Ssh3Error;
 
@@ -7,6 +8,16 @@ use crate::error::Ssh3Error;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AuthCredential {
     Basic { username: String, password: String },
+}
+
+impl fmt::Display for AuthCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Basic { username, .. } => {
+                write!(f, "Basic(username={username}, password=<redacted>)")
+            }
+        }
+    }
 }
 
 /// Authentication scheme.
@@ -146,5 +157,17 @@ mod tests {
     #[test]
     fn test_auth_scheme_debug() {
         assert_eq!(format!("{:?}", AuthScheme::Basic), "Basic");
+    }
+
+    #[test]
+    fn test_auth_credential_display_redacts_password() {
+        let credential = AuthCredential::Basic {
+            username: "user".into(),
+            password: "secret-pass".into(),
+        };
+
+        let formatted = credential.to_string();
+        assert_eq!(formatted, "Basic(username=user, password=<redacted>)");
+        assert!(!formatted.contains("secret-pass"));
     }
 }

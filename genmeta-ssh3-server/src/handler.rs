@@ -88,7 +88,7 @@ fn evaluate_connect(
     // 4. Authentication.
     match auth::extract_auth_credential(headers) {
         Ok(credential) => {
-            tracing::debug!(?credential, "authenticated SSH3 CONNECT");
+            tracing::debug!(%credential, "authenticated SSH3 CONNECT");
             ConnectDecision::Ok {
                 version_header: version::version_response_header(&version),
                 credential: Some(credential),
