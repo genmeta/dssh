@@ -37,6 +37,14 @@ use tracing::Instrument;
 
 use crate::channel::ChannelEvent;
 use crate::session::pty::{PtyPair, PtyRequest, SignalRequest, WindowChangeRequest, set_window_size};
+
+async fn decode_request_payload<T>(request_data: &[u8]) -> io::Result<T>
+where
+    for<'a> T: DecodeFrom<&'a mut &'a [u8], Error = io::Error>,
+{
+    let mut reader = request_data;
+    reader.decode_one().await
+}
 // ---------------------------------------------------------------------------
 // Parsed request types
 // ---------------------------------------------------------------------------
@@ -243,60 +251,60 @@ where
 
     match request_type {
         "exec" => {
-            let command = ExecRequest::decode_from(request_data).await?.command;
+            let command = decode_request_payload::<ExecRequest>(request_data).await?.command;
             if want_reply {
-                SshMessage::ChannelSuccess.encode_into(writer).await?;
+                writer.encode_one(&SshMessage::ChannelSuccess).await?;
             }
             Ok(Some(RequestAction::Exec(command)))
         }
         "shell" => {
             if want_reply {
-                SshMessage::ChannelSuccess.encode_into(writer).await?;
+                writer.encode_one(&SshMessage::ChannelSuccess).await?;
             }
             Ok(Some(RequestAction::Shell))
         }
         "pty-req" => {
-            let req = PtyRequest::decode_from(request_data).await?;
+            let req = decode_request_payload::<PtyRequest>(request_data).await?;
             // Reply is deferred to the caller — sent only after allocation
             // succeeds or fails (see session_driver.rs / channel.rs).
             Ok(Some(RequestAction::AllocatePty(req, want_reply)))
         }
         "window-change" => {
-            let req = WindowChangeRequest::decode_from(request_data).await?;
+            let req = decode_request_payload::<WindowChangeRequest>(request_data).await?;
             if want_reply {
-                SshMessage::ChannelSuccess.encode_into(writer).await?;
+                writer.encode_one(&SshMessage::ChannelSuccess).await?;
             }
             Ok(Some(RequestAction::WindowChange(req)))
         }
         "signal" => {
-            let req = SignalRequest::decode_from(request_data).await?;
+            let req = decode_request_payload::<SignalRequest>(request_data).await?;
             if want_reply {
-                SshMessage::ChannelSuccess.encode_into(writer).await?;
+                writer.encode_one(&SshMessage::ChannelSuccess).await?;
             }
             Ok(Some(RequestAction::Signal(req)))
         }
         "subsystem" => {
             // MVP: subsystem not implemented, return failure.
-            let _req = SubsystemRequest::decode_from(request_data).await?;
+            let _req = decode_request_payload::<SubsystemRequest>(request_data).await?;
             if want_reply {
-                SshMessage::ChannelFailure.encode_into(writer).await?;
+                writer.encode_one(&SshMessage::ChannelFailure).await?;
             }
             Ok(None)
         }
         "exit-status" => {
             // Server→client direction: parse and acknowledge (no action needed).
-            let _req = ExitStatusRequest::decode_from(request_data).await?;
+            let _req = decode_request_payload::<ExitStatusRequest>(request_data).await?;
             Ok(None)
         }
         "exit-signal" => {
             // Server→client direction: parse and acknowledge (no action needed).
-            let _req = ExitSignalRequest::decode_from(request_data).await?;
+            let _req = decode_request_payload::<ExitSignalRequest>(request_data).await?;
             Ok(None)
         }
         _ => {
             // Unknown request type — send failure if reply requested.
             if want_reply {
-                SshMessage::ChannelFailure.encode_into(writer).await?;
+                writer.encode_one(&SshMessage::ChannelFailure).await?;
             }
             Ok(None)
         }
@@ -390,7 +398,7 @@ where
         Ok(child) => child,
         Err(e) => {
             tracing::error!(error = %Report::from_error(&e), "failed to spawn command");
-            SshMessage::ChannelFailure.encode_into(writer).await?;
+            writer.encode_one(&SshMessage::ChannelFailure).await?;
             return Err(e);
         }
     };
@@ -436,12 +444,10 @@ where
     // Send any stderr data as ChannelExtendedData.
     let stderr_data = stderr_result?;
     if !stderr_data.is_empty() {
-        SshMessage::ChannelExtendedData {
+        writer.encode_one(&SshMessage::ChannelExtendedData {
             data_type: VarInt::from(1u8),
             data: stderr_data,
-        }
-        .encode_into(&mut *writer)
-        .await?;
+        }).await?;
     }
 
     stdout_result?;
@@ -460,13 +466,11 @@ where
             })
             .await
             .map_err(io::Error::other)?;
-        SshMessage::ChannelRequest {
+        writer.encode_one(&SshMessage::ChannelRequest {
             request_type: "exit-signal".into(),
             want_reply: false,
             request_data,
-        }
-        .encode_into(&mut *writer)
-        .await?;
+        }).await?;
     } else {
         let exit_code = status.code().unwrap_or(255) as u32;
         let mut request_data = Vec::new();
@@ -474,18 +478,16 @@ where
             .encode_one(&ExitStatusRequest { exit_status: exit_code })
             .await
             .map_err(io::Error::other)?;
-        SshMessage::ChannelRequest {
+        writer.encode_one(&SshMessage::ChannelRequest {
             request_type: "exit-status".into(),
             want_reply: false,
             request_data,
-        }
-        .encode_into(&mut *writer)
-        .await?;
+        }).await?;
     }
 
     // Send EOF + Close.
-    SshMessage::ChannelEof.encode_into(&mut *writer).await?;
-    SshMessage::ChannelClose.encode_into(&mut *writer).await?;
+    writer.encode_one(&SshMessage::ChannelEof).await?;
+    writer.encode_one(&SshMessage::ChannelClose).await?;
     writer.shutdown().await?;
 
     // Clean up stdin relay task.
@@ -523,7 +525,7 @@ where
         Ok(child) => child,
         Err(e) => {
             tracing::error!(error = %Report::from_error(&e), "failed to spawn command with PTY");
-            SshMessage::ChannelFailure.encode_into(writer).await?;
+            writer.encode_one(&SshMessage::ChannelFailure).await?;
             return Err(e);
         }
     };
@@ -561,7 +563,7 @@ where
                             }
                         }
                         "window-change" => {
-                            if let Ok(req) = WindowChangeRequest::decode_from(request_data.as_slice()).await {
+                            if let Ok(req) = decode_request_payload::<WindowChangeRequest>(request_data.as_slice()).await {
                                 if let Err(error) = set_window_size(master_raw_fd, &req) {
                                     tracing::warn!(
                                         error = %Report::from_error(&error),
@@ -606,13 +608,11 @@ where
             })
             .await
             .map_err(io::Error::other)?;
-        SshMessage::ChannelRequest {
+        writer.encode_one(&SshMessage::ChannelRequest {
             request_type: "exit-signal".into(),
             want_reply: false,
             request_data,
-        }
-        .encode_into(&mut *writer)
-        .await?;
+        }).await?;
     } else {
         let exit_code = status.code().unwrap_or(255) as u32;
         let mut request_data = Vec::new();
@@ -620,18 +620,16 @@ where
             .encode_one(&ExitStatusRequest { exit_status: exit_code })
             .await
             .map_err(io::Error::other)?;
-        SshMessage::ChannelRequest {
+        writer.encode_one(&SshMessage::ChannelRequest {
             request_type: "exit-status".into(),
             want_reply: false,
             request_data,
-        }
-        .encode_into(&mut *writer)
-        .await?;
+        }).await?;
     }
 
     // Send EOF + Close.
-    SshMessage::ChannelEof.encode_into(&mut *writer).await?;
-    SshMessage::ChannelClose.encode_into(&mut *writer).await?;
+    writer.encode_one(&SshMessage::ChannelEof).await?;
+    writer.encode_one(&SshMessage::ChannelClose).await?;
     writer.shutdown().await?;
 
     // Clean up stdin relay task.
@@ -660,11 +658,9 @@ where
         if n == 0 {
             break;
         }
-        SshMessage::ChannelData {
+        writer.encode_one(&SshMessage::ChannelData {
             data: buf[..n].to_vec(),
-        }
-        .encode_into(&mut *writer)
-        .await?;
+        }).await?;
     }
     Ok(())
 }
@@ -722,7 +718,7 @@ async fn deliver_signal_request(child_pid: i32, request_data: &[u8]) -> io::Resu
         return Ok(());
     }
 
-    let req = SignalRequest::decode_from(request_data).await?;
+    let req = decode_request_payload::<SignalRequest>(request_data).await?;
     let Some(signal_number) = signal_number(req.signal_name.as_str()) else {
         return Ok(());
     };

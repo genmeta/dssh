@@ -12,7 +12,7 @@ use std::os::fd::AsRawFd;
 use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::message::SshMessage;
 use genmeta_ssh3_proto::session::{SessionError, SessionInit, Ssh3Transport, Ssh3TransportClient};
-use h3x::codec::EncodeInto;
+use h3x::codec::EncodeExt;
 use snafu::Report;
 use tokio::{io::AsyncWrite, sync::mpsc, task::JoinSet};
 use tracing::Instrument;
@@ -244,8 +244,8 @@ impl Ssh3Session {
                             pty_pair = Some(pair);
                             tracing::info!(term = %req.term_type, "PTY allocated");
                             if want_reply {
-                                SshMessage::ChannelSuccess
-                                    .encode_into(&mut writer)
+                                writer
+                                    .encode_one(&SshMessage::ChannelSuccess)
                                     .await
                                     .map_err(SessionError::new)?;
                             }
@@ -253,8 +253,8 @@ impl Ssh3Session {
                         Err(error) => {
                             tracing::warn!(error = %Report::from_error(&error), "PTY allocation failed");
                             if want_reply {
-                                SshMessage::ChannelFailure
-                                    .encode_into(&mut writer)
+                                writer
+                                    .encode_one(&SshMessage::ChannelFailure)
                                     .await
                                     .map_err(SessionError::new)?;
                             }
@@ -278,8 +278,8 @@ impl Ssh3Session {
                     None => {}
                 },
                 ChannelEvent::Eof => {
-                    SshMessage::ChannelEof
-                        .encode_into(&mut writer)
+                    writer
+                        .encode_one(&SshMessage::ChannelEof)
                         .await
                         .map_err(SessionError::new)?;
                     tokio::io::AsyncWriteExt::shutdown(&mut writer)
@@ -288,8 +288,8 @@ impl Ssh3Session {
                     break;
                 }
                 ChannelEvent::Close => {
-                    SshMessage::ChannelClose
-                        .encode_into(&mut writer)
+                    writer
+                        .encode_one(&SshMessage::ChannelClose)
                         .await
                         .map_err(SessionError::new)?;
                     break;
@@ -307,7 +307,7 @@ mod tests {
     use super::*;
     use h3x::stream_id::StreamId;
     use genmeta_ssh3_proto::session::TransportError;
-    use h3x::codec::DecodeFrom;
+    use h3x::codec::{DecodeFrom, EncodeInto};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc as StdArc;
