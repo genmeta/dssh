@@ -506,22 +506,8 @@ where
                 } => {
                     match request_type.as_str() {
                         "signal" => {
-                            if let Ok(req) = parse_signal(&request_data).await
-                                && child_pid > 0
-                            {
-                                let sig = match req.signal_name.as_str() {
-                                    "HUP" => Some(libc::SIGHUP),
-                                    "INT" => Some(libc::SIGINT),
-                                    "QUIT" => Some(libc::SIGQUIT),
-                                    "KILL" => Some(libc::SIGKILL),
-                                    "TERM" => Some(libc::SIGTERM),
-                                    "USR1" => Some(libc::SIGUSR1),
-                                    "USR2" => Some(libc::SIGUSR2),
-                                    _ => None,
-                                };
-                                if let Some(sig) = sig {
-                                    unsafe { libc::kill(child_pid, sig) };
-                                }
+                            if let Err(error) = deliver_signal_request(child_pid, &request_data).await {
+                                tracing::warn!(error = %Report::from_error(&error), child_pid, "failed to deliver signal to PTY child");
                             }
                         }
                         "window-change" => {
@@ -549,12 +535,22 @@ where
         stdout_result?;
     }
 
-    // Wait for process to exit.
+    // Wait for process to exit — use the same signal-aware split as non-PTY.
     let status = child.wait().await?;
-    let exit_code = status.code().unwrap_or(255) as u32;
-
-    // Send exit-status request.
-    send_exit_status(exit_code, writer).await?;
+    if let Some(signal_number) = status.signal() {
+        let signal_name = signal_number_name(signal_number).unwrap_or("TERM");
+        send_exit_signal(
+            signal_name,
+            status.core_dumped(),
+            "terminated by signal",
+            "",
+            writer,
+        )
+        .await?;
+    } else {
+        let exit_code = status.code().unwrap_or(255) as u32;
+        send_exit_status(exit_code, writer).await?;
+    }
 
     // Send EOF + Close.
     SshMessage::ChannelEof.encode_into(&mut *writer).await?;
@@ -1301,6 +1297,174 @@ mod tests {
         });
         assert!(has_stderr, "expected ChannelExtendedData with stderr_msg, got: {messages:?}");
     }
+
+    // -------------------------------------------------------------------
+    // Test 16: PTY signal termination emits exit-signal, not exit-status
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pty_signal_emits_exit_signal_instead_of_exit_status() {
+        use crate::session::pty::{allocate_pty, PtyRequest};
+
+        let pty_req = PtyRequest {
+            term_type: "xterm".into(),
+            width_cols: 80,
+            height_rows: 24,
+            width_px: 0,
+            height_px: 0,
+            terminal_modes: vec![],
+        };
+        let pty_pair = allocate_pty(&pty_req).expect("allocate_pty failed");
+
+        let (server_writer, mut client_reader) = duplex(65536);
+        let mut server_writer = server_writer;
+
+        let (event_tx, rx) = mpsc::channel(8);
+        let run_handle = tokio::spawn(async move {
+            run_exec(
+                default_shell(),
+                b"exec sleep 30",
+                &mut server_writer,
+                rx,
+                Some(pty_pair),
+            )
+            .await
+            .unwrap();
+            drop(server_writer);
+        });
+
+        // Give the child time to start.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Send TERM signal via channel event.
+        let mut request_data = Vec::new();
+        SshString("TERM".into())
+            .encode_into(&mut request_data)
+            .await
+            .unwrap();
+        event_tx
+            .send(ChannelEvent::Request {
+                request_type: "signal".into(),
+                want_reply: false,
+                request_data,
+            })
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("signaled PTY command should terminate promptly")
+            .unwrap();
+
+        let mut saw_exit_signal = false;
+        let mut saw_exit_status = false;
+        loop {
+            match SshMessage::decode_from(&mut client_reader).await {
+                Ok(SshMessage::ChannelRequest {
+                    request_type,
+                    want_reply,
+                    request_data,
+                    ..
+                }) if request_type == "exit-signal" => {
+                    let req = parse_exit_signal_request(&request_data).await.unwrap();
+                    assert_eq!(req.signal_name, "TERM");
+                    assert!(!want_reply, "exit-signal must have want_reply=false");
+                    saw_exit_signal = true;
+                }
+                Ok(SshMessage::ChannelRequest {
+                    request_type, ..
+                }) if request_type == "exit-status" => {
+                    saw_exit_status = true;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert!(
+            saw_exit_signal,
+            "expected exit-signal after PTY signal termination"
+        );
+        assert!(
+            !saw_exit_status,
+            "PTY signal termination should not emit exit-status (no double-emission)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Test 17: PTY numeric exit still emits exit-status
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pty_numeric_exit_emits_exit_status() {
+        use crate::session::pty::{allocate_pty, PtyRequest};
+
+        let pty_req = PtyRequest {
+            term_type: "xterm".into(),
+            width_cols: 80,
+            height_rows: 24,
+            width_px: 0,
+            height_px: 0,
+            terminal_modes: vec![],
+        };
+        let pty_pair = allocate_pty(&pty_req).expect("allocate_pty failed");
+
+        let (server_writer, mut client_reader) = duplex(65536);
+        let mut server_writer = server_writer;
+
+        let (_, rx) = mpsc::channel(1);
+        run_exec(
+            default_shell(),
+            b"exit 42",
+            &mut server_writer,
+            rx,
+            Some(pty_pair),
+        )
+        .await
+        .unwrap();
+        drop(server_writer);
+
+        let mut saw_exit_status = false;
+        let mut saw_exit_signal = false;
+        loop {
+            match SshMessage::decode_from(&mut client_reader).await {
+                Ok(SshMessage::ChannelRequest {
+                    request_type,
+                    want_reply,
+                    request_data,
+                    ..
+                }) if request_type == "exit-status" => {
+                    assert!(!want_reply, "exit-status must have want_reply=false");
+                    let req = parse_exit_status_request(&request_data).await.unwrap();
+                    assert_eq!(req.exit_status, 42);
+                    saw_exit_status = true;
+                }
+                Ok(SshMessage::ChannelRequest {
+                    request_type, ..
+                }) if request_type == "exit-signal" => {
+                    saw_exit_signal = true;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert!(
+            saw_exit_status,
+            "PTY numeric exit should emit exit-status"
+        );
+        assert!(
+            !saw_exit_signal,
+            "PTY numeric exit should not emit exit-signal"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Test 18: non-PTY signal emits exit-signal instead of exit-status
+    // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn non_pty_signal_emits_exit_signal_instead_of_exit_status() {

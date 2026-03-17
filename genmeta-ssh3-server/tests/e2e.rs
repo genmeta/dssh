@@ -1245,7 +1245,7 @@ fn test_non_pty_signal_exit_signal() {
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert!(matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }));
 
-        genmeta_ssh3_client::session::send_exec_request(&mut writer, b"sleep 30", true)
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, b"exec sleep 30", true)
             .await
             .unwrap();
 
@@ -1309,6 +1309,119 @@ fn test_non_pty_signal_exit_signal() {
         assert!(!saw_exit_status, "non-PTY signal termination should not emit exit-status");
         assert!(saw_eof, "expected ChannelEof after signal termination");
         assert!(saw_close, "expected ChannelClose after signal termination");
+
+        server_task.await.unwrap();
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 18b. PTY signal termination: signal-killed PTY process emits exit-signal,
+//      not exit-status, and no double-emission occurs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pty_signal_exit_signal() {
+    run("test_pty_signal_exit_signal", async move {
+        let (client_writer, server_reader) = duplex(65536);
+        let (server_writer, mut client_reader) = duplex(65536);
+
+        let header = ChannelHeader {
+            signal_value: 0xaf3627e6,
+            conversation_id: 1,
+            channel_type: "session".into(),
+            max_message_size: 1 << 20,
+        };
+
+        let server_task = tokio::spawn(async move {
+            handle_session_channel(header, server_reader, server_writer)
+                .await
+                .expect("handle_channel failed");
+        });
+
+        let mut writer = client_writer;
+
+        let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert!(matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }));
+
+        genmeta_ssh3_client::session::send_pty_request(
+            &mut writer,
+            "xterm-256color",
+            80, 24, 0, 0,
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
+
+        let pty_success = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert_eq!(pty_success, SshMessage::ChannelSuccess);
+
+        genmeta_ssh3_client::session::send_exec_request(&mut writer, b"exec sleep 30", true)
+            .await
+            .unwrap();
+
+        let exec_success = SshMessage::decode_from(&mut client_reader).await.unwrap();
+        assert_eq!(exec_success, SshMessage::ChannelSuccess);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut request_data = Vec::new();
+        SshString("TERM".into()).encode_into(&mut request_data).await.unwrap();
+        SshMessage::ChannelRequest {
+            request_type: "signal".into(),
+            want_reply: false,
+            request_data,
+        }
+        .encode_into(&mut writer)
+        .await
+        .unwrap();
+        drop(writer);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_exit_signal = false;
+        let mut saw_exit_status = false;
+        let mut saw_eof = false;
+        let mut saw_close = false;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, SshMessage::decode_from(&mut client_reader)).await {
+                Ok(Ok(SshMessage::ChannelRequest {
+                    request_type,
+                    want_reply,
+                    request_data,
+                    ..
+                })) if request_type == "exit-signal" => {
+                    let req = genmeta_ssh3_server::session::request::parse_exit_signal_request(&request_data)
+                        .await
+                        .unwrap();
+                    assert_eq!(req.signal_name, "TERM");
+                    assert!(!want_reply, "exit-signal must have want_reply=false");
+                    saw_exit_signal = true;
+                }
+                Ok(Ok(SshMessage::ChannelRequest { request_type, .. })) if request_type == "exit-status" => {
+                    saw_exit_status = true;
+                }
+                Ok(Ok(SshMessage::ChannelEof)) => saw_eof = true,
+                Ok(Ok(SshMessage::ChannelClose)) => {
+                    saw_close = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Ok(Err(e)) => panic!("unexpected decode error: {e}"),
+                Err(_) => break,
+            }
+        }
+
+        assert!(saw_exit_signal, "expected exit-signal after PTY signal termination");
+        assert!(!saw_exit_status, "PTY signal termination should not emit exit-status (no double-emission)");
+        assert!(saw_eof, "expected ChannelEof after PTY signal termination");
+        assert!(saw_close, "expected ChannelClose after PTY signal termination");
 
         server_task.await.unwrap();
     })
