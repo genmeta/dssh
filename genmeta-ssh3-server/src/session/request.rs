@@ -17,21 +17,26 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 
-use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
+use genmeta_ssh3_proto::{
+    codec::{SshBool, SshString},
+    message::SshMessage,
+};
 use h3x::{
     codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
     varint::VarInt,
 };
-use snafu::Report;
+use nix::{
+    errno::Errno,
+    sys::signal::{self, Signal},
+    unistd::{Pid, dup, setpgid},
+};
+use snafu::{Report, ResultExt, Snafu};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use crate::channel::ChannelEvent;
-use crate::session::pty::{
-    PtyPair, PtyRequest, SignalRequest, WindowChangeRequest, parse_pty_request, parse_signal,
-    parse_window_change, set_window_size,
-};
+use crate::session::pty::{PtyPair, PtyRequest, SignalRequest, WindowChangeRequest, set_window_size};
 // ---------------------------------------------------------------------------
 // Parsed request types
 // ---------------------------------------------------------------------------
@@ -62,6 +67,110 @@ pub struct ExitSignalRequest {
     pub language_tag: String,
 }
 
+#[derive(Debug, Snafu)]
+pub enum RequestCodecError {
+    #[snafu(display("request codec I/O error: {source}"), context(false))]
+    Io { source: io::Error },
+
+    #[snafu(display("request codec VarInt conversion error: {source}"))]
+    VarIntConversion { source: h3x::varint::err::Overflow },
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for ExecRequest {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let len: VarInt = stream.decode_one().await?;
+        let mut command = vec![0u8; len.into_inner() as usize];
+        stream.read_exact(&mut command).await?;
+        Ok(Self { command })
+    }
+}
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for &ExecRequest {
+    type Output = ();
+    type Error = RequestCodecError;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream
+            .encode_one(VarInt::try_from(self.command.len() as u64).context(VarIntConversionSnafu)?)
+            .await?;
+        stream.write_all(&self.command).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for SubsystemRequest {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let subsystem_name: SshString = stream.decode_one().await?;
+        Ok(Self {
+            subsystem_name: subsystem_name.0,
+        })
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for ExitStatusRequest {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let exit_status: VarInt = stream.decode_one().await?;
+        Ok(Self {
+            exit_status: exit_status.into_inner() as u32,
+        })
+    }
+}
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for &ExitStatusRequest {
+    type Output = ();
+    type Error = RequestCodecError;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream
+            .encode_one(VarInt::try_from(self.exit_status as u64).context(VarIntConversionSnafu)?)
+            .await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for ExitSignalRequest {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let signal_name: SshString = stream.decode_one().await?;
+        let core_dumped: SshBool = stream.decode_one().await?;
+        let error_message: SshString = stream.decode_one().await?;
+        let language_tag: SshString = stream.decode_one().await?;
+        Ok(Self {
+            signal_name: signal_name.0,
+            core_dumped: core_dumped.0,
+            error_message: error_message.0,
+            language_tag: language_tag.0,
+        })
+    }
+}
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for &ExitSignalRequest {
+    type Output = ();
+    type Error = RequestCodecError;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream.encode_one(SshString(self.signal_name.clone())).await?;
+        stream.encode_one(SshBool(self.core_dumped)).await?;
+        stream.encode_one(SshString(self.error_message.clone())).await?;
+        stream.encode_one(SshString(self.language_tag.clone())).await?;
+        Ok(())
+    }
+}
+
 /// Action returned by [`handle_request`] indicating what the caller should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestAction {
@@ -77,69 +186,6 @@ pub enum RequestAction {
     WindowChange(WindowChangeRequest),
     /// Deliver a signal to the running process.
     Signal(SignalRequest),
-}
-
-// ---------------------------------------------------------------------------
-// Request data parsing
-// ---------------------------------------------------------------------------
-
-pub async fn parse_exec_command(request_data: &[u8]) -> io::Result<Vec<u8>> {
-    let mut reader = request_data;
-    let len: VarInt = reader.decode_one().await?;
-    let mut command = vec![0u8; len.into_inner() as usize];
-    reader.read_exact(&mut command).await?;
-    Ok(command)
-}
-
-/// Parse a subsystem name from request_data bytes.
-///
-/// The subsystem name is encoded as an `SshString`.
-pub async fn parse_subsystem_request(request_data: &[u8]) -> io::Result<SubsystemRequest> {
-    let mut reader = request_data;
-    let subsystem_name = SshString::decode_from(&mut reader).await?;
-    Ok(SubsystemRequest {
-        subsystem_name: subsystem_name.0,
-    })
-}
-
-/// Parse exit-status request_data: a uint32 encoded as VarInt.
-pub async fn parse_exit_status_request(request_data: &[u8]) -> io::Result<ExitStatusRequest> {
-    let mut reader = request_data;
-    let exit_status: VarInt = reader.decode_one().await?;
-    Ok(ExitStatusRequest {
-        exit_status: exit_status.into_inner() as u32,
-    })
-}
-
-/// Parse exit-signal request_data: signal_name(SshString) + core_dumped(bool byte) +
-/// error_message(SshString) + language_tag(SshString).
-pub async fn parse_exit_signal_request(request_data: &[u8]) -> io::Result<ExitSignalRequest> {
-    let mut reader = request_data;
-    let signal_name = SshString::decode_from(&mut reader).await?;
-    // core_dumped is a single byte boolean (0x00 or 0x01), matching SshBool encoding.
-    let core_dumped_byte = AsyncReadExt::read_u8(&mut reader).await?;
-    let core_dumped = core_dumped_byte != 0;
-    let error_message = SshString::decode_from(&mut reader).await?;
-    let language_tag = SshString::decode_from(&mut reader).await?;
-    Ok(ExitSignalRequest {
-        signal_name: signal_name.0,
-        core_dumped,
-        error_message: error_message.0,
-        language_tag: language_tag.0,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Exit-status/exit-signal encoding (for sending from server)
-// ---------------------------------------------------------------------------
-
-/// Encode an exit code as QUIC VarInt bytes for the exit-status request_data.
-pub async fn encode_exit_status_data(exit_code: u32) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let varint = VarInt::try_from(exit_code as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(varint).await?;
-    Ok(buf)
 }
 
 /// Synchronous version of exit-status encoding for use in assertions.
@@ -167,27 +213,6 @@ pub fn encode_exit_status(exit_code: u32) -> Vec<u8> {
 #[cfg(test)]
 fn default_shell() -> &'static OsStr {
     OsStr::new("/bin/sh")
-}
-
-/// Encode exit-signal request_data.
-pub async fn encode_exit_signal_data(
-    signal_name: &str,
-    core_dumped: bool,
-    error_message: &str,
-    language_tag: &str,
-) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    SshString(signal_name.to_owned())
-        .encode_into(&mut buf)
-        .await?;
-    buf.write_u8(if core_dumped { 0x01 } else { 0x00 }).await?;
-    SshString(error_message.to_owned())
-        .encode_into(&mut buf)
-        .await?;
-    SshString(language_tag.to_owned())
-        .encode_into(&mut buf)
-        .await?;
-    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +243,7 @@ where
 
     match request_type {
         "exec" => {
-            let command = parse_exec_command(request_data).await?;
+            let command = ExecRequest::decode_from(request_data).await?.command;
             if want_reply {
                 SshMessage::ChannelSuccess.encode_into(writer).await?;
             }
@@ -231,20 +256,20 @@ where
             Ok(Some(RequestAction::Shell))
         }
         "pty-req" => {
-            let req = parse_pty_request(request_data).await?;
+            let req = PtyRequest::decode_from(request_data).await?;
             // Reply is deferred to the caller — sent only after allocation
             // succeeds or fails (see session_driver.rs / channel.rs).
             Ok(Some(RequestAction::AllocatePty(req, want_reply)))
         }
         "window-change" => {
-            let req = parse_window_change(request_data).await?;
+            let req = WindowChangeRequest::decode_from(request_data).await?;
             if want_reply {
                 SshMessage::ChannelSuccess.encode_into(writer).await?;
             }
             Ok(Some(RequestAction::WindowChange(req)))
         }
         "signal" => {
-            let req = parse_signal(request_data).await?;
+            let req = SignalRequest::decode_from(request_data).await?;
             if want_reply {
                 SshMessage::ChannelSuccess.encode_into(writer).await?;
             }
@@ -252,7 +277,7 @@ where
         }
         "subsystem" => {
             // MVP: subsystem not implemented, return failure.
-            let _req = parse_subsystem_request(request_data).await?;
+            let _req = SubsystemRequest::decode_from(request_data).await?;
             if want_reply {
                 SshMessage::ChannelFailure.encode_into(writer).await?;
             }
@@ -260,12 +285,12 @@ where
         }
         "exit-status" => {
             // Server→client direction: parse and acknowledge (no action needed).
-            let _req = parse_exit_status_request(request_data).await?;
+            let _req = ExitStatusRequest::decode_from(request_data).await?;
             Ok(None)
         }
         "exit-signal" => {
             // Server→client direction: parse and acknowledge (no action needed).
-            let _req = parse_exit_signal_request(request_data).await?;
+            let _req = ExitSignalRequest::decode_from(request_data).await?;
             Ok(None)
         }
         _ => {
@@ -357,11 +382,7 @@ where
         .stdin(Stdio::piped());
     unsafe {
         command.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
+            setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(io::Error::other)
         });
     }
 
@@ -429,17 +450,37 @@ where
     let status = child.wait().await?;
     if let Some(signal_number) = status.signal() {
         let signal_name = exit_signal_name(signal_number);
-        send_exit_signal(
-            signal_name.as_ref(),
-            status.core_dumped(),
-            "",
-            "",
-            writer,
-        )
+        let mut request_data = Vec::new();
+        request_data
+            .encode_one(&ExitSignalRequest {
+                signal_name: signal_name.into_owned(),
+                core_dumped: status.core_dumped(),
+                error_message: String::new(),
+                language_tag: String::new(),
+            })
+            .await
+            .map_err(io::Error::other)?;
+        SshMessage::ChannelRequest {
+            request_type: "exit-signal".into(),
+            want_reply: false,
+            request_data,
+        }
+        .encode_into(&mut *writer)
         .await?;
     } else {
         let exit_code = status.code().unwrap_or(255) as u32;
-        send_exit_status(exit_code, writer).await?;
+        let mut request_data = Vec::new();
+        request_data
+            .encode_one(&ExitStatusRequest { exit_status: exit_code })
+            .await
+            .map_err(io::Error::other)?;
+        SshMessage::ChannelRequest {
+            request_type: "exit-status".into(),
+            want_reply: false,
+            request_data,
+        }
+        .encode_into(&mut *writer)
+        .await?;
     }
 
     // Send EOF + Close.
@@ -468,14 +509,8 @@ where
 {
     // Duplicate the slave fd for stdout and stderr before consuming for stdin.
     let slave_raw = pty_pair.slave.as_raw_fd();
-    let stdout_fd = unsafe { libc::dup(slave_raw) };
-    if stdout_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stderr_fd = unsafe { libc::dup(slave_raw) };
-    if stderr_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let stdout_fd = dup(slave_raw).map_err(io::Error::other)?;
+    let stderr_fd = dup(slave_raw).map_err(io::Error::other)?;
     let stdin_fd = pty_pair.slave.into_raw_fd();
 
     let mut child = match tokio::process::Command::new(program)
@@ -526,7 +561,7 @@ where
                             }
                         }
                         "window-change" => {
-                            if let Ok(req) = parse_window_change(&request_data).await {
+                            if let Ok(req) = WindowChangeRequest::decode_from(request_data.as_slice()).await {
                                 if let Err(error) = set_window_size(master_raw_fd, &req) {
                                     tracing::warn!(
                                         error = %Report::from_error(&error),
@@ -561,17 +596,37 @@ where
     let status = child.wait().await?;
     if let Some(signal_number) = status.signal() {
         let signal_name = exit_signal_name(signal_number);
-        send_exit_signal(
-            signal_name.as_ref(),
-            status.core_dumped(),
-            "",
-            "",
-            writer,
-        )
+        let mut request_data = Vec::new();
+        request_data
+            .encode_one(&ExitSignalRequest {
+                signal_name: signal_name.into_owned(),
+                core_dumped: status.core_dumped(),
+                error_message: String::new(),
+                language_tag: String::new(),
+            })
+            .await
+            .map_err(io::Error::other)?;
+        SshMessage::ChannelRequest {
+            request_type: "exit-signal".into(),
+            want_reply: false,
+            request_data,
+        }
+        .encode_into(&mut *writer)
         .await?;
     } else {
         let exit_code = status.code().unwrap_or(255) as u32;
-        send_exit_status(exit_code, writer).await?;
+        let mut request_data = Vec::new();
+        request_data
+            .encode_one(&ExitStatusRequest { exit_status: exit_code })
+            .await
+            .map_err(io::Error::other)?;
+        SshMessage::ChannelRequest {
+            request_type: "exit-status".into(),
+            want_reply: false,
+            request_data,
+        }
+        .encode_into(&mut *writer)
+        .await?;
     }
 
     // Send EOF + Close.
@@ -584,47 +639,6 @@ where
     let _ = stdin_task.await;
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Exit-status/exit-signal sending helpers
-// ---------------------------------------------------------------------------
-
-/// Send an exit-status ChannelRequest to the client.
-pub async fn send_exit_status<W>(exit_code: u32, writer: &mut W) -> io::Result<()>
-where
-    W: AsyncWrite + Send + Unpin,
-{
-    let request_data = encode_exit_status_data(exit_code).await?;
-    SshMessage::ChannelRequest {
-        request_type: "exit-status".into(),
-        want_reply: false,
-        request_data,
-    }
-    .encode_into(writer)
-    .await
-}
-
-/// Send an exit-signal ChannelRequest to the client.
-pub async fn send_exit_signal<W>(
-    signal_name: &str,
-    core_dumped: bool,
-    error_message: &str,
-    language_tag: &str,
-    writer: &mut W,
-) -> io::Result<()>
-where
-    W: AsyncWrite + Send + Unpin,
-{
-    let request_data =
-        encode_exit_signal_data(signal_name, core_dumped, error_message, language_tag).await?;
-    SshMessage::ChannelRequest {
-        request_type: "exit-signal".into(),
-        want_reply: false,
-        request_data,
-    }
-    .encode_into(writer)
-    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -665,15 +679,15 @@ where
     Ok(buf)
 }
 
-fn signal_number(signal_name: &str) -> Option<i32> {
+fn signal_number(signal_name: &str) -> Option<Signal> {
     match signal_name {
-        "HUP" => Some(libc::SIGHUP),
-        "INT" => Some(libc::SIGINT),
-        "QUIT" => Some(libc::SIGQUIT),
-        "KILL" => Some(libc::SIGKILL),
-        "TERM" => Some(libc::SIGTERM),
-        "USR1" => Some(libc::SIGUSR1),
-        "USR2" => Some(libc::SIGUSR2),
+        "HUP" => Some(Signal::SIGHUP),
+        "INT" => Some(Signal::SIGINT),
+        "QUIT" => Some(Signal::SIGQUIT),
+        "KILL" => Some(Signal::SIGKILL),
+        "TERM" => Some(Signal::SIGTERM),
+        "USR1" => Some(Signal::SIGUSR1),
+        "USR2" => Some(Signal::SIGUSR2),
         _ => None,
     }
 }
@@ -708,26 +722,16 @@ async fn deliver_signal_request(child_pid: i32, request_data: &[u8]) -> io::Resu
         return Ok(());
     }
 
-    let req = parse_signal(request_data).await?;
+    let req = SignalRequest::decode_from(request_data).await?;
     let Some(signal_number) = signal_number(req.signal_name.as_str()) else {
         return Ok(());
     };
 
-    let result = unsafe { libc::kill(-child_pid, signal_number) };
-    if result == 0 {
-        Ok(())
-    } else {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            let fallback = unsafe { libc::kill(child_pid, signal_number) };
-            if fallback == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        } else {
-            Err(error)
-        }
+    let child_pid = Pid::from_raw(child_pid);
+    match signal::killpg(child_pid, signal_number) {
+        Ok(()) => Ok(()),
+        Err(Errno::ESRCH) => signal::kill(child_pid, signal_number).map_err(io::Error::other),
+        Err(error) => Err(io::Error::other(error)),
     }
 }
 
@@ -739,14 +743,24 @@ async fn deliver_signal_request(child_pid: i32, request_data: &[u8]) -> io::Resu
 mod tests {
     use super::*;
     use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
+    use h3x::codec::EncodeExt;
     use tokio::io::duplex;
 
+    async fn encode_request_data<T, E>(item: T) -> Result<Vec<u8>, E>
+    where
+        for<'a> T: EncodeInto<&'a mut Vec<u8>, Output = (), Error = E>,
+    {
+        let mut buf = Vec::new();
+        buf.encode_one(item).await?;
+        Ok(buf)
+    }
+
     // -------------------------------------------------------------------
-    // Test 1: parse_exec_command parses SshString from bytes
+    // Test 1: exec request codec parses SshString payloads
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn parse_exec_command_simple() {
+    async fn exec_request_codec_simple() {
         // Encode "echo hello" as SshString
         let (mut writer, mut reader) = duplex(4096);
         SshString("echo hello".into())
@@ -758,12 +772,12 @@ mod tests {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
 
-        let cmd = parse_exec_command(&buf).await.unwrap();
-        assert_eq!(cmd, b"echo hello");
+        let req = ExecRequest::decode_from(buf.as_slice()).await.unwrap();
+        assert_eq!(req.command, b"echo hello");
     }
 
     #[tokio::test]
-    async fn parse_exec_command_empty() {
+    async fn exec_request_codec_empty() {
         // Encode empty string as SshString
         let (mut writer, mut reader) = duplex(4096);
         SshString(String::new())
@@ -775,16 +789,16 @@ mod tests {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
 
-        let cmd = parse_exec_command(&buf).await.unwrap();
-        assert_eq!(cmd, b"");
+        let req = ExecRequest::decode_from(buf.as_slice()).await.unwrap();
+        assert_eq!(req.command, b"");
     }
 
     #[tokio::test]
-    async fn parse_exec_command_non_utf8() {
+    async fn exec_request_codec_non_utf8() {
         let request_data = vec![0x03, 0x66, 0x6f, 0xff];
 
-        let cmd = parse_exec_command(&request_data).await.unwrap();
-        assert_eq!(cmd, vec![0x66, 0x6f, 0xff]);
+        let req = ExecRequest::decode_from(request_data.as_slice()).await.unwrap();
+        assert_eq!(req.command, vec![0x66, 0x6f, 0xff]);
     }
 
     // -------------------------------------------------------------------
@@ -1118,40 +1132,51 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Test 7: parse_exit_status_request roundtrip
+    // Test 7: exit-status request codec roundtrip
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn parse_exit_status_roundtrip() {
-        let data = encode_exit_status_data(42).await.unwrap();
-        let req = parse_exit_status_request(&data).await.unwrap();
+    async fn exit_status_request_codec_roundtrip() {
+        let data = encode_request_data(&ExitStatusRequest { exit_status: 42 })
+            .await
+            .unwrap();
+        let req = ExitStatusRequest::decode_from(data.as_slice()).await.unwrap();
         assert_eq!(req.exit_status, 42);
     }
 
     #[tokio::test]
-    async fn parse_exit_status_zero() {
-        let data = encode_exit_status_data(0).await.unwrap();
-        let req = parse_exit_status_request(&data).await.unwrap();
+    async fn exit_status_request_codec_zero() {
+        let data = encode_request_data(&ExitStatusRequest { exit_status: 0 })
+            .await
+            .unwrap();
+        let req = ExitStatusRequest::decode_from(data.as_slice()).await.unwrap();
         assert_eq!(req.exit_status, 0);
     }
 
     #[tokio::test]
-    async fn parse_exit_status_255() {
-        let data = encode_exit_status_data(255).await.unwrap();
-        let req = parse_exit_status_request(&data).await.unwrap();
+    async fn exit_status_request_codec_255() {
+        let data = encode_request_data(&ExitStatusRequest { exit_status: 255 })
+            .await
+            .unwrap();
+        let req = ExitStatusRequest::decode_from(data.as_slice()).await.unwrap();
         assert_eq!(req.exit_status, 255);
     }
 
     // -------------------------------------------------------------------
-    // Test 8: parse_exit_signal_request roundtrip
+    // Test 8: exit-signal request codec roundtrip
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn parse_exit_signal_roundtrip() {
-        let data = encode_exit_signal_data("KILL", true, "killed by signal", "en")
+    async fn exit_signal_request_codec_roundtrip() {
+        let data = encode_request_data(&ExitSignalRequest {
+            signal_name: "KILL".into(),
+            core_dumped: true,
+            error_message: "killed by signal".into(),
+            language_tag: "en".into(),
+        })
             .await
             .unwrap();
-        let req = parse_exit_signal_request(&data).await.unwrap();
+        let req = ExitSignalRequest::decode_from(data.as_slice()).await.unwrap();
         assert_eq!(req.signal_name, "KILL");
         assert!(req.core_dumped);
         assert_eq!(req.error_message, "killed by signal");
@@ -1159,11 +1184,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_exit_signal_no_core_dump() {
-        let data = encode_exit_signal_data("TERM", false, "terminated", "")
+    async fn exit_signal_request_codec_no_core_dump() {
+        let data = encode_request_data(&ExitSignalRequest {
+            signal_name: "TERM".into(),
+            core_dumped: false,
+            error_message: "terminated".into(),
+            language_tag: String::new(),
+        })
             .await
             .unwrap();
-        let req = parse_exit_signal_request(&data).await.unwrap();
+        let req = ExitSignalRequest::decode_from(data.as_slice()).await.unwrap();
         assert_eq!(req.signal_name, "TERM");
         assert!(!req.core_dumped);
         assert_eq!(req.error_message, "terminated");
@@ -1171,13 +1201,25 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Test 9: send_exit_status writes correct ChannelRequest
+    // Test 9: exit-status channel request encoding
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn send_exit_status_message() {
+    async fn exit_status_channel_request_message() {
         let (mut writer, mut reader) = duplex(8192);
-        send_exit_status(42, &mut writer).await.unwrap();
+        let mut request_data = Vec::new();
+        request_data
+            .encode_one(&ExitStatusRequest { exit_status: 42 })
+            .await
+            .unwrap();
+        SshMessage::ChannelRequest {
+            request_type: "exit-status".into(),
+            want_reply: false,
+            request_data,
+        }
+        .encode_into(&mut writer)
+        .await
+        .unwrap();
         drop(writer);
 
         let msg = SshMessage::decode_from(&mut reader).await.unwrap();
@@ -1189,7 +1231,7 @@ mod tests {
             } => {
                 assert_eq!(request_type, "exit-status");
                 assert!(!want_reply);
-                let req = parse_exit_status_request(&request_data).await.unwrap();
+                let req = ExitStatusRequest::decode_from(request_data.as_slice()).await.unwrap();
                 assert_eq!(req.exit_status, 42);
             }
             other => panic!("expected ChannelRequest, got {other:?}"),
@@ -1197,13 +1239,28 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Test 10: send_exit_signal writes correct ChannelRequest
+    // Test 10: exit-signal channel request encoding
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn send_exit_signal_message() {
+    async fn exit_signal_channel_request_message() {
         let (mut writer, mut reader) = duplex(8192);
-        send_exit_signal("TERM", false, "terminated", "en", &mut writer)
+        let mut request_data = Vec::new();
+        request_data
+            .encode_one(&ExitSignalRequest {
+                signal_name: "TERM".into(),
+                core_dumped: false,
+                error_message: "terminated".into(),
+                language_tag: "en".into(),
+            })
+            .await
+            .unwrap();
+        SshMessage::ChannelRequest {
+            request_type: "exit-signal".into(),
+            want_reply: false,
+            request_data,
+        }
+        .encode_into(&mut writer)
             .await
             .unwrap();
         drop(writer);
@@ -1217,7 +1274,7 @@ mod tests {
             } => {
                 assert_eq!(request_type, "exit-signal");
                 assert!(!want_reply);
-                let req = parse_exit_signal_request(&request_data).await.unwrap();
+                let req = ExitSignalRequest::decode_from(request_data.as_slice()).await.unwrap();
                 assert_eq!(req.signal_name, "TERM");
                 assert!(!req.core_dumped);
                 assert_eq!(req.error_message, "terminated");
@@ -1228,7 +1285,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Test 11: parse_subsystem_request
+    // Test 11: subsystem request codec
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -1238,7 +1295,7 @@ mod tests {
             .encode_into(&mut buf)
             .await
             .unwrap();
-        let req = parse_subsystem_request(&buf).await.unwrap();
+        let req = SubsystemRequest::decode_from(buf.as_slice()).await.unwrap();
         assert_eq!(req.subsystem_name, "sftp");
     }
 
@@ -1251,7 +1308,9 @@ mod tests {
         let (server_writer, _client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        let request_data = encode_exit_status_data(0).await.unwrap();
+        let request_data = encode_request_data(&ExitStatusRequest { exit_status: 0 })
+            .await
+            .unwrap();
         let event = ChannelEvent::Request {
             request_type: "exit-status".into(),
             want_reply: false,
@@ -1274,7 +1333,12 @@ mod tests {
         let (server_writer, _client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        let request_data = encode_exit_signal_data("KILL", true, "killed", "en")
+        let request_data = encode_request_data(&ExitSignalRequest {
+            signal_name: "KILL".into(),
+            core_dumped: true,
+            error_message: "killed".into(),
+            language_tag: "en".into(),
+        })
             .await
             .unwrap();
         let event = ChannelEvent::Request {
@@ -1446,7 +1510,7 @@ mod tests {
                     request_data,
                     ..
                 }) if request_type == "exit-signal" => {
-                    let req = parse_exit_signal_request(&request_data).await.unwrap();
+                    let req = ExitSignalRequest::decode_from(request_data.as_slice()).await.unwrap();
                     assert_eq!(req.signal_name, "TERM");
                     assert_eq!(req.error_message, "");
                     assert_eq!(req.language_tag, "");
@@ -1518,7 +1582,7 @@ mod tests {
                     ..
                 }) if request_type == "exit-status" => {
                     assert!(!want_reply, "exit-status must have want_reply=false");
-                    let req = parse_exit_status_request(&request_data).await.unwrap();
+                    let req = ExitStatusRequest::decode_from(request_data.as_slice()).await.unwrap();
                     assert_eq!(req.exit_status, 42);
                     saw_exit_status = true;
                 }
@@ -1588,7 +1652,7 @@ mod tests {
                     request_data,
                     ..
                 }) if request_type == "exit-signal" => {
-                    let req = parse_exit_signal_request(&request_data).await.unwrap();
+                    let req = ExitSignalRequest::decode_from(request_data.as_slice()).await.unwrap();
                     assert_eq!(req.signal_name, "TERM");
                     assert_eq!(req.error_message, "");
                     assert_eq!(req.language_tag, "");

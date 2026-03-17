@@ -3,12 +3,21 @@
 //! Handles `pty-req`, `window-change`, and `signal` ChannelRequest types
 //! per RFC 4254 Sections 6.2, 6.7.
 
-use std::io;
 use std::os::fd::{OwnedFd, RawFd};
+use std::pin::pin;
 
 use genmeta_ssh3_proto::codec::SshString;
-use h3x::{codec::{DecodeExt, DecodeFrom}, varint::VarInt};
+use h3x::{
+    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
+    varint::VarInt,
+};
 use nix::pty::{openpty, Winsize};
+use snafu::{ResultExt, Snafu};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, libc::winsize);
+#[cfg(test)]
+nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
 
 // ---------------------------------------------------------------------------
 // Parsed request types
@@ -61,77 +70,178 @@ pub struct PtyPair {
 }
 
 // ---------------------------------------------------------------------------
-// Request parsing
+// Error types
 // ---------------------------------------------------------------------------
 
-/// Decode a pty-req request from `request_data` bytes.
+/// Errors that can occur when encoding/decoding PTY-related request structs.
+#[derive(Debug, Snafu)]
+pub enum PtyCodecError {
+    /// An I/O error occurred during encoding or decoding.
+    #[snafu(display("PTY codec I/O error: {source}"), context(false))]
+    Io { source: io::Error },
+
+    /// A VarInt value could not be converted for encoding.
+    #[snafu(display("PTY codec VarInt conversion error: {source}"))]
+    VarIntConversion { source: h3x::varint::err::Overflow },
+}
+
+// ---------------------------------------------------------------------------
+// DecodeFrom / EncodeInto implementations
+// ---------------------------------------------------------------------------
+
+/// Decode a pty-req request from a stream (RFC 4254 §6.2).
 ///
-/// Fields (RFC 4254 §6.2):
+/// Fields:
 /// - `SshString`: TERM environment variable value
 /// - `VarInt` (u32): terminal width, characters
 /// - `VarInt` (u32): terminal height, rows
 /// - `VarInt` (u32): terminal width, pixels
 /// - `VarInt` (u32): terminal height, pixels
 /// - varint-length-prefixed bytes: encoded terminal modes
-pub async fn parse_pty_request(request_data: &[u8]) -> io::Result<PtyRequest> {
-    let mut reader = request_data;
+impl<S: AsyncRead + Send> DecodeFrom<S> for PtyRequest {
+    type Error = io::Error;
 
-    let term_type = SshString::decode_from(&mut reader).await?;
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = pin!(stream);
 
-    let width_cols: VarInt = reader.decode_one().await?;
-    let height_rows: VarInt = reader.decode_one().await?;
-    let width_px: VarInt = reader.decode_one().await?;
-    let height_px: VarInt = reader.decode_one().await?;
+        let term_type: SshString = stream.decode_one().await?;
+        let width_cols: VarInt = stream.decode_one().await?;
+        let height_rows: VarInt = stream.decode_one().await?;
+        let width_px: VarInt = stream.decode_one().await?;
+        let height_px: VarInt = stream.decode_one().await?;
 
-    // Terminal modes: varint length prefix + raw bytes (same encoding as SshBytes).
-    let modes_len: VarInt = reader.decode_one().await?;
-    let modes_len = modes_len.into_inner() as usize;
-    let mut terminal_modes = vec![0u8; modes_len];
-    tokio::io::AsyncReadExt::read_exact(&mut reader, &mut terminal_modes).await?;
+        // Terminal modes: varint length prefix + raw bytes (same encoding as SshBytes).
+        let modes_len: VarInt = stream.decode_one().await?;
+        let modes_len = modes_len.into_inner() as usize;
+        let mut terminal_modes = vec![0u8; modes_len];
+        stream.read_exact(&mut terminal_modes).await?;
 
-    Ok(PtyRequest {
-        term_type: term_type.0,
-        width_cols: width_cols.into_inner() as u32,
-        height_rows: height_rows.into_inner() as u32,
-        width_px: width_px.into_inner() as u32,
-        height_px: height_px.into_inner() as u32,
-        terminal_modes,
-    })
+        Ok(PtyRequest {
+            term_type: term_type.0,
+            width_cols: width_cols.into_inner() as u32,
+            height_rows: height_rows.into_inner() as u32,
+            width_px: width_px.into_inner() as u32,
+            height_px: height_px.into_inner() as u32,
+            terminal_modes,
+        })
+    }
 }
 
-/// Decode a window-change request from `request_data` bytes.
+/// Encode a pty-req request into a stream (RFC 4254 §6.2).
+impl<S: AsyncWrite + Send> EncodeInto<S> for &PtyRequest {
+    type Output = ();
+    type Error = PtyCodecError;
+
+    async fn encode_into(self, stream: S) -> Result<(), PtyCodecError> {
+        let mut stream = pin!(stream);
+
+        stream
+            .encode_one(SshString(self.term_type.clone()))
+            .await?;
+
+        stream
+            .encode_one(VarInt::try_from(self.width_cols as u64).context(VarIntConversionSnafu)?)
+            .await?;
+        stream
+            .encode_one(VarInt::try_from(self.height_rows as u64).context(VarIntConversionSnafu)?)
+            .await?;
+        stream
+            .encode_one(VarInt::try_from(self.width_px as u64).context(VarIntConversionSnafu)?)
+            .await?;
+        stream
+            .encode_one(VarInt::try_from(self.height_px as u64).context(VarIntConversionSnafu)?)
+            .await?;
+
+        // Terminal modes: varint length prefix + raw bytes.
+        stream
+            .encode_one(VarInt::try_from(self.terminal_modes.len() as u64).context(VarIntConversionSnafu)?)
+            .await?;
+        stream.write_all(&self.terminal_modes).await?;
+
+        Ok(())
+    }
+}
+
+/// Decode a window-change request from a stream (RFC 4254 §6.7).
 ///
-/// Fields (RFC 4254 §6.7):
+/// Fields:
 /// - `VarInt` (u32): terminal width, columns
 /// - `VarInt` (u32): terminal height, rows
 /// - `VarInt` (u32): terminal width, pixels
 /// - `VarInt` (u32): terminal height, pixels
-pub async fn parse_window_change(request_data: &[u8]) -> io::Result<WindowChangeRequest> {
-    let mut reader = request_data;
+impl<S: AsyncRead + Send> DecodeFrom<S> for WindowChangeRequest {
+    type Error = io::Error;
 
-    let width_cols: VarInt = reader.decode_one().await?;
-    let height_rows: VarInt = reader.decode_one().await?;
-    let width_px: VarInt = reader.decode_one().await?;
-    let height_px: VarInt = reader.decode_one().await?;
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = pin!(stream);
 
-    Ok(WindowChangeRequest {
-        width_cols: width_cols.into_inner() as u32,
-        height_rows: height_rows.into_inner() as u32,
-        width_px: width_px.into_inner() as u32,
-        height_px: height_px.into_inner() as u32,
-    })
+        let width_cols: VarInt = stream.decode_one().await?;
+        let height_rows: VarInt = stream.decode_one().await?;
+        let width_px: VarInt = stream.decode_one().await?;
+        let height_px: VarInt = stream.decode_one().await?;
+
+        Ok(WindowChangeRequest {
+            width_cols: width_cols.into_inner() as u32,
+            height_rows: height_rows.into_inner() as u32,
+            width_px: width_px.into_inner() as u32,
+            height_px: height_px.into_inner() as u32,
+        })
+    }
 }
 
-/// Decode a signal request from `request_data` bytes.
+/// Encode a window-change request into a stream (RFC 4254 §6.7).
+impl<S: AsyncWrite + Send> EncodeInto<S> for &WindowChangeRequest {
+    type Output = ();
+    type Error = PtyCodecError;
+
+    async fn encode_into(self, stream: S) -> Result<(), PtyCodecError> {
+        let mut stream = pin!(stream);
+
+        stream
+            .encode_one(VarInt::try_from(self.width_cols as u64).context(VarIntConversionSnafu)?)
+            .await?;
+        stream
+            .encode_one(VarInt::try_from(self.height_rows as u64).context(VarIntConversionSnafu)?)
+            .await?;
+        stream
+            .encode_one(VarInt::try_from(self.width_px as u64).context(VarIntConversionSnafu)?)
+            .await?;
+        stream
+            .encode_one(VarInt::try_from(self.height_px as u64).context(VarIntConversionSnafu)?)
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// Decode a signal request from a stream (RFC 4254 §6.9).
 ///
-/// Fields (RFC 4254 §6.9):
+/// Fields:
 /// - `SshString`: signal name (without "SIG" prefix, e.g., "INT", "TERM", "KILL")
-pub async fn parse_signal(request_data: &[u8]) -> io::Result<SignalRequest> {
-    let mut reader = request_data;
-    let signal_name = SshString::decode_from(&mut reader).await?;
-    Ok(SignalRequest {
-        signal_name: signal_name.0,
-    })
+impl<S: AsyncRead + Send> DecodeFrom<S> for SignalRequest {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = pin!(stream);
+        let signal_name: SshString = stream.decode_one().await?;
+        Ok(SignalRequest {
+            signal_name: signal_name.0,
+        })
+    }
+}
+
+/// Encode a signal request into a stream (RFC 4254 §6.9).
+impl<S: AsyncWrite + Send> EncodeInto<S> for &SignalRequest {
+    type Output = ();
+    type Error = PtyCodecError;
+
+    async fn encode_into(self, stream: S) -> Result<(), PtyCodecError> {
+        let mut stream = pin!(stream);
+        stream
+            .encode_one(SshString(self.signal_name.clone()))
+            .await?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,27 +250,14 @@ pub async fn parse_signal(request_data: &[u8]) -> io::Result<SignalRequest> {
 
 /// Error returned when an RFC `uint32` dimension value exceeds `u16::MAX`
 /// and cannot be used for the ioctl `winsize` struct.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Snafu)]
+#[snafu(display("PTY dimension overflow: {field} = {value} exceeds u16::MAX (65535)"))]
 pub struct DimensionOverflow {
     /// Name of the overflowing field (e.g., "width_cols").
     pub field: &'static str,
     /// The value that overflowed.
     pub value: u32,
 }
-
-impl std::fmt::Display for DimensionOverflow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "PTY dimension overflow: {} = {} exceeds u16::MAX ({})",
-            self.field,
-            self.value,
-            u16::MAX,
-        )
-    }
-}
-
-impl std::error::Error for DimensionOverflow {}
 
 /// Attempt checked conversion of all four PTY dimension fields from `u32` to `u16`.
 ///
@@ -172,22 +269,35 @@ pub fn checked_winsize(
     width_px: u32,
     height_px: u32,
 ) -> Result<libc::winsize, DimensionOverflow> {
-    let ws_col = u16::try_from(width_cols).map_err(|_| DimensionOverflow {
-        field: "width_cols",
-        value: width_cols,
-    })?;
-    let ws_row = u16::try_from(height_rows).map_err(|_| DimensionOverflow {
-        field: "height_rows",
-        value: height_rows,
-    })?;
-    let ws_xpixel = u16::try_from(width_px).map_err(|_| DimensionOverflow {
-        field: "width_px",
-        value: width_px,
-    })?;
-    let ws_ypixel = u16::try_from(height_px).map_err(|_| DimensionOverflow {
-        field: "height_px",
-        value: height_px,
-    })?;
+    if width_cols > u16::MAX as u32 {
+        return Err(DimensionOverflow {
+            field: "width_cols",
+            value: width_cols,
+        });
+    }
+    if height_rows > u16::MAX as u32 {
+        return Err(DimensionOverflow {
+            field: "height_rows",
+            value: height_rows,
+        });
+    }
+    if width_px > u16::MAX as u32 {
+        return Err(DimensionOverflow {
+            field: "width_px",
+            value: width_px,
+        });
+    }
+    if height_px > u16::MAX as u32 {
+        return Err(DimensionOverflow {
+            field: "height_px",
+            value: height_px,
+        });
+    }
+
+    let ws_col = width_cols as u16;
+    let ws_row = height_rows as u16;
+    let ws_xpixel = width_px as u16;
+    let ws_ypixel = height_px as u16;
 
     Ok(libc::winsize {
         ws_row,
@@ -223,9 +333,17 @@ pub fn validate_window_change_dimensions(
     )
 }
 
-// ---------------------------------------------------------------------------
-// PTY allocation and terminal size
-// ---------------------------------------------------------------------------
+/// Errors arising from PTY allocation or terminal resize operations.
+#[derive(Debug, Snafu)]
+pub enum PtyError {
+    /// A dimension value overflows `u16` and cannot be used for ioctl winsize.
+    #[snafu(display("{source}"))]
+    Dimension { source: DimensionOverflow },
+
+    /// An OS-level error from `openpty` or `ioctl`.
+    #[snafu(display("PTY OS error: {source}"))]
+    Os { source: nix::Error },
+}
 
 /// Allocate a new PTY pair with the requested terminal size.
 ///
@@ -234,10 +352,8 @@ pub fn validate_window_change_dimensions(
 ///
 /// Returns `Err` if any dimension overflows `u16` (no silent truncation) or
 /// if the underlying `openpty` call fails.
-pub fn allocate_pty(request: &PtyRequest) -> io::Result<PtyPair> {
-    let ws = validate_pty_dimensions(request).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidInput, e)
-    })?;
+pub fn allocate_pty(request: &PtyRequest) -> Result<PtyPair, PtyError> {
+    let ws = validate_pty_dimensions(request).map_err(|source| PtyError::Dimension { source })?;
     let winsize = Winsize {
         ws_row: ws.ws_row,
         ws_col: ws.ws_col,
@@ -245,8 +361,7 @@ pub fn allocate_pty(request: &PtyRequest) -> io::Result<PtyPair> {
         ws_ypixel: ws.ws_ypixel,
     };
 
-    let pty_result = openpty(Some(&winsize), None)
-        .map_err(io::Error::other)?;
+    let pty_result = openpty(Some(&winsize), None).context(OsSnafu)?;
 
     Ok(PtyPair {
         master: pty_result.master,
@@ -258,90 +373,13 @@ pub fn allocate_pty(request: &PtyRequest) -> io::Result<PtyPair> {
 ///
 /// Returns `Err` if any dimension overflows `u16` (no silent truncation) or
 /// if the ioctl fails.
-pub fn set_window_size(master_fd: RawFd, request: &WindowChangeRequest) -> io::Result<()> {
-    let winsize = validate_window_change_dimensions(request).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidInput, e)
-    })?;
+pub fn set_window_size(master_fd: RawFd, request: &WindowChangeRequest) -> Result<(), PtyError> {
+    let winsize =
+        validate_window_change_dimensions(request).map_err(|source| PtyError::Dimension { source })?;
 
-    let ret = unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &winsize as *const _) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    unsafe { tiocswinsz(master_fd, &winsize as *const libc::winsize) }.context(OsSnafu)?;
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Encoding helpers (for test roundtrips)
-// ---------------------------------------------------------------------------
-
-/// Encode a PtyRequest into wire bytes for testing.
-#[cfg(test)]
-async fn encode_pty_request(req: &PtyRequest) -> io::Result<Vec<u8>> {
-    use h3x::codec::{EncodeExt, EncodeInto};
-    use tokio::io::AsyncWriteExt;
-
-    let mut buf = Vec::new();
-    SshString(req.term_type.clone()).encode_into(&mut buf).await?;
-
-    let width_cols = VarInt::try_from(req.width_cols as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(width_cols).await?;
-
-    let height_rows = VarInt::try_from(req.height_rows as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(height_rows).await?;
-
-    let width_px = VarInt::try_from(req.width_px as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(width_px).await?;
-
-    let height_px = VarInt::try_from(req.height_px as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(height_px).await?;
-
-    // Terminal modes: varint length prefix + raw bytes.
-    let modes_len = VarInt::try_from(req.terminal_modes.len() as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(modes_len).await?;
-    buf.write_all(&req.terminal_modes).await?;
-
-    Ok(buf)
-}
-
-/// Encode a WindowChangeRequest into wire bytes for testing.
-#[cfg(test)]
-async fn encode_window_change(req: &WindowChangeRequest) -> io::Result<Vec<u8>> {
-    use h3x::codec::EncodeExt;
-
-    let mut buf = Vec::new();
-
-    let width_cols = VarInt::try_from(req.width_cols as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(width_cols).await?;
-
-    let height_rows = VarInt::try_from(req.height_rows as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(height_rows).await?;
-
-    let width_px = VarInt::try_from(req.width_px as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(width_px).await?;
-
-    let height_px = VarInt::try_from(req.height_px as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(height_px).await?;
-
-    Ok(buf)
-}
-
-/// Encode a SignalRequest into wire bytes for testing.
-#[cfg(test)]
-async fn encode_signal(req: &SignalRequest) -> io::Result<Vec<u8>> {
-    use h3x::codec::EncodeInto;
-    let mut buf = Vec::new();
-    SshString(req.signal_name.clone()).encode_into(&mut buf).await?;
-    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +390,7 @@ async fn encode_signal(req: &SignalRequest) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    use h3x::codec::{DecodeExt, EncodeExt};
 
     // -------------------------------------------------------------------
     // Test 1: parse_pty_request roundtrip
@@ -368,8 +407,10 @@ mod tests {
             terminal_modes: vec![0x01, 0x00, 0x00, 0x00, 0x03],
         };
 
-        let encoded = encode_pty_request(&original).await.unwrap();
-        let parsed = parse_pty_request(&encoded).await.unwrap();
+        let mut encoded = Vec::new();
+        encoded.encode_one(&original).await.unwrap();
+        let mut reader = encoded.as_slice();
+        let parsed: PtyRequest = reader.decode_one().await.unwrap();
 
         assert_eq!(parsed.term_type, original.term_type);
         assert_eq!(parsed.width_cols, original.width_cols);
@@ -380,11 +421,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Test 2: parse_window_change roundtrip
+    // Test 2: window-change codec roundtrip
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn parse_window_change_roundtrip() {
+    async fn window_change_codec_roundtrip() {
         let original = WindowChangeRequest {
             width_cols: 120,
             height_rows: 40,
@@ -392,8 +433,10 @@ mod tests {
             height_px: 800,
         };
 
-        let encoded = encode_window_change(&original).await.unwrap();
-        let parsed = parse_window_change(&encoded).await.unwrap();
+        let mut encoded = Vec::new();
+        encoded.encode_one(&original).await.unwrap();
+        let mut reader = encoded.as_slice();
+        let parsed: WindowChangeRequest = reader.decode_one().await.unwrap();
 
         assert_eq!(parsed.width_cols, original.width_cols);
         assert_eq!(parsed.height_rows, original.height_rows);
@@ -402,17 +445,19 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Test 3: parse_signal roundtrip
+    // Test 3: signal codec roundtrip
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn parse_signal_roundtrip() {
+    async fn signal_codec_roundtrip() {
         let original = SignalRequest {
             signal_name: "INT".into(),
         };
 
-        let encoded = encode_signal(&original).await.unwrap();
-        let parsed = parse_signal(&encoded).await.unwrap();
+        let mut encoded = Vec::new();
+        encoded.encode_one(&original).await.unwrap();
+        let mut reader = encoded.as_slice();
+        let parsed: SignalRequest = reader.decode_one().await.unwrap();
 
         assert_eq!(parsed.signal_name, "INT");
     }
@@ -470,10 +515,7 @@ mod tests {
 
         // Verify by reading back the winsize via TIOCGWINSZ.
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        let ret = unsafe {
-            libc::ioctl(pair.master.as_raw_fd(), libc::TIOCGWINSZ, &mut ws as *mut _)
-        };
-        assert_eq!(ret, 0);
+        unsafe { tiocgwinsz(pair.master.as_raw_fd(), &mut ws as *mut libc::winsize) }.unwrap();
         assert_eq!(ws.ws_col, 120);
         assert_eq!(ws.ws_row, 40);
         assert_eq!(ws.ws_xpixel, 960);
@@ -481,11 +523,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Test 6: parse_pty_request with empty terminal modes
+    // Test 6: pty request codec with empty terminal modes
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn parse_pty_request_empty_terminal_modes() {
+    async fn pty_request_codec_empty_terminal_modes() {
         let original = PtyRequest {
             term_type: "dumb".into(),
             width_cols: 40,
@@ -495,8 +537,10 @@ mod tests {
             terminal_modes: vec![],
         };
 
-        let encoded = encode_pty_request(&original).await.unwrap();
-        let parsed = parse_pty_request(&encoded).await.unwrap();
+        let mut encoded = Vec::new();
+        encoded.encode_one(&original).await.unwrap();
+        let mut reader = encoded.as_slice();
+        let parsed: PtyRequest = reader.decode_one().await.unwrap();
 
         assert_eq!(parsed.term_type, "dumb");
         assert_eq!(parsed.width_cols, 40);
@@ -505,17 +549,19 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Test 7: parse_signal with various signal names
+    // Test 7: signal codec with various signal names
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn parse_signal_various_names() {
+    async fn signal_codec_various_names() {
         for name in &["TERM", "KILL", "HUP", "USR1", "USR2", "QUIT"] {
             let original = SignalRequest {
                 signal_name: name.to_string(),
             };
-            let encoded = encode_signal(&original).await.unwrap();
-            let parsed = parse_signal(&encoded).await.unwrap();
+            let mut encoded = Vec::new();
+            encoded.encode_one(&original).await.unwrap();
+            let mut reader = encoded.as_slice();
+            let parsed: SignalRequest = reader.decode_one().await.unwrap();
             assert_eq!(parsed.signal_name, *name);
         }
     }
@@ -539,10 +585,7 @@ mod tests {
 
         // Verify the initial size was set via TIOCGWINSZ on the master.
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        let ret = unsafe {
-            libc::ioctl(pair.master.as_raw_fd(), libc::TIOCGWINSZ, &mut ws as *mut _)
-        };
-        assert_eq!(ret, 0);
+        unsafe { tiocgwinsz(pair.master.as_raw_fd(), &mut ws as *mut libc::winsize) }.unwrap();
         assert_eq!(ws.ws_col, 132);
         assert_eq!(ws.ws_row, 43);
         assert_eq!(ws.ws_xpixel, 1056);
@@ -610,8 +653,13 @@ mod tests {
             terminal_modes: vec![],
         };
         let err = allocate_pty(&request).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("width_cols"));
+        match err {
+            PtyError::Dimension { source } => {
+                assert_eq!(source.field, "width_cols");
+                assert_eq!(source.value, u16::MAX as u32 + 1);
+            }
+            other => panic!("expected DimensionOverflow, got {other:?}"),
+        }
     }
 
     #[test]
@@ -633,7 +681,12 @@ mod tests {
             height_px: 0,
         };
         let err = set_window_size(pair.master.as_raw_fd(), &resize).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("height_rows"));
+        match err {
+            PtyError::Dimension { source } => {
+                assert_eq!(source.field, "height_rows");
+                assert_eq!(source.value, u16::MAX as u32 + 1);
+            }
+            other => panic!("expected DimensionOverflow, got {other:?}"),
+        }
     }
 }

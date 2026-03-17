@@ -1284,7 +1284,7 @@ fn test_non_pty_signal_exit_signal() {
                     request_data,
                     ..
                 })) if request_type == "exit-signal" => {
-                    let req = genmeta_ssh3_server::session::request::parse_exit_signal_request(&request_data)
+                    let req = genmeta_ssh3_server::session::request::ExitSignalRequest::decode_from(request_data.as_slice())
                         .await
                         .unwrap();
                     assert_eq!(req.signal_name, "TERM");
@@ -1366,7 +1366,7 @@ fn test_non_pty_unknown_signal_preserves_wire_fidelity() {
                     request_data,
                     ..
                 })) if request_type == "exit-signal" => {
-                    let req = genmeta_ssh3_server::session::request::parse_exit_signal_request(&request_data)
+                    let req = genmeta_ssh3_server::session::request::ExitSignalRequest::decode_from(request_data.as_slice())
                         .await
                         .unwrap();
                     assert_eq!(req.signal_name, expected_signal);
@@ -1477,7 +1477,7 @@ fn test_pty_signal_exit_signal() {
                     request_data,
                     ..
                 })) if request_type == "exit-signal" => {
-                    let req = genmeta_ssh3_server::session::request::parse_exit_signal_request(&request_data)
+                    let req = genmeta_ssh3_server::session::request::ExitSignalRequest::decode_from(request_data.as_slice())
                         .await
                         .unwrap();
                     assert_eq!(req.signal_name, "TERM");
