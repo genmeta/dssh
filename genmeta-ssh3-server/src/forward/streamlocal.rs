@@ -241,6 +241,60 @@ async fn encode_forwarded_streamlocal_request_data<W: AsyncWrite + Send + Unpin>
     Ok(())
 }
 
+fn forwarded_streamlocal_header(conversation_id: StreamId) -> ChannelHeader {
+    ChannelHeader {
+        signal_value: CHANNEL_SIGNAL_VALUE,
+        conversation_id: conversation_id.into_inner(),
+        channel_type: "forwarded-streamlocal@openssh.com".to_string(),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+    }
+}
+
+async fn finish_forwarded_streamlocal_channel<R, W>(
+    mut reader: R,
+    mut writer: W,
+    unix_stream: UnixStream,
+    socket_path: &str,
+) -> io::Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    encode_forwarded_streamlocal_request_data(&mut writer, socket_path).await?;
+    writer.flush().await?;
+
+    let response = SshMessage::decode_from(&mut reader).await?;
+    match response {
+        SshMessage::ChannelOpenConfirmation { .. } => {}
+        SshMessage::ChannelOpenFailure { .. } => {
+            return Ok(());
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected ChannelOpenConfirmation or ChannelOpenFailure, got {other:?}"
+                ),
+            ));
+        }
+    }
+
+    let (unix_reader, unix_writer) = unix_stream.into_split();
+
+    let q2u = tokio::spawn(super::relay(reader, unix_writer));
+    let u2q = tokio::spawn(super::relay(unix_reader, writer));
+
+    let (r1, r2) = tokio::join!(q2u, u2q);
+    if let Ok(Err(e)) = r1 {
+        tracing::warn!(error = %Report::from_error(&e), "relay quic→unix error");
+    }
+    if let Ok(Err(e)) = r2 {
+        tracing::warn!(error = %Report::from_error(&e), "relay unix→quic error");
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ReverseStreamlocalForwarder
 // ---------------------------------------------------------------------------
@@ -295,14 +349,14 @@ impl ReverseStreamlocalForwarder {
                         let path = socket_path_clone.clone();
                         let conv_id = conversation_id;
                         let connection_handle = tokio::spawn(async move {
-                            match transport.open_channel(None).await {
+                            let header = forwarded_streamlocal_header(conv_id);
+                            match transport.open_channel(Some(header)).await {
                                 Ok((from_remote_rx, to_remote_tx)) => {
                                     let reader = ChannelReader::new(from_remote_rx);
                                     let writer = ChannelWriter::new(to_remote_tx);
-                                    if let Err(e) = handle_forwarded_streamlocal_channel(
+                                    if let Err(e) = finish_forwarded_streamlocal_channel(
                                         reader, writer, unix_stream,
                                         &path,
-                                        conv_id,
                                     ).await {
                                         tracing::warn!(
                                             error = %Report::from_error(&e),
@@ -416,7 +470,7 @@ impl Default for ReverseStreamlocalForwarder {
 ///
 /// **CRITICAL**: Raw bytes are bridged — NO `SSH_MSG_CHANNEL_DATA(94)` wrapping.
 pub async fn handle_forwarded_streamlocal_channel<R, W>(
-    mut reader: R,
+    reader: R,
     mut writer: W,
     unix_stream: UnixStream,
     socket_path: &str,
@@ -426,55 +480,9 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    // 1. Write ChannelHeader.
-    let header = ChannelHeader {
-        signal_value: CHANNEL_SIGNAL_VALUE,
-        conversation_id: conversation_id.into_inner(),
-        channel_type: "forwarded-streamlocal@openssh.com".to_string(),
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-    };
+    let header = forwarded_streamlocal_header(conversation_id);
     header.encode_into(&mut writer).await?;
-
-    // 2. Write request_data fields.
-    encode_forwarded_streamlocal_request_data(&mut writer, socket_path).await?;
-    writer.flush().await?;
-
-    // 3. Read response from client.
-    let response = SshMessage::decode_from(&mut reader).await?;
-    match response {
-        SshMessage::ChannelOpenConfirmation { .. } => {
-            // Client accepted — bridge raw bytes.
-        }
-        SshMessage::ChannelOpenFailure { .. } => {
-            // Client rejected — drop Unix stream (implicit on return).
-            return Ok(());
-        }
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "expected ChannelOpenConfirmation or ChannelOpenFailure, got {other:?}"
-                ),
-            ));
-        }
-    }
-
-    // 4. Bridge raw bytes bidirectionally.
-    let (unix_reader, unix_writer) = unix_stream.into_split();
-
-    let q2u = tokio::spawn(super::relay(reader, unix_writer));
-    let u2q = tokio::spawn(super::relay(unix_reader, writer));
-
-    // Wait for both directions, handle errors.
-    let (r1, r2) = tokio::join!(q2u, u2q);
-    if let Ok(Err(e)) = r1 {
-        tracing::warn!(error = %Report::from_error(&e), "relay quic→unix error");
-    }
-    if let Ok(Err(e)) = r2 {
-        tracing::warn!(error = %Report::from_error(&e), "relay unix→quic error");
-    }
-
-    Ok(())
+    finish_forwarded_streamlocal_channel(reader, writer, unix_stream, socket_path).await
 }
 
 // ---------------------------------------------------------------------------

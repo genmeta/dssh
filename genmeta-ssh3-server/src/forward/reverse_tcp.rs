@@ -203,6 +203,68 @@ async fn encode_forwarded_tcpip_request_data<W: AsyncWrite + Send + Unpin>(
     Ok(())
 }
 
+fn forwarded_tcpip_header(conversation_id: StreamId) -> ChannelHeader {
+    ChannelHeader {
+        signal_value: CHANNEL_SIGNAL_VALUE,
+        conversation_id: conversation_id.into_inner(),
+        channel_type: "forwarded-tcpip".to_string(),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+    }
+}
+
+async fn finish_forwarded_tcpip_channel<R, W>(
+    mut reader: R,
+    mut writer: W,
+    tcp_stream: tokio::net::TcpStream,
+    connected_addr: &str,
+    connected_port: u16,
+    originator_addr: &str,
+    originator_port: u16,
+) -> io::Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    encode_forwarded_tcpip_request_data(
+        &mut writer,
+        connected_addr,
+        connected_port,
+        originator_addr,
+        originator_port,
+    )
+    .await?;
+    writer.flush().await?;
+
+    let response = SshMessage::decode_from(&mut reader).await?;
+    match response {
+        SshMessage::ChannelOpenConfirmation { .. } => {}
+        SshMessage::ChannelOpenFailure { .. } => {
+            return Ok(());
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected ChannelOpenConfirmation or ChannelOpenFailure, got {other:?}"),
+            ));
+        }
+    }
+
+    let (tcp_reader, tcp_writer) = tcp_stream.into_split();
+
+    let q2t = tokio::spawn(super::relay(reader, tcp_writer));
+    let t2q = tokio::spawn(super::relay(tcp_reader, writer));
+
+    let (r1, r2) = tokio::join!(q2t, t2q);
+    if let Ok(Err(e)) = r1 {
+        tracing::warn!(error = %Report::from_error(&e), "relay quic→tcp error");
+    }
+    if let Ok(Err(e)) = r2 {
+        tracing::warn!(error = %Report::from_error(&e), "relay tcp→quic error");
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ReverseTcpForwarder
 // ---------------------------------------------------------------------------
@@ -264,15 +326,15 @@ impl ReverseTcpForwarder {
                         let port = actual_port;
                         let conv_id = conversation_id;
                         let connection_handle = tokio::spawn(async move {
-                            match transport.open_channel(None).await {
+                            let header = forwarded_tcpip_header(conv_id);
+                            match transport.open_channel(Some(header)).await {
                                 Ok((from_remote_rx, to_remote_tx)) => {
                                     let reader = ChannelReader::new(from_remote_rx);
                                     let writer = ChannelWriter::new(to_remote_tx);
-                                    if let Err(e) = handle_forwarded_tcpip_channel(
+                                    if let Err(e) = finish_forwarded_tcpip_channel(
                                         reader, writer, tcp_stream,
                                         &addr, port,
                                         &peer_addr.ip().to_string(), peer_addr.port(),
-                                        conv_id,
                                     ).await {
                                         tracing::warn!(
                                             error = %Report::from_error(&e),
@@ -382,7 +444,7 @@ impl Default for ReverseTcpForwarder {
 ///
 /// **CRITICAL**: Raw bytes are bridged — NO `SSH_MSG_CHANNEL_DATA(94)` wrapping.
 pub async fn handle_forwarded_tcpip_channel<R, W>(
-    mut reader: R,
+    reader: R,
     mut writer: W,
     tcp_stream: tokio::net::TcpStream,
     connected_addr: &str,
@@ -395,60 +457,18 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    // 1. Write ChannelHeader.
-        let header = ChannelHeader {
-            signal_value: CHANNEL_SIGNAL_VALUE,
-            conversation_id: conversation_id.into_inner(),
-            channel_type: "forwarded-tcpip".to_string(),
-            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-        };
+    let header = forwarded_tcpip_header(conversation_id);
     header.encode_into(&mut writer).await?;
-
-    // 2. Write request_data fields.
-    encode_forwarded_tcpip_request_data(
-        &mut writer,
+    finish_forwarded_tcpip_channel(
+        reader,
+        writer,
+        tcp_stream,
         connected_addr,
         connected_port,
         originator_addr,
         originator_port,
     )
-    .await?;
-    writer.flush().await?;
-
-    // 3. Read response from client.
-    let response = SshMessage::decode_from(&mut reader).await?;
-    match response {
-        SshMessage::ChannelOpenConfirmation { .. } => {
-            // Client accepted — bridge raw bytes.
-        }
-        SshMessage::ChannelOpenFailure { .. } => {
-            // Client rejected — drop TCP stream (implicit on return).
-            return Ok(());
-        }
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected ChannelOpenConfirmation or ChannelOpenFailure, got {other:?}"),
-            ));
-        }
-    }
-
-    // 4. Bridge raw bytes bidirectionally.
-    let (tcp_reader, tcp_writer) = tcp_stream.into_split();
-
-    let q2t = tokio::spawn(super::relay(reader, tcp_writer));
-    let t2q = tokio::spawn(super::relay(tcp_reader, writer));
-
-    // Wait for both directions, handle errors.
-    let (r1, r2) = tokio::join!(q2t, t2q);
-    if let Ok(Err(e)) = r1 {
-        tracing::warn!(error = %Report::from_error(&e), "relay quic→tcp error");
-    }
-    if let Ok(Err(e)) = r2 {
-        tracing::warn!(error = %Report::from_error(&e), "relay tcp→quic error");
-    }
-
-    Ok(())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -797,8 +817,11 @@ mod tests {
             );
         }
 
-        let owned_connect = tokio::net::TcpStream::connect(format!("127.0.0.1:{owned_port}")).await;
-        assert!(owned_connect.is_err(), "owned listener should be closed after cleanup");
+        assert_tcp_port_eventually_closes(
+            owned_port,
+            "owned listener should be closed within timeout after cleanup",
+        )
+        .await;
 
         let other_connect = tokio::net::TcpStream::connect(format!("127.0.0.1:{other_port}")).await;
         assert!(other_connect.is_ok(), "other owner's listener should remain reachable");

@@ -1500,7 +1500,7 @@ fn test_reverse_tcp_forwarded_channel() {
             > { Ok(None) }
             async fn open_channel(
                 &self,
-                _header: Option<ChannelHeader>,
+                header: Option<ChannelHeader>,
             ) -> Result<
                 (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
                 TransportError,
@@ -1527,6 +1527,11 @@ fn test_reverse_tcp_forwarded_channel() {
                 });
                 tokio::spawn(async move {
                     let mut writer = server_write;
+                    if let Some(header) = header {
+                        if header.encode_into(&mut writer).await.is_err() {
+                            return;
+                        }
+                    }
                     let mut rx = from_client_rx;
                     while let Ok(Some(data)) = rx.recv().await {
                         if writer.write_all(&data).await.is_err() {
