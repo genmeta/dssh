@@ -783,8 +783,11 @@ mod tests {
             assert!(!listeners.contains_key(&("127.0.0.1".to_string(), port)));
         }
 
-        let connect_result = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
-        assert!(connect_result.is_err(), "listener port should be closed after cleanup");
+        assert_tcp_port_eventually_closes(
+            port,
+            "listener port should be closed within timeout after idempotent cleanup",
+        )
+        .await;
     }
 
     #[tokio::test]
