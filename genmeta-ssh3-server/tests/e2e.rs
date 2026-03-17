@@ -1734,10 +1734,10 @@ fn test_reverse_tcp_forwarded_channel() {
                 });
                 tokio::spawn(async move {
                     let mut writer = server_write;
-                    if let Some(header) = header {
-                        if header.encode_into(&mut writer).await.is_err() {
-                            return;
-                        }
+                    if let Some(header) = header
+                        && header.encode_into(&mut writer).await.is_err()
+                    {
+                        return;
                     }
                     let mut rx = from_client_rx;
                     while let Ok(Some(data)) = rx.recv().await {
@@ -2006,10 +2006,10 @@ fn test_global_request_e2e_control_stream_client_forward_flow() {
                 });
                 tokio::spawn(async move {
                     let mut writer = server_write;
-                    if let Some(header) = header {
-                        if header.encode_into(&mut writer).await.is_err() {
-                            return;
-                        }
+                    if let Some(header) = header
+                        && header.encode_into(&mut writer).await.is_err()
+                    {
+                        return;
                     }
                     let mut rx = from_client_rx;
                     while let Ok(Some(data)) = rx.recv().await {

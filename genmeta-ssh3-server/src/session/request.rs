@@ -563,15 +563,15 @@ where
                             }
                         }
                         "window-change" => {
-                            if let Ok(req) = decode_request_payload::<WindowChangeRequest>(request_data.as_slice()).await {
-                                if let Err(error) = set_window_size(master_raw_fd, &req) {
-                                    tracing::warn!(
-                                        error = %Report::from_error(&error),
-                                        width_cols = req.width_cols,
-                                        height_rows = req.height_rows,
-                                        "window-change resize failed, keeping current size"
-                                    );
-                                }
+                            if let Ok(req) = decode_request_payload::<WindowChangeRequest>(request_data.as_slice()).await
+                                && let Err(error) = set_window_size(master_raw_fd, &req)
+                            {
+                                tracing::warn!(
+                                    error = %Report::from_error(&error),
+                                    width_cols = req.width_cols,
+                                    height_rows = req.height_rows,
+                                    "window-change resize failed, keeping current size"
+                                );
                             }
                         }
                         _ => {}

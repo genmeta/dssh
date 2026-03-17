@@ -241,7 +241,7 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                     // If a PAM backend is configured, verify credentials through it.
                     if let Some(ref pam) = pam_backend {
                         let genmeta_ssh3_proto::auth::AuthCredential::Basic { ref username, ref password } = credential;
-                        if let Err(_) = pam.authenticate("ssh3", username, password) {
+                        if pam.authenticate("ssh3", username, password).is_err() {
                             *response.status_mut() = StatusCode::UNAUTHORIZED;
                             response.headers_mut().insert(
                                 http::header::WWW_AUTHENTICATE,

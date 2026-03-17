@@ -261,15 +261,15 @@ impl Ssh3Session {
                         }
                     },
                     Some(RequestAction::WindowChange(req)) => {
-                        if let Some(ref pair) = pty_pair {
-                            if let Err(error) = set_window_size(pair.master.as_raw_fd(), &req) {
-                                tracing::warn!(
-                                    error = %Report::from_error(&error),
-                                    width_cols = req.width_cols,
-                                    height_rows = req.height_rows,
-                                    "window-change resize failed, keeping current size"
-                                );
-                            }
+                        if let Some(ref pair) = pty_pair
+                            && let Err(error) = set_window_size(pair.master.as_raw_fd(), &req)
+                        {
+                            tracing::warn!(
+                                error = %Report::from_error(&error),
+                                width_cols = req.width_cols,
+                                height_rows = req.height_rows,
+                                "window-change resize failed, keeping current size"
+                            );
                         }
                     }
                     Some(RequestAction::Signal(_)) => {
@@ -343,20 +343,19 @@ mod tests {
         client
     }
 
+    type MockChannel = (
+        ChannelHeader,
+        remoc::rch::mpsc::Receiver<Vec<u8>>,
+        remoc::rch::mpsc::Sender<Vec<u8>>,
+    );
+
     /// A mock transport that feeds one session channel, then signals end.
     struct ChannelFeedingTransport {
-        channel_tx: tokio::sync::Mutex<Option<(
-            ChannelHeader,
-            remoc::rch::mpsc::Receiver<Vec<u8>>,
-            remoc::rch::mpsc::Sender<Vec<u8>>,
-        )>>,
+        channel_tx: tokio::sync::Mutex<Option<MockChannel>>,
     }
 
     impl genmeta_ssh3_proto::session::Ssh3Transport for ChannelFeedingTransport {
-        async fn accept_channel(&self) -> Result<
-            Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
-            TransportError,
-        > {
+        async fn accept_channel(&self) -> Result<Option<MockChannel>, TransportError> {
             let mut guard = self.channel_tx.lock().await;
             Ok(guard.take())
         }

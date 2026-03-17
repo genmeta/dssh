@@ -494,15 +494,15 @@ where
                         }
                     }
                     Some(RequestAction::WindowChange(req)) => {
-                        if let Some(ref pair) = pty_pair {
-                            if let Err(error) = set_window_size(pair.master.as_raw_fd(), &req) {
-                                tracing::warn!(
-                                    error = %Report::from_error(&error),
-                                    width_cols = req.width_cols,
-                                    height_rows = req.height_rows,
-                                    "window-change resize failed, keeping current size"
-                                );
-                            }
+                        if let Some(ref pair) = pty_pair
+                            && let Err(error) = set_window_size(pair.master.as_raw_fd(), &req)
+                        {
+                            tracing::warn!(
+                                error = %Report::from_error(&error),
+                                width_cols = req.width_cols,
+                                height_rows = req.height_rows,
+                                "window-change resize failed, keeping current size"
+                            );
                         }
                     }
                     Some(RequestAction::Signal(_)) => {
@@ -1482,10 +1482,10 @@ mod tests {
             let handler_calls = Arc::clone(&handler_calls_for_handler);
             async move {
                 handler_calls.fetch_add(1, AtomicOrdering::SeqCst);
-                if request_type == "first" {
-                    if let Some(rx) = release_rx.lock().await.take() {
-                        let _ = rx.await;
-                    }
+                if request_type == "first"
+                    && let Some(rx) = release_rx.lock().await.take()
+                {
+                    let _ = rx.await;
                 }
                 Ok(GlobalRequestReply::Success(request_type.into_bytes()))
             }
