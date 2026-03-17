@@ -13,80 +13,156 @@ use genmeta_ssh3_proto::codec::SshString;
 use genmeta_ssh3_proto::message::SshMessage;
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
 use h3x::varint::VarInt;
-use tokio::io::{self, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
-// ---------------------------------------------------------------------------
-// Session request_data encoders
-// ---------------------------------------------------------------------------
-
-pub async fn encode_exec_request_data(command: &[u8]) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let len = VarInt::try_from(command.len() as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    len.encode_into(&mut buf).await?;
-    buf.write_all(command).await?;
-    Ok(buf)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientExecRequest {
+    command: Vec<u8>,
 }
 
-/// Encode a pty-req request_data (RFC 4254 §6.2):
-///
-/// - `SshString(term)` — TERM environment variable
-/// - `VarInt(width_cols)` — terminal width in characters
-/// - `VarInt(height_rows)` — terminal height in rows
-/// - `VarInt(width_px)` — terminal width in pixels
-/// - `VarInt(height_px)` — terminal height in pixels
-/// - varint-length-prefixed bytes — encoded terminal modes
-pub async fn encode_pty_request_data(
-    term: &str,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientPtyRequest {
+    term_type: String,
     width_cols: u32,
     height_rows: u32,
     width_px: u32,
     height_px: u32,
-    terminal_modes: &[u8],
-) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    SshString(term.to_owned()).encode_into(&mut buf).await?;
-
-    let to_varint =
-        |v: u32| VarInt::try_from(v as u64).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e));
-
-    buf.encode_one(to_varint(width_cols)?).await?;
-    buf.encode_one(to_varint(height_rows)?).await?;
-    buf.encode_one(to_varint(width_px)?).await?;
-    buf.encode_one(to_varint(height_px)?).await?;
-
-    // Terminal modes: varint length prefix + raw bytes.
-    let modes_len = VarInt::try_from(terminal_modes.len() as u64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.encode_one(modes_len).await?;
-    buf.write_all(terminal_modes).await?;
-
-    Ok(buf)
+    terminal_modes: Vec<u8>,
 }
 
-/// Encode a window-change request_data (RFC 4254 §6.7):
-///
-/// - `VarInt(width_cols)` — terminal width in columns
-/// - `VarInt(height_rows)` — terminal height in rows
-/// - `VarInt(width_px)` — terminal width in pixels
-/// - `VarInt(height_px)` — terminal height in pixels
-pub async fn encode_window_change_request_data(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientWindowChangeRequest {
     width_cols: u32,
     height_rows: u32,
     width_px: u32,
     height_px: u32,
-) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
+}
 
-    let to_varint =
-        |v: u32| VarInt::try_from(v as u64).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e));
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientExitStatusRequest {
+    exit_status: u32,
+}
 
-    buf.encode_one(to_varint(width_cols)?).await?;
-    buf.encode_one(to_varint(height_rows)?).await?;
-    buf.encode_one(to_varint(width_px)?).await?;
-    buf.encode_one(to_varint(height_px)?).await?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientExitSignalRequest {
+    signal_name: String,
+    core_dumped: bool,
+    error_message: String,
+    language_tag: String,
+}
 
-    Ok(buf)
+impl<S: AsyncWrite + Send> EncodeInto<S> for &ClientExecRequest {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream
+            .encode_one(VarInt::try_from(self.command.len() as u64).map_err(io::Error::other)?)
+            .await?;
+        stream.write_all(&self.command).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for ClientExecRequest {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let len: VarInt = stream.decode_one().await?;
+        let mut command = vec![0u8; len.into_inner() as usize];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut command).await?;
+        Ok(Self { command })
+    }
+}
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for &ClientPtyRequest {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream.encode_one(SshString(self.term_type.clone())).await?;
+        stream.encode_one(VarInt::try_from(self.width_cols as u64).map_err(io::Error::other)?).await?;
+        stream.encode_one(VarInt::try_from(self.height_rows as u64).map_err(io::Error::other)?).await?;
+        stream.encode_one(VarInt::try_from(self.width_px as u64).map_err(io::Error::other)?).await?;
+        stream.encode_one(VarInt::try_from(self.height_px as u64).map_err(io::Error::other)?).await?;
+        stream.encode_one(VarInt::try_from(self.terminal_modes.len() as u64).map_err(io::Error::other)?).await?;
+        stream.write_all(&self.terminal_modes).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for &ClientWindowChangeRequest {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream.encode_one(VarInt::try_from(self.width_cols as u64).map_err(io::Error::other)?).await?;
+        stream.encode_one(VarInt::try_from(self.height_rows as u64).map_err(io::Error::other)?).await?;
+        stream.encode_one(VarInt::try_from(self.width_px as u64).map_err(io::Error::other)?).await?;
+        stream.encode_one(VarInt::try_from(self.height_px as u64).map_err(io::Error::other)?).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for &ClientExitStatusRequest {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream
+            .encode_one(VarInt::try_from(self.exit_status as u64).map_err(io::Error::other)?)
+            .await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for ClientExitStatusRequest {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let exit_status: VarInt = stream.decode_one().await?;
+        Ok(Self {
+            exit_status: exit_status.into_inner() as u32,
+        })
+    }
+}
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for &ClientExitSignalRequest {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream.encode_one(SshString(self.signal_name.clone())).await?;
+        stream.write_u8(if self.core_dumped { 0x01 } else { 0x00 }).await?;
+        stream.encode_one(SshString(self.error_message.clone())).await?;
+        stream.encode_one(SshString(self.language_tag.clone())).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for ClientExitSignalRequest {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let signal_name: SshString = stream.decode_one().await?;
+        let core_dumped = tokio::io::AsyncReadExt::read_u8(&mut stream).await? != 0;
+        let error_message: SshString = stream.decode_one().await?;
+        let language_tag: SshString = stream.decode_one().await?;
+        Ok(Self {
+            signal_name: signal_name.0,
+            core_dumped,
+            error_message: error_message.0,
+            language_tag: language_tag.0,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +175,12 @@ pub async fn send_exec_request<W: AsyncWrite + Send + Unpin>(
     command: &[u8],
     want_reply: bool,
 ) -> io::Result<()> {
-    let request_data = encode_exec_request_data(command).await?;
+    let mut request_data = Vec::new();
+    request_data
+        .encode_one(&ClientExecRequest {
+            command: command.to_vec(),
+        })
+        .await?;
     SshMessage::ChannelRequest {
         request_type: "exec".into(),
         want_reply,
@@ -133,9 +214,17 @@ pub async fn send_pty_request<W: AsyncWrite + Send + Unpin>(
     terminal_modes: &[u8],
     want_reply: bool,
 ) -> io::Result<()> {
-    let request_data =
-        encode_pty_request_data(term, width_cols, height_rows, width_px, height_px, terminal_modes)
-            .await?;
+    let mut request_data = Vec::new();
+    request_data
+        .encode_one(&ClientPtyRequest {
+            term_type: term.to_owned(),
+            width_cols,
+            height_rows,
+            width_px,
+            height_px,
+            terminal_modes: terminal_modes.to_vec(),
+        })
+        .await?;
     SshMessage::ChannelRequest {
         request_type: "pty-req".into(),
         want_reply,
@@ -154,8 +243,15 @@ pub async fn send_window_change<W: AsyncWrite + Send + Unpin>(
     width_px: u32,
     height_px: u32,
 ) -> io::Result<()> {
-    let request_data =
-        encode_window_change_request_data(width_cols, height_rows, width_px, height_px).await?;
+    let mut request_data = Vec::new();
+    request_data
+        .encode_one(&ClientWindowChangeRequest {
+            width_cols,
+            height_rows,
+            width_px,
+            height_px,
+        })
+        .await?;
     SshMessage::ChannelRequest {
         request_type: "window-change".into(),
         want_reply: false,
@@ -198,24 +294,6 @@ pub enum SessionEvent {
     Failure,
 }
 
-pub async fn parse_exit_status(request_data: &[u8]) -> io::Result<u32> {
-    let mut reader = request_data;
-    let exit_status: VarInt = reader.decode_one().await?;
-    Ok(exit_status.into_inner() as u32)
-}
-
-/// Parse exit-signal request_data: signal_name(SshString) + core_dumped(u8) +
-/// error_message(SshString) + language_tag(SshString).
-pub async fn parse_exit_signal(request_data: &[u8]) -> io::Result<(String, bool, String, String)> {
-    use tokio::io::AsyncReadExt;
-    let mut reader = request_data;
-    let signal_name = SshString::decode_from(&mut reader).await?;
-    let core_dumped_byte = AsyncReadExt::read_u8(&mut reader).await?;
-    let error_message = SshString::decode_from(&mut reader).await?;
-    let language_tag = SshString::decode_from(&mut reader).await?;
-    Ok((signal_name.0, core_dumped_byte != 0, error_message.0, language_tag.0))
-}
-
 /// Convert a decoded `SshMessage` into a `SessionEvent`.
 ///
 /// Returns `None` for message types not relevant to session handling
@@ -238,16 +316,15 @@ pub async fn message_to_session_event(msg: SshMessage) -> io::Result<Option<Sess
             ..
         } => {
             if request_type == "exit-status" {
-                let code = parse_exit_status(&request_data).await?;
-                Ok(Some(SessionEvent::ExitStatus(code)))
+                let req = ClientExitStatusRequest::decode_from(request_data.as_slice()).await?;
+                Ok(Some(SessionEvent::ExitStatus(req.exit_status)))
             } else if request_type == "exit-signal" {
-                let (name, core_dumped, message, language) =
-                    parse_exit_signal(&request_data).await?;
+                let req = ClientExitSignalRequest::decode_from(request_data.as_slice()).await?;
                 Ok(Some(SessionEvent::ExitSignal {
-                    name,
-                    core_dumped,
-                    message,
-                    language,
+                    name: req.signal_name,
+                    core_dumped: req.core_dumped,
+                    message: req.error_message,
+                    language: req.language_tag,
                 }))
             } else {
                 Ok(None)
@@ -300,13 +377,22 @@ pub fn exit_signal_to_legacy_status(event: SessionEvent) -> SessionEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use h3x::codec::DecodeFrom;
+    use h3x::codec::{DecodeFrom, EncodeExt};
     use genmeta_ssh3_proto::message::SshMessage;
+    use genmeta_ssh3_server::session::pty::{PtyRequest, WindowChangeRequest};
     use genmeta_ssh3_server::session::request::{
-        encode_exit_status, encode_exit_status_data, encode_exit_signal_data, parse_exec_command,
+        ExecRequest, ExitSignalRequest, ExitStatusRequest, encode_exit_status,
     };
-    use genmeta_ssh3_server::session::pty::{parse_pty_request, parse_window_change};
     use tokio::io::{duplex, AsyncReadExt};
+
+    async fn encode_request_data<T, E>(item: T) -> Result<Vec<u8>, E>
+    where
+        for<'a> T: EncodeInto<&'a mut Vec<u8>, Output = (), Error = E>,
+    {
+        let mut buf = Vec::new();
+        buf.encode_one(item).await?;
+        Ok(buf)
+    }
 
     // -------------------------------------------------------------------
     // Test 1: exec request encoding verified against server's parser
@@ -314,10 +400,13 @@ mod tests {
 
     #[tokio::test]
     async fn exec_request_data_roundtrip() {
-        let data = encode_exec_request_data(b"echo hello").await.unwrap();
-        // The server parses this with parse_exec_command
-        let cmd = parse_exec_command(&data).await.unwrap();
-        assert_eq!(cmd, b"echo hello");
+        let data = encode_request_data(&ClientExecRequest {
+            command: b"echo hello".to_vec(),
+        })
+        .await
+        .unwrap();
+        let req = ExecRequest::decode_from(data.as_slice()).await.unwrap();
+        assert_eq!(req.command, b"echo hello");
     }
 
     // -------------------------------------------------------------------
@@ -326,7 +415,11 @@ mod tests {
 
     #[tokio::test]
     async fn exec_request_data_hex_dump() {
-        let data = encode_exec_request_data(b"hi").await.unwrap();
+        let data = encode_request_data(&ClientExecRequest {
+            command: b"hi".to_vec(),
+        })
+        .await
+        .unwrap();
         // "hi": varint(2)=0x02, b"hi"=[0x68, 0x69]
         assert_eq!(data, vec![0x02, 0x68, 0x69]);
     }
@@ -353,8 +446,8 @@ mod tests {
                 assert_eq!(request_type, "exec");
                 assert!(want_reply);
                 // Verify request_data decodes to "echo hello"
-                let cmd = parse_exec_command(&request_data).await.unwrap();
-                assert_eq!(cmd, b"echo hello");
+                let req = ExecRequest::decode_from(request_data.as_slice()).await.unwrap();
+                assert_eq!(req.command, b"echo hello");
             }
             other => panic!("expected ChannelRequest, got {other:?}"),
         }
@@ -362,7 +455,11 @@ mod tests {
 
     #[tokio::test]
     async fn exec_request_data_allows_non_utf8_bytes() {
-        let data = encode_exec_request_data(&[0x66, 0x6f, 0xff]).await.unwrap();
+        let data = encode_request_data(&ClientExecRequest {
+            command: vec![0x66, 0x6f, 0xff],
+        })
+        .await
+        .unwrap();
 
         let mut reader = data.as_slice();
         let len = VarInt::decode_from(&mut reader).await.unwrap();
@@ -404,19 +501,19 @@ mod tests {
 
     #[tokio::test]
     async fn pty_request_roundtrip() {
-        let data = encode_pty_request_data(
-            "xterm-256color",
-            80,
-            24,
-            640,
-            480,
-            &[0x01, 0x00, 0x00, 0x00, 0x03],
-        )
+        let data = encode_request_data(&ClientPtyRequest {
+            term_type: "xterm-256color".into(),
+            width_cols: 80,
+            height_rows: 24,
+            width_px: 640,
+            height_px: 480,
+            terminal_modes: vec![0x01, 0x00, 0x00, 0x00, 0x03],
+        })
         .await
         .unwrap();
 
         // Parse with server's parser
-        let parsed = parse_pty_request(&data).await.unwrap();
+        let parsed = PtyRequest::decode_from(data.as_slice()).await.unwrap();
         assert_eq!(parsed.term_type, "xterm-256color");
         assert_eq!(parsed.width_cols, 80);
         assert_eq!(parsed.height_rows, 24);
@@ -431,12 +528,16 @@ mod tests {
 
     #[tokio::test]
     async fn window_change_roundtrip() {
-        let data =
-            encode_window_change_request_data(120, 40, 960, 800)
-                .await
-                .unwrap();
+        let data = encode_request_data(&ClientWindowChangeRequest {
+            width_cols: 120,
+            height_rows: 40,
+            width_px: 960,
+            height_px: 800,
+        })
+        .await
+        .unwrap();
 
-        let parsed = parse_window_change(&data).await.unwrap();
+        let parsed = WindowChangeRequest::decode_from(data.as_slice()).await.unwrap();
         assert_eq!(parsed.width_cols, 120);
         assert_eq!(parsed.height_rows, 40);
         assert_eq!(parsed.width_px, 960);
@@ -479,7 +580,9 @@ mod tests {
 
     #[tokio::test]
     async fn exit_status_extraction() {
-        let request_data = encode_exit_status_data(42).await.unwrap();
+        let request_data = encode_request_data(&ExitStatusRequest { exit_status: 42 })
+            .await
+            .unwrap();
         let msg = SshMessage::ChannelRequest {
             request_type: "exit-status".into(),
             want_reply: false,
@@ -495,8 +598,13 @@ mod tests {
 
     #[tokio::test]
     async fn exit_status_zero() {
-        let request_data = encode_exit_status_data(0).await.unwrap();
-        let code = parse_exit_status(&request_data).await.unwrap();
+        let request_data = encode_request_data(&ExitStatusRequest { exit_status: 0 })
+            .await
+            .unwrap();
+        let code = ClientExitStatusRequest::decode_from(request_data.as_slice())
+            .await
+            .unwrap()
+            .exit_status;
         assert_eq!(code, 0);
     }
 
@@ -506,8 +614,13 @@ mod tests {
 
     #[tokio::test]
     async fn exit_status_255() {
-        let request_data = encode_exit_status_data(255).await.unwrap();
-        let code = parse_exit_status(&request_data).await.unwrap();
+        let request_data = encode_request_data(&ExitStatusRequest { exit_status: 255 })
+            .await
+            .unwrap();
+        let code = ClientExitStatusRequest::decode_from(request_data.as_slice())
+            .await
+            .unwrap()
+            .exit_status;
         assert_eq!(code, 255);
     }
 
@@ -589,7 +702,9 @@ mod tests {
             .await
             .unwrap();
 
-            let exit_data = encode_exit_status_data(0).await.unwrap();
+            let exit_data = encode_request_data(&ExitStatusRequest { exit_status: 0 })
+                .await
+                .unwrap();
             SshMessage::ChannelRequest {
                 request_type: "exit-status".into(),
                 want_reply: false,
@@ -657,7 +772,7 @@ mod tests {
             } => {
                 assert_eq!(request_type, "pty-req");
                 assert!(want_reply);
-                let parsed = parse_pty_request(&request_data).await.unwrap();
+                let parsed = PtyRequest::decode_from(request_data.as_slice()).await.unwrap();
                 assert_eq!(parsed.term_type, "xterm");
                 assert_eq!(parsed.width_cols, 80);
                 assert_eq!(parsed.height_rows, 24);
@@ -687,7 +802,7 @@ mod tests {
             } => {
                 assert_eq!(request_type, "window-change");
                 assert!(!want_reply, "window-change must have want_reply=false");
-                let parsed = parse_window_change(&request_data).await.unwrap();
+                let parsed = WindowChangeRequest::decode_from(request_data.as_slice()).await.unwrap();
                 assert_eq!(parsed.width_cols, 120);
                 assert_eq!(parsed.height_rows, 40);
                 assert_eq!(parsed.width_px, 960);
@@ -749,10 +864,14 @@ mod tests {
 
     #[tokio::test]
     async fn exit_signal_decodes_to_exit_signal_event() {
-        let request_data =
-            encode_exit_signal_data("TERM", false, "terminated", "en")
-                .await
-                .unwrap();
+        let request_data = encode_request_data(&ExitSignalRequest {
+            signal_name: "TERM".into(),
+            core_dumped: false,
+            error_message: "terminated".into(),
+            language_tag: "en".into(),
+        })
+        .await
+        .unwrap();
         let msg = SshMessage::ChannelRequest {
             request_type: "exit-signal".into(),
             want_reply: false,
@@ -772,10 +891,14 @@ mod tests {
 
     #[tokio::test]
     async fn exit_signal_with_core_dump() {
-        let request_data =
-            encode_exit_signal_data("SEGV", true, "segfault", "")
-                .await
-                .unwrap();
+        let request_data = encode_request_data(&ExitSignalRequest {
+            signal_name: "SEGV".into(),
+            core_dumped: true,
+            error_message: "segfault".into(),
+            language_tag: String::new(),
+        })
+        .await
+        .unwrap();
         let msg = SshMessage::ChannelRequest {
             request_type: "exit-signal".into(),
             want_reply: false,
@@ -800,7 +923,9 @@ mod tests {
     #[tokio::test]
     async fn exit_status_still_decodes_correctly() {
         for code in [0u32, 1, 42, 127, 255] {
-            let request_data = encode_exit_status_data(code).await.unwrap();
+            let request_data = encode_request_data(&ExitStatusRequest { exit_status: code })
+                .await
+                .unwrap();
             let msg = SshMessage::ChannelRequest {
                 request_type: "exit-status".into(),
                 want_reply: false,
