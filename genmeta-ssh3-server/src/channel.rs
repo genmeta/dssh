@@ -230,6 +230,7 @@ where
             let stopped = ctx.tcp_forwarder.stop_listening(
                 &req.bind_address,
                 bind_port,
+                ctx.conversation_id,
             ).await;
             if want_reply {
                 if stopped {
@@ -275,6 +276,7 @@ where
             );
             let stopped = ctx.streamlocal_forwarder.stop_listening(
                 &req.socket_path,
+                ctx.conversation_id,
             ).await;
             if want_reply {
                 if stopped {

@@ -25,6 +25,49 @@ use tracing::Instrument;
 
 use crate::byte_channel::{ChannelReader, ChannelWriter};
 
+struct ReverseTcpListenerEntry {
+    owner: StreamId,
+    handle: tokio::task::JoinHandle<()>,
+    connection_tasks: Arc<Mutex<TrackedConnectionTasks>>,
+}
+
+#[derive(Default)]
+struct TrackedConnectionTasks {
+    shutting_down: bool,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+async fn register_tracked_connection(
+    tracked_tasks: &Arc<Mutex<TrackedConnectionTasks>>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut tracked_tasks = tracked_tasks.lock().await;
+    if tracked_tasks.shutting_down {
+        handle.abort();
+    } else {
+        tracked_tasks.handles.push(handle);
+    }
+}
+
+async fn abort_tracked_connections(tracked_tasks: &Arc<Mutex<TrackedConnectionTasks>>) {
+    let handles = {
+        let mut tracked_tasks = tracked_tasks.lock().await;
+        tracked_tasks.shutting_down = true;
+        std::mem::take(&mut tracked_tasks.handles)
+    };
+
+    for handle in handles {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+async fn abort_listener_entry(entry: ReverseTcpListenerEntry) {
+    entry.handle.abort();
+    let _ = entry.handle.await;
+    abort_tracked_connections(&entry.connection_tasks).await;
+}
+
 /// Default maximum message size advertised in ChannelHeaders.
 const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
 
@@ -173,7 +216,7 @@ async fn encode_forwarded_tcpip_request_data<W: AsyncWrite + Send + Unpin>(
 pub struct ReverseTcpForwarder {
     /// Active listeners keyed by (bind_address, bind_port).
     /// The JoinHandle can be aborted to stop the listener.
-    listeners: Arc<Mutex<HashMap<(String, u16), tokio::task::JoinHandle<()>>>>,
+    listeners: Arc<Mutex<HashMap<(String, u16), ReverseTcpListenerEntry>>>,
 }
 
 impl ReverseTcpForwarder {
@@ -208,6 +251,9 @@ impl ReverseTcpForwarder {
         // Clone bind_address for use inside the spawned task.
         let bind_address_clone = bind_address.to_string();
 
+        let connection_tasks = Arc::new(Mutex::new(TrackedConnectionTasks::default()));
+        let accept_loop_tasks = Arc::clone(&connection_tasks);
+
         // Spawn the accept loop as a background task.
         let handle = tokio::spawn(async move {
             loop {
@@ -217,7 +263,7 @@ impl ReverseTcpForwarder {
                         let addr = bind_address_clone.clone();
                         let port = actual_port;
                         let conv_id = conversation_id;
-                        tokio::spawn(async move {
+                        let connection_handle = tokio::spawn(async move {
                             match transport.open_channel(None).await {
                                 Ok((from_remote_rx, to_remote_tx)) => {
                                     let reader = ChannelReader::new(from_remote_rx);
@@ -242,6 +288,7 @@ impl ReverseTcpForwarder {
                                 }
                             }
                         }.in_current_span());
+                        register_tracked_connection(&accept_loop_tasks, connection_handle).await;
                     }
                     Err(e) => {
                         tracing::warn!(error = %Report::from_error(&e), "reverse-tcp accept error");
@@ -251,10 +298,19 @@ impl ReverseTcpForwarder {
             }
         }.in_current_span());
 
-        let mut listeners = self.listeners.lock().await;
-        // If there was already a listener on this key, abort the old one.
-        if let Some(old_handle) = listeners.insert(key, handle) {
-            old_handle.abort();
+        let old_entry = {
+            let mut listeners = self.listeners.lock().await;
+            listeners.insert(
+                key,
+                ReverseTcpListenerEntry {
+                    owner: conversation_id,
+                    handle,
+                    connection_tasks,
+                },
+            )
+        };
+        if let Some(old_entry) = old_entry {
+            abort_listener_entry(old_entry).await;
         }
 
         Ok(actual_port)
@@ -263,14 +319,41 @@ impl ReverseTcpForwarder {
     /// Stop listening on `bind_address:bind_port`.
     ///
     /// Returns `true` if a listener was found and stopped, `false` otherwise.
-    pub async fn stop_listening(&self, bind_address: &str, bind_port: u16) -> bool {
+    pub async fn stop_listening(&self, bind_address: &str, bind_port: u16, owner: StreamId) -> bool {
         let key = (bind_address.to_string(), bind_port);
-        let mut listeners = self.listeners.lock().await;
-        if let Some(handle) = listeners.remove(&key) {
-            handle.abort();
-            true
-        } else {
-            false
+        let entry = {
+            let mut listeners = self.listeners.lock().await;
+            match listeners.get(&key) {
+                Some(entry) if entry.owner == owner => {}
+                Some(_) => return false,
+                None => return false,
+            }
+
+            listeners.remove(&key).expect("listener should exist after ownership check")
+        };
+        abort_listener_entry(entry).await;
+        true
+    }
+
+    pub async fn cleanup_for_owner(&self, owner: StreamId) {
+        let entries = {
+            let mut listeners = self.listeners.lock().await;
+            let keys_to_remove: Vec<_> = listeners
+                .iter()
+                .filter_map(|(key, entry)| (entry.owner == owner).then_some(key.clone()))
+                .collect();
+
+            let mut entries = Vec::with_capacity(keys_to_remove.len());
+            for key in keys_to_remove {
+                if let Some(entry) = listeners.remove(&key) {
+                    entries.push(entry);
+                }
+            }
+            entries
+        };
+
+        for entry in entries {
+            abort_listener_entry(entry).await;
         }
     }
 }
@@ -379,9 +462,11 @@ mod tests {
     use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportServerShared, TransportError};
     use h3x::codec::DecodeExt;
     use h3x::varint::VarInt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use remoc::rtc::ServerShared;
+    use tokio::sync::Notify;
 
     struct TestTransport;
 
@@ -407,6 +492,85 @@ mod tests {
 
     fn test_transport_client() -> Ssh3TransportClient {
         let (server, client) = Ssh3TransportServerShared::new(Arc::new(TestTransport), 16);
+        tokio::spawn(async move {
+            let _ = server.serve(true).await;
+        });
+        client
+    }
+
+    async fn wait_for_counter(counter: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while counter.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for expected counter value");
+    }
+
+    async fn assert_tcp_port_eventually_closes(port: u16, context: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{context}"));
+    }
+
+    struct BlockingTransport {
+        started: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+    }
+
+    impl Ssh3Transport for BlockingTransport {
+        async fn accept_channel(&self) -> Result<
+            Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+            TransportError,
+        > {
+            Ok(None)
+        }
+
+        async fn open_channel(
+            &self,
+            _header: Option<ChannelHeader>,
+        ) -> Result<
+            (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            TransportError,
+        > {
+            struct DropGuard(Arc<AtomicUsize>);
+
+            impl Drop for DropGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let _guard = DropGuard(Arc::clone(&self.dropped));
+            self.release.notified().await;
+            Err(TransportError::Other("released".into()))
+        }
+    }
+
+    fn blocking_transport_client(
+        started: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+    ) -> Ssh3TransportClient {
+        let transport = Arc::new(BlockingTransport {
+            started,
+            dropped,
+            release,
+        });
+        let (server, client) = Ssh3TransportServerShared::new(transport, 16);
         tokio::spawn(async move {
             let _ = server.serve(true).await;
         });
@@ -503,7 +667,8 @@ mod tests {
         }
 
         // Stop listening.
-        let stopped = forwarder.stop_listening("127.0.0.1", port).await;
+        let owner = h3x::stream_id::StreamId(VarInt::from(1u8));
+        let stopped = forwarder.stop_listening("127.0.0.1", port, owner).await;
         assert!(stopped, "should return true when listener exists");
 
         // Verify it's gone.
@@ -513,7 +678,7 @@ mod tests {
         }
 
         // Stopping again should return false.
-        let stopped_again = forwarder.stop_listening("127.0.0.1", port).await;
+        let stopped_again = forwarder.stop_listening("127.0.0.1", port, owner).await;
         assert!(!stopped_again, "should return false when listener doesn't exist");
     }
 
@@ -550,8 +715,135 @@ mod tests {
         assert_ne!(port1, port2, "two dynamic allocations should yield different ports");
 
         // Clean up.
-        forwarder.stop_listening("127.0.0.1", port1).await;
-        forwarder.stop_listening("127.0.0.1", port2).await;
+        forwarder
+            .stop_listening("127.0.0.1", port1, h3x::stream_id::StreamId(VarInt::from(1u8)))
+            .await;
+        forwarder
+            .stop_listening("127.0.0.1", port2, h3x::stream_id::StreamId(VarInt::from(2u8)))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn non_owner_cannot_stop_listener() {
+        let forwarder = ReverseTcpForwarder::new();
+        let owner = h3x::stream_id::StreamId(VarInt::from(7u8));
+        let other_owner = h3x::stream_id::StreamId(VarInt::from(8u8));
+
+        let port = forwarder
+            .start_listening("127.0.0.1", 0, test_transport_client(), owner)
+            .await
+            .unwrap();
+
+        let stopped = forwarder.stop_listening("127.0.0.1", port, other_owner).await;
+        assert!(!stopped, "non-owner should not stop listener");
+
+        {
+            let listeners = forwarder.listeners.lock().await;
+            assert!(listeners.contains_key(&("127.0.0.1".to_string(), port)));
+        }
+
+        forwarder.cleanup_for_owner(owner).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_for_owner_is_idempotent() {
+        let forwarder = ReverseTcpForwarder::new();
+        let owner = h3x::stream_id::StreamId(VarInt::from(9u8));
+
+        let port = forwarder
+            .start_listening("127.0.0.1", 0, test_transport_client(), owner)
+            .await
+            .unwrap();
+
+        forwarder.cleanup_for_owner(owner).await;
+        forwarder.cleanup_for_owner(owner).await;
+
+        {
+            let listeners = forwarder.listeners.lock().await;
+            assert!(!listeners.contains_key(&("127.0.0.1".to_string(), port)));
+        }
+
+        let connect_result = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
+        assert!(connect_result.is_err(), "listener port should be closed after cleanup");
+    }
+
+    #[tokio::test]
+    async fn cleanup_for_owner_preserves_other_owner_listener() {
+        let forwarder = ReverseTcpForwarder::new();
+        let owner = h3x::stream_id::StreamId(VarInt::from(10u8));
+        let other_owner = h3x::stream_id::StreamId(VarInt::from(11u8));
+
+        let owned_port = forwarder
+            .start_listening("127.0.0.1", 0, test_transport_client(), owner)
+            .await
+            .unwrap();
+        let other_port = forwarder
+            .start_listening("127.0.0.1", 0, test_transport_client(), other_owner)
+            .await
+            .unwrap();
+
+        forwarder.cleanup_for_owner(owner).await;
+        forwarder.cleanup_for_owner(owner).await;
+
+        {
+            let listeners = forwarder.listeners.lock().await;
+            assert!(
+                !listeners.contains_key(&("127.0.0.1".to_string(), owned_port)),
+                "owned listener should be removed"
+            );
+            assert!(
+                listeners.contains_key(&("127.0.0.1".to_string(), other_port)),
+                "other owner's listener must remain registered"
+            );
+        }
+
+        let owned_connect = tokio::net::TcpStream::connect(format!("127.0.0.1:{owned_port}")).await;
+        assert!(owned_connect.is_err(), "owned listener should be closed after cleanup");
+
+        let other_connect = tokio::net::TcpStream::connect(format!("127.0.0.1:{other_port}")).await;
+        assert!(other_connect.is_ok(), "other owner's listener should remain reachable");
+
+        forwarder.cleanup_for_owner(other_owner).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_after_stop_listening_aborts_tracked_connection_tasks() {
+        let forwarder = ReverseTcpForwarder::new();
+        let owner = h3x::stream_id::StreamId(VarInt::from(12u8));
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+
+        let port = forwarder
+            .start_listening(
+                "127.0.0.1",
+                0,
+                blocking_transport_client(started.clone(), dropped.clone(), release.clone()),
+                owner,
+            )
+            .await
+            .unwrap();
+
+        let tcp_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connection should reach listener before cleanup");
+
+        wait_for_counter(&started, 1).await;
+
+        assert!(forwarder.stop_listening("127.0.0.1", port, owner).await);
+        forwarder.cleanup_for_owner(owner).await;
+        forwarder.cleanup_for_owner(owner).await;
+
+        wait_for_counter(&dropped, 1).await;
+
+        assert_tcp_port_eventually_closes(
+            port,
+            "listener should be closed within timeout after stop + cleanup",
+        )
+        .await;
+
+        drop(tcp_stream);
+        release.notify_waiters();
     }
 
     // -------------------------------------------------------------------

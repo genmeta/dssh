@@ -1360,7 +1360,13 @@ fn test_global_request_tcpip_forward() {
                 let reply = TcpipForwardReply::decode_from_bytes(&data).await.unwrap();
                 assert!(reply.allocated_port > 0, "allocated_port should be > 0, got {}", reply.allocated_port);
                 // Clean up: stop the listener.
-                tcp_forwarder.stop_listening("127.0.0.1", reply.allocated_port as u16).await;
+                tcp_forwarder
+                    .stop_listening(
+                        "127.0.0.1",
+                        reply.allocated_port as u16,
+                        StreamId::try_from(1u64).unwrap(),
+                    )
+                    .await;
             }
             other => panic!("expected RequestSuccess, got {other:?}"),
         }
@@ -1617,7 +1623,13 @@ fn test_reverse_tcp_forwarded_channel() {
         client_end_reader.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, b"hello-from-tcp", "data from TCP should arrive on QUIC side");
 
-        tcp_forwarder.stop_listening("127.0.0.1", allocated_port as u16).await;
+        tcp_forwarder
+            .stop_listening(
+                "127.0.0.1",
+                allocated_port as u16,
+                StreamId::try_from(1u64).unwrap(),
+            )
+            .await;
     })
 }
 
@@ -1727,7 +1739,9 @@ fn test_global_request_streamlocal_forward() {
         server_task.await.unwrap();
 
         // Clean up: stop the listener and remove the socket file.
-        streamlocal_forwarder.stop_listening(&socket_path).await;
+        streamlocal_forwarder
+            .stop_listening(&socket_path, StreamId::try_from(1u64).unwrap())
+            .await;
         let _ = std::fs::remove_file(&socket_path);
     })
 }

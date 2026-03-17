@@ -45,6 +45,53 @@ use tokio::sync::Mutex;
 
 use crate::byte_channel::{ChannelReader, ChannelWriter};
 
+struct ReverseStreamlocalListenerEntry {
+    owner: StreamId,
+    created_socket: bool,
+    handle: tokio::task::JoinHandle<()>,
+    connection_tasks: Arc<Mutex<TrackedConnectionTasks>>,
+}
+
+#[derive(Default)]
+struct TrackedConnectionTasks {
+    shutting_down: bool,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+async fn register_tracked_connection(
+    tracked_tasks: &Arc<Mutex<TrackedConnectionTasks>>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut tracked_tasks = tracked_tasks.lock().await;
+    if tracked_tasks.shutting_down {
+        handle.abort();
+    } else {
+        tracked_tasks.handles.push(handle);
+    }
+}
+
+async fn abort_tracked_connections(tracked_tasks: &Arc<Mutex<TrackedConnectionTasks>>) {
+    let handles = {
+        let mut tracked_tasks = tracked_tasks.lock().await;
+        tracked_tasks.shutting_down = true;
+        std::mem::take(&mut tracked_tasks.handles)
+    };
+
+    for handle in handles {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+async fn abort_listener_entry(socket_path: &str, entry: ReverseStreamlocalListenerEntry) {
+    entry.handle.abort();
+    let _ = entry.handle.await;
+    abort_tracked_connections(&entry.connection_tasks).await;
+    if entry.created_socket {
+        let _ = std::fs::remove_file(socket_path);
+    }
+}
+
 /// Default maximum message size advertised in ChannelOpenConfirmation.
 const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
 
@@ -207,7 +254,7 @@ async fn encode_forwarded_streamlocal_request_data<W: AsyncWrite + Send + Unpin>
 pub struct ReverseStreamlocalForwarder {
     /// Active listeners keyed by socket_path.
     /// The JoinHandle can be aborted to stop the listener.
-    listeners: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    listeners: Arc<Mutex<HashMap<String, ReverseStreamlocalListenerEntry>>>,
 }
 
 impl ReverseStreamlocalForwarder {
@@ -236,6 +283,9 @@ impl ReverseStreamlocalForwarder {
         // Clone socket_path for use inside the spawned task.
         let socket_path_clone = socket_path.to_string();
 
+        let connection_tasks = Arc::new(Mutex::new(TrackedConnectionTasks::default()));
+        let accept_loop_tasks = Arc::clone(&connection_tasks);
+
         // Spawn the accept loop as a background task.
         let handle = tokio::spawn(async move {
             loop {
@@ -244,7 +294,7 @@ impl ReverseStreamlocalForwarder {
                         let transport = transport.clone();
                         let path = socket_path_clone.clone();
                         let conv_id = conversation_id;
-                        tokio::spawn(async move {
+                        let connection_handle = tokio::spawn(async move {
                             match transport.open_channel(None).await {
                                 Ok((from_remote_rx, to_remote_tx)) => {
                                     let reader = ChannelReader::new(from_remote_rx);
@@ -268,6 +318,7 @@ impl ReverseStreamlocalForwarder {
                                 }
                             }
                         }.in_current_span());
+                        register_tracked_connection(&accept_loop_tasks, connection_handle).await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -280,10 +331,20 @@ impl ReverseStreamlocalForwarder {
             }
         }.in_current_span());
 
-        let mut listeners = self.listeners.lock().await;
-        // If there was already a listener on this key, abort the old one.
-        if let Some(old_handle) = listeners.insert(key, handle) {
-            old_handle.abort();
+        let old_entry = {
+            let mut listeners = self.listeners.lock().await;
+            listeners.insert(
+                key,
+                ReverseStreamlocalListenerEntry {
+                    owner: conversation_id,
+                    created_socket: true,
+                    handle,
+                    connection_tasks,
+                },
+            )
+        };
+        if let Some(old_entry) = old_entry {
+            abort_listener_entry(socket_path, old_entry).await;
         }
 
         Ok(())
@@ -293,16 +354,41 @@ impl ReverseStreamlocalForwarder {
     ///
     /// Returns `true` if a listener was found and stopped, `false` otherwise.
     /// Also removes the socket file from the filesystem.
-    pub async fn stop_listening(&self, socket_path: &str) -> bool {
+    pub async fn stop_listening(&self, socket_path: &str, owner: StreamId) -> bool {
         let key = socket_path.to_string();
-        let mut listeners = self.listeners.lock().await;
-        if let Some(handle) = listeners.remove(&key) {
-            handle.abort();
-            // Clean up the socket file.
-            let _ = std::fs::remove_file(socket_path);
-            true
-        } else {
-            false
+        let entry = {
+            let mut listeners = self.listeners.lock().await;
+            match listeners.get(&key) {
+                Some(entry) if entry.owner == owner => {}
+                Some(_) => return false,
+                None => return false,
+            }
+
+            listeners.remove(&key).expect("listener should exist after ownership check")
+        };
+        abort_listener_entry(socket_path, entry).await;
+        true
+    }
+
+    pub async fn cleanup_for_owner(&self, owner: StreamId) {
+        let entries = {
+            let mut listeners = self.listeners.lock().await;
+            let keys_to_remove: Vec<_> = listeners
+                .iter()
+                .filter_map(|(key, entry)| (entry.owner == owner).then_some(key.clone()))
+                .collect();
+
+            let mut entries = Vec::with_capacity(keys_to_remove.len());
+            for key in keys_to_remove {
+                if let Some(entry) = listeners.remove(&key) {
+                    entries.push((key, entry));
+                }
+            }
+            entries
+        };
+
+        for (key, entry) in entries {
+            abort_listener_entry(&key, entry).await;
         }
     }
 }
@@ -402,9 +488,10 @@ mod tests {
     use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
     use h3x::codec::{DecodeExt, EncodeExt};
     use h3x::varint::VarInt;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use remoc::rtc::ServerShared;
+    use tokio::sync::Notify;
 
     struct TestTransport;
 
@@ -430,6 +517,69 @@ mod tests {
 
     fn test_transport_client() -> Ssh3TransportClient {
         let (server, client) = Ssh3TransportServerShared::new(Arc::new(TestTransport), 16);
+        tokio::spawn(async move {
+            let _ = server.serve(true).await;
+        });
+        client
+    }
+
+    async fn wait_for_counter(counter: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while counter.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for expected counter value");
+    }
+
+    struct BlockingTransport {
+        started: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+    }
+
+    impl Ssh3Transport for BlockingTransport {
+        async fn accept_channel(&self) -> Result<
+            Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+            TransportError,
+        > {
+            Ok(None)
+        }
+
+        async fn open_channel(
+            &self,
+            _header: Option<ChannelHeader>,
+        ) -> Result<
+            (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            TransportError,
+        > {
+            struct DropGuard(Arc<AtomicUsize>);
+
+            impl Drop for DropGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let _guard = DropGuard(Arc::clone(&self.dropped));
+            self.release.notified().await;
+            Err(TransportError::Other("released".into()))
+        }
+    }
+
+    fn blocking_transport_client(
+        started: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+    ) -> Ssh3TransportClient {
+        let transport = Arc::new(BlockingTransport {
+            started,
+            dropped,
+            release,
+        });
+        let (server, client) = Ssh3TransportServerShared::new(transport, 16);
         tokio::spawn(async move {
             let _ = server.serve(true).await;
         });
@@ -676,7 +826,8 @@ mod tests {
         }
 
         // Stop listening.
-        let stopped = forwarder.stop_listening(&sock_path).await;
+        let owner = h3x::stream_id::StreamId(VarInt::from(1u8));
+        let stopped = forwarder.stop_listening(&sock_path, owner).await;
         assert!(stopped, "should return true when listener exists");
 
         // Verify it's gone.
@@ -686,7 +837,7 @@ mod tests {
         }
 
         // Stopping again should return false.
-        let stopped_again = forwarder.stop_listening(&sock_path).await;
+        let stopped_again = forwarder.stop_listening(&sock_path, owner).await;
         assert!(!stopped_again, "should return false when listener doesn't exist");
 
         // Socket file should have been cleaned up by stop_listening.
@@ -694,6 +845,148 @@ mod tests {
             !std::path::Path::new(&sock_path).exists(),
             "socket file should be removed after stop"
         );
+    }
+
+    #[tokio::test]
+    async fn non_owner_cannot_remove_streamlocal_listener() {
+        let forwarder = ReverseStreamlocalForwarder::new();
+        let owner = h3x::stream_id::StreamId(VarInt::from(7u8));
+        let other_owner = h3x::stream_id::StreamId(VarInt::from(8u8));
+        let sock_path = test_sock_path("non-owner");
+
+        forwarder
+            .start_listening(&sock_path, test_transport_client(), owner)
+            .await
+            .unwrap();
+
+        let stopped = forwarder.stop_listening(&sock_path, other_owner).await;
+        assert!(!stopped, "non-owner should not stop streamlocal listener");
+        assert!(std::path::Path::new(&sock_path).exists(), "socket path should remain for owner listener");
+
+        forwarder.cleanup_for_owner(owner).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_for_owner_is_idempotent_and_preserves_non_owned_socket() {
+        let forwarder = ReverseStreamlocalForwarder::new();
+        let owner = h3x::stream_id::StreamId(VarInt::from(9u8));
+        let sock_path = test_sock_path("cleanup");
+        let foreign_sock_path = test_sock_path("foreign");
+
+        let foreign_listener = UnixListener::bind(&foreign_sock_path).unwrap();
+
+        forwarder
+            .start_listening(&sock_path, test_transport_client(), owner)
+            .await
+            .unwrap();
+
+        forwarder.cleanup_for_owner(owner).await;
+        forwarder.cleanup_for_owner(owner).await;
+
+        {
+            let listeners = forwarder.listeners.lock().await;
+            assert!(!listeners.contains_key(&sock_path));
+        }
+
+        assert!(
+            !std::path::Path::new(&sock_path).exists(),
+            "owned socket should be removed after cleanup"
+        );
+        assert!(
+            std::path::Path::new(&foreign_sock_path).exists(),
+            "non-owned pre-existing socket should be preserved"
+        );
+
+        drop(foreign_listener);
+        let _ = std::fs::remove_file(&foreign_sock_path);
+    }
+
+    #[tokio::test]
+    async fn cleanup_for_owner_preserves_other_owner_listener_and_socket() {
+        let forwarder = ReverseStreamlocalForwarder::new();
+        let owner = h3x::stream_id::StreamId(VarInt::from(10u8));
+        let other_owner = h3x::stream_id::StreamId(VarInt::from(11u8));
+        let owned_sock_path = test_sock_path("owned-cleanup");
+        let other_sock_path = test_sock_path("other-cleanup");
+
+        forwarder
+            .start_listening(&owned_sock_path, test_transport_client(), owner)
+            .await
+            .unwrap();
+        forwarder
+            .start_listening(&other_sock_path, test_transport_client(), other_owner)
+            .await
+            .unwrap();
+
+        forwarder.cleanup_for_owner(owner).await;
+        forwarder.cleanup_for_owner(owner).await;
+
+        {
+            let listeners = forwarder.listeners.lock().await;
+            assert!(
+                !listeners.contains_key(&owned_sock_path),
+                "owned listener should be removed"
+            );
+            assert!(
+                listeners.contains_key(&other_sock_path),
+                "other owner's listener must remain registered"
+            );
+        }
+
+        assert!(
+            !std::path::Path::new(&owned_sock_path).exists(),
+            "owned socket should be removed after cleanup"
+        );
+        assert!(
+            std::path::Path::new(&other_sock_path).exists(),
+            "other owner's socket should remain after cleanup"
+        );
+
+        let other_connect = UnixStream::connect(&other_sock_path).await;
+        assert!(other_connect.is_ok(), "other owner's streamlocal listener should remain reachable");
+
+        forwarder.cleanup_for_owner(other_owner).await;
+        let _ = std::fs::remove_file(&owned_sock_path);
+        let _ = std::fs::remove_file(&other_sock_path);
+    }
+
+    #[tokio::test]
+    async fn cleanup_after_stop_listening_aborts_tracked_connection_tasks() {
+        let forwarder = ReverseStreamlocalForwarder::new();
+        let owner = h3x::stream_id::StreamId(VarInt::from(12u8));
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let sock_path = test_sock_path("partial-cleanup");
+
+        forwarder
+            .start_listening(
+                &sock_path,
+                blocking_transport_client(started.clone(), dropped.clone(), release.clone()),
+                owner,
+            )
+            .await
+            .unwrap();
+
+        let unix_stream = UnixStream::connect(&sock_path)
+            .await
+            .expect("connection should reach listener before cleanup");
+
+        wait_for_counter(&started, 1).await;
+
+        assert!(forwarder.stop_listening(&sock_path, owner).await);
+        forwarder.cleanup_for_owner(owner).await;
+        forwarder.cleanup_for_owner(owner).await;
+
+        wait_for_counter(&dropped, 1).await;
+
+        assert!(
+            !std::path::Path::new(&sock_path).exists(),
+            "socket should be removed after stop + cleanup"
+        );
+
+        drop(unix_stream);
+        release.notify_waiters();
     }
 
     // -------------------------------------------------------------------
