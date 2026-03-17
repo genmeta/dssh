@@ -21,7 +21,7 @@ use genmeta_ssh3_proto::codec::ChannelHeader;
 use genmeta_ssh3_proto::session::{Ssh3TransportClient, Ssh3TransportServerShared};
 use h3x::{
     codec::{
-        DecodeExt, DecodeFrom, ErasedPeekableBiStream, ErasedPeekableUniStream,
+        DecodeExt, ErasedPeekableBiStream, ErasedPeekableUniStream,
         SinkWriter, StreamReader,
     },
     connection::StreamError,
@@ -233,7 +233,7 @@ impl Ssh3Protocol {
         let stream_writer = writer;
 
         // Decode the full ChannelHeader from the reset reader.
-        let header = match ChannelHeader::decode_from(&mut stream_reader).await {
+        let header = match stream_reader.decode_one::<ChannelHeader>().await {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!("failed to decode SSH3 ChannelHeader: {e}");
@@ -514,7 +514,7 @@ impl<C: quic::Connection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use h3x::codec::{EncodeExt, EncodeInto};
+    use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
     use h3x::stream_id::StreamId;
     use tokio::io::{AsyncReadExt, duplex};
 

@@ -11,7 +11,7 @@ use std::{future::Future, os::fd::AsRawFd, pin::Pin, sync::Arc};
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
 use genmeta_ssh3_proto::session::{Ssh3Transport as RemoteSsh3Transport, Ssh3TransportClient, TransportError};
-use h3x::codec::{DecodeFrom, EncodeInto};
+use h3x::codec::{DecodeExt, EncodeExt};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
 use snafu::Report;
@@ -126,7 +126,7 @@ where
         reason_code: VarInt::from(3u8),
         description: "unknown channel type".into(),
     };
-    failure.encode_into(&mut writer).await?;
+    writer.encode_one(&failure).await?;
     Ok(())
 }
 
@@ -150,7 +150,7 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // Read a single GlobalRequest from the stream.
-    let msg = SshMessage::decode_from(&mut reader).await?;
+    let msg: SshMessage = reader.decode_one().await?;
 
     let SshMessage::GlobalRequest {
         request_type,
@@ -164,7 +164,15 @@ where
 
     let reply = process_global_request(&request_type, &data, global_ctx).await?;
     if want_reply {
-        write_global_request_reply(&mut writer, reply).await?;
+        match reply {
+            GlobalRequestReply::Success(data) => {
+                writer.encode_one(&SshMessage::RequestSuccess { data }).await?
+            }
+            GlobalRequestReply::Failure => {
+                writer.encode_one(&SshMessage::RequestFailure).await?
+            }
+        }
+        writer.flush().await?;
     }
 
     Ok(())
@@ -172,7 +180,7 @@ where
 
 pub async fn process_global_request(
     request_type: &str,
-    data: &[u8],
+    mut data: &[u8],
     global_ctx: Option<Arc<GlobalRequestContext>>,
 ) -> io::Result<GlobalRequestReply> {
     use crate::forward::reverse_tcp::{CancelTcpipForwardRequest, TcpipForwardReply, TcpipForwardRequest};
@@ -188,7 +196,7 @@ pub async fn process_global_request(
 
     match request_type {
         "tcpip-forward" => {
-            let req = TcpipForwardRequest::decode_from_bytes(data).await?;
+            let req: TcpipForwardRequest = data.decode_one().await?;
             tracing::info!(bind_address = %req.bind_address, bind_port = req.bind_port, "tcpip-forward request");
             let bind_port = match validate_global_request_port(req.bind_port) {
                 Ok(port) => port,
@@ -204,11 +212,12 @@ pub async fn process_global_request(
                 .await
             {
                 Ok(actual_port) => {
-                    let reply_data = TcpipForwardReply {
+                    let mut reply_data = Vec::new();
+                    reply_data
+                        .encode_one(&TcpipForwardReply {
                         allocated_port: actual_port as u32,
-                    }
-                    .encode_to_bytes()
-                    .await;
+                        })
+                        .await?;
                     Ok(GlobalRequestReply::Success(reply_data))
                 }
                 Err(e) => {
@@ -218,7 +227,7 @@ pub async fn process_global_request(
             }
         }
         "cancel-tcpip-forward" => {
-            let req = CancelTcpipForwardRequest::decode_from_bytes(data).await?;
+            let req: CancelTcpipForwardRequest = data.decode_one().await?;
             tracing::info!(bind_address = %req.bind_address, bind_port = req.bind_port, "cancel-tcpip-forward request");
             let bind_port = match validate_global_request_port(req.bind_port) {
                 Ok(port) => port,
@@ -239,7 +248,7 @@ pub async fn process_global_request(
             }
         }
         "streamlocal-forward@openssh.com" => {
-            let req = StreamlocalForwardRequest::decode_from_bytes(data).await?;
+            let req: StreamlocalForwardRequest = data.decode_one().await?;
             tracing::info!(socket_path = %req.socket_path, "streamlocal-forward request");
             match ctx
                 .streamlocal_forwarder
@@ -254,7 +263,7 @@ pub async fn process_global_request(
             }
         }
         "cancel-streamlocal-forward@openssh.com" => {
-            let req = CancelStreamlocalForwardRequest::decode_from_bytes(data).await?;
+            let req: CancelStreamlocalForwardRequest = data.decode_one().await?;
             tracing::info!(socket_path = %req.socket_path, "cancel-streamlocal-forward request");
             let stopped = ctx
                 .streamlocal_forwarder
@@ -273,19 +282,6 @@ pub async fn process_global_request(
     }
 }
 
-pub async fn write_global_request_reply<W: AsyncWrite + Send + Unpin>(
-    writer: &mut W,
-    reply: GlobalRequestReply,
-) -> io::Result<()> {
-    match reply {
-        GlobalRequestReply::Success(data) => {
-            SshMessage::RequestSuccess { data }.encode_into(&mut *writer).await?
-        }
-        GlobalRequestReply::Failure => SshMessage::RequestFailure.encode_into(&mut *writer).await?,
-    }
-    writer.flush().await
-}
-
 pub async fn reject_legacy_global_request_channel<W>(mut writer: W) -> io::Result<()>
 where
     W: AsyncWrite + Send + Unpin,
@@ -294,7 +290,7 @@ where
         reason_code: VarInt::from(3u8),
         description: "legacy global-request channel path rejected; use control stream".into(),
     };
-    failure.encode_into(&mut writer).await?;
+    writer.encode_one(&failure).await?;
     writer.flush().await
 }
 
@@ -343,7 +339,15 @@ where
             match action {
                 ControlStreamAction::Reply { want_reply, reply } => {
                     if want_reply {
-                        write_global_request_reply(&mut writer, reply).await?;
+                        match reply {
+                            GlobalRequestReply::Success(data) => {
+                                writer.encode_one(&SshMessage::RequestSuccess { data }).await?
+                            }
+                            GlobalRequestReply::Failure => {
+                                writer.encode_one(&SshMessage::RequestFailure).await?
+                            }
+                        }
+                        writer.flush().await?;
                     }
                 }
                 ControlStreamAction::Close => {
@@ -356,7 +360,7 @@ where
     });
 
     loop {
-        let msg = match SshMessage::decode_from(&mut *reader).await {
+        let msg = match reader.decode_one::<SshMessage>().await {
             Ok(msg) => msg,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(error) => {
@@ -444,7 +448,7 @@ where
     let confirm = SshMessage::ChannelOpenConfirmation {
         max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
     };
-    confirm.encode_into(&mut writer).await?;
+    writer.encode_one(&confirm).await?;
 
     // Spawn the message-loop reader, producing events into the channel.
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -478,13 +482,13 @@ where
                                 pty_pair = Some(pair);
                                 tracing::info!(term = %req.term_type, "PTY allocated");
                                 if want_reply {
-                                    SshMessage::ChannelSuccess.encode_into(&mut writer).await?;
+                                    writer.encode_one(&SshMessage::ChannelSuccess).await?;
                                 }
                             }
                             Err(e) => {
                                 tracing::warn!(%e, "PTY allocation failed");
                                 if want_reply {
-                                    SshMessage::ChannelFailure.encode_into(&mut writer).await?;
+                                    writer.encode_one(&SshMessage::ChannelFailure).await?;
                                 }
                             }
                         }
@@ -509,12 +513,12 @@ where
                 }
             }
             ChannelEvent::Eof => {
-                SshMessage::ChannelEof.encode_into(&mut writer).await?;
+                writer.encode_one(&SshMessage::ChannelEof).await?;
                 writer.shutdown().await?;
                 break;
             }
             ChannelEvent::Close => {
-                SshMessage::ChannelClose.encode_into(&mut writer).await?;
+                writer.encode_one(&SshMessage::ChannelClose).await?;
                 break;
             }
             ChannelEvent::Data(_) | ChannelEvent::ExtendedData { .. } => {
@@ -562,7 +566,7 @@ where
     let confirm = SshMessage::ChannelOpenConfirmation {
         max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
     };
-    confirm.encode_into(&mut writer).await?;
+    writer.encode_one(&confirm).await?;
 
     let (event_tx, event_rx) = mpsc::channel(64);
     tokio::spawn(async move {
@@ -584,7 +588,7 @@ where
     R: AsyncRead + Send + Unpin,
 {
     loop {
-        let msg = match SshMessage::decode_from(&mut reader).await {
+        let msg = match reader.decode_one::<SshMessage>().await {
             Ok(msg) => msg,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 // Stream closed — normal termination.
@@ -761,7 +765,7 @@ impl RemoteSsh3Transport for Ssh3Transport {
         };
 
         if let Some(h) = &header {
-            h.encode_into(&mut quic_writer)
+            quic_writer.encode_one(h)
                 .await
                 .map_err(|e| TransportError::OpenFailed(e.to_string()))?;
             quic_writer
@@ -815,6 +819,7 @@ mod tests {
     use crate::forward::streamlocal::ReverseStreamlocalForwarder;
     use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
     use genmeta_ssh3_proto::session::{Ssh3Transport as RemoteSessionTransport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
+    use h3x::codec::{DecodeFrom, EncodeInto};
     use h3x::stream_id::StreamId;
     use remoc::rtc::ServerShared;
     use std::sync::{Arc, atomic::{AtomicUsize, Ordering as AtomicOrdering}};
@@ -1286,12 +1291,14 @@ mod tests {
         });
 
         let mut client_writer = client_writer;
-        let request_data = TcpipForwardRequest {
+        let mut request_data = Vec::new();
+        request_data
+            .encode_one(&TcpipForwardRequest {
             bind_address: "127.0.0.1".into(),
             bind_port: u16::MAX as u32 + 1,
-        }
-        .encode_to_bytes()
-        .await;
+            })
+            .await
+            .unwrap();
         SshMessage::GlobalRequest {
             request_type: "tcpip-forward".into(),
             want_reply: true,
@@ -1321,12 +1328,14 @@ mod tests {
         });
 
         let mut client_writer = client_writer;
-        let request_data = CancelTcpipForwardRequest {
+        let mut request_data = Vec::new();
+        request_data
+            .encode_one(&CancelTcpipForwardRequest {
             bind_address: "127.0.0.1".into(),
             bind_port: u16::MAX as u32 + 1,
-        }
-        .encode_to_bytes()
-        .await;
+            })
+            .await
+            .unwrap();
         SshMessage::GlobalRequest {
             request_type: "cancel-tcpip-forward".into(),
             want_reply: true,
