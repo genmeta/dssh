@@ -85,24 +85,25 @@ pub struct TcpipForwardRequest {
     pub bind_port: u32,
 }
 
-impl TcpipForwardRequest {
-    /// Encode into wire format: SshString(bind_address) + VarInt(bind_port).
-    pub async fn encode_to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        SshString(self.bind_address.clone()).encode_into(&mut buf)
-            .await
-            .expect("vec write cannot fail");
-        buf.encode_one(VarInt::from(self.bind_port))
-            .await
-            .expect("vec write cannot fail");
-        buf
-    }
+impl<S: AsyncWrite + Send> EncodeInto<S> for &TcpipForwardRequest {
+    type Output = ();
+    type Error = io::Error;
 
-    /// Decode from wire format bytes.
-    pub async fn decode_from_bytes(data: &[u8]) -> io::Result<Self> {
-        let mut reader = data;
-        let bind_address = SshString::decode_from(&mut reader).await?;
-        let bind_port: VarInt = reader.decode_one().await?;
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream.encode_one(SshString(self.bind_address.clone())).await?;
+        stream.encode_one(VarInt::from(self.bind_port)).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for TcpipForwardRequest {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let bind_address: SshString = stream.decode_one().await?;
+        let bind_port: VarInt = stream.decode_one().await?;
         Ok(TcpipForwardRequest {
             bind_address: bind_address.0,
             bind_port: bind_port.into_inner() as u32,
@@ -117,24 +118,25 @@ pub struct CancelTcpipForwardRequest {
     pub bind_port: u32,
 }
 
-impl CancelTcpipForwardRequest {
-    /// Encode into wire format: SshString(bind_address) + VarInt(bind_port).
-    pub async fn encode_to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        SshString(self.bind_address.clone()).encode_into(&mut buf)
-            .await
-            .expect("vec write cannot fail");
-        buf.encode_one(VarInt::from(self.bind_port))
-            .await
-            .expect("vec write cannot fail");
-        buf
-    }
+impl<S: AsyncWrite + Send> EncodeInto<S> for &CancelTcpipForwardRequest {
+    type Output = ();
+    type Error = io::Error;
 
-    /// Decode from wire format bytes.
-    pub async fn decode_from_bytes(data: &[u8]) -> io::Result<Self> {
-        let mut reader = data;
-        let bind_address = SshString::decode_from(&mut reader).await?;
-        let bind_port: VarInt = reader.decode_one().await?;
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream.encode_one(SshString(self.bind_address.clone())).await?;
+        stream.encode_one(VarInt::from(self.bind_port)).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for CancelTcpipForwardRequest {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let bind_address: SshString = stream.decode_one().await?;
+        let bind_port: VarInt = stream.decode_one().await?;
         Ok(CancelTcpipForwardRequest {
             bind_address: bind_address.0,
             bind_port: bind_port.into_inner() as u32,
@@ -148,23 +150,48 @@ pub struct TcpipForwardReply {
     pub allocated_port: u32,
 }
 
-impl TcpipForwardReply {
-    /// Encode into wire format: VarInt(allocated_port).
-    pub async fn encode_to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.encode_one(VarInt::from(self.allocated_port))
-            .await
-            .expect("vec write cannot fail");
-        buf
-    }
+impl<S: AsyncWrite + Send> EncodeInto<S> for &TcpipForwardReply {
+    type Output = ();
+    type Error = io::Error;
 
-    /// Decode from wire format bytes.
-    pub async fn decode_from_bytes(data: &[u8]) -> io::Result<Self> {
-        let mut reader = data;
-        let allocated_port: VarInt = reader.decode_one().await?;
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream.encode_one(VarInt::from(self.allocated_port)).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for TcpipForwardReply {
+    type Error = io::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let allocated_port: VarInt = stream.decode_one().await?;
         Ok(TcpipForwardReply {
             allocated_port: allocated_port.into_inner() as u32,
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForwardedTcpipRequestData {
+    connected_addr: String,
+    connected_port: u16,
+    originator_addr: String,
+    originator_port: u16,
+}
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for &ForwardedTcpipRequestData {
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream.encode_one(SshString(self.connected_addr.clone())).await?;
+        stream.encode_one(VarInt::from(self.connected_port)).await?;
+        stream.encode_one(SshString(self.originator_addr.clone())).await?;
+        stream.encode_one(VarInt::from(self.originator_port)).await?;
+        Ok(())
     }
 }
 
@@ -179,30 +206,6 @@ impl TcpipForwardReply {
 /// - connected_port: VarInt
 /// - originator_address: SshString
 /// - originator_port: VarInt
-async fn encode_forwarded_tcpip_request_data<W: AsyncWrite + Send + Unpin>(
-    writer: &mut W,
-    connected_addr: &str,
-    connected_port: u16,
-    originator_addr: &str,
-    originator_port: u16,
-) -> io::Result<()> {
-    SshString(connected_addr.to_string()).encode_into(&mut *writer).await?;
-    writer
-        .encode_one(
-            VarInt::try_from(connected_port as u64)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
-        )
-        .await?;
-    SshString(originator_addr.to_string()).encode_into(&mut *writer).await?;
-    writer
-        .encode_one(
-            VarInt::try_from(originator_port as u64)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
-        )
-        .await?;
-    Ok(())
-}
-
 fn forwarded_tcpip_header(conversation_id: StreamId) -> ChannelHeader {
     ChannelHeader {
         signal_value: CHANNEL_SIGNAL_VALUE,
@@ -225,17 +228,17 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    encode_forwarded_tcpip_request_data(
-        &mut writer,
-        connected_addr,
-        connected_port,
-        originator_addr,
-        originator_port,
-    )
-    .await?;
+    writer
+        .encode_one(&ForwardedTcpipRequestData {
+            connected_addr: connected_addr.to_string(),
+            connected_port,
+            originator_addr: originator_addr.to_string(),
+            originator_port,
+        })
+        .await?;
     writer.flush().await?;
 
-    let response = SshMessage::decode_from(&mut reader).await?;
+    let response: SshMessage = reader.decode_one().await?;
     match response {
         SshMessage::ChannelOpenConfirmation { .. } => {}
         SshMessage::ChannelOpenFailure { .. } => {
@@ -458,7 +461,7 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let header = forwarded_tcpip_header(conversation_id);
-    header.encode_into(&mut writer).await?;
+    writer.encode_one(&header).await?;
     finish_forwarded_tcpip_channel(
         reader,
         writer,
@@ -607,8 +610,9 @@ mod tests {
             bind_address: "0.0.0.0".into(),
             bind_port: 8080,
         };
-        let bytes = req.encode_to_bytes().await;
-        let decoded = TcpipForwardRequest::decode_from_bytes(&bytes).await.unwrap();
+        let mut bytes = Vec::new();
+        bytes.encode_one(&req).await.unwrap();
+        let decoded: TcpipForwardRequest = bytes.as_slice().decode_one().await.unwrap();
         assert_eq!(decoded, req);
     }
 
@@ -622,7 +626,8 @@ mod tests {
             bind_address: "hi".into(),
             bind_port: 22,
         };
-        let bytes = req.encode_to_bytes().await;
+        let mut bytes = Vec::new();
+        bytes.encode_one(&req).await.unwrap();
         // "hi": varint(2)=0x02, b"hi"=[0x68, 0x69]
         // port 22: varint(22) = 1-byte [0x16]
         assert_eq!(
@@ -641,8 +646,9 @@ mod tests {
             bind_address: "127.0.0.1".into(),
             bind_port: 3000,
         };
-        let bytes = req.encode_to_bytes().await;
-        let decoded = CancelTcpipForwardRequest::decode_from_bytes(&bytes).await.unwrap();
+        let mut bytes = Vec::new();
+        bytes.encode_one(&req).await.unwrap();
+        let decoded: CancelTcpipForwardRequest = bytes.as_slice().decode_one().await.unwrap();
         assert_eq!(decoded, req);
     }
 
@@ -655,8 +661,9 @@ mod tests {
         let reply = TcpipForwardReply {
             allocated_port: 49152,
         };
-        let bytes = reply.encode_to_bytes().await;
-        let decoded = TcpipForwardReply::decode_from_bytes(&bytes).await.unwrap();
+        let mut bytes = Vec::new();
+        bytes.encode_one(&reply).await.unwrap();
+        let decoded: TcpipForwardReply = bytes.as_slice().decode_one().await.unwrap();
         assert_eq!(decoded, reply);
     }
 

@@ -17,7 +17,7 @@
 //! NOT wrapped in `SSH_MSG_CHANNEL_DATA(94)`.
 
 use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
-use h3x::codec::{DecodeExt, DecodeFrom, EncodeInto};
+use h3x::codec::{DecodeExt, EncodeExt};
 use h3x::varint::VarInt;
 use snafu::Report;
 use tokio::io::{self, AsyncRead, AsyncWrite};
@@ -53,9 +53,9 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // Parse request_data fields (RFC 4254 §7.2).
-    let dest_host = SshString::decode_from(&mut reader).await?;
+    let dest_host: SshString = reader.decode_one().await?;
     let dest_port: VarInt = reader.decode_one().await?;
-    let _originator_host = SshString::decode_from(&mut reader).await?;
+    let _originator_host: SshString = reader.decode_one().await?;
     let _originator_port: VarInt = reader.decode_one().await?;
 
     let dest_port = match validate_port(dest_port.into_inner(), "destination port") {
@@ -65,7 +65,7 @@ where
                 reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                 description: error.to_string(),
             };
-            failure.encode_into(&mut writer).await?;
+            writer.encode_one(&failure).await?;
             return Ok(());
         }
     };
@@ -84,7 +84,7 @@ where
                 reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                 description: format!("connect failed: {e}"),
             };
-            failure.encode_into(&mut writer).await?;
+            writer.encode_one(&failure).await?;
             return Ok(());
         }
     };
@@ -93,7 +93,7 @@ where
     let confirm = SshMessage::ChannelOpenConfirmation {
         max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
     };
-    confirm.encode_into(&mut writer).await?;
+    writer.encode_one(&confirm).await?;
 
     // Bridge raw bytes bidirectionally between QUIC stream and TCP socket.
     // We spawn two tasks for true concurrency — this avoids deadlocks that
@@ -120,7 +120,7 @@ where
 mod tests {
     use super::*;
     use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
-    use h3x::codec::EncodeExt;
+    use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
     use h3x::varint::VarInt;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
