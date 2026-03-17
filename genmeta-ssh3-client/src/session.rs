@@ -11,7 +11,7 @@
 
 use genmeta_ssh3_proto::codec::SshString;
 use genmeta_ssh3_proto::message::SshMessage;
-use h3x::codec::{DecodeExt, EncodeExt, EncodeInto};
+use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
 use h3x::varint::VarInt;
 use tokio::io::{self, AsyncWrite, AsyncWriteExt};
 
@@ -177,6 +177,17 @@ pub enum SessionEvent {
     Stderr(Vec<u8>),
     /// The server reported the process exit code.
     ExitStatus(u32),
+    /// The server reported the process was killed by a signal (RFC 4254 §6.10).
+    ExitSignal {
+        /// Signal name without `SIG` prefix (e.g., `TERM`, `KILL`).
+        name: String,
+        /// Whether a core dump was produced.
+        core_dumped: bool,
+        /// Error message (may be empty).
+        message: String,
+        /// Language tag for the error message (may be empty).
+        language: String,
+    },
     /// The server signaled end-of-file.
     Eof,
     /// The server closed the channel.
@@ -187,14 +198,22 @@ pub enum SessionEvent {
     Failure,
 }
 
-/// Parse an exit-status from the request_data of a ChannelRequest
-/// with request_type="exit-status".
-///
-/// The exit code is encoded as a VarInt.
 pub async fn parse_exit_status(request_data: &[u8]) -> io::Result<u32> {
     let mut reader = request_data;
     let exit_status: VarInt = reader.decode_one().await?;
     Ok(exit_status.into_inner() as u32)
+}
+
+/// Parse exit-signal request_data: signal_name(SshString) + core_dumped(u8) +
+/// error_message(SshString) + language_tag(SshString).
+pub async fn parse_exit_signal(request_data: &[u8]) -> io::Result<(String, bool, String, String)> {
+    use tokio::io::AsyncReadExt;
+    let mut reader = request_data;
+    let signal_name = SshString::decode_from(&mut reader).await?;
+    let core_dumped_byte = AsyncReadExt::read_u8(&mut reader).await?;
+    let error_message = SshString::decode_from(&mut reader).await?;
+    let language_tag = SshString::decode_from(&mut reader).await?;
+    Ok((signal_name.0, core_dumped_byte != 0, error_message.0, language_tag.0))
 }
 
 /// Convert a decoded `SshMessage` into a `SessionEvent`.
@@ -222,8 +241,14 @@ pub async fn message_to_session_event(msg: SshMessage) -> io::Result<Option<Sess
                 let code = parse_exit_status(&request_data).await?;
                 Ok(Some(SessionEvent::ExitStatus(code)))
             } else if request_type == "exit-signal" {
-                // For now, treat exit-signal as exit code 255 (killed by signal).
-                Ok(Some(SessionEvent::ExitStatus(255)))
+                let (name, core_dumped, message, language) =
+                    parse_exit_signal(&request_data).await?;
+                Ok(Some(SessionEvent::ExitSignal {
+                    name,
+                    core_dumped,
+                    message,
+                    language,
+                }))
             } else {
                 Ok(None)
             }
@@ -233,6 +258,38 @@ pub async fn message_to_session_event(msg: SshMessage) -> io::Result<Option<Sess
         SshMessage::ChannelSuccess => Ok(Some(SessionEvent::Success)),
         SshMessage::ChannelFailure => Ok(Some(SessionEvent::Failure)),
         _ => Ok(None),
+    }
+}
+
+/// Legacy compatibility helper: convert a `SessionEvent::ExitSignal` into an
+/// `ExitStatus(128 + signal_number)` using standard POSIX signal numbering.
+///
+/// Returns the original event unchanged for non-signal events.
+/// Unrecognized signal names map to `ExitStatus(255)`.
+pub fn exit_signal_to_legacy_status(event: SessionEvent) -> SessionEvent {
+    match event {
+        SessionEvent::ExitSignal { ref name, .. } => {
+            let sig_num: u32 = match name.as_str() {
+                "HUP" => 1,
+                "INT" => 2,
+                "QUIT" => 3,
+                "ILL" => 4,
+                "TRAP" => 5,
+                "ABRT" | "IOT" => 6,
+                "BUS" => 7,
+                "FPE" => 8,
+                "KILL" => 9,
+                "USR1" => 10,
+                "SEGV" => 11,
+                "USR2" => 12,
+                "PIPE" => 13,
+                "ALRM" => 14,
+                "TERM" => 15,
+                _ => return SessionEvent::ExitStatus(255),
+            };
+            SessionEvent::ExitStatus(128 + sig_num)
+        }
+        other => other,
     }
 }
 
@@ -246,7 +303,7 @@ mod tests {
     use h3x::codec::DecodeFrom;
     use genmeta_ssh3_proto::message::SshMessage;
     use genmeta_ssh3_server::session::request::{
-        encode_exit_status, encode_exit_status_data, parse_exec_command,
+        encode_exit_status, encode_exit_status_data, encode_exit_signal_data, parse_exec_command,
     };
     use genmeta_ssh3_server::session::pty::{parse_pty_request, parse_window_change};
     use tokio::io::{duplex, AsyncReadExt};
@@ -684,5 +741,139 @@ mod tests {
 
         assert_eq!(stdout, b"stdout data");
         assert_eq!(stderr, b"stderr data");
+    }
+
+    // -------------------------------------------------------------------
+    // Test 19: exit-signal decodes to SessionEvent::ExitSignal
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn exit_signal_decodes_to_exit_signal_event() {
+        let request_data =
+            encode_exit_signal_data("TERM", false, "terminated", "en")
+                .await
+                .unwrap();
+        let msg = SshMessage::ChannelRequest {
+            request_type: "exit-signal".into(),
+            want_reply: false,
+            request_data,
+        };
+        let event = message_to_session_event(msg).await.unwrap();
+        assert_eq!(
+            event,
+            Some(SessionEvent::ExitSignal {
+                name: "TERM".into(),
+                core_dumped: false,
+                message: "terminated".into(),
+                language: "en".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_signal_with_core_dump() {
+        let request_data =
+            encode_exit_signal_data("SEGV", true, "segfault", "")
+                .await
+                .unwrap();
+        let msg = SshMessage::ChannelRequest {
+            request_type: "exit-signal".into(),
+            want_reply: false,
+            request_data,
+        };
+        let event = message_to_session_event(msg).await.unwrap();
+        assert_eq!(
+            event,
+            Some(SessionEvent::ExitSignal {
+                name: "SEGV".into(),
+                core_dumped: true,
+                message: "segfault".into(),
+                language: String::new(),
+            })
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Test 20: exit-status still decodes correctly (not regressed)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn exit_status_still_decodes_correctly() {
+        for code in [0u32, 1, 42, 127, 255] {
+            let request_data = encode_exit_status_data(code).await.unwrap();
+            let msg = SshMessage::ChannelRequest {
+                request_type: "exit-status".into(),
+                want_reply: false,
+                request_data,
+            };
+            let event = message_to_session_event(msg).await.unwrap();
+            assert_eq!(event, Some(SessionEvent::ExitStatus(code)));
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Test 21: compatibility helper maps signal to legacy status
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn compat_helper_maps_known_signals() {
+        let cases = [
+            ("HUP", 128 + 1),
+            ("INT", 128 + 2),
+            ("QUIT", 128 + 3),
+            ("ILL", 128 + 4),
+            ("TRAP", 128 + 5),
+            ("ABRT", 128 + 6),
+            ("BUS", 128 + 7),
+            ("FPE", 128 + 8),
+            ("KILL", 128 + 9),
+            ("USR1", 128 + 10),
+            ("SEGV", 128 + 11),
+            ("USR2", 128 + 12),
+            ("PIPE", 128 + 13),
+            ("ALRM", 128 + 14),
+            ("TERM", 128 + 15),
+        ];
+        for (sig, expected_code) in cases {
+            let event = SessionEvent::ExitSignal {
+                name: sig.into(),
+                core_dumped: false,
+                message: String::new(),
+                language: String::new(),
+            };
+            assert_eq!(
+                exit_signal_to_legacy_status(event),
+                SessionEvent::ExitStatus(expected_code),
+                "signal {sig} should map to exit code {expected_code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_helper_unknown_signal_maps_to_255() {
+        let event = SessionEvent::ExitSignal {
+            name: "UNKNOWN".into(),
+            core_dumped: false,
+            message: String::new(),
+            language: String::new(),
+        };
+        assert_eq!(
+            exit_signal_to_legacy_status(event),
+            SessionEvent::ExitStatus(255)
+        );
+    }
+
+    #[tokio::test]
+    async fn compat_helper_passes_through_non_signal_events() {
+        let events = vec![
+            SessionEvent::ExitStatus(42),
+            SessionEvent::Stdout(b"data".to_vec()),
+            SessionEvent::Eof,
+            SessionEvent::Close,
+        ];
+        for event in events {
+            let original = event.clone();
+            assert_eq!(exit_signal_to_legacy_status(event), original);
+        }
     }
 }
