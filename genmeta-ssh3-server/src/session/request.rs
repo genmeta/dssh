@@ -69,7 +69,9 @@ pub enum RequestAction {
     /// Launch an interactive shell.
     Shell,
     /// Allocate a PTY with the given parameters.
-    AllocatePty(PtyRequest),
+    /// The `bool` carries `want_reply` so the caller can send success/failure
+    /// AFTER allocation completes (not before).
+    AllocatePty(PtyRequest, bool),
     /// Resize the terminal window.
     WindowChange(WindowChangeRequest),
     /// Deliver a signal to the running process.
@@ -223,10 +225,9 @@ where
         }
         "pty-req" => {
             let req = parse_pty_request(request_data).await?;
-            if want_reply {
-                SshMessage::ChannelSuccess.encode_into(writer).await?;
-            }
-            Ok(Some(RequestAction::AllocatePty(req)))
+            // Reply is deferred to the caller — sent only after allocation
+            // succeeds or fails (see session_driver.rs / channel.rs).
+            Ok(Some(RequestAction::AllocatePty(req, want_reply)))
         }
         "window-change" => {
             let req = parse_window_change(request_data).await?;
@@ -512,7 +513,14 @@ where
                         }
                         "window-change" => {
                             if let Ok(req) = parse_window_change(&request_data).await {
-                                let _ = set_window_size(master_raw_fd, &req);
+                                if let Err(error) = set_window_size(master_raw_fd, &req) {
+                                    tracing::warn!(
+                                        error = %Report::from_error(&error),
+                                        width_cols = req.width_cols,
+                                        height_rows = req.height_rows,
+                                        "window-change resize failed, keeping current size"
+                                    );
+                                }
                             }
                         }
                         _ => {}
@@ -1522,5 +1530,88 @@ mod tests {
 
         assert!(saw_exit_signal, "expected exit-signal after non-PTY signal termination");
         assert!(!saw_exit_status, "non-PTY signal termination should not emit exit-status");
+    }
+
+    // -------------------------------------------------------------------
+    // Test 19: pty-req with want_reply=true sends NO premature reply
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_request_pty_req_no_premature_reply() {
+        let mut request_data = Vec::new();
+        SshString("xterm".into()).encode_into(&mut request_data).await.unwrap();
+        let zero = VarInt::try_from(80u64).unwrap();
+        request_data.encode_one(zero).await.unwrap();
+        let zero = VarInt::try_from(24u64).unwrap();
+        request_data.encode_one(zero).await.unwrap();
+        let zero = VarInt::from(0u8);
+        request_data.encode_one(zero).await.unwrap();
+        let zero = VarInt::from(0u8);
+        request_data.encode_one(zero).await.unwrap();
+        let modes_len = VarInt::from(0u8);
+        request_data.encode_one(modes_len).await.unwrap();
+
+        let event = ChannelEvent::Request {
+            request_type: "pty-req".into(),
+            want_reply: true,
+            request_data,
+        };
+
+        let (server_writer, mut client_reader) = duplex(8192);
+        let mut server_writer = server_writer;
+
+        let result = handle_request(&event, &mut server_writer).await.unwrap();
+        assert!(
+            matches!(result, Some(RequestAction::AllocatePty(_, true))),
+            "expected AllocatePty with want_reply=true, got {result:?}"
+        );
+
+        drop(server_writer);
+
+        let read_result = SshMessage::decode_from(&mut client_reader).await;
+        assert!(
+            read_result.is_err(),
+            "pty-req must NOT send premature ChannelSuccess; reply is deferred to caller"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Test 20: pty-req returns want_reply=true in AllocatePty
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_request_pty_req_returns_want_reply() {
+        let mut request_data = Vec::new();
+        SshString("vt100".into()).encode_into(&mut request_data).await.unwrap();
+        for &val in &[80u64, 24, 0, 0, 0] {
+            let v = VarInt::try_from(val).unwrap();
+            request_data.encode_one(v).await.unwrap();
+        }
+
+        let event_true = ChannelEvent::Request {
+            request_type: "pty-req".into(),
+            want_reply: true,
+            request_data: request_data.clone(),
+        };
+        let event_false = ChannelEvent::Request {
+            request_type: "pty-req".into(),
+            want_reply: false,
+            request_data,
+        };
+
+        let (mut w1, _r1) = duplex(8192);
+        let (mut w2, _r2) = duplex(8192);
+
+        let result_true = handle_request(&event_true, &mut w1).await.unwrap();
+        let result_false = handle_request(&event_false, &mut w2).await.unwrap();
+
+        match result_true {
+            Some(RequestAction::AllocatePty(_, wr)) => assert!(wr, "want_reply should be true"),
+            other => panic!("expected AllocatePty, got {other:?}"),
+        }
+        match result_false {
+            Some(RequestAction::AllocatePty(_, wr)) => assert!(!wr, "want_reply should be false"),
+            other => panic!("expected AllocatePty, got {other:?}"),
+        }
     }
 }

@@ -239,18 +239,37 @@ impl Ssh3Session {
                             .map_err(SessionError::new)?;
                         return Ok(());
                     }
-                    Some(RequestAction::AllocatePty(req)) => match allocate_pty(&req) {
+                    Some(RequestAction::AllocatePty(req, want_reply)) => match allocate_pty(&req) {
                         Ok(pair) => {
                             pty_pair = Some(pair);
                             tracing::info!(term = %req.term_type, "PTY allocated");
+                            if want_reply {
+                                SshMessage::ChannelSuccess
+                                    .encode_into(&mut writer)
+                                    .await
+                                    .map_err(SessionError::new)?;
+                            }
                         }
                         Err(error) => {
-                            tracing::error!(error = %Report::from_error(error), "PTY allocation failed");
+                            tracing::warn!(error = %Report::from_error(&error), "PTY allocation failed");
+                            if want_reply {
+                                SshMessage::ChannelFailure
+                                    .encode_into(&mut writer)
+                                    .await
+                                    .map_err(SessionError::new)?;
+                            }
                         }
                     },
                     Some(RequestAction::WindowChange(req)) => {
                         if let Some(ref pair) = pty_pair {
-                            let _ = set_window_size(pair.master.as_raw_fd(), &req);
+                            if let Err(error) = set_window_size(pair.master.as_raw_fd(), &req) {
+                                tracing::warn!(
+                                    error = %Report::from_error(&error),
+                                    width_cols = req.width_cols,
+                                    height_rows = req.height_rows,
+                                    "window-change resize failed, keeping current size"
+                                );
+                            }
                         }
                     }
                     Some(RequestAction::Signal(_)) => {

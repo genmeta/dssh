@@ -472,21 +472,33 @@ where
                         run_shell(shell.as_os_str(), &mut writer, event_rx, pty_pair.take()).await?;
                         return Ok(());
                     }
-                    Some(RequestAction::AllocatePty(req)) => {
+                    Some(RequestAction::AllocatePty(req, want_reply)) => {
                         match allocate_pty(&req) {
                             Ok(pair) => {
                                 pty_pair = Some(pair);
                                 tracing::info!(term = %req.term_type, "PTY allocated");
+                                if want_reply {
+                                    SshMessage::ChannelSuccess.encode_into(&mut writer).await?;
+                                }
                             }
                             Err(e) => {
-                                tracing::error!(%e, "PTY allocation failed");
-                                // PTY failure is non-fatal — exec/shell will use piped stdio
+                                tracing::warn!(%e, "PTY allocation failed");
+                                if want_reply {
+                                    SshMessage::ChannelFailure.encode_into(&mut writer).await?;
+                                }
                             }
                         }
                     }
                     Some(RequestAction::WindowChange(req)) => {
                         if let Some(ref pair) = pty_pair {
-                            let _ = set_window_size(pair.master.as_raw_fd(), &req);
+                            if let Err(error) = set_window_size(pair.master.as_raw_fd(), &req) {
+                                tracing::warn!(
+                                    error = %Report::from_error(&error),
+                                    width_cols = req.width_cols,
+                                    height_rows = req.height_rows,
+                                    "window-change resize failed, keeping current size"
+                                );
+                            }
                         }
                     }
                     Some(RequestAction::Signal(_)) => {

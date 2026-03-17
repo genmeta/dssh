@@ -135,6 +135,95 @@ pub async fn parse_signal(request_data: &[u8]) -> io::Result<SignalRequest> {
 }
 
 // ---------------------------------------------------------------------------
+// Checked u32→u16 dimension conversion
+// ---------------------------------------------------------------------------
+
+/// Error returned when an RFC `uint32` dimension value exceeds `u16::MAX`
+/// and cannot be used for the ioctl `winsize` struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DimensionOverflow {
+    /// Name of the overflowing field (e.g., "width_cols").
+    pub field: &'static str,
+    /// The value that overflowed.
+    pub value: u32,
+}
+
+impl std::fmt::Display for DimensionOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PTY dimension overflow: {} = {} exceeds u16::MAX ({})",
+            self.field,
+            self.value,
+            u16::MAX,
+        )
+    }
+}
+
+impl std::error::Error for DimensionOverflow {}
+
+/// Attempt checked conversion of all four PTY dimension fields from `u32` to `u16`.
+///
+/// Returns `Ok(winsize)` if all values fit, or `Err(DimensionOverflow)` identifying
+/// the first field that overflows.
+pub fn checked_winsize(
+    width_cols: u32,
+    height_rows: u32,
+    width_px: u32,
+    height_px: u32,
+) -> Result<libc::winsize, DimensionOverflow> {
+    let ws_col = u16::try_from(width_cols).map_err(|_| DimensionOverflow {
+        field: "width_cols",
+        value: width_cols,
+    })?;
+    let ws_row = u16::try_from(height_rows).map_err(|_| DimensionOverflow {
+        field: "height_rows",
+        value: height_rows,
+    })?;
+    let ws_xpixel = u16::try_from(width_px).map_err(|_| DimensionOverflow {
+        field: "width_px",
+        value: width_px,
+    })?;
+    let ws_ypixel = u16::try_from(height_px).map_err(|_| DimensionOverflow {
+        field: "height_px",
+        value: height_px,
+    })?;
+
+    Ok(libc::winsize {
+        ws_row,
+        ws_col,
+        ws_xpixel,
+        ws_ypixel,
+    })
+}
+
+/// Validate that a [`PtyRequest`]'s dimensions fit in `u16`.
+///
+/// Returns `Ok(winsize)` or `Err(DimensionOverflow)`.
+pub fn validate_pty_dimensions(request: &PtyRequest) -> Result<libc::winsize, DimensionOverflow> {
+    checked_winsize(
+        request.width_cols,
+        request.height_rows,
+        request.width_px,
+        request.height_px,
+    )
+}
+
+/// Validate that a [`WindowChangeRequest`]'s dimensions fit in `u16`.
+///
+/// Returns `Ok(winsize)` or `Err(DimensionOverflow)`.
+pub fn validate_window_change_dimensions(
+    request: &WindowChangeRequest,
+) -> Result<libc::winsize, DimensionOverflow> {
+    checked_winsize(
+        request.width_cols,
+        request.height_rows,
+        request.width_px,
+        request.height_px,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // PTY allocation and terminal size
 // ---------------------------------------------------------------------------
 
@@ -142,12 +231,18 @@ pub async fn parse_signal(request_data: &[u8]) -> io::Result<SignalRequest> {
 ///
 /// Uses `nix::pty::openpty` to create the master/slave pair, then sets the
 /// terminal size via ioctl `TIOCSWINSZ`.
+///
+/// Returns `Err` if any dimension overflows `u16` (no silent truncation) or
+/// if the underlying `openpty` call fails.
 pub fn allocate_pty(request: &PtyRequest) -> io::Result<PtyPair> {
+    let ws = validate_pty_dimensions(request).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidInput, e)
+    })?;
     let winsize = Winsize {
-        ws_row: request.height_rows as u16,
-        ws_col: request.width_cols as u16,
-        ws_xpixel: request.width_px as u16,
-        ws_ypixel: request.height_px as u16,
+        ws_row: ws.ws_row,
+        ws_col: ws.ws_col,
+        ws_xpixel: ws.ws_xpixel,
+        ws_ypixel: ws.ws_ypixel,
     };
 
     let pty_result = openpty(Some(&winsize), None)
@@ -160,13 +255,13 @@ pub fn allocate_pty(request: &PtyRequest) -> io::Result<PtyPair> {
 }
 
 /// Update the terminal size of an existing PTY via ioctl `TIOCSWINSZ`.
+///
+/// Returns `Err` if any dimension overflows `u16` (no silent truncation) or
+/// if the ioctl fails.
 pub fn set_window_size(master_fd: RawFd, request: &WindowChangeRequest) -> io::Result<()> {
-    let winsize = libc::winsize {
-        ws_row: request.height_rows as u16,
-        ws_col: request.width_cols as u16,
-        ws_xpixel: request.width_px as u16,
-        ws_ypixel: request.height_px as u16,
-    };
+    let winsize = validate_window_change_dimensions(request).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidInput, e)
+    })?;
 
     let ret = unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &winsize as *const _) };
     if ret < 0 {
@@ -452,5 +547,93 @@ mod tests {
         assert_eq!(ws.ws_row, 43);
         assert_eq!(ws.ws_xpixel, 1056);
         assert_eq!(ws.ws_ypixel, 688);
+    }
+
+    // -------------------------------------------------------------------
+    // checked_winsize overflow tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn checked_winsize_overflow_width_cols() {
+        let result = checked_winsize(u16::MAX as u32 + 1, 24, 0, 0);
+        let err = result.unwrap_err();
+        assert_eq!(err.field, "width_cols");
+        assert_eq!(err.value, u16::MAX as u32 + 1);
+    }
+
+    #[test]
+    fn checked_winsize_overflow_height_rows() {
+        let result = checked_winsize(80, u16::MAX as u32 + 1, 0, 0);
+        let err = result.unwrap_err();
+        assert_eq!(err.field, "height_rows");
+        assert_eq!(err.value, u16::MAX as u32 + 1);
+    }
+
+    #[test]
+    fn checked_winsize_overflow_pixel_width() {
+        let result = checked_winsize(80, 24, u16::MAX as u32 + 1, 0);
+        let err = result.unwrap_err();
+        assert_eq!(err.field, "width_px");
+        assert_eq!(err.value, u16::MAX as u32 + 1);
+    }
+
+    #[test]
+    fn checked_winsize_overflow_pixel_height() {
+        let result = checked_winsize(80, 24, 0, u16::MAX as u32 + 1);
+        let err = result.unwrap_err();
+        assert_eq!(err.field, "height_px");
+        assert_eq!(err.value, u16::MAX as u32 + 1);
+    }
+
+    #[test]
+    fn checked_winsize_all_in_range() {
+        let ws = checked_winsize(
+            u16::MAX as u32,
+            u16::MAX as u32,
+            u16::MAX as u32,
+            u16::MAX as u32,
+        ).unwrap();
+        assert_eq!(ws.ws_col, u16::MAX);
+        assert_eq!(ws.ws_row, u16::MAX);
+        assert_eq!(ws.ws_xpixel, u16::MAX);
+        assert_eq!(ws.ws_ypixel, u16::MAX);
+    }
+
+    #[test]
+    fn allocate_pty_rejects_overflow() {
+        let request = PtyRequest {
+            term_type: "xterm".into(),
+            width_cols: u16::MAX as u32 + 1,
+            height_rows: 24,
+            width_px: 0,
+            height_px: 0,
+            terminal_modes: vec![],
+        };
+        let err = allocate_pty(&request).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("width_cols"));
+    }
+
+    #[test]
+    fn set_window_size_rejects_overflow() {
+        let pty_req = PtyRequest {
+            term_type: "xterm".into(),
+            width_cols: 80,
+            height_rows: 24,
+            width_px: 0,
+            height_px: 0,
+            terminal_modes: vec![],
+        };
+        let pair = allocate_pty(&pty_req).unwrap();
+
+        let resize = WindowChangeRequest {
+            width_cols: 80,
+            height_rows: u16::MAX as u32 + 1,
+            width_px: 0,
+            height_px: 0,
+        };
+        let err = set_window_size(pair.master.as_raw_fd(), &resize).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("height_rows"));
     }
 }
