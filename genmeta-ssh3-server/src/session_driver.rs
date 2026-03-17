@@ -6,6 +6,8 @@
 //! loop (PTY, shell, exec) over byte-channel adapters bridging remoc channels
 //! to `AsyncRead`/`AsyncWrite`.
 
+#[cfg(not(test))]
+use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
@@ -24,33 +26,82 @@ use crate::forward::streamlocal::ReverseStreamlocalForwarder;
 use crate::session::pty::{allocate_pty, set_window_size, PtyPair};
 use crate::session::request::{handle_request, run_exec, run_shell, RequestAction};
 
-/// Drop root privileges by switching to the given uid/gid.
-///
-/// **Order matters:** `setgid` must be called before `setuid`, because once
-/// we drop root via `setuid` we can no longer change the group.
-#[cfg(not(test))]
-fn drop_privileges(uid: u32, gid: u32) -> Result<(), SessionError> {
-    unsafe {
-        if libc::setgid(gid) != 0 {
-            return Err(SessionError::new(format!(
-                "setgid({gid}) failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        if libc::setuid(uid) != 0 {
-            return Err(SessionError::new(format!(
-                "setuid({uid}) failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-    }
-    tracing::info!(uid, gid, "dropped privileges");
-    Ok(())
+trait PrivilegeTransitionOps {
+    fn init_groups(&self, username: &str, gid: u32) -> Result<(), SessionError>;
+    fn set_primary_gid(&self, gid: u32) -> Result<(), SessionError>;
+    fn set_uid(&self, uid: u32) -> Result<(), SessionError>;
 }
 
-/// No-op privilege drop for tests (requires root on real systems).
-#[cfg(test)]
-fn drop_privileges(_uid: u32, _gid: u32) -> Result<(), SessionError> {
+struct RealPrivilegeTransitionOps;
+
+impl PrivilegeTransitionOps for RealPrivilegeTransitionOps {
+    #[cfg(not(test))]
+    fn init_groups(&self, username: &str, gid: u32) -> Result<(), SessionError> {
+        let username = CString::new(username)
+            .map_err(|error| SessionError::new(format!("invalid username for initgroups: {error}")))?;
+        let result = unsafe { libc::initgroups(username.as_ptr(), gid) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(SessionError::new(format!(
+                "initgroups({username:?}, {gid}) failed: {}",
+                std::io::Error::last_os_error()
+            )))
+        }
+    }
+
+    #[cfg(test)]
+    fn init_groups(&self, _username: &str, _gid: u32) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn set_primary_gid(&self, gid: u32) -> Result<(), SessionError> {
+        let result = unsafe { libc::setgid(gid) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(SessionError::new(format!(
+                "setgid({gid}) failed: {}",
+                std::io::Error::last_os_error()
+            )))
+        }
+    }
+
+    #[cfg(test)]
+    fn set_primary_gid(&self, _gid: u32) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn set_uid(&self, uid: u32) -> Result<(), SessionError> {
+        let result = unsafe { libc::setuid(uid) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(SessionError::new(format!(
+                "setuid({uid}) failed: {}",
+                std::io::Error::last_os_error()
+            )))
+        }
+    }
+
+    #[cfg(test)]
+    fn set_uid(&self, _uid: u32) -> Result<(), SessionError> {
+        Ok(())
+    }
+}
+
+fn apply_privilege_transition(
+    username: &str,
+    uid: u32,
+    gid: u32,
+    ops: &impl PrivilegeTransitionOps,
+) -> Result<(), SessionError> {
+    ops.init_groups(username, gid)?;
+    ops.set_primary_gid(gid)?;
+    ops.set_uid(uid)?;
+    tracing::info!(uid, gid, username, "dropped privileges");
     Ok(())
 }
 
@@ -82,7 +133,11 @@ impl Ssh3Session {
     /// 1. Drops privileges to the authenticated user.
     /// 3. Enters the channel-accept loop, dispatching session and non-session channels.
     pub async fn run(self) -> Result<(), SessionError> {
-        drop_privileges(self.init.uid, self.init.gid)?;
+        self.run_with_privilege_ops(&RealPrivilegeTransitionOps).await
+    }
+
+    async fn run_with_privilege_ops(self, ops: &impl PrivilegeTransitionOps) -> Result<(), SessionError> {
+        apply_privilege_transition(&self.init.username, self.init.uid, self.init.gid, ops)?;
 
         let mut channel_tasks = JoinSet::new();
         let transport = self.transport.clone();
@@ -101,6 +156,16 @@ impl Ssh3Session {
                 tracing::warn!(error = %Report::from_error(error), "channel task panicked");
             }
         }
+
+        self.global_requests
+            .tcp_forwarder
+            .cleanup_for_owner(self.init.conversation_id)
+            .await;
+        self.global_requests
+            .streamlocal_forwarder
+            .cleanup_for_owner(self.init.conversation_id)
+            .await;
+
         Ok(())
     }
 
@@ -252,6 +317,8 @@ mod tests {
     use genmeta_ssh3_proto::session::TransportError;
     use h3x::codec::DecodeFrom;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
     use crate::channel::DEFAULT_MAX_MESSAGE_SIZE;
 
     struct MockSsh3Transport;
@@ -339,6 +406,88 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MockPrivilegeTransitionOps {
+        fail_on_init_groups: bool,
+        fail_on_setgid: bool,
+        fail_on_setuid: bool,
+        steps: StdArc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl PrivilegeTransitionOps for MockPrivilegeTransitionOps {
+        fn init_groups(&self, _username: &str, _gid: u32) -> Result<(), SessionError> {
+            self.steps.lock().unwrap().push("initgroups");
+            if self.fail_on_init_groups {
+                Err(SessionError::new("initgroups failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn set_primary_gid(&self, _gid: u32) -> Result<(), SessionError> {
+            self.steps.lock().unwrap().push("setgid");
+            if self.fail_on_setgid {
+                Err(SessionError::new("setgid failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn set_uid(&self, _uid: u32) -> Result<(), SessionError> {
+            self.steps.lock().unwrap().push("setuid");
+            if self.fail_on_setuid {
+                Err(SessionError::new("setuid failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct TrackingTransport {
+        accept_called: AtomicBool,
+    }
+
+    impl genmeta_ssh3_proto::session::Ssh3Transport for TrackingTransport {
+        async fn accept_channel(&self) -> Result<
+            Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+            TransportError,
+        > {
+            self.accept_called.store(true, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        async fn open_channel(
+            &self,
+            _header: Option<ChannelHeader>,
+        ) -> Result<
+            (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            TransportError,
+        > {
+            Err(TransportError::Other("mock: open_channel not available".into()))
+        }
+    }
+
+    fn tracking_transport_client(flag: StdArc<AtomicBool>) -> Ssh3TransportClient {
+        use genmeta_ssh3_proto::session::Ssh3TransportServerShared;
+        use remoc::rtc::ServerShared;
+        let transport = std::sync::Arc::new(TrackingTransport {
+            accept_called: AtomicBool::new(flag.load(Ordering::SeqCst)),
+        });
+        let transport_ref = transport.clone();
+        let (server, client) = Ssh3TransportServerShared::new(transport, 16);
+        tokio::spawn(async move { let _ = server.serve(true).await; });
+        tokio::spawn(async move {
+            loop {
+                if transport_ref.accept_called.load(Ordering::SeqCst) {
+                    flag.store(true, Ordering::SeqCst);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        client
+    }
+
     #[tokio::test]
     async fn run_session_happy_path() {
         let transport = mock_transport_client();
@@ -346,6 +495,37 @@ mod tests {
         // Transport returns Ok(None) immediately, so run() completes.
         let result = session.run().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn privilege_transition_uses_strict_order() {
+        let ops = MockPrivilegeTransitionOps::default();
+
+        apply_privilege_transition("alice", 1000, 1000, &ops).unwrap();
+
+        let steps = ops.steps.lock().unwrap().clone();
+        assert_eq!(steps, vec!["initgroups", "setgid", "setuid"]);
+    }
+
+    #[tokio::test]
+    async fn privilege_transition_failure_aborts_session_startup() {
+        let accept_called = StdArc::new(AtomicBool::new(false));
+        let session = Ssh3Session::new(tracking_transport_client(accept_called.clone()), sample_init());
+        let ops = MockPrivilegeTransitionOps {
+            fail_on_setgid: true,
+            ..Default::default()
+        };
+
+        let result = session.run_with_privilege_ops(&ops).await;
+
+        assert!(result.is_err(), "privilege failure should abort startup");
+        assert!(
+            !accept_called.load(Ordering::SeqCst),
+            "accept_channel must not be reached after partial privilege transition failure"
+        );
+
+        let steps = ops.steps.lock().unwrap().clone();
+        assert_eq!(steps, vec!["initgroups", "setgid"]);
     }
 
     #[tokio::test]
@@ -374,6 +554,72 @@ mod tests {
 
     fn sample_session() -> Ssh3Session {
         Ssh3Session::new(mock_transport_client(), sample_init())
+    }
+
+    async fn assert_tcp_port_eventually_closes(port: u16, context: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{context}"));
+    }
+
+    #[tokio::test]
+    async fn session_run_cleans_up_owned_forwarders_on_exit() {
+        let session = sample_session();
+        let owner = session.init.conversation_id;
+
+        let tcp_port = session
+            .global_requests
+            .tcp_forwarder
+            .start_listening(
+                "127.0.0.1",
+                0,
+                session.global_requests.transport.clone(),
+                owner,
+            )
+            .await
+            .unwrap();
+
+        let socket_path = format!(
+            "/tmp/test-ssh3-session-cleanup-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        session
+            .global_requests
+            .streamlocal_forwarder
+            .start_listening(
+                &socket_path,
+                session.global_requests.transport.clone(),
+                owner,
+            )
+            .await
+            .unwrap();
+
+        session.run().await.unwrap();
+
+        assert!(
+            !std::path::Path::new(&socket_path).exists(),
+            "owned streamlocal socket should be removed when session exits"
+        );
+
+        assert_tcp_port_eventually_closes(
+            tcp_port,
+            "owned TCP listener should be closed within timeout when session exits",
+        )
+        .await;
     }
 
     // -----------------------------------------------------------------------
