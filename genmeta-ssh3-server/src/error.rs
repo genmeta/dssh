@@ -45,8 +45,8 @@ pub enum ServerError {
     #[snafu(display("ssh3-session binary not found at {path}"))]
     MissingSessionBinary { path: String },
 
-    #[snafu(display("failed to send bootstrap to child: {message}"))]
-    SendBootstrap { message: String },
+    #[snafu(display("failed to send bootstrap to child"))]
+    SendBootstrap,
 
     #[snafu(display("failed to construct WWW-Authenticate header value '{value}'"))]
     InvalidAuthenticateHeader {

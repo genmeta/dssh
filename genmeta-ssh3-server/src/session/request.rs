@@ -77,10 +77,10 @@ pub struct ExitSignalRequest {
 
 #[derive(Debug, Snafu)]
 pub enum RequestCodecError {
-    #[snafu(display("request codec I/O error: {source}"), context(false))]
+    #[snafu(display("request codec I/O error"), context(false))]
     Io { source: io::Error },
 
-    #[snafu(display("request codec VarInt conversion error: {source}"))]
+    #[snafu(display("request codec VarInt conversion error"))]
     VarIntConversion { source: h3x::varint::err::Overflow },
 }
 

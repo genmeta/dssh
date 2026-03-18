@@ -77,11 +77,11 @@ pub struct PtyPair {
 #[derive(Debug, Snafu)]
 pub enum PtyCodecError {
     /// An I/O error occurred during encoding or decoding.
-    #[snafu(display("PTY codec I/O error: {source}"), context(false))]
+    #[snafu(display("PTY codec I/O error"), context(false))]
     Io { source: io::Error },
 
     /// A VarInt value could not be converted for encoding.
-    #[snafu(display("PTY codec VarInt conversion error: {source}"))]
+    #[snafu(display("PTY codec VarInt conversion error"))]
     VarIntConversion { source: h3x::varint::err::Overflow },
 }
 
@@ -341,7 +341,7 @@ pub enum PtyError {
     Dimension { source: DimensionOverflow },
 
     /// An OS-level error from `openpty` or `ioctl`.
-    #[snafu(display("PTY OS error: {source}"))]
+    #[snafu(display("PTY OS error"))]
     Os { source: nix::Error },
 }
 
