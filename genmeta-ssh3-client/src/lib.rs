@@ -23,17 +23,41 @@ pub const SSH3_CONNECT_PATH: &str = "/.well-known/ssh3/connect";
 /// Errors that can occur during SSH3 client operations.
 #[derive(Debug, Snafu)]
 pub enum ClientError {
+    /// The authority string could not be parsed.
+    #[snafu(display("invalid authority"))]
+    InvalidAuthority { source: http::uri::InvalidUri },
+
+    /// QUIC-level connection establishment failed.
+    #[snafu(display("failed to establish QUIC connection"))]
+    QuicConnectFailed,
+
+    /// The constructed URI is invalid.
+    #[snafu(display("invalid URI"))]
+    InvalidUri { source: http::uri::InvalidUri },
+
+    /// Building the HTTP request failed.
+    #[snafu(display("failed to build request"))]
+    RequestBuildFailed { source: http::Error },
+
     /// The Extended CONNECT request could not be sent.
-    #[snafu(display("{message}"))]
-    ConnectFailed { message: String },
+    #[snafu(display("extended CONNECT request failed"))]
+    ConnectRequestFailed,
 
     /// The server rejected authentication (HTTP 401).
     #[snafu(display("authentication failed"))]
     AuthenticationFailed,
 
-    /// The server returned an unexpected status code or missing headers.
-    #[snafu(display("{message}"))]
-    ProtocolError { message: String },
+    /// The server returned an unexpected status code.
+    #[snafu(display("unexpected status code: {status}"))]
+    UnexpectedStatus { status: StatusCode },
+
+    /// The response is missing the `ssh-version` header.
+    #[snafu(display("missing ssh-version response header"))]
+    MissingSshVersionHeader,
+
+    /// The `ssh-version` response header value is not valid ASCII.
+    #[snafu(display("invalid ssh-version response header value"))]
+    InvalidSshVersionHeader { source: http::header::ToStrError },
 
     /// The server's ssh-version response did not match any supported version.
     #[snafu(display("server offered unsupported version {server_version}"))]
@@ -100,23 +124,17 @@ impl Ssh3Client {
             .config
             .authority
             .parse()
-            .map_err(|_| ClientError::ConnectFailed {
-                message: "invalid authority".into(),
-            })?;
+            .map_err(|e| ClientError::InvalidAuthority { source: e })?;
 
         let connection = client
             .connect(authority.clone())
             .await
-            .map_err(|_| ClientError::ConnectFailed {
-                message: "failed to establish QUIC connection".into(),
-            })?;
+            .map_err(|_| ClientError::QuicConnectFailed)?;
 
         let uri: http::Uri =
             format!("https://{authority}{SSH3_CONNECT_PATH}")
                 .parse()
-                .map_err(|_| ClientError::ConnectFailed {
-                    message: "invalid URI".into(),
-                })?;
+                .map_err(|e| ClientError::InvalidUri { source: e })?;
 
         let request = http::Request::builder()
             .method(Method::CONNECT)
@@ -125,16 +143,12 @@ impl Ssh3Client {
             .header(http::header::AUTHORIZATION, self.basic_auth_header())
             .extension(Protocol::new("ssh3"))
             .body(Empty::<Bytes>::new())
-            .map_err(|_| ClientError::ConnectFailed {
-                message: "failed to build request".into(),
-            })?;
+            .map_err(|e| ClientError::RequestBuildFailed { source: e })?;
 
         let response = connection
             .execute_hyper_request(request)
             .await
-            .map_err(|_| ClientError::ConnectFailed {
-                message: "extended CONNECT request failed".into(),
-            })?;
+            .map_err(|_| ClientError::ConnectRequestFailed)?;
 
         // Check response status.
         let status = response.status();
@@ -142,22 +156,16 @@ impl Ssh3Client {
             return Err(ClientError::AuthenticationFailed);
         }
         if status != StatusCode::OK {
-            return Err(ClientError::ProtocolError {
-                message: format!("unexpected status code: {status}"),
-            });
+            return Err(ClientError::UnexpectedStatus { status });
         }
 
         // Validate ssh-version response header.
         let server_version = response
             .headers()
             .get("ssh-version")
-            .ok_or_else(|| ClientError::ProtocolError {
-                message: "missing ssh-version response header".into(),
-            })?
+            .ok_or(ClientError::MissingSshVersionHeader)?
             .to_str()
-            .map_err(|_| ClientError::ProtocolError {
-                message: "invalid ssh-version response header value".into(),
-            })?
+            .map_err(|e| ClientError::InvalidSshVersionHeader { source: e })?
             .to_owned();
 
         if server_version != SSH_VERSION {
@@ -341,15 +349,17 @@ mod tests {
         let err = ClientError::AuthenticationFailed;
         assert_eq!(err.to_string(), "authentication failed");
 
-        let err = ClientError::ConnectFailed {
-            message: "timeout".into(),
-        };
-        assert_eq!(err.to_string(), "timeout");
+        let err = ClientError::QuicConnectFailed;
+        assert_eq!(err.to_string(), "failed to establish QUIC connection");
 
-        let err = ClientError::ProtocolError {
-            message: "bad status".into(),
+        let err = ClientError::UnexpectedStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
         };
-        assert_eq!(err.to_string(), "bad status");
+        assert!(err.to_string().contains("unexpected status code"));
+        assert!(err.to_string().contains("500"));
+
+        let err = ClientError::MissingSshVersionHeader;
+        assert_eq!(err.to_string(), "missing ssh-version response header");
 
         let err = ClientError::VersionMismatch {
             server_version: "unknown-99".into(),

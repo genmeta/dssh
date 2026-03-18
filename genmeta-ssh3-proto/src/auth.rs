@@ -39,33 +39,27 @@ pub enum AuthScheme {
 pub fn parse_authorization_header(header_value: &str) -> Result<AuthCredential, Ssh3Error> {
     let (scheme, credentials) = header_value
         .split_once(' ')
-        .ok_or_else(|| Ssh3Error::Auth {
-            message: "missing scheme/credentials separator".into(),
-        })?;
+        .ok_or(Ssh3Error::MissingSchemeSeparator)?;
 
     if !scheme.eq_ignore_ascii_case("Basic") {
-        return Err(Ssh3Error::Auth {
-            message: format!("unsupported auth scheme: {scheme}"),
+        return Err(Ssh3Error::UnsupportedAuthScheme {
+            scheme: scheme.to_owned(),
         });
     }
 
     if credentials.is_empty() {
-        return Err(Ssh3Error::Auth {
-            message: "empty credentials".into(),
-        });
+        return Err(Ssh3Error::EmptyCredentials);
     }
 
-    let decoded_bytes = STANDARD.decode(credentials).map_err(|_| Ssh3Error::Auth {
-        message: "invalid base64 credentials".into(),
-    })?;
+    let decoded_bytes = STANDARD
+        .decode(credentials)
+        .map_err(|_| Ssh3Error::InvalidBase64Credentials)?;
 
-    let decoded = String::from_utf8(decoded_bytes).map_err(|_| Ssh3Error::Auth {
-        message: "credentials are not valid UTF-8".into(),
-    })?;
+    let decoded = String::from_utf8(decoded_bytes).map_err(|_| Ssh3Error::CredentialsNotUtf8)?;
 
-    let (username, password) = decoded.split_once(':').ok_or_else(|| Ssh3Error::Auth {
-        message: "missing ':' separator in decoded credentials".into(),
-    })?;
+    let (username, password) = decoded
+        .split_once(':')
+        .ok_or(Ssh3Error::MissingCredentialSeparator)?;
 
     Ok(AuthCredential::Basic {
         username: username.to_owned(),

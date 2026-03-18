@@ -4,26 +4,72 @@ use snafu::Snafu;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module)]
 pub enum Ssh3Error {
-    /// Codec-level errors (varint too large, buffer underflow, invalid encoding)
-    #[snafu(display("{message}"))]
-    Codec { message: String },
+    // ── Codec variants ──────────────────────────────────────────────────
+    /// Varint exceeds maximum allowed size.
+    #[snafu(display("varint too large"))]
+    VarintTooLarge,
 
-    /// Protocol-level errors (unknown channel type, unexpected message, version mismatch)
-    #[snafu(display("{message}"))]
-    Protocol { message: String },
+    // ── Protocol variants ───────────────────────────────────────────────
+    /// The `ssh-version` request header is absent.
+    #[snafu(display("missing ssh-version header"))]
+    MissingSshVersionHeader,
 
-    /// Authentication errors (invalid credentials, PAM failure, unsupported scheme)
-    #[snafu(display("{message}"))]
-    Auth { message: String },
+    /// The `ssh-version` header value is not valid ASCII / HTTP header text.
+    #[snafu(display("invalid ssh-version header value"))]
+    InvalidSshVersionHeaderValue,
 
-    /// Channel errors (channel closed, EOF, request failed)
-    #[snafu(display("{message}"))]
-    Channel { message: String },
+    /// The `ssh-version` header is present but empty.
+    #[snafu(display("empty ssh-version header"))]
+    EmptySshVersionHeader,
 
-    /// Session errors (exec failed, pty allocation failed, forwarding failed)
-    #[snafu(display("{message}"))]
-    Session { message: String },
+    /// None of the client-offered versions are supported by the server.
+    #[snafu(display("no supported ssh-version found in client offer: {offered:?}"))]
+    UnsupportedSshVersion { offered: String },
 
+    /// Received an unknown channel type.
+    #[snafu(display("unknown channel type"))]
+    UnknownChannelType,
+
+    // ── Auth variants ───────────────────────────────────────────────────
+    /// Authorization header missing the scheme/credentials separator (space).
+    #[snafu(display("missing scheme/credentials separator"))]
+    MissingSchemeSeparator,
+
+    /// The auth scheme is not supported (only Basic is accepted).
+    #[snafu(display("unsupported auth scheme: {scheme}"))]
+    UnsupportedAuthScheme { scheme: String },
+
+    /// Credentials portion of the Authorization header is empty.
+    #[snafu(display("empty credentials"))]
+    EmptyCredentials,
+
+    /// Base64 decoding of the credentials failed.
+    #[snafu(display("invalid base64 credentials"))]
+    InvalidBase64Credentials,
+
+    /// Decoded credentials are not valid UTF-8.
+    #[snafu(display("credentials are not valid UTF-8"))]
+    CredentialsNotUtf8,
+
+    /// Decoded credentials lack the `':'` separator between username and password.
+    #[snafu(display("missing ':' separator in decoded credentials"))]
+    MissingCredentialSeparator,
+
+    /// Generic invalid credentials (e.g. wrong username/password).
+    #[snafu(display("invalid credentials"))]
+    InvalidCredentials,
+
+    // ── Channel variants ────────────────────────────────────────────────
+    /// The channel has been closed.
+    #[snafu(display("channel closed"))]
+    ChannelClosed,
+
+    // ── Session variants ────────────────────────────────────────────────
+    /// Remote command execution failed.
+    #[snafu(display("exec failed"))]
+    ExecFailed,
+
+    // ── IO variant ──────────────────────────────────────────────────────
     /// IO errors
     #[snafu(display("I/O error"))]
     Io { source: std::io::Error },
@@ -35,41 +81,31 @@ mod tests {
 
     #[test]
     fn test_codec_error_display() {
-        let err = Ssh3Error::Codec {
-            message: "varint too large".into(),
-        };
+        let err = Ssh3Error::VarintTooLarge;
         assert_eq!(err.to_string(), "varint too large");
     }
 
     #[test]
     fn test_protocol_error_display() {
-        let err = Ssh3Error::Protocol {
-            message: "unknown channel type".into(),
-        };
+        let err = Ssh3Error::UnknownChannelType;
         assert_eq!(err.to_string(), "unknown channel type");
     }
 
     #[test]
     fn test_auth_error_display() {
-        let err = Ssh3Error::Auth {
-            message: "invalid credentials".into(),
-        };
+        let err = Ssh3Error::InvalidCredentials;
         assert_eq!(err.to_string(), "invalid credentials");
     }
 
     #[test]
     fn test_channel_error_display() {
-        let err = Ssh3Error::Channel {
-            message: "channel closed".into(),
-        };
+        let err = Ssh3Error::ChannelClosed;
         assert_eq!(err.to_string(), "channel closed");
     }
 
     #[test]
     fn test_session_error_display() {
-        let err = Ssh3Error::Session {
-            message: "exec failed".into(),
-        };
+        let err = Ssh3Error::ExecFailed;
         assert_eq!(err.to_string(), "exec failed");
     }
 

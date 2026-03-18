@@ -28,18 +28,12 @@ pub struct SshVersion {
 pub fn negotiate_version(headers: &http::HeaderMap) -> Result<SshVersion, Ssh3Error> {
     let header_value = headers
         .get("ssh-version")
-        .ok_or_else(|| Ssh3Error::Protocol {
-            message: "missing ssh-version header".into(),
-        })?
+        .ok_or(Ssh3Error::MissingSshVersionHeader)?
         .to_str()
-        .map_err(|_| Ssh3Error::Protocol {
-            message: "invalid ssh-version header value".into(),
-        })?;
+        .map_err(|_| Ssh3Error::InvalidSshVersionHeaderValue)?;
 
     if header_value.is_empty() {
-        return Err(Ssh3Error::Protocol {
-            message: "empty ssh-version header".into(),
-        });
+        return Err(Ssh3Error::EmptySshVersionHeader);
     }
 
     for offered in header_value.split(',') {
@@ -51,8 +45,8 @@ pub fn negotiate_version(headers: &http::HeaderMap) -> Result<SshVersion, Ssh3Er
         }
     }
 
-    Err(Ssh3Error::Protocol {
-        message: format!("no supported ssh-version found in client offer: {header_value:?}"),
+    Err(Ssh3Error::UnsupportedSshVersion {
+        offered: header_value.to_owned(),
     })
 }
 
