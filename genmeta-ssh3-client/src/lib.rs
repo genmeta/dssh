@@ -29,7 +29,9 @@ pub enum ClientError {
 
     /// QUIC-level connection establishment failed.
     #[snafu(display("failed to establish QUIC connection"))]
-    QuicConnectFailed,
+    QuicConnectFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     /// The constructed URI is invalid.
     #[snafu(display("invalid URI"))]
@@ -41,7 +43,9 @@ pub enum ClientError {
 
     /// The Extended CONNECT request could not be sent.
     #[snafu(display("extended CONNECT request failed"))]
-    ConnectRequestFailed,
+    ConnectRequestFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     /// The server rejected authentication (HTTP 401).
     #[snafu(display("authentication failed"))]
@@ -116,6 +120,7 @@ impl Ssh3Client {
     ) -> Result<Ssh3Connection<std::sync::Arc<h3x::connection::Connection<C::Connection>>>, ClientError>
     where
         C: h3x::quic::Connect + Sync,
+        C::Error: Send + Sync,
         C::Connection: Send + 'static,
         <C::Connection as h3x::quic::ManageStream>::StreamReader: Send,
         <C::Connection as h3x::quic::ManageStream>::StreamWriter: Send,
@@ -129,7 +134,9 @@ impl Ssh3Client {
         let connection = client
             .connect(authority.clone())
             .await
-            .map_err(|_| ClientError::QuicConnectFailed)?;
+            .map_err(|e| ClientError::QuicConnectFailed {
+                source: Box::new(e),
+            })?;
 
         let uri: http::Uri =
             format!("https://{authority}{SSH3_CONNECT_PATH}")
@@ -148,7 +155,9 @@ impl Ssh3Client {
         let response = connection
             .execute_hyper_request(request)
             .await
-            .map_err(|_| ClientError::ConnectRequestFailed)?;
+            .map_err(|e| ClientError::ConnectRequestFailed {
+                source: Box::new(e),
+            })?;
 
         // Check response status.
         let status = response.status();
@@ -349,7 +358,12 @@ mod tests {
         let err = ClientError::AuthenticationFailed;
         assert_eq!(err.to_string(), "authentication failed");
 
-        let err = ClientError::QuicConnectFailed;
+        let err = ClientError::QuicConnectFailed {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "test",
+            )),
+        };
         assert_eq!(err.to_string(), "failed to establish QUIC connection");
 
         let err = ClientError::UnexpectedStatus {

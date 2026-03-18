@@ -353,7 +353,7 @@ pub enum PtyError {
 /// Returns `Err` if any dimension overflows `u16` (no silent truncation) or
 /// if the underlying `openpty` call fails.
 pub fn allocate_pty(request: &PtyRequest) -> Result<PtyPair, PtyError> {
-    let ws = validate_pty_dimensions(request).map_err(|source| PtyError::Dimension { source })?;
+    let ws = validate_pty_dimensions(request).context(DimensionSnafu)?;
     let winsize = Winsize {
         ws_row: ws.ws_row,
         ws_col: ws.ws_col,
@@ -375,7 +375,7 @@ pub fn allocate_pty(request: &PtyRequest) -> Result<PtyPair, PtyError> {
 /// if the ioctl fails.
 pub fn set_window_size(master_fd: RawFd, request: &WindowChangeRequest) -> Result<(), PtyError> {
     let winsize =
-        validate_window_change_dimensions(request).map_err(|source| PtyError::Dimension { source })?;
+        validate_window_change_dimensions(request).context(DimensionSnafu)?;
 
     unsafe { tiocswinsz(master_fd, &winsize as *const libc::winsize) }.context(OsSnafu)?;
 
