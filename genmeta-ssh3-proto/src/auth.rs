@@ -55,12 +55,12 @@ pub fn parse_authorization_header(header_value: &str) -> Result<AuthCredential, 
         });
     }
 
-    let decoded_bytes = STANDARD.decode(credentials).map_err(|e| Ssh3Error::Auth {
-        message: format!("invalid base64: {e}"),
+    let decoded_bytes = STANDARD.decode(credentials).map_err(|_| Ssh3Error::Auth {
+        message: "invalid base64 credentials".into(),
     })?;
 
-    let decoded = String::from_utf8(decoded_bytes).map_err(|e| Ssh3Error::Auth {
-        message: format!("credentials are not valid UTF-8: {e}"),
+    let decoded = String::from_utf8(decoded_bytes).map_err(|_| Ssh3Error::Auth {
+        message: "credentials are not valid UTF-8".into(),
     })?;
 
     let (username, password) = decoded.split_once(':').ok_or_else(|| Ssh3Error::Auth {

@@ -5,27 +5,27 @@ use snafu::Snafu;
 #[snafu(visibility(pub(crate)), module)]
 pub enum Ssh3Error {
     /// Codec-level errors (varint too large, buffer underflow, invalid encoding)
-    #[snafu(display("codec error: {message}"))]
+    #[snafu(display("{message}"))]
     Codec { message: String },
 
     /// Protocol-level errors (unknown channel type, unexpected message, version mismatch)
-    #[snafu(display("protocol error: {message}"))]
+    #[snafu(display("{message}"))]
     Protocol { message: String },
 
     /// Authentication errors (invalid credentials, PAM failure, unsupported scheme)
-    #[snafu(display("auth error: {message}"))]
+    #[snafu(display("{message}"))]
     Auth { message: String },
 
     /// Channel errors (channel closed, EOF, request failed)
-    #[snafu(display("channel error: {message}"))]
+    #[snafu(display("{message}"))]
     Channel { message: String },
 
     /// Session errors (exec failed, pty allocation failed, forwarding failed)
-    #[snafu(display("session error: {message}"))]
+    #[snafu(display("{message}"))]
     Session { message: String },
 
     /// IO errors
-    #[snafu(display("io error: {source}"))]
+    #[snafu(display("I/O error"))]
     Io { source: std::io::Error },
 }
 
@@ -38,7 +38,7 @@ mod tests {
         let err = Ssh3Error::Codec {
             message: "varint too large".into(),
         };
-        assert_eq!(err.to_string(), "codec error: varint too large");
+        assert_eq!(err.to_string(), "varint too large");
     }
 
     #[test]
@@ -46,7 +46,7 @@ mod tests {
         let err = Ssh3Error::Protocol {
             message: "unknown channel type".into(),
         };
-        assert_eq!(err.to_string(), "protocol error: unknown channel type");
+        assert_eq!(err.to_string(), "unknown channel type");
     }
 
     #[test]
@@ -54,7 +54,7 @@ mod tests {
         let err = Ssh3Error::Auth {
             message: "invalid credentials".into(),
         };
-        assert_eq!(err.to_string(), "auth error: invalid credentials");
+        assert_eq!(err.to_string(), "invalid credentials");
     }
 
     #[test]
@@ -62,7 +62,7 @@ mod tests {
         let err = Ssh3Error::Channel {
             message: "channel closed".into(),
         };
-        assert_eq!(err.to_string(), "channel error: channel closed");
+        assert_eq!(err.to_string(), "channel closed");
     }
 
     #[test]
@@ -70,15 +70,14 @@ mod tests {
         let err = Ssh3Error::Session {
             message: "exec failed".into(),
         };
-        assert_eq!(err.to_string(), "session error: exec failed");
+        assert_eq!(err.to_string(), "exec failed");
     }
 
     #[test]
     fn test_io_error_conversion() {
         let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broken");
         let err = Ssh3Error::Io { source: io_err };
-        assert!(err.to_string().contains("io error:"));
-        assert!(err.to_string().contains("pipe broken"));
+        assert_eq!(err.to_string(), "I/O error");
     }
 
     #[test]

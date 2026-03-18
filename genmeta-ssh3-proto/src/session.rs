@@ -87,35 +87,144 @@ where
 
 /// Serializable error type for RTC method returns.
 ///
-/// Uses a simple string wrapper because `snafu` errors are not `Serialize`/`Deserialize`.
 /// This type crosses process boundaries via remoc, so it must be fully serializable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionError {
-    /// Error message.
-    pub message: String,
+pub enum SessionError {
+    Message(String),
+    Io(IoErrorKind),
+    Transport(TransportError),
+    Remote(remoc::rtc::CallError),
 }
 
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for SessionError {}
-
-impl From<remoc::rtc::CallError> for SessionError {
-    fn from(err: remoc::rtc::CallError) -> Self {
-        Self {
-            message: err.to_string(),
+        match self {
+            Self::Message(message) => f.write_str(message),
+            Self::Io(kind) => kind.fmt(f),
+            Self::Transport(error) => error.fmt(f),
+            Self::Remote(error) => error.fmt(f),
         }
     }
 }
 
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Remote(error) => Some(error),
+            Self::Message(_) | Self::Io(_) => None,
+        }
+    }
+}
+
+impl From<remoc::rtc::CallError> for SessionError {
+    fn from(err: remoc::rtc::CallError) -> Self {
+        Self::Remote(err)
+    }
+}
+
+impl From<std::io::Error> for SessionError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err.kind().into())
+    }
+}
+
+impl From<TransportError> for SessionError {
+    fn from(err: TransportError) -> Self {
+        Self::Transport(err)
+    }
+}
+
 impl SessionError {
-    /// Create a new `SessionError` from any displayable value.
-    pub fn new(msg: impl std::fmt::Display) -> Self {
-        Self {
-            message: msg.to_string(),
+    pub fn new(msg: impl Into<String>) -> Self {
+        Self::Message(msg.into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IoErrorKind {
+    NotFound,
+    PermissionDenied,
+    ConnectionRefused,
+    ConnectionReset,
+    HostUnreachable,
+    NetworkUnreachable,
+    ConnectionAborted,
+    NotConnected,
+    AddrInUse,
+    AddrNotAvailable,
+    NetworkDown,
+    BrokenPipe,
+    AlreadyExists,
+    WouldBlock,
+    InvalidInput,
+    InvalidData,
+    TimedOut,
+    WriteZero,
+    Interrupted,
+    Unsupported,
+    UnexpectedEof,
+    OutOfMemory,
+    Other,
+}
+
+impl std::fmt::Display for IoErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::NotFound => "not found",
+            Self::PermissionDenied => "permission denied",
+            Self::ConnectionRefused => "connection refused",
+            Self::ConnectionReset => "connection reset",
+            Self::HostUnreachable => "host unreachable",
+            Self::NetworkUnreachable => "network unreachable",
+            Self::ConnectionAborted => "connection aborted",
+            Self::NotConnected => "not connected",
+            Self::AddrInUse => "address in use",
+            Self::AddrNotAvailable => "address not available",
+            Self::NetworkDown => "network down",
+            Self::BrokenPipe => "broken pipe",
+            Self::AlreadyExists => "already exists",
+            Self::WouldBlock => "operation would block",
+            Self::InvalidInput => "invalid input",
+            Self::InvalidData => "invalid data",
+            Self::TimedOut => "timed out",
+            Self::WriteZero => "write zero",
+            Self::Interrupted => "interrupted",
+            Self::Unsupported => "unsupported",
+            Self::UnexpectedEof => "unexpected end of file",
+            Self::OutOfMemory => "out of memory",
+            Self::Other => "other I/O error",
+        };
+        f.write_str(name)
+    }
+}
+
+impl From<std::io::ErrorKind> for IoErrorKind {
+    fn from(kind: std::io::ErrorKind) -> Self {
+        match kind {
+            std::io::ErrorKind::NotFound => Self::NotFound,
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            std::io::ErrorKind::ConnectionRefused => Self::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset => Self::ConnectionReset,
+            std::io::ErrorKind::HostUnreachable => Self::HostUnreachable,
+            std::io::ErrorKind::NetworkUnreachable => Self::NetworkUnreachable,
+            std::io::ErrorKind::ConnectionAborted => Self::ConnectionAborted,
+            std::io::ErrorKind::NotConnected => Self::NotConnected,
+            std::io::ErrorKind::AddrInUse => Self::AddrInUse,
+            std::io::ErrorKind::AddrNotAvailable => Self::AddrNotAvailable,
+            std::io::ErrorKind::NetworkDown => Self::NetworkDown,
+            std::io::ErrorKind::BrokenPipe => Self::BrokenPipe,
+            std::io::ErrorKind::AlreadyExists => Self::AlreadyExists,
+            std::io::ErrorKind::WouldBlock => Self::WouldBlock,
+            std::io::ErrorKind::InvalidInput => Self::InvalidInput,
+            std::io::ErrorKind::InvalidData => Self::InvalidData,
+            std::io::ErrorKind::TimedOut => Self::TimedOut,
+            std::io::ErrorKind::WriteZero => Self::WriteZero,
+            std::io::ErrorKind::Interrupted => Self::Interrupted,
+            std::io::ErrorKind::Unsupported => Self::Unsupported,
+            std::io::ErrorKind::UnexpectedEof => Self::UnexpectedEof,
+            std::io::ErrorKind::OutOfMemory => Self::OutOfMemory,
+            _ => Self::Other,
         }
     }
 }
@@ -127,24 +236,33 @@ pub enum TransportError {
     OpenFailed(String),
     Timeout,
     Other(String),
+    Remote(remoc::rtc::CallError),
 }
 
 impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ChannelClosed(msg) => write!(f, "channel closed: {msg}"),
-            Self::OpenFailed(msg) => write!(f, "open failed: {msg}"),
+            Self::ChannelClosed(msg) => f.write_str(msg),
+            Self::OpenFailed(msg) => f.write_str(msg),
             Self::Timeout => write!(f, "timeout"),
-            Self::Other(msg) => write!(f, "{msg}"),
+            Self::Other(msg) => f.write_str(msg),
+            Self::Remote(error) => error.fmt(f),
         }
     }
 }
 
-impl std::error::Error for TransportError {}
+impl std::error::Error for TransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Remote(error) => Some(error),
+            Self::ChannelClosed(_) | Self::OpenFailed(_) | Self::Timeout | Self::Other(_) => None,
+        }
+    }
+}
 
 impl From<remoc::rtc::CallError> for TransportError {
     fn from(err: remoc::rtc::CallError) -> Self {
-        Self::Other(err.to_string())
+        Self::Remote(err)
     }
 }
 
@@ -247,12 +365,10 @@ mod tests {
 
     #[test]
     fn session_error_roundtrip() {
-        let err = SessionError {
-            message: "test error".into(),
-        };
+        let err = SessionError::new("test error");
         let json = serde_json::to_string(&err).unwrap();
         let decoded: SessionError = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.message, "test error");
+        assert_eq!(err.to_string(), decoded.to_string());
     }
 
     #[test]
