@@ -11,6 +11,28 @@ use h3x::{
 };
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub const MAX_REMOTE_FIELD_SIZE: usize = 1 << 20;
+
+pub fn checked_remote_field_len(len: u64, field_name: &'static str) -> io::Result<usize> {
+    let len = usize::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field_name} length does not fit in usize: {len}"),
+        )
+    })?;
+
+    if len > MAX_REMOTE_FIELD_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{field_name} length {len} exceeds maximum {MAX_REMOTE_FIELD_SIZE}"
+            ),
+        ));
+    }
+
+    Ok(len)
+}
+
 /// A UTF-8 string encoded as varint length-prefix + UTF-8 bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshString(pub String);
@@ -70,7 +92,7 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshString {
     async fn decode_from(stream: S) -> Result<Self, io::Error> {
         let mut stream = pin!(stream);
         let len = VarInt::decode_from(&mut stream).await?;
-        let len = len.into_inner() as usize;
+        let len = checked_remote_field_len(len.into_inner(), "ssh string")?;
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
         let s = String::from_utf8(buf)
@@ -117,7 +139,7 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshBytes {
     async fn decode_from(stream: S) -> Result<Self, io::Error> {
         let mut stream = pin!(stream);
         let len = VarInt::decode_from(&mut stream).await?;
-        let len = len.into_inner() as usize;
+        let len = checked_remote_field_len(len.into_inner(), "ssh bytes")?;
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
         Ok(SshBytes(buf))
@@ -491,6 +513,34 @@ mod tests {
         drop(writer);
         let decoded = SshBytes::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, SshBytes(large));
+    }
+
+    #[tokio::test]
+    async fn ssh_string_rejects_oversized_payload_before_allocation() {
+        let (mut writer, mut reader) = duplex(64);
+        writer
+            .encode_one(VarInt::try_from((MAX_REMOTE_FIELD_SIZE + 1) as u64).unwrap())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let err = SshString::decode_from(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("ssh string length"));
+    }
+
+    #[tokio::test]
+    async fn ssh_bytes_rejects_oversized_payload_before_allocation() {
+        let (mut writer, mut reader) = duplex(64);
+        writer
+            .encode_one(VarInt::try_from((MAX_REMOTE_FIELD_SIZE + 1) as u64).unwrap())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let err = SshBytes::decode_from(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("ssh bytes length"));
     }
 
     #[tokio::test]
