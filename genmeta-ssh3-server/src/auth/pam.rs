@@ -19,6 +19,7 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
@@ -59,11 +60,12 @@ pub enum AuthResult {
 // ---------------------------------------------------------------------------
 
 /// Error type for PAM authentication failures.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct PamError {
     /// Human-readable description of what went wrong.
     pub message: String,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 impl PamError {
@@ -71,17 +73,40 @@ impl PamError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            source: None,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(Arc::new(source)),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
 impl fmt::Display for PamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PAM error: {}", self.message)
+        f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for PamError {}
+impl std::error::Error for PamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // UserInfo — resolved user metadata
@@ -190,14 +215,14 @@ impl PamBackend for SystemPam {
                 password: password.to_owned(),
             },
         )
-        .map_err(|e| PamError::new(format!("failed to create PAM context: {e}")))?;
+        .map_err(|error| PamError::with_source("failed to create PAM context", error))?;
 
         Ok(Box::new(SystemPamTransaction { context }))
     }
 
     fn get_user_info(&self, username: &str) -> Result<UserInfo, PamError> {
         let user = User::from_name(username)
-            .map_err(|e| PamError::new(format!("getpwnam syscall failed: {e}")))?
+            .map_err(|error| PamError::with_source("getpwnam syscall failed", error))?
             .ok_or_else(|| PamError::new(format!("user '{username}' not found")))?;
 
         Ok(UserInfo {
@@ -214,13 +239,13 @@ impl PamTransaction for SystemPamTransaction {
     fn authenticate(&mut self) -> Result<(), PamError> {
         self.context
             .authenticate(Flag::NONE)
-            .map_err(|e| PamError::new(format!("pam_authenticate failed: {e}")))
+            .map_err(|error| PamError::with_source("pam_authenticate failed", error))
     }
 
     fn acct_mgmt(&mut self) -> Result<(), PamError> {
         self.context
             .acct_mgmt(Flag::NONE)
-            .map_err(|e| PamError::new(format!("pam_acct_mgmt failed: {e}")))
+            .map_err(|error| PamError::with_source("pam_acct_mgmt failed", error))
     }
 }
 
@@ -539,7 +564,7 @@ mod tests {
     #[test]
     fn test_pam_error_display() {
         let err = PamError::new("authentication failure");
-        assert_eq!(err.to_string(), "PAM error: authentication failure");
+        assert_eq!(err.to_string(), "authentication failure");
     }
 
     #[test]

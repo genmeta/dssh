@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap = base_rx
         .recv()
         .await
-        .map_err(|e| format!("failed to receive ChildBootstrap: {e}"))?
+        .map_err(std::io::Error::other)?
         .ok_or("parent closed base channel without sending ChildBootstrap")?;
 
     tracing::debug!("received ChildBootstrap from parent");
@@ -115,7 +115,7 @@ async fn run_pam_auth(username: &str, password: &str) -> AuthResult {
             AuthResult::Failure { reason }
         }
         Err(pam_err) => AuthResult::Failure {
-            reason: pam_err.to_string(),
+            reason: pam_err.message().to_owned(),
         },
     }
 }
