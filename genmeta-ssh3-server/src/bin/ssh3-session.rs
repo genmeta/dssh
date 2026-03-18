@@ -115,7 +115,7 @@ async fn run_pam_auth(username: &str, password: &str) -> AuthResult {
             AuthResult::Failure { reason }
         }
         Err(pam_err) => AuthResult::Failure {
-            reason: pam_err.message().to_owned(),
+            reason: pam_err.to_string(),
         },
     }
 }

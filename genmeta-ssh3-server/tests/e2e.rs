@@ -2160,10 +2160,9 @@ impl TestPamBackend {
         }
     }
 
-    /// Backend that always fails with the given error message.
-    fn failure(message: &str) -> Self {
+    fn failure() -> Self {
         Self {
-            auth_error: Some(PamError::new(message)),
+            auth_error: Some(PamError::AuthenticationRejected),
             user_info: UserInfo {
                 uid: 0,
                 gid: 0,
@@ -2259,7 +2258,7 @@ fn test_pam_auth_success() {
 #[test]
 fn test_pam_auth_failure() {
     run("test_pam_auth_failure", async move {
-        let pam: Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend> = Arc::new(TestPamBackend::failure("invalid credentials"));
+        let pam: Arc<dyn genmeta_ssh3_server::auth::pam::PamBackend> = Arc::new(TestPamBackend::failure());
 
     let service = TestChannelService::new(Some(pam));
         let service = TowerService(service);

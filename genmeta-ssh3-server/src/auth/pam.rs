@@ -17,12 +17,13 @@
 use std::ffi::CStr;
 #[cfg(feature = "pam")]
 use std::ffi::CString;
-use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
+#[cfg(feature = "pam")]
+use snafu::ResultExt;
+use snafu::Snafu;
 
 #[cfg(feature = "pam")]
 use nix::unistd::User;
@@ -60,52 +61,45 @@ pub enum AuthResult {
 // ---------------------------------------------------------------------------
 
 /// Error type for PAM authentication failures.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct PamError {
-    /// Human-readable description of what went wrong.
-    pub message: String,
-    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
-}
+#[derive(Debug, Clone, Snafu)]
+#[snafu(visibility(pub))]
+pub enum PamError {
+    // ── Real PAM variants (feature-gated) ─────────────────────────────────
 
-impl PamError {
-    #[allow(dead_code)]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            source: None,
-        }
-    }
+    /// Failed to create a PAM transaction context.
+    #[cfg(feature = "pam")]
+    #[snafu(display("failed to create PAM context"))]
+    PamContextCreation { source: pam_client2::Error },
 
-    #[allow(dead_code)]
-    pub fn with_source(
-        message: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            message: message.into(),
-            source: Some(Arc::new(source)),
-        }
-    }
+    /// `pam_authenticate` call failed.
+    #[cfg(feature = "pam")]
+    #[snafu(display("pam_authenticate failed"))]
+    AuthenticateFailed { source: pam_client2::Error },
 
-    #[allow(dead_code)]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
+    /// `pam_acct_mgmt` call failed.
+    #[cfg(feature = "pam")]
+    #[snafu(display("pam_acct_mgmt failed"))]
+    AccountCheckFailed { source: pam_client2::Error },
 
-impl fmt::Display for PamError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
+    /// `getpwnam` syscall failed while resolving user info.
+    #[cfg(feature = "pam")]
+    #[snafu(display("getpwnam syscall failed"))]
+    GetpwnamFailed { source: nix::errno::Errno },
 
-impl std::error::Error for PamError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn std::error::Error + 'static))
-    }
+    /// The specified POSIX user does not exist.
+    #[cfg(feature = "pam")]
+    #[snafu(display("user '{username}' not found"))]
+    UserNotFound { username: String },
+
+    // ── Always-available variants (for mocks and non-PAM builds) ──────────
+
+    /// Authentication was rejected (wrong credentials).
+    #[snafu(display("authentication rejected"))]
+    AuthenticationRejected,
+
+    /// Account check failed (e.g. account expired or locked).
+    #[snafu(display("account check failed"))]
+    AccountCheckRejected,
 }
 
 // ---------------------------------------------------------------------------
@@ -215,15 +209,15 @@ impl PamBackend for SystemPam {
                 password: password.to_owned(),
             },
         )
-        .map_err(|error| PamError::with_source("failed to create PAM context", error))?;
+        .context(PamContextCreationSnafu)?;
 
         Ok(Box::new(SystemPamTransaction { context }))
     }
 
     fn get_user_info(&self, username: &str) -> Result<UserInfo, PamError> {
         let user = User::from_name(username)
-            .map_err(|error| PamError::with_source("getpwnam syscall failed", error))?
-            .ok_or_else(|| PamError::new(format!("user '{username}' not found")))?;
+            .context(GetpwnamFailedSnafu)?
+            .ok_or_else(|| PamError::UserNotFound { username: username.to_owned() })?;
 
         Ok(UserInfo {
             uid: user.uid.as_raw(),
@@ -239,13 +233,13 @@ impl PamTransaction for SystemPamTransaction {
     fn authenticate(&mut self) -> Result<(), PamError> {
         self.context
             .authenticate(Flag::NONE)
-            .map_err(|error| PamError::with_source("pam_authenticate failed", error))
+            .context(AuthenticateFailedSnafu)
     }
 
     fn acct_mgmt(&mut self) -> Result<(), PamError> {
         self.context
             .acct_mgmt(Flag::NONE)
-            .map_err(|error| PamError::with_source("pam_acct_mgmt failed", error))
+            .context(AccountCheckFailedSnafu)
     }
 }
 
@@ -359,9 +353,9 @@ mod tests {
             }
         }
 
-        fn auth_failure(message: &str, dropped: Arc<AtomicBool>) -> Self {
+        fn auth_failure(dropped: Arc<AtomicBool>) -> Self {
             Self {
-                auth_error: Some(PamError::new(message)),
+                auth_error: Some(PamError::AuthenticationRejected),
                 acct_error: None,
                 user_info: default_user_info(),
                 dropped,
@@ -369,10 +363,10 @@ mod tests {
             }
         }
 
-        fn acct_failure(message: &str, dropped: Arc<AtomicBool>) -> Self {
+        fn acct_failure(dropped: Arc<AtomicBool>) -> Self {
             Self {
                 auth_error: None,
-                acct_error: Some(PamError::new(message)),
+                acct_error: Some(PamError::AccountCheckRejected),
                 user_info: default_user_info(),
                 dropped,
                 calls: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -486,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn test_pam_auth_failure_with_delay() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let mock = MockPam::auth_failure("authentication failure", dropped.clone());
+        let mock = MockPam::auth_failure(dropped.clone());
 
         let start = tokio::time::Instant::now();
         let result = pam_authenticate(&mock, "alice", "wrong-password").await;
@@ -494,7 +488,7 @@ mod tests {
 
         assert!(result.is_err(), "expected Err, got {result:?}");
         let err = result.unwrap_err();
-        assert_eq!(err.message, "authentication failure");
+        assert!(matches!(err, PamError::AuthenticationRejected));
 
         // Verify timing-attack protection delay was applied (at least 100ms)
         assert!(
@@ -509,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn test_pam_acct_mgmt_failure() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let mock = MockPam::acct_failure("account expired", dropped.clone());
+        let mock = MockPam::acct_failure(dropped.clone());
         let calls = mock.call_log();
 
         let start = tokio::time::Instant::now();
@@ -518,7 +512,7 @@ mod tests {
 
         assert!(result.is_err(), "expected Err, got {result:?}");
         let err = result.unwrap_err();
-        assert_eq!(err.message, "account expired");
+        assert!(matches!(err, PamError::AccountCheckRejected));
         assert_eq!(
             &*calls.lock().unwrap(),
             &["start_transaction", "authenticate", "acct_mgmt"]
@@ -551,7 +545,7 @@ mod tests {
         // Verify that Drop is called on failure path
         let dropped_failure = Arc::new(AtomicBool::new(false));
         {
-            let mock = MockPam::auth_failure("fail", dropped_failure.clone());
+            let mock = MockPam::auth_failure(dropped_failure.clone());
             let _ = pam_authenticate(&mock, "user", "pass").await;
             // mock goes out of scope here
         }
@@ -563,8 +557,11 @@ mod tests {
 
     #[test]
     fn test_pam_error_display() {
-        let err = PamError::new("authentication failure");
-        assert_eq!(err.to_string(), "authentication failure");
+        let err = PamError::AuthenticationRejected;
+        assert_eq!(err.to_string(), "authentication rejected");
+
+        let err = PamError::AccountCheckRejected;
+        assert_eq!(err.to_string(), "account check failed");
     }
 
     #[test]
