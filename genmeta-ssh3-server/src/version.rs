@@ -32,8 +32,8 @@ pub fn negotiate_version(headers: &http::HeaderMap) -> Result<SshVersion, Ssh3Er
             message: "missing ssh-version header".into(),
         })?
         .to_str()
-        .map_err(|e| Ssh3Error::Protocol {
-            message: format!("invalid ssh-version header value: {e}"),
+        .map_err(|_| Ssh3Error::Protocol {
+            message: "invalid ssh-version header value".into(),
         })?;
 
     if header_value.is_empty() {

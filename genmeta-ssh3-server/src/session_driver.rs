@@ -34,15 +34,12 @@ impl PrivilegeTransitionOps for RealPrivilegeTransitionOps {
     #[cfg(not(test))]
     fn init_groups(&self, username: &str, gid: u32) -> Result<(), SessionError> {
         let username = CString::new(username)
-            .map_err(|error| SessionError::new(format!("invalid username for initgroups: {error}")))?;
+            .map_err(|_| SessionError::new("invalid username for initgroups"))?;
         let result = unsafe { libc::initgroups(username.as_ptr(), gid) };
         if result == 0 {
             Ok(())
         } else {
-            Err(SessionError::new(format!(
-                "initgroups({username:?}, {gid}) failed: {}",
-                std::io::Error::last_os_error()
-            )))
+            Err(SessionError::new("initgroups failed"))
         }
     }
 
@@ -57,10 +54,7 @@ impl PrivilegeTransitionOps for RealPrivilegeTransitionOps {
         if result == 0 {
             Ok(())
         } else {
-            Err(SessionError::new(format!(
-                "setgid({gid}) failed: {}",
-                std::io::Error::last_os_error()
-            )))
+            Err(SessionError::new("setgid failed"))
         }
     }
 
@@ -75,10 +69,7 @@ impl PrivilegeTransitionOps for RealPrivilegeTransitionOps {
         if result == 0 {
             Ok(())
         } else {
-            Err(SessionError::new(format!(
-                "setuid({uid}) failed: {}",
-                std::io::Error::last_os_error()
-            )))
+            Err(SessionError::new("setuid failed"))
         }
     }
 
@@ -189,28 +180,28 @@ impl Ssh3Session {
             "session" => {
                 let (event_rx, writer) = open_session_channel(reader, writer)
                     .await
-                    .map_err(SessionError::new)?;
+                    .map_err(SessionError::from)?;
                 self.run_session_requests(event_rx, writer).await
             }
             "direct-tcpip" => crate::forward::direct_tcp::handle_direct_tcp(header, reader, writer)
                 .await
-                .map_err(SessionError::new),
+                .map_err(SessionError::from),
             "direct-streamlocal@openssh.com" => {
                 crate::forward::streamlocal::handle_direct_streamlocal(header, reader, writer)
                     .await
-                    .map_err(SessionError::new)
+                    .map_err(SessionError::from)
             }
             "socks5" => crate::forward::socks5::handle_socks5(header, reader, writer)
                 .await
-                .map_err(SessionError::new),
+                .map_err(SessionError::from),
             "global-request" => {
                 reject_legacy_global_request_channel(writer)
                     .await
-                    .map_err(SessionError::new)
+                    .map_err(SessionError::from)
             }
             other => {
                 tracing::warn!(channel_type = %other, "unknown channel type in child");
-                Err(SessionError::new(format!("unknown channel type: {other}")))
+                Err(SessionError::new("unknown channel type"))
             }
         }
     }
@@ -225,18 +216,18 @@ impl Ssh3Session {
             match event {
                 ChannelEvent::Request { .. } => match handle_request(&event, &mut writer)
                     .await
-                    .map_err(SessionError::new)?
+                    .map_err(SessionError::from)?
                 {
                     Some(RequestAction::Exec(command)) => {
                         run_exec(self.init.shell.as_os_str(), &command, &mut writer, event_rx, pty_pair.take())
                             .await
-                            .map_err(SessionError::new)?;
+                            .map_err(SessionError::from)?;
                         return Ok(());
                     }
                     Some(RequestAction::Shell) => {
                         run_shell(self.init.shell.as_os_str(), &mut writer, event_rx, pty_pair.take())
                             .await
-                            .map_err(SessionError::new)?;
+                            .map_err(SessionError::from)?;
                         return Ok(());
                     }
                     Some(RequestAction::AllocatePty(req, want_reply)) => match allocate_pty(&req) {
@@ -247,7 +238,7 @@ impl Ssh3Session {
                                 writer
                                     .encode_one(&SshMessage::ChannelSuccess)
                                     .await
-                                    .map_err(SessionError::new)?;
+                                    .map_err(SessionError::from)?;
                             }
                         }
                         Err(error) => {
@@ -256,7 +247,7 @@ impl Ssh3Session {
                                 writer
                                     .encode_one(&SshMessage::ChannelFailure)
                                     .await
-                                    .map_err(SessionError::new)?;
+                                    .map_err(SessionError::from)?;
                             }
                         }
                     },
@@ -281,17 +272,17 @@ impl Ssh3Session {
                     writer
                         .encode_one(&SshMessage::ChannelEof)
                         .await
-                        .map_err(SessionError::new)?;
+                        .map_err(SessionError::from)?;
                     tokio::io::AsyncWriteExt::shutdown(&mut writer)
                         .await
-                        .map_err(SessionError::new)?;
+                        .map_err(SessionError::from)?;
                     break;
                 }
                 ChannelEvent::Close => {
                     writer
                         .encode_one(&SshMessage::ChannelClose)
                         .await
-                        .map_err(SessionError::new)?;
+                        .map_err(SessionError::from)?;
                     break;
                 }
                 ChannelEvent::Data(_) | ChannelEvent::ExtendedData { .. } => {}

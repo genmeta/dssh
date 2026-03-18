@@ -232,8 +232,8 @@ impl Ssh3ConnectHandler {
             return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
         }
 
-        if let Err(e) = child_bootstrap_tx.send(bootstrap).await {
-            tracing::error!(error = %Report::from_error(ServerError::SendBootstrap { message: e.to_string() }), %conversation_id, "failed to send ChildBootstrap to child");
+        if let Err(_) = child_bootstrap_tx.send(bootstrap).await {
+            tracing::error!(error = %Report::from_error(ServerError::SendBootstrap), %conversation_id, "failed to send ChildBootstrap to child");
             return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
         }
 
@@ -258,7 +258,7 @@ impl Ssh3ConnectHandler {
                         async move {
                             let (reader, writer) = upgrade::on(request)
                                 .await
-                                .map_err(|error| io::Error::other(format!("failed to take over SSH3 CONNECT stream: {error:?}")))?;
+                                .map_err(|_| io::Error::other("failed to take over SSH3 CONNECT stream"))?;
                             let _ = control_stream_started_tx.send(Ok(()));
                             serve_control_stream_global_requests(
                                 reader,
