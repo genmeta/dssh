@@ -2,7 +2,7 @@ use snafu::Snafu;
 
 /// Top-level error type for the SSH3 protocol crate.
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)), module)]
+#[snafu(visibility(pub), module)]
 pub enum Ssh3Error {
     // ── Codec variants ──────────────────────────────────────────────────
     /// Varint exceeds maximum allowed size.
@@ -16,7 +16,7 @@ pub enum Ssh3Error {
 
     /// The `ssh-version` header value is not valid ASCII / HTTP header text.
     #[snafu(display("invalid ssh-version header value"))]
-    InvalidSshVersionHeaderValue,
+    InvalidSshVersionHeaderValue { source: http::header::ToStrError },
 
     /// The `ssh-version` header is present but empty.
     #[snafu(display("empty ssh-version header"))]
@@ -45,11 +45,11 @@ pub enum Ssh3Error {
 
     /// Base64 decoding of the credentials failed.
     #[snafu(display("invalid base64 credentials"))]
-    InvalidBase64Credentials,
+    InvalidBase64Credentials { source: base64::DecodeError },
 
     /// Decoded credentials are not valid UTF-8.
     #[snafu(display("credentials are not valid UTF-8"))]
-    CredentialsNotUtf8,
+    CredentialsNotUtf8 { source: std::string::FromUtf8Error },
 
     /// Decoded credentials lack the `':'` separator between username and password.
     #[snafu(display("missing ':' separator in decoded credentials"))]

@@ -1,7 +1,9 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use snafu::ResultExt;
 use std::fmt;
 
+use crate::error::ssh3_error;
 use crate::error::Ssh3Error;
 
 /// Authentication credential — only Basic auth is supported.
@@ -53,9 +55,9 @@ pub fn parse_authorization_header(header_value: &str) -> Result<AuthCredential, 
 
     let decoded_bytes = STANDARD
         .decode(credentials)
-        .map_err(|_| Ssh3Error::InvalidBase64Credentials)?;
+        .context(ssh3_error::InvalidBase64CredentialsSnafu)?;
 
-    let decoded = String::from_utf8(decoded_bytes).map_err(|_| Ssh3Error::CredentialsNotUtf8)?;
+    let decoded = String::from_utf8(decoded_bytes).context(ssh3_error::CredentialsNotUtf8Snafu)?;
 
     let (username, password) = decoded
         .split_once(':')

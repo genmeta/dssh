@@ -13,7 +13,7 @@ use bytes::Bytes;
 use h3x::qpack::field::Protocol;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::Empty;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 /// The SSH3 version string used in the `ssh-version` header.
 pub const SSH_VERSION: &str = "michel-ssh3-00";
 
@@ -124,7 +124,7 @@ impl Ssh3Client {
             .config
             .authority
             .parse()
-            .map_err(|e| ClientError::InvalidAuthority { source: e })?;
+            .context(InvalidAuthoritySnafu)?;
 
         let connection = client
             .connect(authority.clone())
@@ -134,7 +134,7 @@ impl Ssh3Client {
         let uri: http::Uri =
             format!("https://{authority}{SSH3_CONNECT_PATH}")
                 .parse()
-                .map_err(|e| ClientError::InvalidUri { source: e })?;
+                .context(InvalidUriSnafu)?;
 
         let request = http::Request::builder()
             .method(Method::CONNECT)
@@ -143,7 +143,7 @@ impl Ssh3Client {
             .header(http::header::AUTHORIZATION, self.basic_auth_header())
             .extension(Protocol::new("ssh3"))
             .body(Empty::<Bytes>::new())
-            .map_err(|e| ClientError::RequestBuildFailed { source: e })?;
+            .context(RequestBuildFailedSnafu)?;
 
         let response = connection
             .execute_hyper_request(request)
@@ -165,7 +165,7 @@ impl Ssh3Client {
             .get("ssh-version")
             .ok_or(ClientError::MissingSshVersionHeader)?
             .to_str()
-            .map_err(|e| ClientError::InvalidSshVersionHeader { source: e })?
+            .context(InvalidSshVersionHeaderSnafu)?
             .to_owned();
 
         if server_version != SSH_VERSION {

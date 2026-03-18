@@ -5,7 +5,9 @@
 //! picks the first client-offered version it also supports and echoes that
 //! single version back in the response `ssh-version` header.
 
+use genmeta_ssh3_proto::error::ssh3_error;
 use genmeta_ssh3_proto::error::Ssh3Error;
+use snafu::ResultExt;
 
 /// The SSH3 draft versions this server supports.
 const SUPPORTED_VERSIONS: &[&str] = &["michel-ssh3-00"];
@@ -22,15 +24,16 @@ pub struct SshVersion {
 ///
 /// # Errors
 ///
-/// Returns [`Ssh3Error::Protocol`] if:
-/// - The `ssh-version` header is missing
-/// - No client version matches any server-supported version
+/// Returns [`Ssh3Error::MissingSshVersionHeader`] if the header is missing,
+/// [`Ssh3Error::InvalidSshVersionHeaderValue`] if it is not valid ASCII,
+/// [`Ssh3Error::EmptySshVersionHeader`] if empty, or
+/// [`Ssh3Error::UnsupportedSshVersion`] if no client version matches.
 pub fn negotiate_version(headers: &http::HeaderMap) -> Result<SshVersion, Ssh3Error> {
     let header_value = headers
         .get("ssh-version")
         .ok_or(Ssh3Error::MissingSshVersionHeader)?
         .to_str()
-        .map_err(|_| Ssh3Error::InvalidSshVersionHeaderValue)?;
+        .context(ssh3_error::InvalidSshVersionHeaderValueSnafu)?;
 
     if header_value.is_empty() {
         return Err(Ssh3Error::EmptySshVersionHeader);

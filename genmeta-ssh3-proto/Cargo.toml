@@ -6,6 +6,7 @@ edition = "2024"
 
 [dependencies]
 h3x = { path = "../../h3x" }
+http = "1"
 snafu = "0.9"
 tracing = "0.1"
 bytes = "1"
