@@ -135,7 +135,7 @@ where
             );
             let failure = SshMessage::ChannelOpenFailure {
                 reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
-                description: format!("connect failed: {e}"),
+                description: "connect failed".into(),
             };
             writer.encode_one(&failure).await?;
             return Ok(());

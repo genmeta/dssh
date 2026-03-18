@@ -423,7 +423,7 @@ where
     drop(action_tx);
     match writer_task.await {
         Ok(result) => result,
-        Err(error) => Err(io::Error::other(format!("control stream writer task failed: {error}"))),
+        Err(error) => Err(io::Error::other(error)),
     }
 }
 
@@ -546,7 +546,7 @@ pub async fn handle_open_channel_request(
     let (from_remote_rx, to_remote_tx) = transport
         .open_channel(header)
         .await
-        .map_err(|e| SessionError::new(e.to_string()))?;
+        .map_err(|_| SessionError::new("failed to open channel"))?;
     Ok((from_remote_rx, to_remote_tx))
 }
 
@@ -756,22 +756,22 @@ impl RemoteSsh3Transport for Ssh3Transport {
         (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
         TransportError,
     > {
-        let (quic_reader, mut quic_writer) = {
+            let (quic_reader, mut quic_writer) = {
             let guard = self.endpoint.lock().await;
             guard
                 .open_stream()
                 .await
-                .map_err(|e| TransportError::OpenFailed(e.to_string()))?
+                .map_err(|_| TransportError::OpenFailed("failed to open stream".into()))?
         };
 
         if let Some(h) = &header {
             quic_writer.encode_one(h)
                 .await
-                .map_err(|e| TransportError::OpenFailed(e.to_string()))?;
+                .map_err(|_| TransportError::OpenFailed("failed to write channel header".into()))?;
             quic_writer
                 .flush()
                 .await
-                .map_err(|e| TransportError::OpenFailed(e.to_string()))?;
+                .map_err(|_| TransportError::OpenFailed("failed to flush channel header".into()))?;
         }
 
         let (from_remote_tx, from_remote_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) = remoc::rch::mpsc::channel(64);

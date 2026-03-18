@@ -60,10 +60,10 @@ where
 
     let dest_port = match validate_port(dest_port.into_inner(), "destination port") {
         Ok(port) => port,
-        Err(error) => {
+        Err(_) => {
             let failure = SshMessage::ChannelOpenFailure {
                 reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
-                description: error.to_string(),
+                description: "destination port is out of range for a TCP port".into(),
             };
             writer.encode_one(&failure).await?;
             return Ok(());
@@ -82,7 +82,7 @@ where
             );
             let failure = SshMessage::ChannelOpenFailure {
                 reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
-                description: format!("connect failed: {e}"),
+                description: "connect failed".into(),
             };
             writer.encode_one(&failure).await?;
             return Ok(());

@@ -495,9 +495,10 @@ impl<C: quic::Connection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
             let opener: crate::channel::OpenBiFactory = Arc::new(move || {
                 let conn = conn.clone();
                 Box::pin(async move {
-                    let (reader, writer) = conn.open_bi().await.map_err(|e| {
-                        io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string())
-                    })?;
+                    let (reader, writer) = conn
+                        .open_bi()
+                        .await
+                        .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))?;
                     let async_reader = StreamReader::new(reader);
                     let async_writer = SinkWriter::new(writer);
                     Ok((
