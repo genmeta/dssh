@@ -18,7 +18,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 
 use genmeta_ssh3_proto::{
-    codec::{SshBool, SshString},
+    codec::{SshBool, SshString, checked_remote_field_len},
     message::SshMessage,
 };
 use h3x::{
@@ -90,7 +90,8 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ExecRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = std::pin::pin!(stream);
         let len: VarInt = stream.decode_one().await?;
-        let mut command = vec![0u8; len.into_inner() as usize];
+        let len = checked_remote_field_len(len.into_inner(), "exec command")?;
+        let mut command = vec![0u8; len];
         stream.read_exact(&mut command).await?;
         Ok(Self { command })
     }
@@ -403,8 +404,8 @@ where
         }
     };
 
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let stdin = child.stdin.take().unwrap();
     let child_pid = child.id().unwrap_or(0) as i32;
 
@@ -435,22 +436,7 @@ where
         drop(stdin); // Close stdin to signal EOF to child
     }.in_current_span());
 
-    // Read stdout and stderr concurrently, sending as channel messages.
-    let (stdout_result, stderr_result) = tokio::join!(
-        copy_stream_to_channel_data(&mut stdout, writer),
-        read_all_stderr(&mut stderr),
-    );
-
-    // Send any stderr data as ChannelExtendedData.
-    let stderr_data = stderr_result?;
-    if !stderr_data.is_empty() {
-        writer.encode_one(&SshMessage::ChannelExtendedData {
-            data_type: VarInt::from(1u8),
-            data: stderr_data,
-        }).await?;
-    }
-
-    stdout_result?;
+    copy_command_output(stdout, stderr, writer).await?;
 
     // Wait for process to exit.
     let status = child.wait().await?;
@@ -585,7 +571,7 @@ where
     }.in_current_span());
 
     // Read from PTY master → ChannelData (PTY combines stdout+stderr).
-    let stdout_result = copy_stream_to_channel_data(&mut master_reader, writer).await;
+    let stdout_result = copy_command_output_from_reader(&mut master_reader, writer).await;
 
     // EIO is expected when the child exits and the slave side closes.
     if let Err(ref e) = stdout_result
@@ -643,11 +629,73 @@ where
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Read from an `AsyncRead` and send chunks as `SshMessage::ChannelData`.
-///
-/// Note: Since we can't share `&mut W` across tasks, stdout is read inline
-/// and stderr is buffered separately.
-async fn copy_stream_to_channel_data<R, W>(reader: &mut R, writer: &mut W) -> io::Result<()>
+enum CommandOutputChunk {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
+
+async fn copy_command_output<Stdout, Stderr, W>(
+    stdout: Stdout,
+    stderr: Stderr,
+    writer: &mut W,
+) -> io::Result<()>
+where
+    Stdout: AsyncRead + Send + Unpin + 'static,
+    Stderr: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin,
+{
+    let (tx, mut rx) = mpsc::channel(8);
+    let stdout_task = tokio::spawn(read_stream_chunks(stdout, tx.clone(), true).in_current_span());
+    let stderr_task = tokio::spawn(read_stream_chunks(stderr, tx, false).in_current_span());
+
+    while let Some(chunk) = rx.recv().await {
+        match chunk {
+            CommandOutputChunk::Stdout(data) => {
+                writer.encode_one(&SshMessage::ChannelData { data }).await?;
+            }
+            CommandOutputChunk::Stderr(data) => {
+                writer
+                    .encode_one(&SshMessage::ChannelExtendedData {
+                        data_type: VarInt::from(1u8),
+                        data,
+                    })
+                    .await?;
+            }
+        }
+    }
+
+    stdout_task.await.map_err(io::Error::other)??;
+    stderr_task.await.map_err(io::Error::other)??;
+    Ok(())
+}
+
+async fn read_stream_chunks<R>(
+    mut reader: R,
+    tx: mpsc::Sender<CommandOutputChunk>,
+    is_stdout: bool,
+) -> io::Result<()>
+where
+    R: AsyncRead + Send + Unpin,
+{
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        let chunk = if is_stdout {
+            CommandOutputChunk::Stdout(buf[..n].to_vec())
+        } else {
+            CommandOutputChunk::Stderr(buf[..n].to_vec())
+        };
+        if tx.send(chunk).await.is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn copy_command_output_from_reader<R, W>(reader: &mut R, writer: &mut W) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
@@ -658,21 +706,13 @@ where
         if n == 0 {
             break;
         }
-        writer.encode_one(&SshMessage::ChannelData {
-            data: buf[..n].to_vec(),
-        }).await?;
+        writer
+            .encode_one(&SshMessage::ChannelData {
+                data: buf[..n].to_vec(),
+            })
+            .await?;
     }
     Ok(())
-}
-
-/// Read all data from an `AsyncRead` into a buffer (used for stderr).
-async fn read_all_stderr<R>(reader: &mut R) -> io::Result<Vec<u8>>
-where
-    R: AsyncRead + Send + Unpin,
-{
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf).await?;
-    Ok(buf)
 }
 
 fn signal_number(signal_name: &str) -> Option<Signal> {
@@ -738,7 +778,7 @@ async fn deliver_signal_request(child_pid: i32, request_data: &[u8]) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
+    use genmeta_ssh3_proto::{codec::{MAX_REMOTE_FIELD_SIZE, SshString}, message::SshMessage};
     use h3x::codec::EncodeExt;
     use tokio::io::duplex;
 
@@ -795,6 +835,21 @@ mod tests {
 
         let req = ExecRequest::decode_from(request_data.as_slice()).await.unwrap();
         assert_eq!(req.command, vec![0x66, 0x6f, 0xff]);
+    }
+
+    #[tokio::test]
+    async fn exec_request_rejects_oversized_command() {
+        let mut request_data = Vec::new();
+        request_data
+            .encode_one(VarInt::try_from((MAX_REMOTE_FIELD_SIZE + 1) as u64).unwrap())
+            .await
+            .unwrap();
+
+        let err = ExecRequest::decode_from(request_data.as_slice())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exec command length"));
     }
 
     // -------------------------------------------------------------------
@@ -1435,6 +1490,68 @@ mod tests {
             has_stderr,
             "expected ChannelExtendedData with stderr_msg, got: {messages:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn exec_large_stderr_streams_incrementally() {
+        let (server_writer, mut client_reader) = duplex(262144);
+        let mut server_writer = server_writer;
+
+        let (_, rx) = mpsc::channel(1);
+        run_exec(
+            default_shell(),
+            b"i=0; while [ $i -lt 20000 ]; do printf x >&2; i=$((i+1)); done",
+            &mut server_writer,
+            rx,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(server_writer);
+
+        let mut stderr_frames = 0usize;
+        let mut total_stderr = 0usize;
+        let mut eof_pos = None;
+        let mut close_pos = None;
+        let mut exit_pos = None;
+        let mut index = 0usize;
+
+        loop {
+            match SshMessage::decode_from(&mut client_reader).await {
+                Ok(SshMessage::ChannelExtendedData { data_type, data }) => {
+                    assert_eq!(data_type, VarInt::from(1u8));
+                    stderr_frames += 1;
+                    total_stderr += data.len();
+                    index += 1;
+                }
+                Ok(SshMessage::ChannelRequest { request_type, .. }) if request_type == "exit-status" => {
+                    exit_pos = Some(index);
+                    index += 1;
+                }
+                Ok(SshMessage::ChannelEof) => {
+                    eof_pos = Some(index);
+                    index += 1;
+                }
+                Ok(SshMessage::ChannelClose) => {
+                    close_pos = Some(index);
+                    index += 1;
+                }
+                Ok(_) => {
+                    index += 1;
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert!(stderr_frames > 1, "expected multiple stderr frames, got {stderr_frames}");
+        assert_eq!(total_stderr, 20000);
+
+        let exit_pos = exit_pos.expect("missing exit-status");
+        let eof_pos = eof_pos.expect("missing eof");
+        let close_pos = close_pos.expect("missing close");
+        assert!(exit_pos < eof_pos, "exit-status should come before EOF");
+        assert!(eof_pos < close_pos, "EOF should come before Close");
     }
 
     // -------------------------------------------------------------------
