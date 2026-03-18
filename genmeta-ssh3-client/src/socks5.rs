@@ -187,9 +187,8 @@ where
             let len = reader.read_u8().await?;
             let mut domain_bytes = vec![0u8; len as usize];
             reader.read_exact(&mut domain_bytes).await?;
-            let domain = String::from_utf8(domain_bytes.clone()).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("invalid domain: {e}"))
-            })?;
+            let domain = String::from_utf8(domain_bytes.clone())
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             // Prepend the length byte for the reply.
             let mut atyp_bytes = vec![len];
             atyp_bytes.extend_from_slice(&domain_bytes);

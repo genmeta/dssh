@@ -24,7 +24,7 @@ pub const SSH3_CONNECT_PATH: &str = "/.well-known/ssh3/connect";
 #[derive(Debug, Snafu)]
 pub enum ClientError {
     /// The Extended CONNECT request could not be sent.
-    #[snafu(display("connect failed: {message}"))]
+    #[snafu(display("{message}"))]
     ConnectFailed { message: String },
 
     /// The server rejected authentication (HTTP 401).
@@ -32,11 +32,11 @@ pub enum ClientError {
     AuthenticationFailed,
 
     /// The server returned an unexpected status code or missing headers.
-    #[snafu(display("protocol error: {message}"))]
+    #[snafu(display("{message}"))]
     ProtocolError { message: String },
 
     /// The server's ssh-version response did not match any supported version.
-    #[snafu(display("version mismatch: server offered {server_version}"))]
+    #[snafu(display("server offered unsupported version {server_version}"))]
     VersionMismatch { server_version: String },
 }
 
@@ -100,22 +100,22 @@ impl Ssh3Client {
             .config
             .authority
             .parse()
-            .map_err(|e| ClientError::ConnectFailed {
-                message: format!("invalid authority: {e}"),
+            .map_err(|_| ClientError::ConnectFailed {
+                message: "invalid authority".into(),
             })?;
 
         let connection = client
             .connect(authority.clone())
             .await
-            .map_err(|e| ClientError::ConnectFailed {
-                message: format!("{e}"),
+            .map_err(|_| ClientError::ConnectFailed {
+                message: "failed to establish QUIC connection".into(),
             })?;
 
         let uri: http::Uri =
             format!("https://{authority}{SSH3_CONNECT_PATH}")
                 .parse()
-                .map_err(|e| ClientError::ConnectFailed {
-                    message: format!("invalid URI: {e}"),
+                .map_err(|_| ClientError::ConnectFailed {
+                    message: "invalid URI".into(),
                 })?;
 
         let request = http::Request::builder()
@@ -125,15 +125,15 @@ impl Ssh3Client {
             .header(http::header::AUTHORIZATION, self.basic_auth_header())
             .extension(Protocol::new("ssh3"))
             .body(Empty::<Bytes>::new())
-            .map_err(|e| ClientError::ConnectFailed {
-                message: format!("failed to build request: {e}"),
+            .map_err(|_| ClientError::ConnectFailed {
+                message: "failed to build request".into(),
             })?;
 
         let response = connection
             .execute_hyper_request(request)
             .await
-            .map_err(|e| ClientError::ConnectFailed {
-                message: format!("{e}"),
+            .map_err(|_| ClientError::ConnectFailed {
+                message: "extended CONNECT request failed".into(),
             })?;
 
         // Check response status.
@@ -344,18 +344,17 @@ mod tests {
         let err = ClientError::ConnectFailed {
             message: "timeout".into(),
         };
-        assert!(err.to_string().contains("connect failed"));
-        assert!(err.to_string().contains("timeout"));
+        assert_eq!(err.to_string(), "timeout");
 
         let err = ClientError::ProtocolError {
             message: "bad status".into(),
         };
-        assert!(err.to_string().contains("protocol error"));
+        assert_eq!(err.to_string(), "bad status");
 
         let err = ClientError::VersionMismatch {
             server_version: "unknown-99".into(),
         };
-        assert!(err.to_string().contains("version mismatch"));
+        assert!(err.to_string().contains("unsupported version"));
         assert!(err.to_string().contains("unknown-99"));
     }
 
