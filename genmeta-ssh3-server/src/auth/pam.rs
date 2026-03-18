@@ -114,21 +114,22 @@ pub struct UserInfo {
 /// Stage 4 (`pam_end`) is handled via `Drop` semantics on the backend.
 #[allow(dead_code)]
 pub trait PamBackend: Send + Sync {
-    /// Authenticate the user (PAM stage 2: `pam_authenticate`).
-    fn authenticate(
+    fn start_transaction(
         &self,
         service: &str,
         username: &str,
         password: &str,
-    ) -> Result<(), PamError>;
-
-    /// Check account validity (PAM stage 3: `pam_acct_mgmt`).
-    fn acct_mgmt(&self, service: &str, username: &str) -> Result<(), PamError>;
+    ) -> Result<Box<dyn PamTransaction>, PamError>;
 
     /// Look up user info (uid, gid, home, shell) for the given username.
     /// 
     /// In production, this would call `nix::unistd::User::from_name()`.
     fn get_user_info(&self, username: &str) -> Result<UserInfo, PamError>;
+}
+
+pub trait PamTransaction: Send {
+    fn authenticate(&mut self) -> Result<(), PamError>;
+    fn acct_mgmt(&mut self) -> Result<(), PamError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +141,11 @@ pub trait PamBackend: Send + Sync {
 /// Gate behind the `pam` feature flag, which enables the `pam-client2` dep.
 #[cfg(feature = "pam")]
 pub struct SystemPam;
+
+#[cfg(feature = "pam")]
+pub struct SystemPamTransaction {
+    context: Context<PasswordConversation>,
+}
 
 #[cfg(feature = "pam")]
 struct PasswordConversation {
@@ -170,13 +176,13 @@ impl pam_client2::ConversationHandler for PasswordConversation {
 
 #[cfg(feature = "pam")]
 impl PamBackend for SystemPam {
-    fn authenticate(
+    fn start_transaction(
         &self,
         service: &str,
         username: &str,
         password: &str,
-    ) -> Result<(), PamError> {
-        let mut context = Context::new(
+    ) -> Result<Box<dyn PamTransaction>, PamError> {
+        let context = Context::new(
             service,
             Some(username),
             PasswordConversation {
@@ -186,22 +192,7 @@ impl PamBackend for SystemPam {
         )
         .map_err(|e| PamError::new(format!("failed to create PAM context: {e}")))?;
 
-        context
-            .authenticate(Flag::NONE)
-            .map_err(|e| PamError::new(format!("pam_authenticate failed: {e}")))
-    }
-
-    fn acct_mgmt(&self, service: &str, username: &str) -> Result<(), PamError> {
-        let mut context = Context::new(
-            service,
-            Some(username),
-            pam_client2::conv_null::Conversation::new(),
-        )
-        .map_err(|e| PamError::new(format!("failed to create PAM context: {e}")))?;
-
-        context
-            .acct_mgmt(Flag::NONE)
-            .map_err(|e| PamError::new(format!("pam_acct_mgmt failed: {e}")))
+        Ok(Box::new(SystemPamTransaction { context }))
     }
 
     fn get_user_info(&self, username: &str) -> Result<UserInfo, PamError> {
@@ -215,6 +206,21 @@ impl PamBackend for SystemPam {
             home: user.dir,
             shell: user.shell,
         })
+    }
+}
+
+#[cfg(feature = "pam")]
+impl PamTransaction for SystemPamTransaction {
+    fn authenticate(&mut self) -> Result<(), PamError> {
+        self.context
+            .authenticate(Flag::NONE)
+            .map_err(|e| PamError::new(format!("pam_authenticate failed: {e}")))
+    }
+
+    fn acct_mgmt(&mut self) -> Result<(), PamError> {
+        self.context
+            .acct_mgmt(Flag::NONE)
+            .map_err(|e| PamError::new(format!("pam_acct_mgmt failed: {e}")))
     }
 }
 
@@ -238,14 +244,22 @@ pub async fn pam_authenticate(
     username: &str,
     password: &str,
 ) -> Result<AuthResult, PamError> {
+    let mut transaction = match backend.start_transaction(PAM_SERVICE, username, password) {
+        Ok(transaction) => transaction,
+        Err(e) => {
+            add_random_delay().await;
+            return Err(e);
+        }
+    };
+
     // Stage 2: authenticate
-    if let Err(e) = backend.authenticate(PAM_SERVICE, username, password) {
+    if let Err(e) = transaction.authenticate() {
         add_random_delay().await;
         return Err(e);
     }
 
     // Stage 3: account management
-    if let Err(e) = backend.acct_mgmt(PAM_SERVICE, username) {
+    if let Err(e) = transaction.acct_mgmt() {
         add_random_delay().await;
         return Err(e);
     }
@@ -299,6 +313,14 @@ mod tests {
         user_info: UserInfo,
         /// Tracks whether cleanup (Drop) was called.
         dropped: Arc<AtomicBool>,
+        /// Tracks transaction usage order.
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    struct MockPamTransaction {
+        auth_error: Option<PamError>,
+        acct_error: Option<PamError>,
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
     impl MockPam {
@@ -308,6 +330,7 @@ mod tests {
                 acct_error: None,
                 user_info,
                 dropped,
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -317,6 +340,7 @@ mod tests {
                 acct_error: None,
                 user_info: default_user_info(),
                 dropped,
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -326,32 +350,50 @@ mod tests {
                 acct_error: Some(PamError::new(message)),
                 user_info: default_user_info(),
                 dropped,
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
+        }
+
+        fn call_log(&self) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+            self.calls.clone()
         }
     }
 
     impl PamBackend for MockPam {
-        fn authenticate(
+        fn start_transaction(
             &self,
             _service: &str,
             _username: &str,
             _password: &str,
-        ) -> Result<(), PamError> {
+        ) -> Result<Box<dyn PamTransaction>, PamError> {
+            self.calls.lock().unwrap().push("start_transaction");
+            Ok(Box::new(MockPamTransaction {
+                auth_error: self.auth_error.clone(),
+                acct_error: self.acct_error.clone(),
+                calls: self.calls.clone(),
+            }))
+        }
+
+        fn get_user_info(&self, _username: &str) -> Result<UserInfo, PamError> {
+            Ok(self.user_info.clone())
+        }
+    }
+
+    impl PamTransaction for MockPamTransaction {
+        fn authenticate(&mut self) -> Result<(), PamError> {
+            self.calls.lock().unwrap().push("authenticate");
             match &self.auth_error {
                 Some(e) => Err(e.clone()),
                 None => Ok(()),
             }
         }
 
-        fn acct_mgmt(&self, _service: &str, _username: &str) -> Result<(), PamError> {
+        fn acct_mgmt(&mut self) -> Result<(), PamError> {
+            self.calls.lock().unwrap().push("acct_mgmt");
             match &self.acct_error {
                 Some(e) => Err(e.clone()),
                 None => Ok(()),
             }
-        }
-
-        fn get_user_info(&self, _username: &str) -> Result<UserInfo, PamError> {
-            Ok(self.user_info.clone())
         }
     }
 
@@ -384,6 +426,7 @@ mod tests {
             shell: PathBuf::from("/bin/zsh"),
         };
         let mock = MockPam::success(info, dropped.clone());
+        let calls = mock.call_log();
 
         let result = pam_authenticate(&mock, "alice", "correct-password").await;
         assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -404,6 +447,11 @@ mod tests {
                 panic!("expected Success, got Failure: {reason}");
             }
         }
+
+        assert_eq!(
+            &*calls.lock().unwrap(),
+            &["start_transaction", "authenticate", "acct_mgmt"]
+        );
 
         // Drop the mock and verify cleanup
         drop(mock);
@@ -437,6 +485,7 @@ mod tests {
     async fn test_pam_acct_mgmt_failure() {
         let dropped = Arc::new(AtomicBool::new(false));
         let mock = MockPam::acct_failure("account expired", dropped.clone());
+        let calls = mock.call_log();
 
         let start = tokio::time::Instant::now();
         let result = pam_authenticate(&mock, "alice", "correct-password").await;
@@ -445,6 +494,10 @@ mod tests {
         assert!(result.is_err(), "expected Err, got {result:?}");
         let err = result.unwrap_err();
         assert_eq!(err.message, "account expired");
+        assert_eq!(
+            &*calls.lock().unwrap(),
+            &["start_transaction", "authenticate", "acct_mgmt"]
+        );
 
         // Verify timing-attack protection delay was applied
         assert!(

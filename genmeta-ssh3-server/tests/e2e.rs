@@ -2140,11 +2140,15 @@ fn test_global_request_e2e_control_stream_legacy_path_rejected() {
 // ===========================================================================
 
 use std::path::PathBuf;
-use genmeta_ssh3_server::auth::pam::{PamBackend, PamError, UserInfo};
+use genmeta_ssh3_server::auth::pam::{PamBackend, PamError, PamTransaction, UserInfo};
 
 struct TestPamBackend {
     auth_error: Option<PamError>,
     user_info: UserInfo,
+}
+
+struct TestPamTransaction {
+    auth_error: Option<PamError>,
 }
 
 impl TestPamBackend {
@@ -2171,24 +2175,32 @@ impl TestPamBackend {
 }
 
 impl PamBackend for TestPamBackend {
-    fn authenticate(
+    fn start_transaction(
         &self,
         _service: &str,
         _username: &str,
         _password: &str,
-    ) -> Result<(), PamError> {
+    ) -> Result<Box<dyn PamTransaction>, PamError> {
+        Ok(Box::new(TestPamTransaction {
+            auth_error: self.auth_error.clone(),
+        }))
+    }
+
+    fn get_user_info(&self, _username: &str) -> Result<UserInfo, PamError> {
+        Ok(self.user_info.clone())
+    }
+}
+
+impl PamTransaction for TestPamTransaction {
+    fn authenticate(&mut self) -> Result<(), PamError> {
         match &self.auth_error {
             Some(e) => Err(e.clone()),
             None => Ok(()),
         }
     }
 
-    fn acct_mgmt(&self, _service: &str, _username: &str) -> Result<(), PamError> {
+    fn acct_mgmt(&mut self) -> Result<(), PamError> {
         Ok(())
-    }
-
-    fn get_user_info(&self, _username: &str) -> Result<UserInfo, PamError> {
-        Ok(self.user_info.clone())
     }
 }
 
