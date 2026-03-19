@@ -7,10 +7,17 @@
 //! - Sending `ChannelOpenConfirmation(91)` or `ChannelOpenFailure(92)`
 //! - Running the session channel message loop (data, requests, EOF, close)
 
-use std::{future::Future, os::fd::AsRawFd, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 
-use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
-use genmeta_ssh3_proto::session::{Ssh3Transport as RemoteSsh3Transport, Ssh3TransportClient, TransportError};
+use genmeta_ssh::{
+    codec::ChannelHeader,
+    message::SshMessage,
+};
+use genmeta_ssh::{
+    CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, StreamlocalForwardRequest,
+    TcpipForwardReply, TcpipForwardRequest,
+};
+use genmeta_ssh::{Ssh3Transport as RemoteSsh3Transport, Ssh3TransportClient, TransportError};
 use h3x::codec::{DecodeExt, EncodeExt};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
@@ -24,8 +31,7 @@ use std::sync::{atomic::{AtomicBool, Ordering}, Arc as StdArc};
 
 use crate::forward::reverse_tcp::ReverseTcpForwarder;
 use crate::forward::streamlocal::ReverseStreamlocalForwarder;
-use crate::session::pty::{PtyPair, allocate_pty, set_window_size};
-use crate::session::request::{handle_request, RequestAction, run_exec, run_shell};
+pub use crate::session::handle_session_channel;
 use crate::protocol::DispatchedStream;
 
 // ---------------------------------------------------------------------------
@@ -66,32 +72,6 @@ fn validate_global_request_port(bind_port: u32) -> io::Result<u16> {
         )
     })
 }
-// ---------------------------------------------------------------------------
-// Channel events dispatched via mpsc
-// ---------------------------------------------------------------------------
-
-/// Events produced by the channel message loop and sent to the session layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelEvent {
-    /// ChannelData(94) — standard channel data.
-    Data(Vec<u8>),
-    /// ChannelExtendedData(95) — extended data (e.g., stderr when data_type=1).
-    ExtendedData { data_type: VarInt, data: Vec<u8> },
-    /// ChannelRequest(98) — channel request with type and opaque payload.
-    Request {
-        request_type: String,
-        want_reply: bool,
-        request_data: Vec<u8>,
-    },
-    /// ChannelEof(96) — remote side signals end of input.
-    Eof,
-    /// ChannelClose(97) — remote side closes the channel.
-    Close,
-}
-
-/// Default maximum message size for session channels.
-pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
-
 // ---------------------------------------------------------------------------
 // Channel dispatch by type
 // ---------------------------------------------------------------------------
@@ -183,9 +163,6 @@ pub async fn process_global_request(
     mut data: &[u8],
     global_ctx: Option<Arc<GlobalRequestContext>>,
 ) -> io::Result<GlobalRequestReply> {
-    use crate::forward::reverse_tcp::{CancelTcpipForwardRequest, TcpipForwardReply, TcpipForwardRequest};
-    use crate::forward::streamlocal::{CancelStreamlocalForwardRequest, StreamlocalForwardRequest};
-
     let ctx = match global_ctx {
         Some(ctx) => ctx,
         None => {
@@ -435,101 +412,6 @@ where
 ///
 /// Returns `(event_rx, io::Result<()>)` via spawning, but for direct use
 /// this function drives the loop to completion.
-pub async fn handle_session_channel<R, W>(
-    _header: ChannelHeader,
-    reader: R,
-    mut writer: W,
-) -> io::Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-{
-    // Send ChannelOpenConfirmation(91).
-    let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
-    };
-    writer.encode_one(&confirm).await?;
-
-    // Spawn the message-loop reader, producing events into the channel.
-    let (event_tx, mut event_rx) = mpsc::channel(64);
-    tokio::spawn(async move {
-        let _ = run_message_loop_with_sender(reader, event_tx).await;
-    }.in_current_span());
-
-    // Dispatch loop: consume events until an exec/shell request arrives.
-    // Tracks PTY allocation state: None (idle) or Some(PtyPair) (PTY allocated).
-    let mut pty_pair: Option<PtyPair> = None;
-
-    while let Some(event) = event_rx.recv().await {
-        match event {
-            ChannelEvent::Request { .. } => {
-                match handle_request(&event, &mut writer).await? {
-                    Some(RequestAction::Exec(command)) => {
-                        let shell = std::env::var_os("SHELL")
-                            .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"));
-                        run_exec(shell.as_os_str(), &command, &mut writer, event_rx, pty_pair.take()).await?;
-                        return Ok(());
-                    }
-                    Some(RequestAction::Shell) => {
-                        let shell = std::env::var_os("SHELL")
-                            .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"));
-                        run_shell(shell.as_os_str(), &mut writer, event_rx, pty_pair.take()).await?;
-                        return Ok(());
-                    }
-                    Some(RequestAction::AllocatePty(req, want_reply)) => {
-                        match allocate_pty(&req) {
-                            Ok(pair) => {
-                                pty_pair = Some(pair);
-                                tracing::info!(term = %req.term_type, "PTY allocated");
-                                if want_reply {
-                                    writer.encode_one(&SshMessage::ChannelSuccess).await?;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(%e, "PTY allocation failed");
-                                if want_reply {
-                                    writer.encode_one(&SshMessage::ChannelFailure).await?;
-                                }
-                            }
-                        }
-                    }
-                    Some(RequestAction::WindowChange(req)) => {
-                        if let Some(ref pair) = pty_pair
-                            && let Err(error) = set_window_size(pair.master.as_raw_fd(), &req)
-                        {
-                            tracing::warn!(
-                                error = %Report::from_error(&error),
-                                width_cols = req.width_cols,
-                                height_rows = req.height_rows,
-                                "window-change resize failed, keeping current size"
-                            );
-                        }
-                    }
-                    Some(RequestAction::Signal(_)) => {
-                        // Signal before exec/shell — no process to signal yet
-                        tracing::debug!("ignoring signal before exec/shell");
-                    }
-                    None => { /* unrecognized request, continue loop */ }
-                }
-            }
-            ChannelEvent::Eof => {
-                writer.encode_one(&SshMessage::ChannelEof).await?;
-                writer.shutdown().await?;
-                break;
-            }
-            ChannelEvent::Close => {
-                writer.encode_one(&SshMessage::ChannelClose).await?;
-                break;
-            }
-            ChannelEvent::Data(_) | ChannelEvent::ExtendedData { .. } => {
-                // No exec/shell running yet — data before a request is meaningless.
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Handle an open-channel request from the child process.
 ///
 /// Opens a new channel via transport and returns remoc
@@ -539,104 +421,15 @@ pub async fn handle_open_channel_request(
     transport: &Ssh3TransportClient,
 ) -> Result<
     (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
-    genmeta_ssh3_proto::session::SessionError,
+    genmeta_ssh::SessionError,
 > {
-    use genmeta_ssh3_proto::session::SessionError;
+    use genmeta_ssh::SessionError;
 
     let (from_remote_rx, to_remote_tx) = transport
         .open_channel(header)
         .await
         .map_err(|_| SessionError::new("failed to open channel"))?;
     Ok((from_remote_rx, to_remote_tx))
-}
-
-/// Open a session channel, send confirmation, and return the event receiver
-/// along with a writer for sending messages back.
-///
-/// This is the public API for the session layer to consume channel events.
-pub async fn open_session_channel<R, W>(
-    reader: R,
-    mut writer: W,
-) -> io::Result<(mpsc::Receiver<ChannelEvent>, W)>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-{
-    // Send ChannelOpenConfirmation(91).
-    let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
-    };
-    writer.encode_one(&confirm).await?;
-
-    let (event_tx, event_rx) = mpsc::channel(64);
-    tokio::spawn(async move {
-        let _ = run_message_loop_with_sender(reader, event_tx).await;
-    }.in_current_span());
-    Ok((event_rx, writer))
-}
-
-// ---------------------------------------------------------------------------
-// Message loop
-// ---------------------------------------------------------------------------
-
-/// Core message loop: reads `SshMessage` from the stream, dispatches to mpsc.
-pub async fn run_message_loop_with_sender<R>(
-    mut reader: R,
-    event_tx: mpsc::Sender<ChannelEvent>,
-) -> io::Result<()>
-where
-    R: AsyncRead + Send + Unpin,
-{
-    loop {
-        let msg = match reader.decode_one::<SshMessage>().await {
-            Ok(msg) => msg,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                // Stream closed — normal termination.
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
-
-        match msg {
-            SshMessage::ChannelData { data } => {
-                let _ = event_tx.send(ChannelEvent::Data(data)).await;
-            }
-            SshMessage::ChannelExtendedData { data_type, data } => {
-                let _ = event_tx
-                    .send(ChannelEvent::ExtendedData { data_type, data })
-                    .await;
-            }
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                let _ = event_tx
-                    .send(ChannelEvent::Request {
-                        request_type,
-                        want_reply,
-                        request_data,
-                    })
-                    .await;
-            }
-            SshMessage::ChannelEof => {
-                let _ = event_tx.send(ChannelEvent::Eof).await;
-            }
-            SshMessage::ChannelClose => {
-                let _ = event_tx.send(ChannelEvent::Close).await;
-                return Ok(());
-            }
-            SshMessage::ChannelSuccess => {
-                tracing::debug!("received ChannelSuccess(99)");
-            }
-            SshMessage::ChannelFailure => {
-                tracing::debug!("received ChannelFailure(100)");
-            }
-            other => {
-                tracing::warn!("unexpected message in channel loop: {other:?}");
-            }
-        }
-    }
 }
 
 pub struct ConversationEndpoint {
@@ -815,10 +608,12 @@ impl RemoteSsh3Transport for Ssh3Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forward::reverse_tcp::{CancelTcpipForwardRequest, ReverseTcpForwarder, TcpipForwardRequest};
+    use crate::forward::reverse_tcp::ReverseTcpForwarder;
     use crate::forward::streamlocal::ReverseStreamlocalForwarder;
-    use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
-    use genmeta_ssh3_proto::session::{Ssh3Transport as RemoteSessionTransport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
+    use genmeta_ssh::ChannelEvent;
+    use genmeta_ssh::{DEFAULT_MAX_MESSAGE_SIZE, codec::ChannelHeader, message::SshMessage, open_session_channel};
+    use genmeta_ssh::{CancelTcpipForwardRequest, TcpipForwardRequest};
+    use genmeta_ssh::{Ssh3Transport as RemoteSessionTransport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
     use h3x::codec::{DecodeFrom, EncodeInto};
     use h3x::stream_id::StreamId;
     use remoc::rtc::ServerShared;

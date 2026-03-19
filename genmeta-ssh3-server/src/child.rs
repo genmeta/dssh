@@ -1,11 +1,11 @@
-//! Parent-side child process manager for ssh3-session.
+//! Parent-side child process manager for the session child binary.
 //!
-//! Spawns the `ssh3-session` binary, establishes a remoc connection over
+//! Spawns the `session` binary (or legacy `ssh3-session` shim), establishes a remoc connection over
 //! stdin/stdout pipes, and manages the child's lifecycle.
 //!
 //! # Protocol
 //!
-//! 1. Parent spawns `ssh3-session` with stdin/stdout piped.
+//! 1. Parent spawns the session child binary with stdin/stdout piped.
 //! 2. Parent establishes remoc connection: reads from child's stdout, writes to child's stdin.
 //! 3. Parent sends [`ChildBootstrap`] (transport + credential) via base channel.
 //! 4. Child performs PAM authentication and sends [`AuthResult`] back.
@@ -13,11 +13,11 @@
 use std::path::Path;
 use std::process::ExitStatus;
 
-use genmeta_ssh3_proto::session::{AuthResult, ChildBootstrap};
+use genmeta_ssh::{AuthResult, ChildBootstrap};
 use tokio::process::{Child, Command};
 use tracing::Instrument;
 
-/// Handle to a spawned `ssh3-session` child process.
+/// Handle to a spawned session child process.
 ///
 /// Manages the child's lifecycle and ensures cleanup on drop.
 /// The remoc connection is established during [`spawn`](Self::spawn).
@@ -26,7 +26,7 @@ pub struct ChildProcess {
 }
 
 impl ChildProcess {
-    /// Spawn the `ssh3-session` binary and establish a remoc connection.
+    /// Spawn the session child binary and establish a remoc connection.
     ///
     /// Returns the process handle, a [`Sender<ChildBootstrap>`] for sending
     /// the bootstrap payload, and a [`Receiver<AuthResult>`] for receiving
@@ -34,14 +34,14 @@ impl ChildProcess {
     ///
     /// # Arguments
     ///
-    /// * `ssh3_session_path` — Path to the `ssh3-session` binary.
+    /// * `session_path` — Path to the session child binary.
     ///
     /// # Errors
     ///
     /// Returns an error if the binary cannot be spawned or the remoc
     /// connection fails.
     pub async fn spawn(
-        ssh3_session_path: impl AsRef<Path>,
+        session_path: impl AsRef<Path>,
     ) -> Result<
         (
             Self,
@@ -50,7 +50,7 @@ impl ChildProcess {
         ),
         std::io::Error,
     > {
-        let mut child = Command::new(ssh3_session_path.as_ref())
+        let mut child = Command::new(session_path.as_ref())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -111,33 +111,37 @@ use super::*;
     use h3x::stream_id::StreamId;
     use std::path::PathBuf;
 
-    /// Locate the `ssh3-session` binary built by cargo.
+    /// Locate the `session` binary built by cargo, falling back to legacy `ssh3-session`.
     ///
     /// In test builds, we can derive the path from the test binary's location:
-    /// the test binary is at `target/<profile>/deps/...` and the ssh3-session
-    /// binary is at `target/<profile>/ssh3-session`.
-    fn ssh3_session_bin() -> PathBuf {
+    /// the test binary is at `target/<profile>/deps/...` and the session
+    /// binary is at `target/<profile>/session`.
+    fn session_bin() -> PathBuf {
         // The current test executable lives in target/<profile>/deps/
         let test_exe = std::env::current_exe().expect("cannot determine test executable path");
         let deps_dir = test_exe.parent().expect("no parent for test exe");
         // Go up from deps/ to the profile dir (e.g., target/debug/)
         let profile_dir = deps_dir.parent().expect("no parent for deps dir");
-        profile_dir.join("ssh3-session")
+        ["session", "ssh3-session"]
+            .into_iter()
+            .map(|name| profile_dir.join(name))
+            .find(|path| path.exists())
+            .unwrap_or_else(|| profile_dir.join("session"))
     }
 
     #[tokio::test]
     async fn spawn_returns_channels() {
-        let bin = ssh3_session_bin();
+        let bin = session_bin();
         if !bin.exists() {
             panic!(
-                "ssh3-session binary not found at {}; run `cargo build --bin ssh3-session` first",
+                "session binary not found at {}; run `cargo build --bin session` first",
                 bin.display()
             );
         }
 
         let (mut child, _bootstrap_tx, _auth_rx) = ChildProcess::spawn(&bin)
             .await
-            .expect("failed to spawn ssh3-session");
+            .expect("failed to spawn session child");
 
         // spawn() returns channels; child waits for ChildBootstrap.
         // Kill the child since we're done.
@@ -150,10 +154,10 @@ use super::*;
 
     #[tokio::test]
     async fn drop_kills_child() {
-        let bin = ssh3_session_bin();
+        let bin = session_bin();
         if !bin.exists() {
             panic!(
-                "ssh3-session binary not found at {}; run `cargo build --bin ssh3-session` first",
+                "session binary not found at {}; run `cargo build --bin session` first",
                 bin.display()
             );
         }
@@ -162,7 +166,7 @@ use super::*;
         {
             let (child, _bootstrap_tx, _auth_rx) = ChildProcess::spawn(&bin)
                 .await
-                .expect("failed to spawn ssh3-session");
+                .expect("failed to spawn session child");
             child_id = child.child.id();
             // Drop child here — should kill the process.
         }
@@ -186,17 +190,17 @@ use super::*;
     // full bootstrap round-trip (parent sends credential, child responds).
     #[tokio::test]
     async fn spawn_and_bootstrap_session() {
-        let bin = ssh3_session_bin();
+        let bin = session_bin();
         if !bin.exists() {
             panic!(
-                "ssh3-session binary not found at {}; run `cargo build --bin ssh3-session` first",
+                "session binary not found at {}; run `cargo build --bin session` first",
                 bin.display()
             );
         }
 
         let (mut child, mut bootstrap_tx, mut auth_rx) = ChildProcess::spawn(&bin)
             .await
-            .expect("failed to spawn ssh3-session");
+            .expect("failed to spawn session child");
 
         let (_dispatch_tx, dispatch_rx) = tokio::sync::mpsc::channel(1);
         let opener: crate::channel::OpenBiFactory = std::sync::Arc::new(|| {
@@ -215,7 +219,7 @@ use super::*;
         let transport =
             std::sync::Arc::new(crate::channel::Ssh3Transport::new(endpoint));
 
-        use genmeta_ssh3_proto::session::Ssh3TransportServerShared;
+        use genmeta_ssh::Ssh3TransportServerShared;
         use remoc::rtc::ServerShared;
         let (server, client) = Ssh3TransportServerShared::new(transport, 16);
         tokio::spawn(async move {
@@ -224,7 +228,7 @@ use super::*;
 
         let bootstrap = ChildBootstrap {
             transport: client,
-            credential: genmeta_ssh3_proto::auth::AuthCredential::Basic {
+            credential: genmeta_ssh::AuthCredential::Basic {
                 username: "testuser".into(),
                 password: "testpass".into(),
             },

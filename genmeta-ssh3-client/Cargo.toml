@@ -5,10 +5,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-genmeta-ssh3-proto = { path = "../genmeta-ssh3-proto" }
+genmeta-ssh = { path = "../genmeta-ssh" }
 h3x = { path = "../../h3x" }
 tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "net"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 base64 = "0.22"
 snafu = "0.9"
 http = "1"
@@ -17,10 +18,11 @@ bytes = "1"
 
 [dev-dependencies]
 genmeta-ssh3-server = { path = "../genmeta-ssh3-server" }
-gm-quic = { path = "../../gm-quic/gm-quic" }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-tower-service = "0.3"
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
-tracing-appender = "0.2"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "ssh3-client"
+path = "src/bin/ssh3-client.rs"

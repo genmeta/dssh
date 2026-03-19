@@ -12,18 +12,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
-use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient};
-use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
+use genmeta_ssh::{ChannelReader, ChannelWriter, finish_forwarded_tcpip_channel, forwarded_tcpip_header};
+use genmeta_ssh::{Ssh3Transport, Ssh3TransportClient};
+use h3x::codec::EncodeExt;
 use h3x::stream_id::StreamId;
-use h3x::varint::VarInt;
 use snafu::Report;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::Instrument;
-
-use crate::byte_channel::{ChannelReader, ChannelWriter};
 
 struct ReverseTcpListenerEntry {
     owner: StreamId,
@@ -68,132 +65,9 @@ async fn abort_listener_entry(entry: ReverseTcpListenerEntry) {
     abort_tracked_connections(&entry.connection_tasks).await;
 }
 
-/// Default maximum message size advertised in ChannelHeaders.
-const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
-
-/// Signal value for channel headers (matching conversation.rs CHANNEL_SIGNAL_VALUE).
-const CHANNEL_SIGNAL_VALUE: u32 = 0xaf3627e6;
-
 // ---------------------------------------------------------------------------
 // Request / response data structures
 // ---------------------------------------------------------------------------
-
-/// Decoded `tcpip-forward` request data: bind_address + bind_port.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TcpipForwardRequest {
-    pub bind_address: String,
-    pub bind_port: u32,
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &TcpipForwardRequest {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.bind_address.clone())).await?;
-        stream.encode_one(VarInt::from(self.bind_port)).await?;
-        Ok(())
-    }
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for TcpipForwardRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        let bind_address: SshString = stream.decode_one().await?;
-        let bind_port: VarInt = stream.decode_one().await?;
-        Ok(TcpipForwardRequest {
-            bind_address: bind_address.0,
-            bind_port: bind_port.into_inner() as u32,
-        })
-    }
-}
-
-/// Decoded `cancel-tcpip-forward` request data: bind_address + bind_port.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CancelTcpipForwardRequest {
-    pub bind_address: String,
-    pub bind_port: u32,
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &CancelTcpipForwardRequest {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.bind_address.clone())).await?;
-        stream.encode_one(VarInt::from(self.bind_port)).await?;
-        Ok(())
-    }
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for CancelTcpipForwardRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        let bind_address: SshString = stream.decode_one().await?;
-        let bind_port: VarInt = stream.decode_one().await?;
-        Ok(CancelTcpipForwardRequest {
-            bind_address: bind_address.0,
-            bind_port: bind_port.into_inner() as u32,
-        })
-    }
-}
-
-/// Reply data for `tcpip-forward` when bind_port was 0 (ephemeral port allocation).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TcpipForwardReply {
-    pub allocated_port: u32,
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &TcpipForwardReply {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(VarInt::from(self.allocated_port)).await?;
-        Ok(())
-    }
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for TcpipForwardReply {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        let allocated_port: VarInt = stream.decode_one().await?;
-        Ok(TcpipForwardReply {
-            allocated_port: allocated_port.into_inner() as u32,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ForwardedTcpipRequestData {
-    connected_addr: String,
-    connected_port: u16,
-    originator_addr: String,
-    originator_port: u16,
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &ForwardedTcpipRequestData {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.connected_addr.clone())).await?;
-        stream.encode_one(VarInt::from(self.connected_port)).await?;
-        stream.encode_one(SshString(self.originator_addr.clone())).await?;
-        stream.encode_one(VarInt::from(self.originator_port)).await?;
-        Ok(())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // forwarded-tcpip channel request_data encoding/decoding
@@ -206,68 +80,6 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &ForwardedTcpipRequestData {
 /// - connected_port: VarInt
 /// - originator_address: SshString
 /// - originator_port: VarInt
-fn forwarded_tcpip_header(conversation_id: StreamId) -> ChannelHeader {
-    ChannelHeader {
-        signal_value: CHANNEL_SIGNAL_VALUE,
-        conversation_id: conversation_id.into_inner(),
-        channel_type: "forwarded-tcpip".to_string(),
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-    }
-}
-
-async fn finish_forwarded_tcpip_channel<R, W>(
-    mut reader: R,
-    mut writer: W,
-    tcp_stream: tokio::net::TcpStream,
-    connected_addr: &str,
-    connected_port: u16,
-    originator_addr: &str,
-    originator_port: u16,
-) -> io::Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-{
-    writer
-        .encode_one(&ForwardedTcpipRequestData {
-            connected_addr: connected_addr.to_string(),
-            connected_port,
-            originator_addr: originator_addr.to_string(),
-            originator_port,
-        })
-        .await?;
-    writer.flush().await?;
-
-    let response: SshMessage = reader.decode_one().await?;
-    match response {
-        SshMessage::ChannelOpenConfirmation { .. } => {}
-        SshMessage::ChannelOpenFailure { .. } => {
-            return Ok(());
-        }
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected ChannelOpenConfirmation or ChannelOpenFailure, got {other:?}"),
-            ));
-        }
-    }
-
-    let (tcp_reader, tcp_writer) = tcp_stream.into_split();
-
-    let q2t = tokio::spawn(super::relay(reader, tcp_writer));
-    let t2q = tokio::spawn(super::relay(tcp_reader, writer));
-
-    let (r1, r2) = tokio::join!(q2t, t2q);
-    if let Ok(Err(e)) = r1 {
-        tracing::warn!(error = %Report::from_error(&e), "relay quic→tcp error");
-    }
-    if let Ok(Err(e)) = r2 {
-        tracing::warn!(error = %Report::from_error(&e), "relay tcp→quic error");
-    }
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // ReverseTcpForwarder
 // ---------------------------------------------------------------------------
@@ -481,9 +293,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
-    use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportServerShared, TransportError};
-    use h3x::codec::DecodeExt;
+    use genmeta_ssh::{
+        CHANNEL_SIGNAL_VALUE,
+        DEFAULT_MAX_MESSAGE_SIZE,
+        codec::ChannelHeader,
+        codec::SshString,
+        message::SshMessage,
+    };
+    use genmeta_ssh::{CancelTcpipForwardRequest, TcpipForwardReply, TcpipForwardRequest};
+    use genmeta_ssh::{Ssh3Transport, Ssh3TransportServerShared, TransportError};
+    use h3x::codec::{DecodeExt, DecodeFrom, EncodeInto};
     use h3x::varint::VarInt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};

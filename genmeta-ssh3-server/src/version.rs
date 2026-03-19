@@ -5,12 +5,10 @@
 //! picks the first client-offered version it also supports and echoes that
 //! single version back in the response `ssh-version` header.
 
-use genmeta_ssh3_proto::error::ssh3_error;
-use genmeta_ssh3_proto::error::Ssh3Error;
+use genmeta_ssh::ssh3_error;
+use genmeta_ssh::Ssh3Error;
+use genmeta_ssh::SUPPORTED_SSH_VERSIONS;
 use snafu::ResultExt;
-
-/// The SSH3 draft versions this server supports.
-const SUPPORTED_VERSIONS: &[&str] = &["michel-ssh3-00"];
 
 /// A negotiated SSH3 version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +39,7 @@ pub fn negotiate_version(headers: &http::HeaderMap) -> Result<SshVersion, Ssh3Er
 
     for offered in header_value.split(',') {
         let trimmed = offered.trim();
-        if SUPPORTED_VERSIONS.contains(&trimmed) {
+        if SUPPORTED_SSH_VERSIONS.contains(&trimmed) {
             return Ok(SshVersion {
                 version_string: trimmed.to_owned(),
             });
@@ -62,6 +60,7 @@ pub fn version_response_header(version: &SshVersion) -> http::HeaderValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use genmeta_ssh::SSH_VERSION;
 
     fn headers_with(name: &str, value: &str) -> http::HeaderMap {
         let mut map = http::HeaderMap::new();
@@ -74,16 +73,16 @@ mod tests {
 
     #[test]
     fn test_version_negotiate_single_valid() {
-        let hdrs = headers_with("ssh-version", "michel-ssh3-00");
+        let hdrs = headers_with("ssh-version", SSH_VERSION);
         let v = negotiate_version(&hdrs).unwrap();
-        assert_eq!(v.version_string, "michel-ssh3-00");
+        assert_eq!(v.version_string, SSH_VERSION);
     }
 
     #[test]
     fn test_version_negotiate_multiple_picks_supported() {
-        let hdrs = headers_with("ssh-version", "michel-ssh3-01,michel-ssh3-00");
+        let hdrs = headers_with("ssh-version", &format!("genmeta-ssh3-01,{SSH_VERSION}"));
         let v = negotiate_version(&hdrs).unwrap();
-        assert_eq!(v.version_string, "michel-ssh3-00");
+        assert_eq!(v.version_string, SSH_VERSION);
     }
 
     #[test]
@@ -95,23 +94,23 @@ mod tests {
 
     #[test]
     fn test_version_negotiate_no_match() {
-        let hdrs = headers_with("ssh-version", "michel-ssh3-99");
+        let hdrs = headers_with("ssh-version", "genmeta-ssh3-99");
         let err = negotiate_version(&hdrs).unwrap_err();
         assert!(err.to_string().contains("no supported ssh-version"));
     }
 
     #[test]
     fn test_version_negotiate_whitespace_handling() {
-        let hdrs = headers_with("ssh-version", "michel-ssh3-00 , michel-ssh3-01");
+        let hdrs = headers_with("ssh-version", &format!("{SSH_VERSION} , genmeta-ssh3-01"));
         let v = negotiate_version(&hdrs).unwrap();
-        assert_eq!(v.version_string, "michel-ssh3-00");
+        assert_eq!(v.version_string, SSH_VERSION);
     }
 
     #[test]
     fn test_version_negotiate_whitespace_around_supported() {
-        let hdrs = headers_with("ssh-version", " michel-ssh3-01 , michel-ssh3-00 ");
+        let hdrs = headers_with("ssh-version", &format!(" genmeta-ssh3-01 , {SSH_VERSION} "));
         let v = negotiate_version(&hdrs).unwrap();
-        assert_eq!(v.version_string, "michel-ssh3-00");
+        assert_eq!(v.version_string, SSH_VERSION);
     }
 
     #[test]
@@ -124,9 +123,9 @@ mod tests {
     #[test]
     fn test_version_response_header() {
         let v = SshVersion {
-            version_string: "michel-ssh3-00".into(),
+            version_string: SSH_VERSION.into(),
         };
         let hv = version_response_header(&v);
-        assert_eq!(hv.to_str().unwrap(), "michel-ssh3-00");
+        assert_eq!(hv.to_str().unwrap(), SSH_VERSION);
     }
 }

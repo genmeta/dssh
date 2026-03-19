@@ -18,6 +18,7 @@ use tokio::{
     sync::mpsc,
 };
 
+use crate::CHANNEL_SIGNAL_VALUE;
 use crate::codec::{ChannelHeader, SshBool, SshBytes, SshString};
 
 // ---------------------------------------------------------------------------
@@ -200,9 +201,6 @@ where
         }
     }
 }
-
-/// Signal value for channel headers written by `open_channel`.
-const CHANNEL_SIGNAL_VALUE: u32 = 0xaf3627e6;
 
 impl<R, W> Conversation for LocalConversation<R, W>
 where

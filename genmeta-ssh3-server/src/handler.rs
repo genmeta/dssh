@@ -9,6 +9,7 @@
 use std::{
     convert::Infallible,
     io,
+    path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
@@ -27,8 +28,8 @@ use crate::{auth, child::ChildProcess, error::ServerError, protocol::Ssh3Protoco
 use crate::channel::{GlobalRequestContext, serve_control_stream_global_requests};
 use crate::forward::reverse_tcp::ReverseTcpForwarder;
 use crate::forward::streamlocal::ReverseStreamlocalForwarder;
-use genmeta_ssh3_proto::auth::AuthCredential;
-use genmeta_ssh3_proto::session::{AuthResult, ChildBootstrap};
+use genmeta_ssh::AuthCredential;
+use genmeta_ssh::{AuthResult, ChildBootstrap};
 use h3x::hyper::upgrade;
 use h3x::protocol::Protocols;
 use remoc::rtc::ServerShared;
@@ -194,10 +195,10 @@ impl Ssh3ConnectHandler {
         });
         tracing::info!(%conversation_id, "registered SSH3 conversation");
 
-        let session_bin = match ssh3_session_binary() {
+        let session_bin = match session_binary() {
             Ok(path) if path.exists() => path,
             Ok(path) => {
-                tracing::error!(error = %Report::from_error(ServerError::MissingSessionBinary { path: path.display().to_string() }), "ssh3-session binary not found");
+                tracing::error!(error = %Report::from_error(ServerError::MissingSessionBinary { path: path.display().to_string() }), "session binary not found");
                 return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
             }
             Err(e) => {
@@ -427,26 +428,49 @@ fn unauthorized_response(www_authenticate: &str) -> http::Response<Empty<bytes::
     response
 }
 
-fn ssh3_session_binary() -> std::io::Result<std::path::PathBuf> {
+const SESSION_BINARY_CANDIDATES: &[&str] = &["session", "ssh3-session"];
+
+fn session_binary() -> std::io::Result<PathBuf> {
     if let Ok(path) = std::env::var("SSH3_SESSION_BIN") {
-        return Ok(std::path::PathBuf::from(path));
+        return Ok(PathBuf::from(path));
     }
 
     let exe = std::env::current_exe()?;
-    let sibling = exe.parent().map(|p| p.join("ssh3-session")).unwrap_or_default();
-    if sibling.exists() {
-        return Ok(sibling);
+    if let Some(path) = resolve_session_binary_near(&exe) {
+        return Ok(path);
     }
 
-    Ok(exe.parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("ssh3-session"))
-        .unwrap_or_default())
+    if let Some(path) = SESSION_BINARY_CANDIDATES
+        .iter()
+        .find_map(|candidate| find_binary_on_path(candidate))
+    {
+        return Ok(path);
+    }
+
+    Ok(exe.parent().map(|p| p.join("session")).unwrap_or_default())
+}
+
+fn resolve_session_binary_near(exe: &Path) -> Option<PathBuf> {
+    [exe.parent(), exe.parent().and_then(|parent| parent.parent())]
+        .into_iter()
+        .flatten()
+        .flat_map(|dir| SESSION_BINARY_CANDIDATES.iter().map(move |name| dir.join(name)))
+        .find(|path| path.is_file())
+}
+
+fn find_binary_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use genmeta_ssh::SSH_VERSION;
+
     fn headers_with_pairs(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
         for &(name, value) in pairs {
@@ -463,7 +487,7 @@ mod tests {
     fn valid_connect_returns_ok() {
         // "user:pass" → base64 "dXNlcjpwYXNz"
         let headers = headers_with_pairs(&[
-            ("ssh-version", "michel-ssh3-00"),
+            ("ssh-version", SSH_VERSION),
             ("authorization", "Basic dXNlcjpwYXNz"),
         ]);
 
@@ -471,7 +495,7 @@ mod tests {
 
         match decision {
             ConnectDecision::Ok { version_header, .. } => {
-                assert_eq!(version_header.to_str().unwrap(), "michel-ssh3-00");
+                assert_eq!(version_header.to_str().unwrap(), SSH_VERSION);
             }
             other => panic!("expected Ok, got {other:?}"),
         }
@@ -516,7 +540,7 @@ mod tests {
     #[test]
     fn missing_auth_returns_unauthorized() {
         let headers = headers_with_pairs(&[
-            ("ssh-version", "michel-ssh3-00"),
+            ("ssh-version", SSH_VERSION),
         ]);
 
         let decision = evaluate_connect(&Method::CONNECT, Some("ssh3"), &headers);
@@ -533,7 +557,7 @@ mod tests {
     #[test]
     fn bearer_auth_returns_unauthorized() {
         let headers = headers_with_pairs(&[
-            ("ssh-version", "michel-ssh3-00"),
+            ("ssh-version", SSH_VERSION),
             ("authorization", "Bearer some-token"),
         ]);
 
@@ -551,7 +575,7 @@ mod tests {
     #[test]
     fn non_connect_method_rejected() {
         let headers = headers_with_pairs(&[
-            ("ssh-version", "michel-ssh3-00"),
+            ("ssh-version", SSH_VERSION),
             ("authorization", "Basic dXNlcjpwYXNz"),
         ]);
 
@@ -569,7 +593,7 @@ mod tests {
     #[test]
     fn post_method_rejected() {
         let headers = headers_with_pairs(&[
-            ("ssh-version", "michel-ssh3-00"),
+            ("ssh-version", SSH_VERSION),
             ("authorization", "Basic dXNlcjpwYXNz"),
         ]);
 
@@ -587,7 +611,7 @@ mod tests {
     #[test]
     fn missing_protocol_rejected() {
         let headers = headers_with_pairs(&[
-            ("ssh-version", "michel-ssh3-00"),
+            ("ssh-version", SSH_VERSION),
             ("authorization", "Basic dXNlcjpwYXNz"),
         ]);
 
@@ -605,7 +629,7 @@ mod tests {
     #[test]
     fn wrong_protocol_rejected() {
         let headers = headers_with_pairs(&[
-            ("ssh-version", "michel-ssh3-00"),
+            ("ssh-version", SSH_VERSION),
             ("authorization", "Basic dXNlcjpwYXNz"),
         ]);
 

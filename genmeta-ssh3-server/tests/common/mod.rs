@@ -240,7 +240,7 @@ impl tower_service::Service<http::Request<UnsyncBoxBody<Bytes, MessageStreamErro
                 Ok(credential) => {
                     // If a PAM backend is configured, verify credentials through it.
                     if let Some(ref pam) = pam_backend {
-                        let genmeta_ssh3_proto::auth::AuthCredential::Basic { ref username, ref password } = credential;
+                        let genmeta_ssh::AuthCredential::Basic { ref username, ref password } = credential;
                         let auth_ok = pam
                             .start_transaction("ssh3", username, password)
                             .and_then(|mut tx| {

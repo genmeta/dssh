@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-genmeta-ssh3-proto = { path = "../genmeta-ssh3-proto" }
+genmeta-ssh = { path = "../genmeta-ssh" }
 h3x = { path = "../../h3x" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "io-util", "time", "process", "net"] }
 tracing = "0.1"
@@ -35,5 +35,17 @@ tokio-util = { version = "0.7", features = ["rt"] }
 genmeta-ssh3-client = { path = "../genmeta-ssh3-client" }
 
 [[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[[bin]]
 name = "ssh3-server"
 path = "src/bin/ssh3-server.rs"
+
+[[bin]]
+name = "session"
+path = "src/bin/session.rs"
+
+[[bin]]
+name = "ssh3-session"
+path = "src/bin/ssh3-session.rs"

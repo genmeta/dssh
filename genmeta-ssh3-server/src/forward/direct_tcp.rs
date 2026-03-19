@@ -16,15 +16,12 @@
 //! **CRITICAL**: After the confirmation, the QUIC stream carries raw bytes —
 //! NOT wrapped in `SSH_MSG_CHANNEL_DATA(94)`.
 
-use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
+use genmeta_ssh::{codec::ChannelHeader, codec::SshString, message::SshMessage, relay, DEFAULT_MAX_MESSAGE_SIZE};
 use h3x::codec::{DecodeExt, EncodeExt};
 use h3x::varint::VarInt;
 use snafu::Report;
 use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-
-/// Default maximum message size advertised in ChannelOpenConfirmation.
-const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
 
 /// SSH_OPEN_CONNECT_FAILED reason code (RFC 4254 §5.1).
 const SSH_OPEN_CONNECT_FAILED: u64 = 2;
@@ -100,8 +97,8 @@ where
     // can occur when both copy futures share a single task (join!/select!).
     let (tcp_reader, tcp_writer) = tcp_stream.into_split();
 
-    let q2t = tokio::spawn(super::relay(reader, tcp_writer));
-    let t2q = tokio::spawn(super::relay(tcp_reader, writer));
+    let q2t = tokio::spawn(relay(reader, tcp_writer));
+    let t2q = tokio::spawn(relay(tcp_reader, writer));
 
     // Wait for both directions, handle errors.
     let (r1, r2) = tokio::join!(q2t, t2q);
@@ -119,7 +116,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh3_proto::{codec::SshString, message::SshMessage};
+    use genmeta_ssh::{codec::SshString, message::SshMessage};
     use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
     use h3x::varint::VarInt;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};

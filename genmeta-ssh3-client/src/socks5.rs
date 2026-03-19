@@ -15,7 +15,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use genmeta_ssh3_proto::message::SshMessage;
+use genmeta_ssh::SshMessage;
 use h3x::codec::DecodeFrom;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -307,8 +307,8 @@ async fn send_reply<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use h3x::codec::EncodeInto;
-    use genmeta_ssh3_proto::codec::ChannelHeader;
-    use genmeta_ssh3_proto::message::SshMessage;
+    use genmeta_ssh::ChannelHeader;
+    use genmeta_ssh::SshMessage;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(header.channel_type, "direct-tcpip");
 
         // Read request_data fields (dest_host, dest_port, originator_host, originator_port).
-        use genmeta_ssh3_proto::codec::SshString;
+        use genmeta_ssh::SshString;
         use h3x::codec::DecodeExt;
         use h3x::varint::VarInt;
         let _dest_host = SshString::decode_from(&mut server_reader).await.unwrap();
@@ -416,7 +416,7 @@ mod tests {
         let _header = ChannelHeader::decode_from(&mut server_reader).await.unwrap();
 
         // Read request_data fields.
-        use genmeta_ssh3_proto::codec::SshString;
+        use genmeta_ssh::SshString;
         use h3x::codec::DecodeExt;
         use h3x::varint::VarInt;
         let _dest_host = SshString::decode_from(&mut server_reader).await.unwrap();

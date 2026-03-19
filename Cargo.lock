@@ -666,33 +666,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "genmeta-ssh3-client"
+name = "genmeta-ssh"
 version = "0.1.0"
 dependencies = [
  "base64",
  "bytes",
- "genmeta-ssh3-proto",
- "genmeta-ssh3-server",
- "gm-quic",
- "h3x",
- "http",
- "http-body-util",
- "rustls",
- "snafu",
- "tokio",
- "tokio-util",
- "tower-service",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "genmeta-ssh3-proto"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bytes",
+ "futures",
  "h3x",
  "http",
  "remoc",
@@ -704,13 +683,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "genmeta-ssh3-client"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "genmeta-ssh",
+ "genmeta-ssh3-server",
+ "h3x",
+ "http",
+ "http-body-util",
+ "snafu",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "genmeta-ssh3-server"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "genmeta-ssh",
  "genmeta-ssh3-client",
- "genmeta-ssh3-proto",
  "gm-quic",
  "h3x",
  "http",

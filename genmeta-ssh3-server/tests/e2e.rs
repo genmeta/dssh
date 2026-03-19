@@ -16,17 +16,17 @@ use h3x::qpack::field::Protocol;
 use http::{Method, StatusCode};
 use http_body_util::Empty;
 use tokio_util::task::AbortOnDropHandle;
-use genmeta_ssh3_proto::codec::ChannelHeader;
-use genmeta_ssh3_proto::message::SshMessage;
+use genmeta_ssh::{ChannelHeader, RequestAction, SshMessage, handle_request, open_session_channel};
 use genmeta_ssh3_server::channel::{
-    open_session_channel, reject_legacy_global_request_channel,
+    reject_legacy_global_request_channel,
     serve_control_stream_global_requests,
 };
 use genmeta_ssh3_server::channel::handle_global_request_channel;
 use genmeta_ssh3_server::channel::handle_session_channel;
 use genmeta_ssh3_server::forward::direct_tcp::handle_direct_tcp;
-use genmeta_ssh3_server::session::request::{encode_exit_status, handle_request, run_exec};
-use genmeta_ssh3_proto::codec::SshString;
+use genmeta_ssh::encode_exit_status;
+use genmeta_ssh3_server::session::request::run_exec;
+use genmeta_ssh::SshString;
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
@@ -34,9 +34,10 @@ use tokio::io::{self, duplex, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use genmeta_ssh3_server::channel::GlobalRequestContext;
-use genmeta_ssh3_server::forward::reverse_tcp::{ReverseTcpForwarder, TcpipForwardRequest, CancelTcpipForwardRequest, TcpipForwardReply};
-use genmeta_ssh3_server::forward::streamlocal::{ReverseStreamlocalForwarder, StreamlocalForwardRequest};
-use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
+use genmeta_ssh3_server::forward::reverse_tcp::ReverseTcpForwarder;
+use genmeta_ssh3_server::forward::streamlocal::ReverseStreamlocalForwarder;
+use genmeta_ssh::{CancelTcpipForwardRequest, StreamlocalForwardRequest, TcpipForwardReply, TcpipForwardRequest};
+use genmeta_ssh::{Ssh3Transport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
 use remoc::rtc::ServerShared;
 
 struct TestTransport;
@@ -115,7 +116,7 @@ fn smoke_connect() {
         let request = http::Request::builder()
             .method(Method::CONNECT)
             .uri(format!("https://{authority}/.well-known/ssh3/connect"))
-            .header("ssh-version", "michel-ssh3-00")
+            .header("ssh-version", SSH_VERSION)
             .header(
                 http::header::AUTHORIZATION,
                 "Basic dGVzdDp0ZXN0cGFzcw==", // test:testpass
@@ -134,7 +135,7 @@ fn smoke_connect() {
             .headers()
             .get("ssh-version")
             .expect("missing ssh-version response header");
-        assert_eq!(ssh_version.to_str().unwrap(), "michel-ssh3-00");
+        assert_eq!(ssh_version.to_str().unwrap(), SSH_VERSION);
     })
 }
 
@@ -472,7 +473,7 @@ fn test_basic_exec() {
             .expect("expected Some(RequestAction::Exec)");
         assert_eq!(
             action,
-            genmeta_ssh3_server::session::request::RequestAction::Exec(b"echo hello".to_vec())
+            RequestAction::Exec(b"echo hello".to_vec())
         );
 
         // Client: read ChannelSuccess (reply to want_reply=true).
@@ -1284,7 +1285,7 @@ fn test_non_pty_signal_exit_signal() {
                     request_data,
                     ..
                 })) if request_type == "exit-signal" => {
-                    let req = genmeta_ssh3_server::session::request::ExitSignalRequest::decode_from(request_data.as_slice())
+                    let req = genmeta_ssh::ExitSignalRequest::decode_from(request_data.as_slice())
                         .await
                         .unwrap();
                     assert_eq!(req.signal_name, "TERM");
@@ -1366,7 +1367,7 @@ fn test_non_pty_unknown_signal_preserves_wire_fidelity() {
                     request_data,
                     ..
                 })) if request_type == "exit-signal" => {
-                    let req = genmeta_ssh3_server::session::request::ExitSignalRequest::decode_from(request_data.as_slice())
+                    let req = genmeta_ssh::ExitSignalRequest::decode_from(request_data.as_slice())
                         .await
                         .unwrap();
                     assert_eq!(req.signal_name, expected_signal);
@@ -1477,7 +1478,7 @@ fn test_pty_signal_exit_signal() {
                     request_data,
                     ..
                 })) if request_type == "exit-signal" => {
-                    let req = genmeta_ssh3_server::session::request::ExitSignalRequest::decode_from(request_data.as_slice())
+                    let req = genmeta_ssh::ExitSignalRequest::decode_from(request_data.as_slice())
                         .await
                         .unwrap();
                     assert_eq!(req.signal_name, "TERM");
@@ -2347,7 +2348,7 @@ fn test_session_exec_flow() {
             .expect("expected Some(RequestAction::Exec)");
         assert_eq!(
             action,
-            genmeta_ssh3_server::session::request::RequestAction::Exec(
+            RequestAction::Exec(
                 b"echo session_flow_test".to_vec(),
             )
         );

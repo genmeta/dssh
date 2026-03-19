@@ -1,13 +1,13 @@
 //! HTTP-layer authentication credential extraction for the SSH3 server.
 //!
-//! Delegates to [`genmeta_ssh3_proto::auth::parse_authorization_header`] for
+//! Delegates to [`genmeta_ssh::auth::parse_authorization_header`] for
 //! the actual parsing and returns an [`AuthChallenge`] on failure so the caller
 //! can build a proper `401 Unauthorized` response.
 //!
 //! Also provides PAM-based password authentication via the [`pam`] submodule.
 
 pub mod pam;
-use genmeta_ssh3_proto::auth::{parse_authorization_header, AuthCredential};
+use genmeta_ssh::{parse_authorization_header, AuthCredential};
 
 /// An auth rejection — carries the information needed for a `401` response.
 #[derive(Debug, Clone, PartialEq, Eq)]

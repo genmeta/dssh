@@ -17,12 +17,9 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 
-use genmeta_ssh3_proto::{
-    codec::{SshBool, SshString, checked_remote_field_len},
-    message::SshMessage,
-};
+use genmeta_ssh::{ChannelEvent, ExitSignalRequest, ExitStatusRequest, SignalRequest, SshMessage, WindowChangeRequest};
 use h3x::{
-    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
+    codec::{DecodeFrom, EncodeExt},
     varint::VarInt,
 };
 use nix::{
@@ -30,286 +27,16 @@ use nix::{
     sys::signal::{self, Signal},
     unistd::{Pid, dup, setpgid},
 };
-use snafu::{Report, ResultExt, Snafu};
+use snafu::Report;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
-use crate::channel::ChannelEvent;
-use crate::session::pty::{PtyPair, PtyRequest, SignalRequest, WindowChangeRequest, set_window_size};
-
-async fn decode_request_payload<T>(request_data: &[u8]) -> io::Result<T>
-where
-    for<'a> T: DecodeFrom<&'a mut &'a [u8], Error = io::Error>,
-{
-    let mut reader = request_data;
-    reader.decode_one().await
-}
-// ---------------------------------------------------------------------------
-// Parsed request types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecRequest {
-    pub command: Vec<u8>,
-}
-
-/// Parsed subsystem request: the subsystem name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubsystemRequest {
-    pub subsystem_name: String,
-}
-
-/// Parsed exit-status request: the process exit code.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExitStatusRequest {
-    pub exit_status: u32,
-}
-
-/// Parsed exit-signal request (RFC 4254 §6.10).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExitSignalRequest {
-    pub signal_name: String,
-    pub core_dumped: bool,
-    pub error_message: String,
-    pub language_tag: String,
-}
-
-#[derive(Debug, Snafu)]
-pub enum RequestCodecError {
-    #[snafu(display("request codec I/O error"), context(false))]
-    Io { source: io::Error },
-
-    #[snafu(display("request codec VarInt conversion error"))]
-    VarIntConversion { source: h3x::varint::err::Overflow },
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for ExecRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        let len: VarInt = stream.decode_one().await?;
-        let len = checked_remote_field_len(len.into_inner(), "exec command")?;
-        let mut command = vec![0u8; len];
-        stream.read_exact(&mut command).await?;
-        Ok(Self { command })
-    }
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &ExecRequest {
-    type Output = ();
-    type Error = RequestCodecError;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream
-            .encode_one(VarInt::try_from(self.command.len() as u64).context(VarIntConversionSnafu)?)
-            .await?;
-        stream.write_all(&self.command).await?;
-        Ok(())
-    }
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for SubsystemRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        let subsystem_name: SshString = stream.decode_one().await?;
-        Ok(Self {
-            subsystem_name: subsystem_name.0,
-        })
-    }
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for ExitStatusRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        let exit_status: VarInt = stream.decode_one().await?;
-        Ok(Self {
-            exit_status: exit_status.into_inner() as u32,
-        })
-    }
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &ExitStatusRequest {
-    type Output = ();
-    type Error = RequestCodecError;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream
-            .encode_one(VarInt::try_from(self.exit_status as u64).context(VarIntConversionSnafu)?)
-            .await?;
-        Ok(())
-    }
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for ExitSignalRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        let signal_name: SshString = stream.decode_one().await?;
-        let core_dumped: SshBool = stream.decode_one().await?;
-        let error_message: SshString = stream.decode_one().await?;
-        let language_tag: SshString = stream.decode_one().await?;
-        Ok(Self {
-            signal_name: signal_name.0,
-            core_dumped: core_dumped.0,
-            error_message: error_message.0,
-            language_tag: language_tag.0,
-        })
-    }
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &ExitSignalRequest {
-    type Output = ();
-    type Error = RequestCodecError;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.signal_name.clone())).await?;
-        stream.encode_one(SshBool(self.core_dumped)).await?;
-        stream.encode_one(SshString(self.error_message.clone())).await?;
-        stream.encode_one(SshString(self.language_tag.clone())).await?;
-        Ok(())
-    }
-}
-
-/// Action returned by [`handle_request`] indicating what the caller should do.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RequestAction {
-    /// Run `exec` with the given command string.
-    Exec(Vec<u8>),
-    /// Launch an interactive shell.
-    Shell,
-    /// Allocate a PTY with the given parameters.
-    /// The `bool` carries `want_reply` so the caller can send success/failure
-    /// AFTER allocation completes (not before).
-    AllocatePty(PtyRequest, bool),
-    /// Resize the terminal window.
-    WindowChange(WindowChangeRequest),
-    /// Deliver a signal to the running process.
-    Signal(SignalRequest),
-}
-
-/// Synchronous version of exit-status encoding for use in assertions.
-///
-/// Uses the QUIC variable-length integer encoding:
-/// - Values 0–63: 1 byte (6-bit value, top 2 bits = 00)
-/// - Values 64–16383: 2 bytes (14-bit value, top 2 bits = 01)
-/// - Values 16384–1073741823: 4 bytes (30-bit value, top 2 bits = 10)
-pub fn encode_exit_status(exit_code: u32) -> Vec<u8> {
-    let v = exit_code as u64;
-    if v < 64 {
-        vec![v as u8]
-    } else if v < 16384 {
-        vec![0x40 | ((v >> 8) as u8), (v & 0xff) as u8]
-    } else if v < 1_073_741_824 {
-        let val = 0x80000000u32 | (v as u32);
-        val.to_be_bytes().to_vec()
-    } else {
-        // Should not happen for exit codes, but handle gracefully.
-        let val = 0xC000_0000_0000_0000u64 | v;
-        val.to_be_bytes().to_vec()
-    }
-}
+use crate::session::pty::{PtyPair, set_window_size};
 
 #[cfg(test)]
 fn default_shell() -> &'static OsStr {
     OsStr::new("/bin/sh")
-}
-
-// ---------------------------------------------------------------------------
-// Request dispatch
-// ---------------------------------------------------------------------------
-
-/// Parse a `ChannelEvent::Request` and determine the appropriate action.
-///
-/// For recognized request types (`exec`, `shell`), sends `ChannelSuccess` if
-/// `want_reply` is true, then returns the action. For unrecognized or
-/// unsupported types (`subsystem`, etc.), sends `ChannelFailure` and returns
-/// `Ok(None)`.
-pub async fn handle_request<W>(
-    event: &ChannelEvent,
-    writer: &mut W,
-) -> io::Result<Option<RequestAction>>
-where
-    W: AsyncWrite + Send + Unpin,
-{
-    let (request_type, want_reply, request_data) = match event {
-        ChannelEvent::Request {
-            request_type,
-            want_reply,
-            request_data,
-        } => (request_type.as_str(), *want_reply, request_data.as_slice()),
-        _ => return Ok(None),
-    };
-
-    match request_type {
-        "exec" => {
-            let command = decode_request_payload::<ExecRequest>(request_data).await?.command;
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelSuccess).await?;
-            }
-            Ok(Some(RequestAction::Exec(command)))
-        }
-        "shell" => {
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelSuccess).await?;
-            }
-            Ok(Some(RequestAction::Shell))
-        }
-        "pty-req" => {
-            let req = decode_request_payload::<PtyRequest>(request_data).await?;
-            // Reply is deferred to the caller — sent only after allocation
-            // succeeds or fails (see session_driver.rs / channel.rs).
-            Ok(Some(RequestAction::AllocatePty(req, want_reply)))
-        }
-        "window-change" => {
-            let req = decode_request_payload::<WindowChangeRequest>(request_data).await?;
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelSuccess).await?;
-            }
-            Ok(Some(RequestAction::WindowChange(req)))
-        }
-        "signal" => {
-            let req = decode_request_payload::<SignalRequest>(request_data).await?;
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelSuccess).await?;
-            }
-            Ok(Some(RequestAction::Signal(req)))
-        }
-        "subsystem" => {
-            // MVP: subsystem not implemented, return failure.
-            let _req = decode_request_payload::<SubsystemRequest>(request_data).await?;
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelFailure).await?;
-            }
-            Ok(None)
-        }
-        "exit-status" => {
-            // Server→client direction: parse and acknowledge (no action needed).
-            let _req = decode_request_payload::<ExitStatusRequest>(request_data).await?;
-            Ok(None)
-        }
-        "exit-signal" => {
-            // Server→client direction: parse and acknowledge (no action needed).
-            let _req = decode_request_payload::<ExitSignalRequest>(request_data).await?;
-            Ok(None)
-        }
-        _ => {
-            // Unknown request type — send failure if reply requested.
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelFailure).await?;
-            }
-            Ok(None)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +276,7 @@ where
                             }
                         }
                         "window-change" => {
-                            if let Ok(req) = decode_request_payload::<WindowChangeRequest>(request_data.as_slice()).await
+                            if let Ok(req) = WindowChangeRequest::decode_from(request_data.as_slice()).await
                                 && let Err(error) = set_window_size(master_raw_fd, &req)
                             {
                                 tracing::warn!(
@@ -758,7 +485,7 @@ async fn deliver_signal_request(child_pid: i32, request_data: &[u8]) -> io::Resu
         return Ok(());
     }
 
-    let req = decode_request_payload::<SignalRequest>(request_data).await?;
+    let req = SignalRequest::decode_from(request_data).await?;
     let Some(signal_number) = signal_number(req.signal_name.as_str()) else {
         return Ok(());
     };
@@ -778,8 +505,16 @@ async fn deliver_signal_request(child_pid: i32, request_data: &[u8]) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh3_proto::{codec::{MAX_REMOTE_FIELD_SIZE, SshString}, message::SshMessage};
-    use h3x::codec::EncodeExt;
+    use genmeta_ssh::{
+        ExecRequest,
+        RequestAction,
+        SubsystemRequest,
+        codec::{MAX_REMOTE_FIELD_SIZE, SshString},
+        handle_request,
+        message::SshMessage,
+        session::encode_exit_status,
+    };
+    use h3x::codec::{EncodeExt, EncodeInto};
     use tokio::io::duplex;
 
     async fn encode_request_data<T, E>(item: T) -> Result<Vec<u8>, E>
@@ -1560,7 +1295,8 @@ mod tests {
 
     #[tokio::test]
     async fn pty_signal_emits_exit_signal_instead_of_exit_status() {
-        use crate::session::pty::{PtyRequest, allocate_pty};
+        use crate::session::pty::allocate_pty;
+        use genmeta_ssh::PtyRequest;
 
         let pty_req = PtyRequest {
             term_type: "xterm".into(),
@@ -1657,7 +1393,8 @@ mod tests {
 
     #[tokio::test]
     async fn pty_numeric_exit_emits_exit_status() {
-        use crate::session::pty::{PtyRequest, allocate_pty};
+        use crate::session::pty::allocate_pty;
+        use genmeta_ssh::PtyRequest;
 
         let pty_req = PtyRequest {
             term_type: "xterm".into(),

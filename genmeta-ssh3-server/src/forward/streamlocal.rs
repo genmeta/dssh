@@ -31,19 +31,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use genmeta_ssh3_proto::{codec::ChannelHeader, codec::SshString, message::SshMessage};
-use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient};
-use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
+use genmeta_ssh::{ChannelReader, ChannelWriter, codec::ChannelHeader, codec::SshString, finish_forwarded_streamlocal_channel, forwarded_streamlocal_header, message::SshMessage, relay, DEFAULT_MAX_MESSAGE_SIZE};
+use genmeta_ssh::{Ssh3Transport, Ssh3TransportClient};
+use h3x::codec::{DecodeExt, EncodeExt};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
 use snafu::Report;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
 use tracing::Instrument;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
-
-use crate::byte_channel::{ChannelReader, ChannelWriter};
 
 struct ReverseStreamlocalListenerEntry {
     owner: StreamId,
@@ -91,12 +89,6 @@ async fn abort_listener_entry(socket_path: &str, entry: ReverseStreamlocalListen
         let _ = std::fs::remove_file(socket_path);
     }
 }
-
-/// Default maximum message size advertised in ChannelOpenConfirmation.
-const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
-
-/// Signal value for channel headers (matching conversation.rs CHANNEL_SIGNAL_VALUE).
-const CHANNEL_SIGNAL_VALUE: u32 = 0xaf3627e6;
 
 /// SSH_OPEN_CONNECT_FAILED reason code (RFC 4254 §5.1).
 const SSH_OPEN_CONNECT_FAILED: u64 = 2;
@@ -151,8 +143,8 @@ where
     // Bridge raw bytes bidirectionally between QUIC stream and Unix socket.
     let (unix_reader, unix_writer) = unix_stream.into_split();
 
-    let q2u = tokio::spawn(super::relay(reader, unix_writer));
-    let u2q = tokio::spawn(super::relay(unix_reader, writer));
+    let q2u = tokio::spawn(relay(reader, unix_writer));
+    let u2q = tokio::spawn(relay(unix_reader, writer));
 
     // Wait for both directions, handle errors.
     let (r1, r2) = tokio::join!(q2u, u2q);
@@ -170,81 +162,6 @@ where
 // Request / response data structures
 // ---------------------------------------------------------------------------
 
-/// Decoded `streamlocal-forward@openssh.com` request data: socket_path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamlocalForwardRequest {
-    pub socket_path: String,
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &StreamlocalForwardRequest {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.socket_path.clone())).await?;
-        Ok(())
-    }
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for StreamlocalForwardRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        let socket_path: SshString = stream.decode_one().await?;
-        Ok(StreamlocalForwardRequest {
-            socket_path: socket_path.0,
-        })
-    }
-}
-
-/// Decoded `cancel-streamlocal-forward@openssh.com` request data: socket_path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CancelStreamlocalForwardRequest {
-    pub socket_path: String,
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &CancelStreamlocalForwardRequest {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.socket_path.clone())).await?;
-        Ok(())
-    }
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for CancelStreamlocalForwardRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        let socket_path: SshString = stream.decode_one().await?;
-        Ok(CancelStreamlocalForwardRequest {
-            socket_path: socket_path.0,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ForwardedStreamlocalRequestData {
-    socket_path: String,
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &ForwardedStreamlocalRequestData {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.socket_path.clone())).await?;
-        stream.encode_one(SshString(String::new())).await?;
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // forwarded-streamlocal@openssh.com channel request_data encoding
 // ---------------------------------------------------------------------------
@@ -254,64 +171,6 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &ForwardedStreamlocalRequestData {
 /// Fields:
 /// - socket_path: SshString
 /// - reserved: SshString (empty)
-fn forwarded_streamlocal_header(conversation_id: StreamId) -> ChannelHeader {
-    ChannelHeader {
-        signal_value: CHANNEL_SIGNAL_VALUE,
-        conversation_id: conversation_id.into_inner(),
-        channel_type: "forwarded-streamlocal@openssh.com".to_string(),
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-    }
-}
-
-async fn finish_forwarded_streamlocal_channel<R, W>(
-    mut reader: R,
-    mut writer: W,
-    unix_stream: UnixStream,
-    socket_path: &str,
-) -> io::Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-{
-    writer
-        .encode_one(&ForwardedStreamlocalRequestData {
-            socket_path: socket_path.to_string(),
-        })
-        .await?;
-    writer.flush().await?;
-
-    let response: SshMessage = reader.decode_one().await?;
-    match response {
-        SshMessage::ChannelOpenConfirmation { .. } => {}
-        SshMessage::ChannelOpenFailure { .. } => {
-            return Ok(());
-        }
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "expected ChannelOpenConfirmation or ChannelOpenFailure, got {other:?}"
-                ),
-            ));
-        }
-    }
-
-    let (unix_reader, unix_writer) = unix_stream.into_split();
-
-    let q2u = tokio::spawn(super::relay(reader, unix_writer));
-    let u2q = tokio::spawn(super::relay(unix_reader, writer));
-
-    let (r1, r2) = tokio::join!(q2u, u2q);
-    if let Ok(Err(e)) = r1 {
-        tracing::warn!(error = %Report::from_error(&e), "relay quic→unix error");
-    }
-    if let Ok(Err(e)) = r2 {
-        tracing::warn!(error = %Report::from_error(&e), "relay unix→quic error");
-    }
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // ReverseStreamlocalForwarder
 // ---------------------------------------------------------------------------
@@ -509,9 +368,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh3_proto::{codec::ChannelHeader, message::SshMessage};
-    use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
-    use h3x::codec::{DecodeExt, EncodeExt};
+    use genmeta_ssh::{
+        CHANNEL_SIGNAL_VALUE,
+        DEFAULT_MAX_MESSAGE_SIZE,
+        codec::ChannelHeader,
+        codec::SshString,
+        message::SshMessage,
+    };
+    use genmeta_ssh::{CancelStreamlocalForwardRequest, StreamlocalForwardRequest};
+    use genmeta_ssh::{Ssh3Transport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
+    use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
     use h3x::varint::VarInt;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};

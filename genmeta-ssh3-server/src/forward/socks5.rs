@@ -11,7 +11,7 @@
 //! 3. **Data relay**: after successful handshake, raw bytes are bridged
 //!    bidirectionally between the QUIC stream and the TCP socket.
 
-use genmeta_ssh3_proto::codec::ChannelHeader;
+use genmeta_ssh::{ChannelHeader, relay};
 use snafu::Report;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -158,8 +158,8 @@ where
     // ---- Phase 4: Bidirectional data relay ----
     let (tcp_reader, tcp_writer) = tcp_stream.into_split();
 
-    let q2t = tokio::spawn(super::relay(reader, tcp_writer));
-    let t2q = tokio::spawn(super::relay(tcp_reader, writer));
+    let q2t = tokio::spawn(relay(reader, tcp_writer));
+    let t2q = tokio::spawn(relay(tcp_reader, writer));
 
     // Wait for both directions, handle errors.
     let (r1, r2) = tokio::join!(q2t, t2q);
@@ -214,7 +214,7 @@ async fn send_reply_with_bound_addr<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh3_proto::codec::ChannelHeader;
+    use genmeta_ssh::ChannelHeader;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 

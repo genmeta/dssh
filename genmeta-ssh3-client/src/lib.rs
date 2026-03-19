@@ -7,18 +7,44 @@
 pub mod forward;
 pub mod session;
 pub mod socks5;
+pub use genmeta_ssh::SSH_VERSION;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use bytes::Bytes;
+use h3x::gm_quic::H3Client;
 use h3x::qpack::field::Protocol;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::Empty;
 use snafu::{ResultExt, Snafu};
-/// The SSH3 version string used in the `ssh-version` header.
-pub const SSH_VERSION: &str = "michel-ssh3-00";
 
 /// The well-known path for SSH3 Extended CONNECT requests.
 pub const SSH3_CONNECT_PATH: &str = "/.well-known/ssh3/connect";
+
+pub fn init_client_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+pub async fn run_env_client() -> Result<(), Box<dyn std::error::Error>> {
+    let authority = std::env::var("SSH3_AUTHORITY")?;
+    let username = std::env::var("SSH3_USERNAME")?;
+    let password = std::env::var("SSH3_PASSWORD")?;
+
+    let client = H3Client::builder()
+        .without_server_cert_verification()
+        .without_identity()?
+        .build();
+    let ssh3 = Ssh3Client::new(Ssh3ClientConfig {
+        authority,
+        username,
+        password,
+    });
+
+    let connection = ssh3.connect(&client).await?;
+    println!("{}", connection.server_version());
+    Ok(())
+}
 
 /// Errors that can occur during SSH3 client operations.
 #[derive(Debug, Snafu)]
@@ -109,7 +135,7 @@ impl Ssh3Client {
     /// - Method: CONNECT
     /// - `:protocol`: ssh3 (via `Protocol` extension)
     /// - Path: `/.well-known/ssh3/connect`
-    /// - `ssh-version`: `michel-ssh3-00`
+    /// - `ssh-version`: `genmeta-ssh3-00`
     /// - `Authorization`: Basic auth from config
     ///
     /// Returns an [`Ssh3Connection`] containing the negotiated version and
@@ -265,10 +291,10 @@ mod tests {
 
         // Verify round-trip via proto parser.
         let cred =
-            genmeta_ssh3_proto::auth::parse_authorization_header(&auth).unwrap();
+            genmeta_ssh::parse_authorization_header(&auth).unwrap();
         assert_eq!(
             cred,
-            genmeta_ssh3_proto::auth::AuthCredential::Basic {
+            genmeta_ssh::auth::AuthCredential::Basic {
                 username: "user".into(),
                 password: "password".into(),
             }
@@ -280,10 +306,10 @@ mod tests {
         // Password with colons: "admin:p:a:ss"
         let auth = encode_basic_auth("admin", "p:a:ss");
         let cred =
-            genmeta_ssh3_proto::auth::parse_authorization_header(&auth).unwrap();
+            genmeta_ssh::parse_authorization_header(&auth).unwrap();
         assert_eq!(
             cred,
-            genmeta_ssh3_proto::auth::AuthCredential::Basic {
+            genmeta_ssh::auth::AuthCredential::Basic {
                 username: "admin".into(),
                 password: "p:a:ss".into(),
             }
@@ -317,10 +343,10 @@ mod tests {
 
         // Verify it decodes correctly.
         let cred =
-            genmeta_ssh3_proto::auth::parse_authorization_header(auth).unwrap();
+            genmeta_ssh::parse_authorization_header(auth).unwrap();
         assert_eq!(
             cred,
-            genmeta_ssh3_proto::auth::AuthCredential::Basic {
+            genmeta_ssh::auth::AuthCredential::Basic {
                 username: "user".into(),
                 password: "pass".into(),
             }
@@ -333,11 +359,11 @@ mod tests {
 
     #[test]
     fn version_negotiation_header() {
-        assert_eq!(SSH_VERSION, "michel-ssh3-00");
+        assert_eq!(SSH_VERSION, "genmeta-ssh3-00");
 
         let (_, headers) = build_connect_headers("example.com:443", "u", "p");
         let version = headers.get("ssh-version").unwrap().to_str().unwrap();
-        assert_eq!(version, "michel-ssh3-00");
+        assert_eq!(version, SSH_VERSION);
     }
 
     // -----------------------------------------------------------------------
@@ -402,10 +428,10 @@ mod tests {
 
         // Verify it round-trips through the proto parser.
         let cred =
-            genmeta_ssh3_proto::auth::parse_authorization_header(header_str).unwrap();
+            genmeta_ssh::parse_authorization_header(header_str).unwrap();
         assert_eq!(
             cred,
-            genmeta_ssh3_proto::auth::AuthCredential::Basic {
+            genmeta_ssh::auth::AuthCredential::Basic {
                 username: "test".into(),
                 password: "testpass".into(),
             }
@@ -439,10 +465,10 @@ mod tests {
         let auth = encode_basic_auth("user", "");
         // "user:" → base64 "dXNlcjo="
         let cred =
-            genmeta_ssh3_proto::auth::parse_authorization_header(&auth).unwrap();
+            genmeta_ssh::parse_authorization_header(&auth).unwrap();
         assert_eq!(
             cred,
-            genmeta_ssh3_proto::auth::AuthCredential::Basic {
+            genmeta_ssh::auth::AuthCredential::Basic {
                 username: "user".into(),
                 password: "".into(),
             }

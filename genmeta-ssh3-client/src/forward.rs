@@ -8,119 +8,20 @@
 //! - **forwarded-tcpip**: Client accepts server-initiated channels for
 //!   reverse-forwarded connections.
 
-use genmeta_ssh3_proto::codec::{ChannelHeader, SshString};
-use genmeta_ssh3_proto::message::SshMessage;
-use h3x::codec::{DecodeExt, EncodeExt, EncodeInto};
-use h3x::varint::VarInt;
-use tokio::io::{self, AsyncRead, AsyncWrite};
+use genmeta_ssh::SshMessage;
+use genmeta_ssh::{ForwardedTcpipRequest, TcpipForwardRequest};
+use h3x::codec::EncodeExt;
+use tokio::io::{self, AsyncWrite};
 
-/// Default maximum message size advertised in ChannelHeaders.
-const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1 << 20; // 1 MiB
-
-/// Signal value for channel headers (must match server's CHANNEL_SIGNAL_VALUE).
-const CHANNEL_SIGNAL_VALUE: u32 = 0xaf3627e6;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DirectTcpipRequestData {
-    dest_host: String,
-    dest_port: u32,
-    originator_host: String,
-    originator_port: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TcpipForwardRequestData {
-    bind_address: String,
-    bind_port: u32,
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &DirectTcpipRequestData {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.dest_host.clone())).await?;
-        stream.encode_one(VarInt::from(self.dest_port)).await?;
-        stream.encode_one(SshString(self.originator_host.clone())).await?;
-        stream.encode_one(VarInt::from(self.originator_port)).await?;
-        Ok(())
-    }
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &TcpipForwardRequestData {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.bind_address.clone())).await?;
-        stream.encode_one(VarInt::from(self.bind_port)).await?;
-        Ok(())
-    }
-}
+pub use genmeta_ssh::{
+    accept_forwarded_channel, encode_direct_tcpip_request_data, parse_tcpip_forward_reply,
+    read_forwarded_tcpip_info, reject_forwarded_channel, write_direct_tcpip_channel_open,
+};
 
 // ---------------------------------------------------------------------------
 // direct-tcpip
 // ---------------------------------------------------------------------------
 
-/// Encode the request_data fields for a `direct-tcpip` channel open (RFC 4254 §7.2):
-///
-/// - `SshString(dest_host)`
-/// - `VarInt(dest_port)`
-/// - `SshString(originator_host)`
-/// - `VarInt(originator_port)`
-pub async fn encode_direct_tcpip_request_data(
-    dest_host: &str,
-    dest_port: u32,
-    originator_host: &str,
-    originator_port: u32,
-) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    buf.encode_one(&DirectTcpipRequestData {
-        dest_host: dest_host.to_owned(),
-        dest_port,
-        originator_host: originator_host.to_owned(),
-        originator_port,
-    })
-    .await?;
-    Ok(buf)
-}
-
-/// Write a `direct-tcpip` channel header followed by request_data fields.
-///
-/// After calling this, the caller should read the server's response:
-/// - `ChannelOpenConfirmation(91)` → success, bridge raw bytes
-/// - `ChannelOpenFailure(92)` → connection failed
-pub async fn write_direct_tcpip_channel_open<W: AsyncWrite + Send + Unpin>(
-    writer: &mut W,
-    conversation_id: u64,
-    dest_host: &str,
-    dest_port: u32,
-    originator_host: &str,
-    originator_port: u32,
-) -> io::Result<()> {
-    let header = ChannelHeader {
-        signal_value: CHANNEL_SIGNAL_VALUE,
-        conversation_id,
-        channel_type: "direct-tcpip".to_string(),
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-    };
-    writer.encode_one(&header).await?;
-
-    // Write request_data fields inline on the stream (NOT as SshBytes — the
-    // server reads them directly after the ChannelHeader).
-    writer
-        .encode_one(&DirectTcpipRequestData {
-            dest_host: dest_host.to_owned(),
-            dest_port,
-            originator_host: originator_host.to_owned(),
-            originator_port,
-        })
-        .await?;
-
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // reverse TCP (tcpip-forward / cancel-tcpip-forward)
@@ -133,7 +34,7 @@ pub async fn encode_tcpip_forward_request(
     bind_port: u32,
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    buf.encode_one(&TcpipForwardRequestData {
+    buf.encode_one(&TcpipForwardRequest {
         bind_address: bind_address.to_owned(),
         bind_port,
     }).await?;
@@ -184,81 +85,8 @@ pub async fn send_cancel_tcpip_forward_request<W: AsyncWrite + Send + Unpin>(
     .await
 }
 
-/// Parse the `RequestSuccess` reply to a `tcpip-forward` request.
-///
-/// When `bind_port == 0`, the reply data contains `VarInt(allocated_port)`.
-/// When `bind_port != 0`, the reply data may be empty (allocated_port = bind_port).
-pub async fn parse_tcpip_forward_reply(data: &[u8], original_bind_port: u32) -> io::Result<u32> {
-    if data.is_empty() {
-        Ok(original_bind_port)
-    } else {
-        let mut reader = data;
-        let port: VarInt = reader.decode_one().await?;
-        Ok(port.into_inner() as u32)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// forwarded-tcpip channel acceptance
-// ---------------------------------------------------------------------------
-
 /// Parsed request_data from a server-initiated `forwarded-tcpip` channel.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForwardedTcpipInfo {
-    /// The address the server was listening on.
-    pub connected_address: String,
-    /// The port the server was listening on.
-    pub connected_port: u32,
-    /// The originator address of the incoming TCP connection.
-    pub originator_address: String,
-    /// The originator port of the incoming TCP connection.
-    pub originator_port: u32,
-}
-
-/// Read the request_data fields from a `forwarded-tcpip` channel.
-///
-/// Called after the client has already read the [`ChannelHeader`] and verified
-/// `channel_type == "forwarded-tcpip"`.
-pub async fn read_forwarded_tcpip_info<R: AsyncRead + Send + Unpin>(
-    reader: &mut R,
-) -> io::Result<ForwardedTcpipInfo> {
-    let connected_address: SshString = reader.decode_one().await?;
-    let connected_port: VarInt = reader.decode_one().await?;
-    let originator_address: SshString = reader.decode_one().await?;
-    let originator_port: VarInt = reader.decode_one().await?;
-
-    Ok(ForwardedTcpipInfo {
-        connected_address: connected_address.0,
-        connected_port: connected_port.into_inner() as u32,
-        originator_address: originator_address.0,
-        originator_port: originator_port.into_inner() as u32,
-    })
-}
-
-/// Accept a server-initiated `forwarded-tcpip` channel by sending
-/// `ChannelOpenConfirmation(91)`.
-pub async fn accept_forwarded_channel<W: AsyncWrite + Send + Unpin>(
-    writer: &mut W,
-) -> io::Result<()> {
-    let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
-    };
-    writer.encode_one(&confirm).await
-}
-
-/// Reject a server-initiated `forwarded-tcpip` channel by sending
-/// `ChannelOpenFailure(92)`.
-pub async fn reject_forwarded_channel<W: AsyncWrite + Send + Unpin>(
-    writer: &mut W,
-    reason_code: VarInt,
-    description: &str,
-) -> io::Result<()> {
-    let failure = SshMessage::ChannelOpenFailure {
-        reason_code,
-        description: description.to_owned(),
-    };
-    writer.encode_one(&failure).await
-}
+pub type ForwardedTcpipInfo = ForwardedTcpipRequest;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -267,12 +95,9 @@ pub async fn reject_forwarded_channel<W: AsyncWrite + Send + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh3_proto::codec::{ChannelHeader, SshString};
-    use genmeta_ssh3_proto::message::SshMessage;
-    use genmeta_ssh3_server::forward::reverse_tcp::{
-        TcpipForwardReply, TcpipForwardRequest,
-    };
-use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt};
+    use genmeta_ssh::{CHANNEL_SIGNAL_VALUE, ChannelHeader, DEFAULT_MAX_MESSAGE_SIZE, SshString, TcpipForwardReply};
+    use genmeta_ssh::SshMessage;
+    use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
     use h3x::varint::VarInt;
     use tokio::io::duplex;
 

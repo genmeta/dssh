@@ -1,4 +1,4 @@
-//! SSH3 session implementation for the ssh3-session child process.
+//! SSH3 session implementation for the session child process.
 //!
 //! This module provides [`Ssh3Session`], which drives the session lifecycle
 //! by pulling channels from an [`Ssh3TransportClient`]. The child process
@@ -9,18 +9,21 @@
 #[cfg(not(test))]
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
-use genmeta_ssh3_proto::codec::ChannelHeader;
-use genmeta_ssh3_proto::message::SshMessage;
-use genmeta_ssh3_proto::session::{SessionError, SessionInit, Ssh3Transport, Ssh3TransportClient};
+use genmeta_ssh::ChannelHeader;
+use genmeta_ssh::SshMessage;
+use genmeta_ssh::{
+    ChannelEvent, ChannelReader, ChannelWriter, RequestAction, SessionError, SessionInit,
+    SessionLoopAction, Ssh3Transport, Ssh3TransportClient, handle_session_loop_event,
+    open_session_channel,
+};
 use h3x::codec::EncodeExt;
 use snafu::Report;
 use tokio::{io::AsyncWrite, sync::mpsc, task::JoinSet};
 use tracing::Instrument;
 
-use crate::byte_channel::{ChannelReader, ChannelWriter};
-use crate::channel::{open_session_channel, reject_legacy_global_request_channel, ChannelEvent};
+use crate::channel::reject_legacy_global_request_channel;
 use crate::session::pty::{allocate_pty, set_window_size, PtyPair};
-use crate::session::request::{handle_request, run_exec, run_shell, RequestAction};
+use crate::session::request::{run_exec, run_shell};
 
 trait PrivilegeTransitionOps {
     fn init_groups(&self, username: &str, gid: u32) -> Result<(), SessionError>;
@@ -213,24 +216,24 @@ impl Ssh3Session {
         let mut pty_pair: Option<PtyPair> = None;
 
         while let Some(event) = event_rx.recv().await {
-            match event {
-                ChannelEvent::Request { .. } => match handle_request(&event, &mut writer)
-                    .await
-                    .map_err(SessionError::from)?
-                {
-                    Some(RequestAction::Exec(command)) => {
+            match handle_session_loop_event(event, &mut writer)
+                .await
+                .map_err(SessionError::from)?
+            {
+                SessionLoopAction::Request(action) => match action {
+                    RequestAction::Exec(command) => {
                         run_exec(self.init.shell.as_os_str(), &command, &mut writer, event_rx, pty_pair.take())
                             .await
                             .map_err(SessionError::from)?;
                         return Ok(());
                     }
-                    Some(RequestAction::Shell) => {
+                    RequestAction::Shell => {
                         run_shell(self.init.shell.as_os_str(), &mut writer, event_rx, pty_pair.take())
                             .await
                             .map_err(SessionError::from)?;
                         return Ok(());
                     }
-                    Some(RequestAction::AllocatePty(req, want_reply)) => match allocate_pty(&req) {
+                    RequestAction::AllocatePty(req, want_reply) => match allocate_pty(&req) {
                         Ok(pair) => {
                             pty_pair = Some(pair);
                             tracing::info!(term = %req.term_type, "PTY allocated");
@@ -251,7 +254,7 @@ impl Ssh3Session {
                             }
                         }
                     },
-                    Some(RequestAction::WindowChange(req)) => {
+                    RequestAction::WindowChange(req) => {
                         if let Some(ref pair) = pty_pair
                             && let Err(error) = set_window_size(pair.master.as_raw_fd(), &req)
                         {
@@ -263,29 +266,17 @@ impl Ssh3Session {
                             );
                         }
                     }
-                    Some(RequestAction::Signal(_)) => {
+                    RequestAction::Signal(_) => {
                         tracing::debug!("ignoring signal before exec/shell");
                     }
-                    None => {}
                 },
-                ChannelEvent::Eof => {
-                    writer
-                        .encode_one(&SshMessage::ChannelEof)
-                        .await
-                        .map_err(SessionError::from)?;
-                    tokio::io::AsyncWriteExt::shutdown(&mut writer)
-                        .await
-                        .map_err(SessionError::from)?;
+                SessionLoopAction::Eof => {
                     break;
                 }
-                ChannelEvent::Close => {
-                    writer
-                        .encode_one(&SshMessage::ChannelClose)
-                        .await
-                        .map_err(SessionError::from)?;
+                SessionLoopAction::Close => {
                     break;
                 }
-                ChannelEvent::Data(_) | ChannelEvent::ExtendedData { .. } => {}
+                SessionLoopAction::Ignore => {}
             }
         }
 
@@ -297,16 +288,16 @@ impl Ssh3Session {
 mod tests {
     use super::*;
     use h3x::stream_id::StreamId;
-    use genmeta_ssh3_proto::session::TransportError;
+    use genmeta_ssh;
+    use genmeta_ssh::TransportError;
     use h3x::codec::{DecodeFrom, EncodeInto};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc as StdArc;
-    use crate::channel::DEFAULT_MAX_MESSAGE_SIZE;
 
     struct MockSsh3Transport;
 
-    impl genmeta_ssh3_proto::session::Ssh3Transport for MockSsh3Transport {
+    impl genmeta_ssh::Ssh3Transport for MockSsh3Transport {
         async fn accept_channel(&self) -> Result<
             Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
             TransportError,
@@ -326,7 +317,7 @@ mod tests {
     }
 
     fn mock_transport_client() -> Ssh3TransportClient {
-        use genmeta_ssh3_proto::session::Ssh3TransportServerShared;
+        use genmeta_ssh::Ssh3TransportServerShared;
         use remoc::rtc::ServerShared;
         let mock = std::sync::Arc::new(MockSsh3Transport);
         let (server, client) = Ssh3TransportServerShared::new(mock, 16);
@@ -345,7 +336,7 @@ mod tests {
         channel_tx: tokio::sync::Mutex<Option<MockChannel>>,
     }
 
-    impl genmeta_ssh3_proto::session::Ssh3Transport for ChannelFeedingTransport {
+    impl genmeta_ssh::Ssh3Transport for ChannelFeedingTransport {
         async fn accept_channel(&self) -> Result<Option<MockChannel>, TransportError> {
             let mut guard = self.channel_tx.lock().await;
             Ok(guard.take())
@@ -367,7 +358,7 @@ mod tests {
         from_client_rx: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client_tx: remoc::rch::mpsc::Sender<Vec<u8>>,
     ) -> Ssh3TransportClient {
-        use genmeta_ssh3_proto::session::Ssh3TransportServerShared;
+        use genmeta_ssh::Ssh3TransportServerShared;
         use remoc::rtc::ServerShared;
         let mock = std::sync::Arc::new(ChannelFeedingTransport {
             channel_tx: tokio::sync::Mutex::new(Some((header, from_client_rx, to_client_tx))),
@@ -429,7 +420,7 @@ mod tests {
         accept_called: AtomicBool,
     }
 
-    impl genmeta_ssh3_proto::session::Ssh3Transport for TrackingTransport {
+    impl genmeta_ssh::Ssh3Transport for TrackingTransport {
         async fn accept_channel(&self) -> Result<
             Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
             TransportError,
@@ -450,7 +441,7 @@ mod tests {
     }
 
     fn tracking_transport_client(flag: StdArc<AtomicBool>) -> Ssh3TransportClient {
-        use genmeta_ssh3_proto::session::Ssh3TransportServerShared;
+        use genmeta_ssh::Ssh3TransportServerShared;
         use remoc::rtc::ServerShared;
         let transport = std::sync::Arc::new(TrackingTransport {
             accept_called: AtomicBool::new(flag.load(Ordering::SeqCst)),
@@ -555,7 +546,7 @@ mod tests {
     /// Helper: encode an SshString into raw bytes.
     async fn encode_ssh_string_to_bytes(s: &str) -> Vec<u8> {
         let (mut w, mut r) = tokio::io::duplex(4096);
-        genmeta_ssh3_proto::codec::SshString(s.into())
+        genmeta_ssh::SshString(s.into())
             .encode_into(&mut w).await.unwrap();
         drop(w);
         let mut buf = Vec::new();
@@ -804,7 +795,7 @@ mod tests {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
                 assert_eq!(
                     max_message_size,
-                    h3x::varint::VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
+                    h3x::varint::VarInt::from(genmeta_ssh::DEFAULT_MAX_MESSAGE_SIZE as u32),
                     "max_message_size should match DEFAULT_MAX_MESSAGE_SIZE"
                 );
             }
@@ -820,7 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_channel_round_trip() {
-        use genmeta_ssh3_proto::session::Ssh3Transport;
+        use genmeta_ssh::Ssh3Transport;
 
         let header = ChannelHeader {
             signal_value: 0,
@@ -858,7 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_channel_round_trip() {
-        use genmeta_ssh3_proto::session::{Ssh3Transport, Ssh3TransportServerShared};
+        use genmeta_ssh::{Ssh3Transport, Ssh3TransportServerShared};
         use remoc::rtc::ServerShared;
 
         // Mock transport that captures the header and returns byte channels.

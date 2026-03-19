@@ -36,13 +36,13 @@ pub enum ServerError {
     #[snafu(display("conversation state lock poisoned"))]
     StatePoisoned,
 
-    #[snafu(display("failed to spawn ssh3-session child"))]
+    #[snafu(display("failed to spawn session child"))]
     SpawnChild { source: std::io::Error },
 
-    #[snafu(display("failed to determine ssh3-session binary path"))]
+    #[snafu(display("failed to determine session binary path"))]
     ResolveSessionBinary { source: std::io::Error },
 
-    #[snafu(display("ssh3-session binary not found at {path}"))]
+    #[snafu(display("session binary not found at {path}; set SSH3_SESSION_BIN or install `session`/`ssh3-session` alongside the server binary"))]
     MissingSessionBinary { path: String },
 
     #[snafu(display("failed to send bootstrap to child"))]
@@ -57,7 +57,7 @@ pub enum ServerError {
     #[snafu(display("failed to initialize SSH3 transport for {conversation_id}"))]
     InitTransport {
         conversation_id: StreamId,
-        source: genmeta_ssh3_proto::session::TransportError,
+        source: genmeta_ssh::TransportError,
     },
 }
 

@@ -4,61 +4,14 @@
 //! per RFC 4254 Sections 6.2, 6.7.
 
 use std::os::fd::{OwnedFd, RawFd};
-use std::pin::pin;
 
-use genmeta_ssh3_proto::codec::SshString;
-use h3x::{
-    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
-    varint::VarInt,
-};
+use genmeta_ssh::{PtyRequest, WindowChangeRequest};
 use nix::pty::{openpty, Winsize};
 use snafu::{ResultExt, Snafu};
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, libc::winsize);
 #[cfg(test)]
 nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
-
-// ---------------------------------------------------------------------------
-// Parsed request types
-// ---------------------------------------------------------------------------
-
-/// Parsed pty-req request (RFC 4254 §6.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PtyRequest {
-    /// TERM environment variable value (e.g., "xterm").
-    pub term_type: String,
-    /// Terminal width in characters/columns.
-    pub width_cols: u32,
-    /// Terminal height in rows.
-    pub height_rows: u32,
-    /// Terminal width in pixels.
-    pub width_px: u32,
-    /// Terminal height in pixels.
-    pub height_px: u32,
-    /// Encoded terminal modes (opaque bytes).
-    pub terminal_modes: Vec<u8>,
-}
-
-/// Parsed window-change request (RFC 4254 §6.7).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WindowChangeRequest {
-    /// Terminal width in columns.
-    pub width_cols: u32,
-    /// Terminal height in rows.
-    pub height_rows: u32,
-    /// Terminal width in pixels.
-    pub width_px: u32,
-    /// Terminal height in pixels.
-    pub height_px: u32,
-}
-
-/// Parsed signal request (RFC 4254 §6.9).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SignalRequest {
-    /// Signal name without "SIG" prefix (e.g., "INT", "TERM", "KILL").
-    pub signal_name: String,
-}
 
 /// A master/slave PTY pair with owned file descriptors.
 #[derive(Debug)]
@@ -72,177 +25,6 @@ pub struct PtyPair {
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
-
-/// Errors that can occur when encoding/decoding PTY-related request structs.
-#[derive(Debug, Snafu)]
-pub enum PtyCodecError {
-    /// An I/O error occurred during encoding or decoding.
-    #[snafu(display("PTY codec I/O error"), context(false))]
-    Io { source: io::Error },
-
-    /// A VarInt value could not be converted for encoding.
-    #[snafu(display("PTY codec VarInt conversion error"))]
-    VarIntConversion { source: h3x::varint::err::Overflow },
-}
-
-// ---------------------------------------------------------------------------
-// DecodeFrom / EncodeInto implementations
-// ---------------------------------------------------------------------------
-
-/// Decode a pty-req request from a stream (RFC 4254 §6.2).
-///
-/// Fields:
-/// - `SshString`: TERM environment variable value
-/// - `VarInt` (u32): terminal width, characters
-/// - `VarInt` (u32): terminal height, rows
-/// - `VarInt` (u32): terminal width, pixels
-/// - `VarInt` (u32): terminal height, pixels
-/// - varint-length-prefixed bytes: encoded terminal modes
-impl<S: AsyncRead + Send> DecodeFrom<S> for PtyRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = pin!(stream);
-
-        let term_type: SshString = stream.decode_one().await?;
-        let width_cols: VarInt = stream.decode_one().await?;
-        let height_rows: VarInt = stream.decode_one().await?;
-        let width_px: VarInt = stream.decode_one().await?;
-        let height_px: VarInt = stream.decode_one().await?;
-
-        // Terminal modes: varint length prefix + raw bytes (same encoding as SshBytes).
-        let modes_len: VarInt = stream.decode_one().await?;
-        let modes_len = modes_len.into_inner() as usize;
-        let mut terminal_modes = vec![0u8; modes_len];
-        stream.read_exact(&mut terminal_modes).await?;
-
-        Ok(PtyRequest {
-            term_type: term_type.0,
-            width_cols: width_cols.into_inner() as u32,
-            height_rows: height_rows.into_inner() as u32,
-            width_px: width_px.into_inner() as u32,
-            height_px: height_px.into_inner() as u32,
-            terminal_modes,
-        })
-    }
-}
-
-/// Encode a pty-req request into a stream (RFC 4254 §6.2).
-impl<S: AsyncWrite + Send> EncodeInto<S> for &PtyRequest {
-    type Output = ();
-    type Error = PtyCodecError;
-
-    async fn encode_into(self, stream: S) -> Result<(), PtyCodecError> {
-        let mut stream = pin!(stream);
-
-        stream
-            .encode_one(SshString(self.term_type.clone()))
-            .await?;
-
-        stream
-            .encode_one(VarInt::try_from(self.width_cols as u64).context(VarIntConversionSnafu)?)
-            .await?;
-        stream
-            .encode_one(VarInt::try_from(self.height_rows as u64).context(VarIntConversionSnafu)?)
-            .await?;
-        stream
-            .encode_one(VarInt::try_from(self.width_px as u64).context(VarIntConversionSnafu)?)
-            .await?;
-        stream
-            .encode_one(VarInt::try_from(self.height_px as u64).context(VarIntConversionSnafu)?)
-            .await?;
-
-        // Terminal modes: varint length prefix + raw bytes.
-        stream
-            .encode_one(VarInt::try_from(self.terminal_modes.len() as u64).context(VarIntConversionSnafu)?)
-            .await?;
-        stream.write_all(&self.terminal_modes).await?;
-
-        Ok(())
-    }
-}
-
-/// Decode a window-change request from a stream (RFC 4254 §6.7).
-///
-/// Fields:
-/// - `VarInt` (u32): terminal width, columns
-/// - `VarInt` (u32): terminal height, rows
-/// - `VarInt` (u32): terminal width, pixels
-/// - `VarInt` (u32): terminal height, pixels
-impl<S: AsyncRead + Send> DecodeFrom<S> for WindowChangeRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = pin!(stream);
-
-        let width_cols: VarInt = stream.decode_one().await?;
-        let height_rows: VarInt = stream.decode_one().await?;
-        let width_px: VarInt = stream.decode_one().await?;
-        let height_px: VarInt = stream.decode_one().await?;
-
-        Ok(WindowChangeRequest {
-            width_cols: width_cols.into_inner() as u32,
-            height_rows: height_rows.into_inner() as u32,
-            width_px: width_px.into_inner() as u32,
-            height_px: height_px.into_inner() as u32,
-        })
-    }
-}
-
-/// Encode a window-change request into a stream (RFC 4254 §6.7).
-impl<S: AsyncWrite + Send> EncodeInto<S> for &WindowChangeRequest {
-    type Output = ();
-    type Error = PtyCodecError;
-
-    async fn encode_into(self, stream: S) -> Result<(), PtyCodecError> {
-        let mut stream = pin!(stream);
-
-        stream
-            .encode_one(VarInt::try_from(self.width_cols as u64).context(VarIntConversionSnafu)?)
-            .await?;
-        stream
-            .encode_one(VarInt::try_from(self.height_rows as u64).context(VarIntConversionSnafu)?)
-            .await?;
-        stream
-            .encode_one(VarInt::try_from(self.width_px as u64).context(VarIntConversionSnafu)?)
-            .await?;
-        stream
-            .encode_one(VarInt::try_from(self.height_px as u64).context(VarIntConversionSnafu)?)
-            .await?;
-
-        Ok(())
-    }
-}
-
-/// Decode a signal request from a stream (RFC 4254 §6.9).
-///
-/// Fields:
-/// - `SshString`: signal name (without "SIG" prefix, e.g., "INT", "TERM", "KILL")
-impl<S: AsyncRead + Send> DecodeFrom<S> for SignalRequest {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = pin!(stream);
-        let signal_name: SshString = stream.decode_one().await?;
-        Ok(SignalRequest {
-            signal_name: signal_name.0,
-        })
-    }
-}
-
-/// Encode a signal request into a stream (RFC 4254 §6.9).
-impl<S: AsyncWrite + Send> EncodeInto<S> for &SignalRequest {
-    type Output = ();
-    type Error = PtyCodecError;
-
-    async fn encode_into(self, stream: S) -> Result<(), PtyCodecError> {
-        let mut stream = pin!(stream);
-        stream
-            .encode_one(SshString(self.signal_name.clone()))
-            .await?;
-        Ok(())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Checked u32→u16 dimension conversion
@@ -391,6 +173,7 @@ mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
     use h3x::codec::{DecodeExt, EncodeExt};
+    use genmeta_ssh::SignalRequest;
 
     // -------------------------------------------------------------------
     // Test 1: parse_pty_request roundtrip

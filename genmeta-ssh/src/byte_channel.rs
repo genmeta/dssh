@@ -1,11 +1,3 @@
-//! Adapters that bridge remoc byte channels to tokio's `AsyncRead`/`AsyncWrite` traits.
-//!
-//! [`ChannelReader`] wraps a `remoc::rch::mpsc::Receiver<Vec<u8>>` into `AsyncRead`.
-//! [`ChannelWriter`] wraps a `remoc::rch::mpsc::Sender<Vec<u8>>` into `AsyncWrite`.
-//!
-//! These adapters let code that operates on generic `AsyncRead`/`AsyncWrite`
-//! (e.g. session handling, forwarding) work transparently over remoc byte channels.
-
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -25,7 +17,6 @@ where
 type ChannelByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 type ChannelByteSink = Pin<Box<dyn Sink<Bytes, Error = io::Error> + Send>>;
 
-/// Wraps a `remoc::rch::mpsc::Receiver<Vec<u8>>` to implement [`AsyncRead`].
 pub struct ChannelReader(H3xStreamReader<ChannelByteStream>);
 
 impl ChannelReader {
@@ -54,7 +45,6 @@ impl AsyncRead for ChannelReader {
     }
 }
 
-/// Wraps a `remoc::rch::mpsc::Sender<Vec<u8>>` to implement [`AsyncWrite`].
 pub struct ChannelWriter(H3xSinkWriter<ChannelByteSink>);
 
 impl ChannelWriter {
@@ -93,16 +83,11 @@ impl AsyncWrite for ChannelWriter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Create a local in-process remoc mpsc channel pair and wrap in adapters.
     fn channel_pair(buffer: usize) -> (ChannelWriter, ChannelReader) {
         let (tx, rx) = remoc::rch::mpsc::channel(buffer);
         (ChannelWriter::new(tx), ChannelReader::new(rx))
@@ -111,10 +96,8 @@ mod tests {
     #[tokio::test]
     async fn roundtrip() {
         let (mut writer, mut reader) = channel_pair(16);
-
         let data = b"hello, byte channel!";
         writer.write_all(data).await.unwrap();
-        // Drop the writer to signal EOF so the reader can finish.
         drop(writer);
 
         let mut output = Vec::new();
@@ -125,8 +108,6 @@ mod tests {
     #[tokio::test]
     async fn eof_on_sender_drop() {
         let (writer, mut reader) = channel_pair(16);
-
-        // Drop sender immediately.
         drop(writer);
 
         let mut buf = [0u8; 64];
@@ -139,12 +120,10 @@ mod tests {
         let (tx, rx) = remoc::rch::mpsc::channel(16);
         let mut reader = ChannelReader::new(rx);
 
-        // Send a large chunk via the raw sender.
         let big_data: Vec<u8> = (0..=255).cycle().take(1024).collect();
         tx.send(big_data.clone()).await.unwrap();
-        drop(tx); // Close after sending.
+        drop(tx);
 
-        // Read with a small buffer (64 bytes at a time).
         let mut output = Vec::new();
         let mut buf = [0u8; 64];
         loop {
@@ -168,7 +147,6 @@ mod tests {
             b"chunk3".to_vec(),
         ];
 
-        // Send multiple chunks.
         for chunk in &chunks {
             tx.send(chunk.clone()).await.unwrap();
         }

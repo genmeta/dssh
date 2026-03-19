@@ -1,3 +1,3 @@
 [workspace]
-members = ["genmeta-ssh3-proto", "genmeta-ssh3-client", "genmeta-ssh3-server"]
+members = ["genmeta-ssh", "genmeta-ssh3-client", "genmeta-ssh3-server"]
 resolver = "3"

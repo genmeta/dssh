@@ -40,7 +40,7 @@ const PAM_SERVICE: &str = "ssh3";
 
 /// Result of a successful PAM authentication, including resolved user info.
 /// 
-/// Defined locally because `genmeta-ssh3-proto::session::AuthResult` is being
+/// Defined locally because the shared core `genmeta-ssh::session::AuthResult` was being
 /// built in a parallel task. Will be unified later.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

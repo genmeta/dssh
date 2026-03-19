@@ -13,12 +13,13 @@ use std::{
 };
 
 use futures::future::BoxFuture;
+use genmeta_ssh::CHANNEL_SIGNAL_VALUE as SSH3_SIGNAL_VALUE;
 use snafu::Report;
 use tokio::io;
 use tokio::sync::mpsc;
 
-use genmeta_ssh3_proto::codec::ChannelHeader;
-use genmeta_ssh3_proto::session::{Ssh3TransportClient, Ssh3TransportServerShared};
+use genmeta_ssh::ChannelHeader;
+use genmeta_ssh::{Ssh3TransportClient, Ssh3TransportServerShared};
 use h3x::{
     codec::{
         DecodeExt, ErasedPeekableBiStream, ErasedPeekableUniStream,
@@ -33,9 +34,6 @@ use h3x::{
 
 use crate::error::{ServerError, ServerResult, map_poison};
 use remoc::rtc::ServerShared;
-
-/// SSH3 signal value used to identify SSH3 channel streams.
-const SSH3_SIGNAL_VALUE: u32 = 0xaf3627e6;
 
 /// Type-erased reader: `StreamReader` wrapping a boxed `dyn ReadStream`.
 pub type BoxReader = StreamReader<Pin<Box<dyn quic::ReadStream + Send>>>;
