@@ -16,7 +16,9 @@
 //! **CRITICAL**: After the confirmation, the QUIC stream carries raw bytes —
 //! NOT wrapped in `SSH_MSG_CHANNEL_DATA(94)`.
 
-use genmeta_ssh::{codec::ChannelHeader, codec::SshString, message::SshMessage, relay, DEFAULT_MAX_MESSAGE_SIZE};
+use genmeta_ssh::{
+    DEFAULT_MAX_MESSAGE_SIZE, codec::ChannelHeader, codec::SshString, message::SshMessage, relay,
+};
 use h3x::codec::{DecodeExt, EncodeExt};
 use h3x::varint::VarInt;
 use snafu::Report;
@@ -66,7 +68,7 @@ where
             return Ok(());
         }
     };
-    let addr = format!("{}:{}", dest_host.0, dest_port);
+    let addr = format!("{}:{}", &*dest_host, dest_port);
 
     // Attempt TCP connection.
     let tcp_stream = match TcpStream::connect(&addr).await {
@@ -88,7 +90,7 @@ where
 
     // Send ChannelOpenConfirmation(91).
     let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
     writer.encode_one(&confirm).await?;
 
@@ -112,14 +114,13 @@ where
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use genmeta_ssh::{codec::SshString, message::SshMessage};
     use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
     use h3x::varint::VarInt;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::net::TcpListener;
 
     /// Encode direct-tcpip request_data fields into bytes.
@@ -130,18 +131,16 @@ mod tests {
         originator_port: u32,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
-        SshString(dest_host.to_owned()).encode_into(&mut buf)
+        SshString(dest_host.to_owned())
+            .encode_into(&mut buf)
             .await
             .unwrap();
-        buf.encode_one(VarInt::from(dest_port))
+        buf.encode_one(VarInt::from(dest_port)).await.unwrap();
+        SshString(originator_host.to_owned())
+            .encode_into(&mut buf)
             .await
             .unwrap();
-        SshString(originator_host.to_owned()).encode_into(&mut buf)
-            .await
-            .unwrap();
-        buf.encode_one(VarInt::from(originator_port))
-            .await
-            .unwrap();
+        buf.encode_one(VarInt::from(originator_port)).await.unwrap();
         buf
     }
 
@@ -205,13 +204,8 @@ mod tests {
         });
 
         // Build the request_data fields.
-        let request_data = encode_request_data(
-            "127.0.0.1",
-            addr.port() as u32,
-            "127.0.0.1",
-            12345,
-        )
-        .await;
+        let request_data =
+            encode_request_data("127.0.0.1", addr.port() as u32, "127.0.0.1", 12345).await;
 
         let header = ChannelHeader {
             signal_value: 0xaf3627e6,
@@ -243,7 +237,10 @@ mod tests {
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(max_message_size, VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32));
+                assert_eq!(
+                    max_message_size,
+                    VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32)
+                );
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -264,8 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_connect_failure() {
-        let request_data =
-            encode_request_data("127.0.0.1", 1, "127.0.0.1", 11111).await;
+        let request_data = encode_request_data("127.0.0.1", 1, "127.0.0.1", 11111).await;
 
         let header = ChannelHeader {
             signal_value: 0xaf3627e6,
@@ -294,7 +290,8 @@ mod tests {
                 description,
             } => {
                 assert_eq!(
-                    reason_code, VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
+                    reason_code,
+                    VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                     "reason_code should be 2 (SSH_OPEN_CONNECT_FAILED)"
                 );
                 assert!(
@@ -311,7 +308,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let overflow_port = listener.local_addr().unwrap().port() as u32 + (u16::MAX as u32) + 1;
 
-        let request_data = encode_request_data("127.0.0.1", overflow_port, "127.0.0.1", 11111).await;
+        let request_data =
+            encode_request_data("127.0.0.1", overflow_port, "127.0.0.1", 11111).await;
 
         let header = ChannelHeader {
             signal_value: 0xaf3627e6,
@@ -337,7 +335,10 @@ mod tests {
                 description,
             } => {
                 assert_eq!(reason_code, VarInt::from(SSH_OPEN_CONNECT_FAILED as u8));
-                assert!(description.contains("out of range"), "unexpected description: {description}");
+                assert!(
+                    description.contains("out of range"),
+                    "unexpected description: {description}"
+                );
             }
             other => panic!("expected ChannelOpenFailure for out-of-range port, got {other:?}"),
         }
@@ -360,13 +361,8 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
 
-        let request_data = encode_request_data(
-            "127.0.0.1",
-            addr.port() as u32,
-            "127.0.0.1",
-            22222,
-        )
-        .await;
+        let request_data =
+            encode_request_data("127.0.0.1", addr.port() as u32, "127.0.0.1", 22222).await;
 
         let header = ChannelHeader {
             signal_value: 0xaf3627e6,

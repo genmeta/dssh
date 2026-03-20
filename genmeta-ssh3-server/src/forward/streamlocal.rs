@@ -31,7 +31,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use genmeta_ssh::{ChannelReader, ChannelWriter, codec::ChannelHeader, codec::SshString, finish_forwarded_streamlocal_channel, forwarded_streamlocal_header, message::SshMessage, relay, DEFAULT_MAX_MESSAGE_SIZE};
+use genmeta_ssh::{
+    ChannelReader, ChannelWriter, DEFAULT_MAX_MESSAGE_SIZE, codec::ChannelHeader, codec::SshString,
+    finish_forwarded_streamlocal_channel, forwarded_streamlocal_header, message::SshMessage, relay,
+};
 use genmeta_ssh::{Ssh3Transport, Ssh3TransportClient};
 use h3x::codec::{DecodeExt, EncodeExt};
 use h3x::stream_id::StreamId;
@@ -39,9 +42,9 @@ use h3x::varint::VarInt;
 use snafu::Report;
 use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
-use tracing::Instrument;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 struct ReverseStreamlocalListenerEntry {
     owner: StreamId,
@@ -117,11 +120,11 @@ where
     let _reserved_uint32: VarInt = reader.decode_one().await?;
 
     // Attempt Unix socket connection.
-    let unix_stream = match UnixStream::connect(&socket_path.0).await {
+    let unix_stream = match UnixStream::connect(&*socket_path).await {
         Ok(stream) => stream,
         Err(e) => {
             tracing::warn!(
-                path = %socket_path.0,
+                path = &*socket_path,
                 error = %Report::from_error(&e),
                 "direct-streamlocal connect failed"
             );
@@ -136,7 +139,7 @@ where
 
     // Send ChannelOpenConfirmation(91).
     let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
     writer.encode_one(&confirm).await?;
 
@@ -217,14 +220,15 @@ impl ReverseStreamlocalForwarder {
         let accept_loop_tasks = Arc::clone(&connection_tasks);
 
         // Spawn the accept loop as a background task.
-        let handle = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((unix_stream, _peer_addr)) => {
-                        let transport = transport.clone();
-                        let path = socket_path_clone.clone();
-                        let conv_id = conversation_id;
-                        let connection_handle = tokio::spawn(async move {
+        let handle = tokio::spawn(
+            async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((unix_stream, _peer_addr)) => {
+                            let transport = transport.clone();
+                            let path = socket_path_clone.clone();
+                            let conv_id = conversation_id;
+                            let connection_handle = tokio::spawn(async move {
                             let header = forwarded_streamlocal_header(conv_id);
                             match transport.open_channel(Some(header)).await {
                                 Ok((from_remote_rx, to_remote_tx)) => {
@@ -248,18 +252,21 @@ impl ReverseStreamlocalForwarder {
                                 }
                             }
                         }.in_current_span());
-                        register_tracked_connection(&accept_loop_tasks, connection_handle).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %Report::from_error(&e),
-                            "reverse-streamlocal accept error"
-                        );
-                        break;
+                            register_tracked_connection(&accept_loop_tasks, connection_handle)
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %Report::from_error(&e),
+                                "reverse-streamlocal accept error"
+                            );
+                            break;
+                        }
                     }
                 }
             }
-        }.in_current_span());
+            .in_current_span(),
+        );
 
         let old_entry = {
             let mut listeners = self.listeners.lock().await;
@@ -294,7 +301,9 @@ impl ReverseStreamlocalForwarder {
                 None => return false,
             }
 
-            listeners.remove(&key).expect("listener should exist after ownership check")
+            listeners
+                .remove(&key)
+                .expect("listener should exist after ownership check")
         };
         abort_listener_entry(socket_path, entry).await;
         true
@@ -357,7 +366,7 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let header = forwarded_streamlocal_header(conversation_id);
-    writer.encode_one(&header).await?;
+    writer.encode_one(header).await?;
     finish_forwarded_streamlocal_channel(reader, writer, unix_stream, socket_path).await
 }
 
@@ -369,26 +378,31 @@ where
 mod tests {
     use super::*;
     use genmeta_ssh::{
-        CHANNEL_SIGNAL_VALUE,
-        DEFAULT_MAX_MESSAGE_SIZE,
-        codec::ChannelHeader,
-        codec::SshString,
+        CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE, codec::ChannelHeader, codec::SshString,
         message::SshMessage,
     };
     use genmeta_ssh::{CancelStreamlocalForwardRequest, StreamlocalForwardRequest};
-    use genmeta_ssh::{Ssh3Transport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
+    use genmeta_ssh::{
+        Ssh3Transport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError,
+    };
     use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
     use h3x::varint::VarInt;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use remoc::rtc::ServerShared;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::sync::Notify;
 
     struct TestTransport;
 
     impl Ssh3Transport for TestTransport {
-        async fn accept_channel(&self) -> Result<
-            Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+        async fn accept_channel(
+            &self,
+        ) -> Result<
+            Option<(
+                ChannelHeader,
+                remoc::rch::mpsc::Receiver<Vec<u8>>,
+                remoc::rch::mpsc::Sender<Vec<u8>>,
+            )>,
             TransportError,
         > {
             Ok(None)
@@ -398,7 +412,10 @@ mod tests {
             &self,
             _header: Option<ChannelHeader>,
         ) -> Result<
-            (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            (
+                remoc::rch::mpsc::Receiver<Vec<u8>>,
+                remoc::rch::mpsc::Sender<Vec<u8>>,
+            ),
             TransportError,
         > {
             let (tx, rx) = remoc::rch::mpsc::channel(16);
@@ -431,8 +448,14 @@ mod tests {
     }
 
     impl Ssh3Transport for BlockingTransport {
-        async fn accept_channel(&self) -> Result<
-            Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+        async fn accept_channel(
+            &self,
+        ) -> Result<
+            Option<(
+                ChannelHeader,
+                remoc::rch::mpsc::Receiver<Vec<u8>>,
+                remoc::rch::mpsc::Sender<Vec<u8>>,
+            )>,
             TransportError,
         > {
             Ok(None)
@@ -442,7 +465,10 @@ mod tests {
             &self,
             _header: Option<ChannelHeader>,
         ) -> Result<
-            (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            (
+                remoc::rch::mpsc::Receiver<Vec<u8>>,
+                remoc::rch::mpsc::Sender<Vec<u8>>,
+            ),
             TransportError,
         > {
             struct DropGuard(Arc<AtomicUsize>);
@@ -493,15 +519,15 @@ mod tests {
         reserved_uint32: u32,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
-        SshString(socket_path.to_owned()).encode_into(&mut buf)
+        SshString(socket_path.to_owned())
+            .encode_into(&mut buf)
             .await
             .unwrap();
-        SshString(reserved_string.to_owned()).encode_into(&mut buf)
+        SshString(reserved_string.to_owned())
+            .encode_into(&mut buf)
             .await
             .unwrap();
-        buf.encode_one(VarInt::from(reserved_uint32))
-            .await
-            .unwrap();
+        buf.encode_one(VarInt::from(reserved_uint32)).await.unwrap();
         buf
     }
 
@@ -591,7 +617,10 @@ mod tests {
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(max_message_size, VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32));
+                assert_eq!(
+                    max_message_size,
+                    VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32)
+                );
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -647,7 +676,8 @@ mod tests {
                 description,
             } => {
                 assert_eq!(
-                    reason_code, VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
+                    reason_code,
+                    VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                     "reason_code should be 2 (SSH_OPEN_CONNECT_FAILED)"
                 );
                 assert!(
@@ -727,7 +757,10 @@ mod tests {
 
         // Stopping again should return false.
         let stopped_again = forwarder.stop_listening(&sock_path, owner).await;
-        assert!(!stopped_again, "should return false when listener doesn't exist");
+        assert!(
+            !stopped_again,
+            "should return false when listener doesn't exist"
+        );
 
         // Socket file should have been cleaned up by stop_listening.
         assert!(
@@ -750,7 +783,10 @@ mod tests {
 
         let stopped = forwarder.stop_listening(&sock_path, other_owner).await;
         assert!(!stopped, "non-owner should not stop streamlocal listener");
-        assert!(std::path::Path::new(&sock_path).exists(), "socket path should remain for owner listener");
+        assert!(
+            std::path::Path::new(&sock_path).exists(),
+            "socket path should remain for owner listener"
+        );
 
         forwarder.cleanup_for_owner(owner).await;
     }
@@ -832,7 +868,10 @@ mod tests {
         );
 
         let other_connect = UnixStream::connect(&other_sock_path).await;
-        assert!(other_connect.is_ok(), "other owner's streamlocal listener should remain reachable");
+        assert!(
+            other_connect.is_ok(),
+            "other owner's streamlocal listener should remain reachable"
+        );
 
         forwarder.cleanup_for_owner(other_owner).await;
         let _ = std::fs::remove_file(&owned_sock_path);
@@ -917,7 +956,9 @@ mod tests {
         });
 
         // Client side: read ChannelHeader.
-        let header = ChannelHeader::decode_from(&mut client_reader).await.unwrap();
+        let header = ChannelHeader::decode_from(&mut client_reader)
+            .await
+            .unwrap();
         assert_eq!(header.signal_value, CHANNEL_SIGNAL_VALUE);
         assert_eq!(header.conversation_id, 42);
         assert_eq!(header.channel_type, "forwarded-streamlocal@openssh.com");
@@ -946,7 +987,10 @@ mod tests {
         // Read the echoed data from the server side (comes via Unix echo → QUIC).
         let mut echoed = Vec::new();
         client_reader.read_to_end(&mut echoed).await.unwrap();
-        assert_eq!(echoed, b"hello-streamlocal", "echoed data should be raw bytes");
+        assert_eq!(
+            echoed, b"hello-streamlocal",
+            "echoed data should be raw bytes"
+        );
 
         client_handle.await.unwrap();
         server_handle.await.unwrap();

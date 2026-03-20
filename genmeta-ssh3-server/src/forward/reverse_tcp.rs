@@ -273,7 +273,7 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let header = forwarded_tcpip_header(conversation_id);
-    writer.encode_one(&header).await?;
+    writer.encode_one(header).await?;
     finish_forwarded_tcpip_channel(
         reader,
         writer,
