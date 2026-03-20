@@ -10,29 +10,29 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use genmeta_ssh::{
-    codec::ChannelHeader,
-    message::SshMessage,
-};
-use genmeta_ssh::{
     CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, StreamlocalForwardRequest,
     TcpipForwardReply, TcpipForwardRequest,
 };
 use genmeta_ssh::{Ssh3Transport as RemoteSsh3Transport, Ssh3TransportClient, TransportError};
+use genmeta_ssh::{codec::ChannelHeader, message::SshMessage};
 use h3x::codec::{DecodeExt, EncodeExt};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
 use snafu::Report;
+use std::sync::{
+    Arc as StdArc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
 use tracing::Instrument;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc as StdArc};
 
 use crate::forward::reverse_tcp::ReverseTcpForwarder;
 use crate::forward::streamlocal::ReverseStreamlocalForwarder;
-pub use crate::session::handle_session_channel;
 use crate::protocol::DispatchedStream;
+pub use crate::session::handle_session_channel;
 
 // ---------------------------------------------------------------------------
 // Global request context for reverse forwarding
@@ -60,15 +60,19 @@ pub enum GlobalRequestReply {
 }
 
 enum ControlStreamAction {
-    Reply { want_reply: bool, reply: GlobalRequestReply },
+    Reply {
+        want_reply: bool,
+        reply: GlobalRequestReply,
+    },
     Close,
 }
 
-fn validate_global_request_port(bind_port: u32) -> io::Result<u16> {
-    u16::try_from(bind_port).map_err(|_| {
+fn validate_global_request_port(bind_port: VarInt) -> io::Result<u16> {
+    let port = bind_port.into_inner();
+    u16::try_from(port).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("bind port {bind_port} is out of range for a TCP port"),
+            format!("bind port {port} is out of range for a TCP port"),
         )
     })
 }
@@ -83,22 +87,19 @@ fn validate_global_request_port(bind_port: u32) -> io::Result<u16> {
 /// - `"global-request"` → decode and handle global requests (requires `global_ctx`)
 /// - TCP/streamlocal forwarding types → appropriate handler
 /// - Unknown → send `ChannelOpenFailure(92)` with reason_code=3
-pub async fn handle_channel<R, W>(
-    header: ChannelHeader,
-    _reader: R,
-    writer: W,
-) -> io::Result<()>
+pub async fn handle_channel<R, W>(header: ChannelHeader, reader: R, writer: W) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    handle_unknown_channel(header, writer).await
+    match &*header.channel_type {
+        "session" => handle_session_channel(header, reader, writer).await,
+        "global-request" => reject_legacy_global_request_channel(writer).await,
+        _ => handle_unknown_channel(header, writer).await,
+    }
 }
 /// Handle an unknown channel type by sending `ChannelOpenFailure(92)`.
-async fn handle_unknown_channel<W>(
-    _header: ChannelHeader,
-    mut writer: W,
-) -> io::Result<()>
+async fn handle_unknown_channel<W>(_header: ChannelHeader, mut writer: W) -> io::Result<()>
 where
     W: AsyncWrite + Send + Unpin,
 {
@@ -146,11 +147,11 @@ where
     if want_reply {
         match reply {
             GlobalRequestReply::Success(data) => {
-                writer.encode_one(&SshMessage::RequestSuccess { data }).await?
+                writer
+                    .encode_one(&SshMessage::RequestSuccess { data })
+                    .await?
             }
-            GlobalRequestReply::Failure => {
-                writer.encode_one(&SshMessage::RequestFailure).await?
-            }
+            GlobalRequestReply::Failure => writer.encode_one(&SshMessage::RequestFailure).await?,
         }
         writer.flush().await?;
     }
@@ -174,25 +175,34 @@ pub async fn process_global_request(
     match request_type {
         "tcpip-forward" => {
             let req: TcpipForwardRequest = data.decode_one().await?;
-            tracing::info!(bind_address = %req.bind_address, bind_port = req.bind_port, "tcpip-forward request");
+            tracing::info!(
+                bind_address = &*req.bind_address,
+                bind_port = req.bind_port.into_inner(),
+                "tcpip-forward request"
+            );
             let bind_port = match validate_global_request_port(req.bind_port) {
                 Ok(port) => port,
                 Err(error) => {
-                    tracing::warn!(error = %Report::from_error(&error), bind_port = req.bind_port, "tcpip-forward bind rejected");
+                    tracing::warn!(error = %Report::from_error(&error), "tcpip-forward bind rejected");
                     return Ok(GlobalRequestReply::Failure);
                 }
             };
 
             match ctx
                 .tcp_forwarder
-                .start_listening(&req.bind_address, bind_port, ctx.transport.clone(), ctx.conversation_id)
+                .start_listening(
+                    &req.bind_address,
+                    bind_port,
+                    ctx.transport.clone(),
+                    ctx.conversation_id,
+                )
                 .await
             {
                 Ok(actual_port) => {
                     let mut reply_data = Vec::new();
                     reply_data
-                        .encode_one(&TcpipForwardReply {
-                        allocated_port: actual_port as u32,
+                        .encode_one(TcpipForwardReply {
+                            allocated_port: VarInt::from(actual_port),
                         })
                         .await?;
                     Ok(GlobalRequestReply::Success(reply_data))
@@ -205,11 +215,15 @@ pub async fn process_global_request(
         }
         "cancel-tcpip-forward" => {
             let req: CancelTcpipForwardRequest = data.decode_one().await?;
-            tracing::info!(bind_address = %req.bind_address, bind_port = req.bind_port, "cancel-tcpip-forward request");
+            tracing::info!(
+                bind_address = &*req.bind_address,
+                bind_port = req.bind_port.into_inner(),
+                "cancel-tcpip-forward request"
+            );
             let bind_port = match validate_global_request_port(req.bind_port) {
                 Ok(port) => port,
                 Err(error) => {
-                    tracing::warn!(error = %Report::from_error(&error), bind_port = req.bind_port, "cancel-tcpip-forward rejected");
+                    tracing::warn!(error = %Report::from_error(&error), "cancel-tcpip-forward rejected");
                     return Ok(GlobalRequestReply::Failure);
                 }
             };
@@ -226,7 +240,10 @@ pub async fn process_global_request(
         }
         "streamlocal-forward@openssh.com" => {
             let req: StreamlocalForwardRequest = data.decode_one().await?;
-            tracing::info!(socket_path = %req.socket_path, "streamlocal-forward request");
+            tracing::info!(
+                socket_path = &*req.socket_path,
+                "streamlocal-forward request"
+            );
             match ctx
                 .streamlocal_forwarder
                 .start_listening(&req.socket_path, ctx.transport.clone(), ctx.conversation_id)
@@ -241,7 +258,10 @@ pub async fn process_global_request(
         }
         "cancel-streamlocal-forward@openssh.com" => {
             let req: CancelStreamlocalForwardRequest = data.decode_one().await?;
-            tracing::info!(socket_path = %req.socket_path, "cancel-streamlocal-forward request");
+            tracing::info!(
+                socket_path = &*req.socket_path,
+                "cancel-streamlocal-forward request"
+            );
             let stopped = ctx
                 .streamlocal_forwarder
                 .stop_listening(&req.socket_path, ctx.conversation_id)
@@ -318,7 +338,9 @@ where
                     if want_reply {
                         match reply {
                             GlobalRequestReply::Success(data) => {
-                                writer.encode_one(&SshMessage::RequestSuccess { data }).await?
+                                writer
+                                    .encode_one(&SshMessage::RequestSuccess { data })
+                                    .await?
                             }
                             GlobalRequestReply::Failure => {
                                 writer.encode_one(&SshMessage::RequestFailure).await?
@@ -420,7 +442,10 @@ pub async fn handle_open_channel_request(
     header: Option<ChannelHeader>,
     transport: &Ssh3TransportClient,
 ) -> Result<
-    (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+    (
+        remoc::rch::mpsc::Receiver<Vec<u8>>,
+        remoc::rch::mpsc::Sender<Vec<u8>>,
+    ),
     genmeta_ssh::SessionError,
 > {
     use genmeta_ssh::SessionError;
@@ -471,15 +496,20 @@ impl ConversationEndpoint {
     )> {
         (self.opener)().await
     }
-
 }
 
 pub type OpenBiFactory = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = io::Result<(
-        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-    )>> + Send>>
-    + Send + Sync,
+    dyn Fn() -> Pin<
+            Box<
+                dyn Future<
+                        Output = io::Result<(
+                            Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+                            Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+                        )>,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
 >;
 
 pub struct Ssh3Transport {
@@ -496,8 +526,14 @@ impl Ssh3Transport {
 }
 
 impl RemoteSsh3Transport for Ssh3Transport {
-    async fn accept_channel(&self) -> Result<
-        Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+    async fn accept_channel(
+        &self,
+    ) -> Result<
+        Option<(
+            ChannelHeader,
+            remoc::rch::mpsc::Receiver<Vec<u8>>,
+            remoc::rch::mpsc::Sender<Vec<u8>>,
+        )>,
         TransportError,
     > {
         let dispatched = {
@@ -510,34 +546,42 @@ impl RemoteSsh3Transport for Ssh3Transport {
             None => return Ok(None),
         };
 
-        let (from_client_tx, from_client_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) = remoc::rch::mpsc::channel(64);
-        let (to_client_tx, to_client_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) = remoc::rch::mpsc::channel(64);
+        let (from_client_tx, from_client_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) =
+            remoc::rch::mpsc::channel(64);
+        let (to_client_tx, to_client_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) =
+            remoc::rch::mpsc::channel(64);
 
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 8192];
-            loop {
-                let n = match quic_reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                if from_client_tx.send(buf[..n].to_vec()).await.is_err() {
-                    break;
+        tokio::spawn(
+            async move {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    let n = match quic_reader.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if from_client_tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
                 }
             }
-        }.in_current_span());
+            .in_current_span(),
+        );
 
-        tokio::spawn(async move {
-            let mut to_client_rx = to_client_rx;
-            while let Ok(Some(data)) = to_client_rx.recv().await {
-                if quic_writer.write_all(&data).await.is_err() {
-                    break;
+        tokio::spawn(
+            async move {
+                let mut to_client_rx = to_client_rx;
+                while let Ok(Some(data)) = to_client_rx.recv().await {
+                    if quic_writer.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    if quic_writer.flush().await.is_err() {
+                        break;
+                    }
                 }
-                if quic_writer.flush().await.is_err() {
-                    break;
-                }
+                let _ = quic_writer.shutdown().await;
             }
-            let _ = quic_writer.shutdown().await;
-        }.in_current_span());
+            .in_current_span(),
+        );
 
         Ok(Some((header, from_client_rx, to_client_tx)))
     }
@@ -546,10 +590,13 @@ impl RemoteSsh3Transport for Ssh3Transport {
         &self,
         header: Option<ChannelHeader>,
     ) -> Result<
-        (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+        (
+            remoc::rch::mpsc::Receiver<Vec<u8>>,
+            remoc::rch::mpsc::Sender<Vec<u8>>,
+        ),
         TransportError,
     > {
-            let (quic_reader, mut quic_writer) = {
+        let (quic_reader, mut quic_writer) = {
             let guard = self.endpoint.lock().await;
             guard
                 .open_stream()
@@ -557,8 +604,9 @@ impl RemoteSsh3Transport for Ssh3Transport {
                 .map_err(|_| TransportError::OpenFailed("failed to open stream".into()))?
         };
 
-        if let Some(h) = &header {
-            quic_writer.encode_one(h)
+        if let Some(h) = header {
+            quic_writer
+                .encode_one(h)
                 .await
                 .map_err(|_| TransportError::OpenFailed("failed to write channel header".into()))?;
             quic_writer
@@ -567,35 +615,43 @@ impl RemoteSsh3Transport for Ssh3Transport {
                 .map_err(|_| TransportError::OpenFailed("failed to flush channel header".into()))?;
         }
 
-        let (from_remote_tx, from_remote_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) = remoc::rch::mpsc::channel(64);
-        let (to_remote_tx, to_remote_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) = remoc::rch::mpsc::channel(64);
+        let (from_remote_tx, from_remote_rx): (remoc::rch::mpsc::Sender<Vec<u8>>, _) =
+            remoc::rch::mpsc::channel(64);
+        let (to_remote_tx, to_remote_rx): (_, remoc::rch::mpsc::Receiver<Vec<u8>>) =
+            remoc::rch::mpsc::channel(64);
 
-        tokio::spawn(async move {
-            let mut quic_reader = quic_reader;
-            let mut buf = vec![0u8; 8192];
-            loop {
-                let n = match quic_reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                if from_remote_tx.send(buf[..n].to_vec()).await.is_err() {
-                    break;
+        tokio::spawn(
+            async move {
+                let mut quic_reader = quic_reader;
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    let n = match quic_reader.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if from_remote_tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
                 }
             }
-        }.in_current_span());
+            .in_current_span(),
+        );
 
-        tokio::spawn(async move {
-            let mut to_remote_rx = to_remote_rx;
-            while let Ok(Some(data)) = to_remote_rx.recv().await {
-                if quic_writer.write_all(&data).await.is_err() {
-                    break;
+        tokio::spawn(
+            async move {
+                let mut to_remote_rx = to_remote_rx;
+                while let Ok(Some(data)) = to_remote_rx.recv().await {
+                    if quic_writer.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    if quic_writer.flush().await.is_err() {
+                        break;
+                    }
                 }
-                if quic_writer.flush().await.is_err() {
-                    break;
-                }
+                let _ = quic_writer.shutdown().await;
             }
-            let _ = quic_writer.shutdown().await;
-        }.in_current_span());
+            .in_current_span(),
+        );
 
         Ok((from_remote_rx, to_remote_tx))
     }
@@ -611,13 +667,21 @@ mod tests {
     use crate::forward::reverse_tcp::ReverseTcpForwarder;
     use crate::forward::streamlocal::ReverseStreamlocalForwarder;
     use genmeta_ssh::ChannelEvent;
-    use genmeta_ssh::{DEFAULT_MAX_MESSAGE_SIZE, codec::ChannelHeader, message::SshMessage, open_session_channel};
     use genmeta_ssh::{CancelTcpipForwardRequest, TcpipForwardRequest};
-    use genmeta_ssh::{Ssh3Transport as RemoteSessionTransport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError};
+    use genmeta_ssh::{
+        DEFAULT_MAX_MESSAGE_SIZE, codec::ChannelHeader, message::SshMessage, open_session_channel,
+    };
+    use genmeta_ssh::{
+        Ssh3Transport as RemoteSessionTransport, Ssh3TransportClient, Ssh3TransportServerShared,
+        TransportError,
+    };
     use h3x::codec::{DecodeFrom, EncodeInto};
     use h3x::stream_id::StreamId;
     use remoc::rtc::ServerShared;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering as AtomicOrdering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
     use tokio::io::duplex;
 
     /// Helper: encode messages into writer half, then drop to signal EOF.
@@ -667,7 +731,10 @@ mod tests {
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(max_message_size, VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32));
+                assert_eq!(
+                    max_message_size,
+                    VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32)
+                );
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -703,7 +770,11 @@ mod tests {
                 reason_code,
                 description,
             } => {
-                assert_eq!(reason_code, VarInt::from(3u8), "reason_code should be 3 (unknown channel type)");
+                assert_eq!(
+                    reason_code,
+                    VarInt::from(3u8),
+                    "reason_code should be 3 (unknown channel type)"
+                );
                 assert_eq!(description, "unknown channel type");
             }
             other => panic!("expected ChannelOpenFailure, got {other:?}"),
@@ -723,24 +794,28 @@ mod tests {
         let client_handle = tokio::spawn(async move {
             SshMessage::ChannelData {
                 data: b"test-data".to_vec(),
-            }.encode_into(&mut client_writer)
+            }
+            .encode_into(&mut client_writer)
             .await
             .unwrap();
-            SshMessage::ChannelClose.encode_into(&mut client_writer)
+            SshMessage::ChannelClose
+                .encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
         });
 
         // Use open_session_channel to get the event receiver
-        let (mut event_rx, _writer) =
-            open_session_channel(server_reader, server_writer)
-                .await
-                .unwrap();
+        let (mut event_rx, _writer) = open_session_channel(server_reader, server_writer)
+            .await
+            .unwrap();
 
         // Read confirmation from client side
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
-        assert!(matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }));
+        assert!(matches!(
+            confirm,
+            SshMessage::ChannelOpenConfirmation { .. }
+        ));
 
         // Receive the data event
         let event = event_rx.recv().await.unwrap();
@@ -767,19 +842,20 @@ mod tests {
                 request_type: "exec".into(),
                 want_reply: true,
                 request_data: b"ls -la".to_vec(),
-            }.encode_into(&mut client_writer)
+            }
+            .encode_into(&mut client_writer)
             .await
             .unwrap();
-            SshMessage::ChannelClose.encode_into(&mut client_writer)
+            SshMessage::ChannelClose
+                .encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
         });
 
-        let (mut event_rx, _writer) =
-            open_session_channel(server_reader, server_writer)
-                .await
-                .unwrap();
+        let (mut event_rx, _writer) = open_session_channel(server_reader, server_writer)
+            .await
+            .unwrap();
 
         // Read confirmation
         let _confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
@@ -808,19 +884,20 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let client_handle = tokio::spawn(async move {
-            SshMessage::ChannelEof.encode_into(&mut client_writer)
+            SshMessage::ChannelEof
+                .encode_into(&mut client_writer)
                 .await
                 .unwrap();
-            SshMessage::ChannelClose.encode_into(&mut client_writer)
+            SshMessage::ChannelClose
+                .encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
         });
 
-        let (mut event_rx, _writer) =
-            open_session_channel(server_reader, server_writer)
-                .await
-                .unwrap();
+        let (mut event_rx, _writer) = open_session_channel(server_reader, server_writer)
+            .await
+            .unwrap();
 
         // Read confirmation
         let _confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
@@ -846,16 +923,16 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let client_handle = tokio::spawn(async move {
-            SshMessage::ChannelClose.encode_into(&mut client_writer)
+            SshMessage::ChannelClose
+                .encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
         });
 
-        let (mut event_rx, _writer) =
-            open_session_channel(server_reader, server_writer)
-                .await
-                .unwrap();
+        let (mut event_rx, _writer) = open_session_channel(server_reader, server_writer)
+            .await
+            .unwrap();
 
         // Read confirmation
         let _confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
@@ -878,10 +955,7 @@ mod tests {
     async fn forwarding_channel_types_stub() {
         // After T8, non-session channel types with no session_client are treated
         // as unknown and get ChannelOpenFailure (same as unknown_channel_type).
-        let forwarding_types = [
-            "forwarded-tcpip",
-            "forwarded-streamlocal@openssh.com",
-        ];
+        let forwarding_types = ["forwarded-tcpip", "forwarded-streamlocal@openssh.com"];
 
         for channel_type in forwarding_types {
             let (_, server_reader) = duplex(8192);
@@ -922,19 +996,20 @@ mod tests {
             SshMessage::ChannelExtendedData {
                 data_type: VarInt::from(1u8), // stderr
                 data: b"error output".to_vec(),
-            }.encode_into(&mut client_writer)
+            }
+            .encode_into(&mut client_writer)
             .await
             .unwrap();
-            SshMessage::ChannelClose.encode_into(&mut client_writer)
+            SshMessage::ChannelClose
+                .encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
         });
 
-        let (mut event_rx, _writer) =
-            open_session_channel(server_reader, server_writer)
-                .await
-                .unwrap();
+        let (mut event_rx, _writer) = open_session_channel(server_reader, server_writer)
+            .await
+            .unwrap();
 
         // Read confirmation
         let _confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
@@ -963,27 +1038,30 @@ mod tests {
 
         let client_handle = tokio::spawn(async move {
             // Send success and failure, then close
-            SshMessage::ChannelSuccess.encode_into(&mut client_writer)
+            SshMessage::ChannelSuccess
+                .encode_into(&mut client_writer)
                 .await
                 .unwrap();
-            SshMessage::ChannelFailure.encode_into(&mut client_writer)
+            SshMessage::ChannelFailure
+                .encode_into(&mut client_writer)
                 .await
                 .unwrap();
             SshMessage::ChannelData {
                 data: b"after".to_vec(),
-            }.encode_into(&mut client_writer)
+            }
+            .encode_into(&mut client_writer)
             .await
             .unwrap();
-            SshMessage::ChannelClose.encode_into(&mut client_writer)
+            SshMessage::ChannelClose
+                .encode_into(&mut client_writer)
                 .await
                 .unwrap();
             drop(client_writer);
         });
 
-        let (mut event_rx, _writer) =
-            open_session_channel(server_reader, server_writer)
-                .await
-                .unwrap();
+        let (mut event_rx, _writer) = open_session_channel(server_reader, server_writer)
+            .await
+            .unwrap();
 
         // Read confirmation
         let _confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
@@ -1009,7 +1087,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let opener: OpenBiFactory = Arc::new(|| {
             Box::pin(async {
-                Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "not used in test",
+                ))
             })
         });
         let mut endpoint = ConversationEndpoint::new(StreamId(VarInt::from(42u8)), rx, opener);
@@ -1025,7 +1106,10 @@ mod tests {
         let (_tx, rx) = mpsc::channel(8);
         let opener: OpenBiFactory = Arc::new(|| {
             Box::pin(async {
-                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "test opener failed"))
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "test opener failed",
+                ))
             })
         });
         let endpoint = ConversationEndpoint::new(StreamId(VarInt::from(7u8)), rx, opener);
@@ -1037,8 +1121,14 @@ mod tests {
     struct TestTransport;
 
     impl RemoteSessionTransport for TestTransport {
-        async fn accept_channel(&self) -> Result<
-            Option<(ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+        async fn accept_channel(
+            &self,
+        ) -> Result<
+            Option<(
+                ChannelHeader,
+                remoc::rch::mpsc::Receiver<Vec<u8>>,
+                remoc::rch::mpsc::Sender<Vec<u8>>,
+            )>,
             TransportError,
         > {
             Ok(None)
@@ -1048,7 +1138,10 @@ mod tests {
             &self,
             _header: Option<ChannelHeader>,
         ) -> Result<
-            (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            (
+                remoc::rch::mpsc::Receiver<Vec<u8>>,
+                remoc::rch::mpsc::Sender<Vec<u8>>,
+            ),
             TransportError,
         > {
             let (tx, rx) = remoc::rch::mpsc::channel(16);
@@ -1089,8 +1182,8 @@ mod tests {
         let mut request_data = Vec::new();
         request_data
             .encode_one(&TcpipForwardRequest {
-            bind_address: "127.0.0.1".into(),
-            bind_port: u16::MAX as u32 + 1,
+                bind_address: "127.0.0.1".into(),
+                bind_port: u16::MAX as u32 + 1,
             })
             .await
             .unwrap();
@@ -1126,8 +1219,8 @@ mod tests {
         let mut request_data = Vec::new();
         request_data
             .encode_one(&CancelTcpipForwardRequest {
-            bind_address: "127.0.0.1".into(),
-            bind_port: u16::MAX as u32 + 1,
+                bind_address: "127.0.0.1".into(),
+                bind_port: u16::MAX as u32 + 1,
             })
             .await
             .unwrap();
@@ -1212,7 +1305,12 @@ mod tests {
         .await
         .expect("post-readiness reply should arrive before deadline")
         .unwrap();
-        assert_eq!(accepted, SshMessage::RequestSuccess { data: b"ok".to_vec() });
+        assert_eq!(
+            accepted,
+            SshMessage::RequestSuccess {
+                data: b"ok".to_vec()
+            }
+        );
         assert_eq!(handler_calls.load(AtomicOrdering::SeqCst), 1);
 
         server_task.await.unwrap();
@@ -1223,7 +1321,9 @@ mod tests {
         let (mut client_writer, mut server_reader) = duplex(8192);
         let (server_writer, mut client_reader) = duplex(8192);
         let readiness = StdArc::new(AtomicBool::new(true));
-        let handler = move |request_type: String, _data: Vec<u8>, _global_ctx: Option<Arc<GlobalRequestContext>>| async move {
+        let handler = move |request_type: String,
+                            _data: Vec<u8>,
+                            _global_ctx: Option<Arc<GlobalRequestContext>>| async move {
             Ok(GlobalRequestReply::Success(request_type.into_bytes()))
         };
 
@@ -1272,7 +1372,9 @@ mod tests {
         let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
         let release_rx_for_handler = Arc::clone(&release_rx);
         let handler_calls_for_handler = Arc::clone(&handler_calls);
-        let handler = move |request_type: String, _data: Vec<u8>, _global_ctx: Option<Arc<GlobalRequestContext>>| {
+        let handler = move |request_type: String,
+                            _data: Vec<u8>,
+                            _global_ctx: Option<Arc<GlobalRequestContext>>| {
             let release_rx = Arc::clone(&release_rx_for_handler);
             let handler_calls = Arc::clone(&handler_calls_for_handler);
             async move {
@@ -1351,7 +1453,9 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let server_task = tokio::spawn(async move {
-            reject_legacy_global_request_channel(server_writer).await.unwrap();
+            reject_legacy_global_request_channel(server_writer)
+                .await
+                .unwrap();
             drop(server_reader);
         });
 

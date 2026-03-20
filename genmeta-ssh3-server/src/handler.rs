@@ -24,10 +24,10 @@ use http_body_util::Empty;
 use snafu::Report;
 use tracing::Instrument;
 
-use crate::{auth, child::ChildProcess, error::ServerError, protocol::Ssh3Protocol, version};
 use crate::channel::{GlobalRequestContext, serve_control_stream_global_requests};
 use crate::forward::reverse_tcp::ReverseTcpForwarder;
 use crate::forward::streamlocal::ReverseStreamlocalForwarder;
+use crate::{auth, child::ChildProcess, error::ServerError, protocol::Ssh3Protocol, version};
 use genmeta_ssh::AuthCredential;
 use genmeta_ssh::{AuthResult, ChildBootstrap};
 use h3x::hyper::upgrade;
@@ -47,9 +47,7 @@ enum ConnectDecision {
     /// Protocol or version error — return 400 Bad Request.
     BadRequest(String),
     /// Authentication failure — return 401 with WWW-Authenticate.
-    Unauthorized {
-        www_authenticate: String,
-    },
+    Unauthorized { www_authenticate: String },
 }
 
 /// Validate method, protocol, version, and auth from raw request data.
@@ -62,9 +60,7 @@ fn evaluate_connect(
 ) -> ConnectDecision {
     // 1. Validate method is CONNECT.
     if *method != Method::CONNECT {
-        return ConnectDecision::BadRequest(format!(
-            "expected CONNECT method, got {method}"
-        ));
+        return ConnectDecision::BadRequest(format!("expected CONNECT method, got {method}"));
     }
 
     // 2. Validate :protocol pseudo-header is "ssh3".
@@ -76,9 +72,7 @@ fn evaluate_connect(
             ));
         }
         None => {
-            return ConnectDecision::BadRequest(
-                "missing :protocol pseudo-header".into(),
-            );
+            return ConnectDecision::BadRequest("missing :protocol pseudo-header".into());
         }
     }
 
@@ -86,9 +80,7 @@ fn evaluate_connect(
     let version = match version::negotiate_version(headers) {
         Ok(v) => v,
         Err(e) => {
-            return ConnectDecision::BadRequest(format!(
-                "version negotiation failed: {e}"
-            ));
+            return ConnectDecision::BadRequest(format!("version negotiation failed: {e}"));
         }
     };
 
@@ -101,14 +93,11 @@ fn evaluate_connect(
                 credential: Some(credential),
             }
         }
-        Err(challenge) => {
-            ConnectDecision::Unauthorized {
-                www_authenticate: challenge.www_authenticate,
-            }
-        }
+        Err(challenge) => ConnectDecision::Unauthorized {
+            www_authenticate: challenge.www_authenticate,
+        },
     }
 }
-
 
 /// Handler for SSH3 Extended CONNECT requests.
 ///
@@ -153,15 +142,26 @@ impl Ssh3ConnectHandler {
         let decision = evaluate_connect(&method, proto_str.as_deref(), request.headers());
 
         match decision {
-            ConnectDecision::Ok { version_header, credential } => {
-                self.handle_accepted_connect(request, protocol, stream_id, version_header, credential)
-                    .await
+            ConnectDecision::Ok {
+                version_header,
+                credential,
+            } => {
+                self.handle_accepted_connect(
+                    request,
+                    protocol,
+                    stream_id,
+                    version_header,
+                    credential,
+                )
+                .await
             }
             ConnectDecision::BadRequest(msg) => {
                 tracing::warn!(%msg, "SSH3 CONNECT rejected");
                 response_with_status(StatusCode::BAD_REQUEST)
             }
-            ConnectDecision::Unauthorized { www_authenticate } => unauthorized_response(&www_authenticate),
+            ConnectDecision::Unauthorized { www_authenticate } => {
+                unauthorized_response(&www_authenticate)
+            }
         }
     }
 
@@ -178,7 +178,10 @@ impl Ssh3ConnectHandler {
         B::Data: Send,
         B::Error: Send,
     {
-        let (reserved, transport_server, transport_client) = match protocol.create_transport(stream_id, 16).await {
+        let (reserved, transport_server, transport_client) = match protocol
+            .create_transport(stream_id, 16)
+            .await
+        {
             Ok(bundle) => bundle,
             Err(e) => {
                 tracing::error!(error = %Report::from_error(e), "failed to initialize SSH3 conversation");
@@ -207,7 +210,11 @@ impl Ssh3ConnectHandler {
             }
         };
 
-        let (child, mut child_bootstrap_tx, mut child_auth_rx) = match ChildProcess::spawn(&session_bin).await {
+        let (child, mut child_bootstrap_tx, mut child_auth_rx) = match ChildProcess::spawn(
+            &session_bin,
+        )
+        .await
+        {
             Ok(tuple) => tuple,
             Err(e) => {
                 tracing::error!(error = %Report::from_error(ServerError::SpawnChild { source: e }), "failed to spawn child process");
@@ -216,8 +223,10 @@ impl Ssh3ConnectHandler {
         };
 
         let transport_server_handle = tokio::spawn(
-            async move { let _ = transport_server.serve(true).await; }
-                .instrument(tracing::info_span!("ssh3_transport_server", %conversation_id))
+            async move {
+                let _ = transport_server.serve(true).await;
+            }
+            .instrument(tracing::info_span!("ssh3_transport_server", %conversation_id)),
         );
 
         let bootstrap = ChildBootstrap {
@@ -233,7 +242,7 @@ impl Ssh3ConnectHandler {
             return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
         }
 
-        if let Err(_) = child_bootstrap_tx.send(bootstrap).await {
+        if child_bootstrap_tx.send(bootstrap).await.is_err() {
             tracing::error!(error = %Report::from_error(ServerError::SendBootstrap), %conversation_id, "failed to send ChildBootstrap to child");
             return response_with_status(StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -355,7 +364,7 @@ impl Default for Ssh3ConnectHandler {
 }
 impl<B> tower_service::Service<http::Request<B>> for Ssh3ConnectHandler
 where
-        B: http_body::Body + Send + Unpin + 'static,
+    B: http_body::Body + Send + Unpin + 'static,
     B::Data: Send,
     B::Error: Send,
 {
@@ -367,14 +376,9 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(
-        &mut self,
-        request: http::Request<B>,
-    ) -> Self::Future {
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
         let handler = self.clone();
-        Box::pin(async move {
-            Ok(handler.handle_request(request).await)
-        })
+        Box::pin(async move { Ok(handler.handle_request(request).await) })
     }
 }
 
@@ -451,11 +455,18 @@ fn session_binary() -> std::io::Result<PathBuf> {
 }
 
 fn resolve_session_binary_near(exe: &Path) -> Option<PathBuf> {
-    [exe.parent(), exe.parent().and_then(|parent| parent.parent())]
-        .into_iter()
-        .flatten()
-        .flat_map(|dir| SESSION_BINARY_CANDIDATES.iter().map(move |name| dir.join(name)))
-        .find(|path| path.is_file())
+    [
+        exe.parent(),
+        exe.parent().and_then(|parent| parent.parent()),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|dir| {
+        SESSION_BINARY_CANDIDATES
+            .iter()
+            .map(move |name| dir.join(name))
+    })
+    .find(|path| path.is_file())
 }
 
 fn find_binary_on_path(name: &str) -> Option<PathBuf> {
@@ -504,9 +515,7 @@ mod tests {
     /// Missing ssh-version header → BadRequest.
     #[test]
     fn missing_version_returns_bad_request() {
-        let headers = headers_with_pairs(&[
-            ("authorization", "Basic dXNlcjpwYXNz"),
-        ]);
+        let headers = headers_with_pairs(&[("authorization", "Basic dXNlcjpwYXNz")]);
 
         let decision = evaluate_connect(&Method::CONNECT, Some("ssh3"), &headers);
 
@@ -539,9 +548,7 @@ mod tests {
     /// Missing auth header → Unauthorized with WWW-Authenticate: Basic.
     #[test]
     fn missing_auth_returns_unauthorized() {
-        let headers = headers_with_pairs(&[
-            ("ssh-version", SSH_VERSION),
-        ]);
+        let headers = headers_with_pairs(&[("ssh-version", SSH_VERSION)]);
 
         let decision = evaluate_connect(&Method::CONNECT, Some("ssh3"), &headers);
 

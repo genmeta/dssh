@@ -5,12 +5,7 @@
 //! are dispatched to registered conversations via mpsc channels. All other streams
 //! are passed to the next protocol layer.
 
-use std::{
-    collections::HashMap,
-    fmt::Debug,
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt::Debug, pin::Pin, sync::Arc};
 
 use futures::future::BoxFuture;
 use genmeta_ssh::CHANNEL_SIGNAL_VALUE as SSH3_SIGNAL_VALUE;
@@ -21,10 +16,7 @@ use tokio::sync::mpsc;
 use genmeta_ssh::ChannelHeader;
 use genmeta_ssh::{Ssh3TransportClient, Ssh3TransportServerShared};
 use h3x::{
-    codec::{
-        DecodeExt, ErasedPeekableBiStream, ErasedPeekableUniStream,
-        SinkWriter, StreamReader,
-    },
+    codec::{DecodeExt, ErasedPeekableBiStream, ErasedPeekableUniStream, SinkWriter, StreamReader},
     connection::StreamError,
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, ConnectionError},
@@ -146,7 +138,11 @@ impl Ssh3Protocol {
             .lock()
             .map_err(|e| map_poison(e, false))?
             .insert(id.into_inner(), slot);
-        Ok(crate::channel::ConversationEndpoint::new(id, rx, self.open_bi_factory()))
+        Ok(crate::channel::ConversationEndpoint::new(
+            id,
+            rx,
+            self.open_bi_factory(),
+        ))
     }
 
     /// Unregisters a conversation, dropping its sender.
@@ -191,7 +187,11 @@ impl Ssh3Protocol {
         &self,
         stream_id: StreamId,
         capacity: usize,
-    ) -> ServerResult<(ReservedConversation, Ssh3TransportServerShared<crate::channel::Ssh3Transport>, Ssh3TransportClient)> {
+    ) -> ServerResult<(
+        ReservedConversation,
+        Ssh3TransportServerShared<crate::channel::Ssh3Transport>,
+        Ssh3TransportClient,
+    )> {
         let mut reserved = self.reserve_conversation(stream_id).await?;
         let (server, client) = reserved.transport_server(self.open_bi_factory(), capacity)?;
         Ok((reserved, server, client))
@@ -215,7 +215,7 @@ impl Ssh3Protocol {
             }
         };
 
-        if signal_value.into_inner() as u32 != SSH3_SIGNAL_VALUE {
+        if signal_value != SSH3_SIGNAL_VALUE {
             // Not SSH3 — pass through. Protocols::accept_bi will reset
             // the peek cursor on Passed streams.
             return Ok(StreamVerdict::Passed((reader, writer)));
@@ -249,11 +249,11 @@ impl Ssh3Protocol {
                     return Ok(StreamVerdict::Accepted);
                 }
             };
-            registry.get(&header.conversation_id).and_then(|slot| {
+            registry.get(&header.conversation_id.into_inner()).and_then(|slot| {
                 let state = match slot.state() {
                     Ok(state) => state,
                     Err(error) => {
-                        tracing::warn!(error = %Report::from_error(error), conversation_id = header.conversation_id, "failed to inspect conversation state");
+                        tracing::warn!(error = %Report::from_error(error), conversation_id = %header.conversation_id, "failed to inspect conversation state");
                         return None;
                     }
                 };
@@ -270,7 +270,7 @@ impl Ssh3Protocol {
             }
         } else {
             tracing::warn!(
-                conversation_id = header.conversation_id,
+                conversation_id = %header.conversation_id,
                 "no registered conversation for stream, dropping"
             );
         }
@@ -304,9 +304,12 @@ impl ReservedConversation {
     /// Called after the bootstrap is sent to the child process, before
     /// waiting for auth result.
     pub fn transition_to_authenticating(&self) -> ServerResult<()> {
-        let slot = self.slot.as_ref().ok_or(ServerError::ConsumedConversationEndpoint {
-            conversation_id: self.conversation_id,
-        })?;
+        let slot = self
+            .slot
+            .as_ref()
+            .ok_or(ServerError::ConsumedConversationEndpoint {
+                conversation_id: self.conversation_id,
+            })?;
         slot.transition(
             ConversationState::Reserved,
             ConversationState::Authenticating,
@@ -317,10 +320,16 @@ impl ReservedConversation {
         &mut self,
         opener: crate::channel::OpenBiFactory,
         capacity: usize,
-    ) -> ServerResult<(Ssh3TransportServerShared<crate::channel::Ssh3Transport>, Ssh3TransportClient)> {
-        let slot = self.slot.as_ref().ok_or(ServerError::ConsumedConversationEndpoint {
-            conversation_id: self.conversation_id,
-        })?;
+    ) -> ServerResult<(
+        Ssh3TransportServerShared<crate::channel::Ssh3Transport>,
+        Ssh3TransportClient,
+    )> {
+        let slot = self
+            .slot
+            .as_ref()
+            .ok_or(ServerError::ConsumedConversationEndpoint {
+                conversation_id: self.conversation_id,
+            })?;
         let state = slot.state()?;
         if state != ConversationState::Reserved && state != ConversationState::Authenticating {
             return Err(ServerError::InvalidConversationState {
@@ -328,9 +337,12 @@ impl ReservedConversation {
                 state,
             });
         }
-        let rx = self.rx.take().ok_or(ServerError::ConsumedConversationEndpoint {
-            conversation_id: self.conversation_id,
-        })?;
+        let rx = self
+            .rx
+            .take()
+            .ok_or(ServerError::ConsumedConversationEndpoint {
+                conversation_id: self.conversation_id,
+            })?;
         let endpoint = crate::channel::ConversationEndpoint::new(self.conversation_id, rx, opener);
         let transport = Arc::new(crate::channel::Ssh3Transport::new(endpoint));
         let (server, client) = Ssh3TransportServerShared::new(transport, capacity);
@@ -338,20 +350,29 @@ impl ReservedConversation {
     }
 
     pub fn consume_into_lease(mut self) -> ServerResult<ConversationLease> {
-        let slot = self.slot.as_ref().ok_or(ServerError::ConsumedConversationEndpoint {
-            conversation_id: self.conversation_id,
-        })?;
+        let slot = self
+            .slot
+            .as_ref()
+            .ok_or(ServerError::ConsumedConversationEndpoint {
+                conversation_id: self.conversation_id,
+            })?;
         slot.transition(
             ConversationState::Authenticating,
             ConversationState::Upgrading,
         )?;
 
-        let slot = self.slot.take().ok_or(ServerError::ConsumedConversationEndpoint {
-            conversation_id: self.conversation_id,
-        })?;
-        let registry = self.registry.take().ok_or(ServerError::ConsumedConversationEndpoint {
-            conversation_id: self.conversation_id,
-        })?;
+        let slot = self
+            .slot
+            .take()
+            .ok_or(ServerError::ConsumedConversationEndpoint {
+                conversation_id: self.conversation_id,
+            })?;
+        let registry = self
+            .registry
+            .take()
+            .ok_or(ServerError::ConsumedConversationEndpoint {
+                conversation_id: self.conversation_id,
+            })?;
 
         Ok(ConversationLease {
             conversation_id: self.conversation_id,
@@ -369,26 +390,37 @@ impl ReservedConversation {
         mut self,
         opener: crate::channel::OpenBiFactory,
     ) -> ServerResult<(ConversationLease, crate::channel::ConversationEndpoint)> {
-        let slot = self.slot.as_ref().ok_or(ServerError::ConsumedConversationEndpoint {
-            conversation_id: self.conversation_id,
-        })?;
+        let slot = self
+            .slot
+            .as_ref()
+            .ok_or(ServerError::ConsumedConversationEndpoint {
+                conversation_id: self.conversation_id,
+            })?;
         slot.transition(
             ConversationState::Authenticating,
             ConversationState::Upgrading,
         )?;
 
-        let slot = self.slot.take().ok_or(ServerError::ConsumedConversationEndpoint {
-            conversation_id: self.conversation_id,
-        })?;
-        let registry = self.registry.take().ok_or(ServerError::ConsumedConversationEndpoint {
-            conversation_id: self.conversation_id,
-        })?;
+        let slot = self
+            .slot
+            .take()
+            .ok_or(ServerError::ConsumedConversationEndpoint {
+                conversation_id: self.conversation_id,
+            })?;
+        let registry = self
+            .registry
+            .take()
+            .ok_or(ServerError::ConsumedConversationEndpoint {
+                conversation_id: self.conversation_id,
+            })?;
 
         let endpoint = crate::channel::ConversationEndpoint::new(
             self.conversation_id,
-            self.rx.take().ok_or(ServerError::ConsumedConversationEndpoint {
-                conversation_id: self.conversation_id,
-            })?,
+            self.rx
+                .take()
+                .ok_or(ServerError::ConsumedConversationEndpoint {
+                    conversation_id: self.conversation_id,
+                })?,
             opener,
         );
 
@@ -411,7 +443,8 @@ impl Drop for ReservedConversation {
             let mut reg = registry.lock().unwrap();
             // Only remove if the slot in the registry is still ours (pointer identity).
             if let Some(existing) = reg.get(&id)
-                && Arc::ptr_eq(existing, &slot) {
+                && Arc::ptr_eq(existing, &slot)
+            {
                 reg.remove(&id);
             }
         }
@@ -433,10 +466,8 @@ impl ConversationLease {
     /// Transition from `Upgrading` to `Active`.
     ///
     pub fn transition_to_active(&self) -> ServerResult<()> {
-        self.slot.transition(
-            ConversationState::Upgrading,
-            ConversationState::Active,
-        )
+        self.slot
+            .transition(ConversationState::Upgrading, ConversationState::Active)
     }
 
     /// Returns the conversation ID.
@@ -451,7 +482,8 @@ impl Drop for ConversationLease {
         self.slot.close();
         let mut reg = self.registry.lock().unwrap();
         if let Some(existing) = reg.get(&self.conversation_id.into_inner())
-            && Arc::ptr_eq(existing, &self.slot) {
+            && Arc::ptr_eq(existing, &self.slot)
+        {
             reg.remove(&self.conversation_id.into_inner());
         }
     }
@@ -470,9 +502,7 @@ impl Protocol for Ssh3Protocol {
         &'a self,
         stream: ErasedPeekableBiStream,
     ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
-        Box::pin(async move {
-            self.accept_bi_inner(stream).await
-        })
+        Box::pin(async move { self.accept_bi_inner(stream).await })
     }
 }
 
@@ -551,10 +581,7 @@ mod tests {
     /// Helper: decode a ChannelHeader from bytes and try to dispatch it
     /// through the protocol's registry. Returns the decoded header on
     /// success, None if the conversation is not registered.
-    async fn simulate_dispatch(
-        protocol: &Ssh3Protocol,
-        header: &ChannelHeader,
-    ) -> bool {
+    async fn simulate_dispatch(protocol: &Ssh3Protocol, header: &ChannelHeader) -> bool {
         let registry = protocol.registry.lock().unwrap();
         registry.contains_key(&header.conversation_id)
     }
@@ -564,7 +591,10 @@ mod tests {
         let proto = Ssh3Protocol::new(test_open_bi_factory());
 
         // Register a conversation.
-        let mut endpoint = proto.register_conversation(StreamId::try_from(42u64).unwrap()).await.unwrap();
+        let mut endpoint = proto
+            .register_conversation(StreamId::try_from(42u64).unwrap())
+            .await
+            .unwrap();
 
         // Verify the sender exists.
         {
@@ -573,7 +603,10 @@ mod tests {
         }
 
         // Unregister.
-        proto.unregister_conversation(StreamId::try_from(42u64).unwrap()).await.unwrap();
+        proto
+            .unregister_conversation(StreamId::try_from(42u64).unwrap())
+            .await
+            .unwrap();
 
         // Verify removed.
         {
@@ -588,10 +621,16 @@ mod tests {
     #[tokio::test]
     async fn unregister_drops_sender() {
         let proto = Ssh3Protocol::new(test_open_bi_factory());
-        let mut endpoint = proto.register_conversation(StreamId::try_from(99u64).unwrap()).await.unwrap();
+        let mut endpoint = proto
+            .register_conversation(StreamId::try_from(99u64).unwrap())
+            .await
+            .unwrap();
 
         // Unregister drops the sender.
-        proto.unregister_conversation(StreamId::try_from(99u64).unwrap()).await.unwrap();
+        proto
+            .unregister_conversation(StreamId::try_from(99u64).unwrap())
+            .await
+            .unwrap();
 
         // recv should return None (channel closed).
         assert!(endpoint.accept_channel().await.is_none());
@@ -600,7 +639,10 @@ mod tests {
     #[tokio::test]
     async fn conversation_dispatch_via_registry() {
         let proto = Ssh3Protocol::new(test_open_bi_factory());
-        let _endpoint = proto.register_conversation(StreamId::try_from(12345u64).unwrap()).await.unwrap();
+        let _endpoint = proto
+            .register_conversation(StreamId::try_from(12345u64).unwrap())
+            .await
+            .unwrap();
 
         let header = ChannelHeader {
             signal_value: SSH3_SIGNAL_VALUE,
@@ -618,7 +660,9 @@ mod tests {
 
         // Verify roundtrip of header via decode.
         let (mut w, mut r) = duplex(4096);
-        tokio::io::AsyncWriteExt::write_all(&mut w, &data).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut w, &data)
+            .await
+            .unwrap();
         drop(w);
         let decoded = ChannelHeader::decode_from(&mut r).await.unwrap();
         assert_eq!(decoded.signal_value, SSH3_SIGNAL_VALUE);
@@ -660,8 +704,14 @@ mod tests {
     #[tokio::test]
     async fn multiple_conversations_isolated() {
         let proto = Ssh3Protocol::new(test_open_bi_factory());
-        let _endpoint1 = proto.register_conversation(StreamId::try_from(100u64).unwrap()).await.unwrap();
-        let _endpoint2 = proto.register_conversation(StreamId::try_from(200u64).unwrap()).await.unwrap();
+        let _endpoint1 = proto
+            .register_conversation(StreamId::try_from(100u64).unwrap())
+            .await
+            .unwrap();
+        let _endpoint2 = proto
+            .register_conversation(StreamId::try_from(200u64).unwrap())
+            .await
+            .unwrap();
 
         // Both conversations should be registered.
         {
@@ -672,7 +722,10 @@ mod tests {
         }
 
         // Unregister one, verify the other remains.
-        proto.unregister_conversation(StreamId::try_from(100u64).unwrap()).await.unwrap();
+        proto
+            .unregister_conversation(StreamId::try_from(100u64).unwrap())
+            .await
+            .unwrap();
         {
             let registry = proto.registry.lock().unwrap();
             assert!(!registry.contains_key(&100));
@@ -683,10 +736,16 @@ mod tests {
     #[tokio::test]
     async fn re_register_conversation() {
         let proto = Ssh3Protocol::new(test_open_bi_factory());
-        let mut endpoint1 = proto.register_conversation(StreamId::try_from(42u64).unwrap()).await.unwrap();
+        let mut endpoint1 = proto
+            .register_conversation(StreamId::try_from(42u64).unwrap())
+            .await
+            .unwrap();
 
         // Re-register with the same id replaces the sender.
-        let endpoint2 = proto.register_conversation(StreamId::try_from(42u64).unwrap()).await.unwrap();
+        let endpoint2 = proto
+            .register_conversation(StreamId::try_from(42u64).unwrap())
+            .await
+            .unwrap();
 
         // Old receiver should be closed (old sender was dropped when replaced).
         assert!(endpoint1.accept_channel().await.is_none());
@@ -712,7 +771,9 @@ mod tests {
 
         // Full roundtrip.
         let (mut w, mut r) = duplex(4096);
-        tokio::io::AsyncWriteExt::write_all(&mut w, &data).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut w, &data)
+            .await
+            .unwrap();
         drop(w);
         let decoded = ChannelHeader::decode_from(&mut r).await.unwrap();
         assert_eq!(decoded, header);
