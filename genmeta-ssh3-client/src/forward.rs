@@ -22,7 +22,6 @@ pub use genmeta_ssh::{
 // direct-tcpip
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // reverse TCP (tcpip-forward / cancel-tcpip-forward)
 // ---------------------------------------------------------------------------
@@ -34,10 +33,11 @@ pub async fn encode_tcpip_forward_request(
     bind_port: u32,
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    buf.encode_one(&TcpipForwardRequest {
-        bind_address: bind_address.to_owned(),
-        bind_port,
-    }).await?;
+    buf.encode_one(TcpipForwardRequest {
+        bind_address: bind_address.to_owned().into(),
+        bind_port: bind_port.into(),
+    })
+    .await?;
     Ok(buf)
 }
 
@@ -62,12 +62,13 @@ pub async fn send_tcpip_forward_request<W: AsyncWrite + Send + Unpin>(
     bind_port: u32,
 ) -> io::Result<()> {
     let data = encode_tcpip_forward_request(bind_address, bind_port).await?;
-    writer.encode_one(&SshMessage::GlobalRequest {
-        request_type: "tcpip-forward".into(),
-        want_reply: true,
-        data,
-    })
-    .await
+    writer
+        .encode_one(&SshMessage::GlobalRequest {
+            request_type: "tcpip-forward".into(),
+            want_reply: true,
+            data,
+        })
+        .await
 }
 
 /// Send a `cancel-tcpip-forward` GlobalRequest(80) to the server.
@@ -77,12 +78,13 @@ pub async fn send_cancel_tcpip_forward_request<W: AsyncWrite + Send + Unpin>(
     bind_port: u32,
 ) -> io::Result<()> {
     let data = encode_cancel_tcpip_forward_request(bind_address, bind_port).await?;
-    writer.encode_one(&SshMessage::GlobalRequest {
-        request_type: "cancel-tcpip-forward".into(),
-        want_reply: true,
-        data,
-    })
-    .await
+    writer
+        .encode_one(&SshMessage::GlobalRequest {
+            request_type: "cancel-tcpip-forward".into(),
+            want_reply: true,
+            data,
+        })
+        .await
 }
 
 /// Parsed request_data from a server-initiated `forwarded-tcpip` channel.
@@ -95,8 +97,10 @@ pub type ForwardedTcpipInfo = ForwardedTcpipRequest;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh::{CHANNEL_SIGNAL_VALUE, ChannelHeader, DEFAULT_MAX_MESSAGE_SIZE, SshString, TcpipForwardReply};
     use genmeta_ssh::SshMessage;
+    use genmeta_ssh::{
+        CHANNEL_SIGNAL_VALUE, ChannelHeader, DEFAULT_MAX_MESSAGE_SIZE, SshString, TcpipForwardReply,
+    };
     use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
     use h3x::varint::VarInt;
     use tokio::io::duplex;
@@ -107,10 +111,9 @@ mod tests {
 
     #[tokio::test]
     async fn direct_tcpip_request_data_roundtrip() {
-        let data =
-            encode_direct_tcpip_request_data("example.com", 8080, "192.168.1.1", 54321)
-                .await
-                .unwrap();
+        let data = encode_direct_tcpip_request_data("example.com", 8080, "192.168.1.1", 54321)
+            .await
+            .unwrap();
 
         let mut reader = &data[..];
         let dest_host = SshString::decode_from(&mut reader).await.unwrap();
@@ -130,10 +133,9 @@ mod tests {
 
     #[tokio::test]
     async fn direct_tcpip_request_data_hex_dump() {
-        let data =
-            encode_direct_tcpip_request_data("hi", 80, "lo", 22)
-                .await
-                .unwrap();
+        let data = encode_direct_tcpip_request_data("hi", 80, "lo", 22)
+            .await
+            .unwrap();
 
         // dest_host "hi": varint(2)=0x02, b"hi"=[0x68, 0x69]
         // dest_port 80: varint(80) = 2-byte [0x40, 0x50] (80 >= 64)
@@ -143,9 +145,9 @@ mod tests {
             data,
             vec![
                 0x02, 0x68, 0x69, // "hi"
-                0x40, 0x50,       // port 80
+                0x40, 0x50, // port 80
                 0x02, 0x6c, 0x6f, // "lo"
-                0x16,             // port 22
+                0x16, // port 22
             ]
         );
     }
@@ -298,18 +300,16 @@ mod tests {
     async fn read_forwarded_tcpip_info_roundtrip() {
         // Encode the fields the same way the server does
         let mut buf = Vec::new();
-        SshString("192.168.1.100".into()).encode_into(&mut buf)
+        SshString("192.168.1.100".into())
+            .encode_into(&mut buf)
             .await
             .unwrap();
-        buf.encode_one(VarInt::from(80u8))
+        buf.encode_one(VarInt::from(80u8)).await.unwrap();
+        SshString("10.0.0.1".into())
+            .encode_into(&mut buf)
             .await
             .unwrap();
-        SshString("10.0.0.1".into()).encode_into(&mut buf)
-            .await
-            .unwrap();
-        buf.encode_one(VarInt::from(54321u16))
-            .await
-            .unwrap();
+        buf.encode_one(VarInt::from(54321u16)).await.unwrap();
 
         let mut reader = &buf[..];
         let info = read_forwarded_tcpip_info(&mut reader).await.unwrap();
@@ -333,7 +333,10 @@ mod tests {
         let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
             SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(max_message_size, VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32));
+                assert_eq!(
+                    max_message_size,
+                    VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32)
+                );
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -346,9 +349,13 @@ mod tests {
     #[tokio::test]
     async fn reject_forwarded_channel_message() {
         let (mut writer, mut reader) = duplex(8192);
-        reject_forwarded_channel(&mut writer, VarInt::from(1u8), "administratively prohibited")
-            .await
-            .unwrap();
+        reject_forwarded_channel(
+            &mut writer,
+            VarInt::from(1u8),
+            "administratively prohibited",
+        )
+        .await
+        .unwrap();
         drop(writer);
 
         let msg = SshMessage::decode_from(&mut reader).await.unwrap();

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use genmeta_ssh::SshMessage;
 use h3x::codec::DecodeFrom;
+use h3x::stream_id::StreamId;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -158,9 +159,7 @@ where
     }
 
     // Reply: no auth required.
-    writer
-        .write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH])
-        .await?;
+    writer.write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH]).await?;
 
     // ---- Phase 2: CONNECT request ----
     let ver = reader.read_u8().await?;
@@ -234,7 +233,7 @@ where
     // Write the direct-tcpip channel open header + request_data.
     write_direct_tcpip_channel_open(
         &mut ch_writer,
-        conversation_id,
+        StreamId::try_from(conversation_id).map_err(io::Error::other)?,
         &dest_addr,
         dest_port as u32,
         "127.0.0.1",
@@ -247,7 +246,14 @@ where
     match response {
         SshMessage::ChannelOpenConfirmation { .. } => {
             // Success — send SOCKS5 success reply.
-            send_reply(&mut writer, REP_SUCCEEDED, atyp, &dest_atyp_bytes, dest_port).await?;
+            send_reply(
+                &mut writer,
+                REP_SUCCEEDED,
+                atyp,
+                &dest_atyp_bytes,
+                dest_port,
+            )
+            .await?;
         }
         SshMessage::ChannelOpenFailure { .. } => {
             // Failure — send SOCKS5 connection refused reply.
@@ -306,10 +312,10 @@ async fn send_reply<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use h3x::codec::EncodeInto;
     use genmeta_ssh::ChannelHeader;
     use genmeta_ssh::SshMessage;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use h3x::codec::EncodeInto;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
@@ -381,7 +387,9 @@ mod tests {
         mut server_writer: DuplexStream,
     ) {
         // Read the channel header the client wrote.
-        let header = ChannelHeader::decode_from(&mut server_reader).await.unwrap();
+        let header = ChannelHeader::decode_from(&mut server_reader)
+            .await
+            .unwrap();
         assert_eq!(header.channel_type, "direct-tcpip");
 
         // Read request_data fields (dest_host, dest_port, originator_host, originator_port).
@@ -396,7 +404,8 @@ mod tests {
         // Send ChannelOpenConfirmation.
         SshMessage::ChannelOpenConfirmation {
             max_message_size: h3x::varint::VarInt::from(TEST_MAX_MESSAGE_SIZE as u32),
-        }.encode_into(&mut server_writer)
+        }
+        .encode_into(&mut server_writer)
         .await
         .unwrap();
 
@@ -413,7 +422,9 @@ mod tests {
         mut server_writer: DuplexStream,
     ) {
         // Read the channel header.
-        let _header = ChannelHeader::decode_from(&mut server_reader).await.unwrap();
+        let _header = ChannelHeader::decode_from(&mut server_reader)
+            .await
+            .unwrap();
 
         // Read request_data fields.
         use genmeta_ssh::SshString;
@@ -428,7 +439,8 @@ mod tests {
         SshMessage::ChannelOpenFailure {
             reason_code: h3x::varint::VarInt::from(2u8), // SSH_OPEN_CONNECT_FAILED
             description: "connection refused by server".to_string(),
-        }.encode_into(&mut server_writer)
+        }
+        .encode_into(&mut server_writer)
         .await
         .unwrap();
 
@@ -545,18 +557,12 @@ mod tests {
 
         // Read greeting reply.
         let mut greeting_reply = [0u8; 2];
-        client_reader
-            .read_exact(&mut greeting_reply)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut greeting_reply).await.unwrap();
         assert_eq!(greeting_reply, [SOCKS5_VERSION, METHOD_NO_AUTH]);
 
         // Read CONNECT reply.
         let mut reply_header = [0u8; 4];
-        client_reader
-            .read_exact(&mut reply_header)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut reply_header).await.unwrap();
         assert_eq!(reply_header[0], SOCKS5_VERSION);
         assert_eq!(reply_header[1], REP_SUCCEEDED);
         assert_eq!(reply_header[2], 0x00); // RSV
@@ -627,18 +633,12 @@ mod tests {
 
         // Read greeting reply.
         let mut greeting_reply = [0u8; 2];
-        client_reader
-            .read_exact(&mut greeting_reply)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut greeting_reply).await.unwrap();
         assert_eq!(greeting_reply, [SOCKS5_VERSION, METHOD_NO_AUTH]);
 
         // Read CONNECT reply.
         let mut reply_header = [0u8; 4];
-        client_reader
-            .read_exact(&mut reply_header)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut reply_header).await.unwrap();
         assert_eq!(reply_header[0], SOCKS5_VERSION);
         assert_eq!(reply_header[1], REP_SUCCEEDED);
 
@@ -707,18 +707,12 @@ mod tests {
 
         // Read greeting reply.
         let mut greeting_reply = [0u8; 2];
-        client_reader
-            .read_exact(&mut greeting_reply)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut greeting_reply).await.unwrap();
         assert_eq!(greeting_reply, [SOCKS5_VERSION, METHOD_NO_AUTH]);
 
         // Read CONNECT reply.
         let mut reply_header = [0u8; 4];
-        client_reader
-            .read_exact(&mut reply_header)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut reply_header).await.unwrap();
         assert_eq!(reply_header[0], SOCKS5_VERSION);
         assert_eq!(reply_header[1], REP_SUCCEEDED);
 
@@ -783,18 +777,12 @@ mod tests {
 
         // Read greeting reply.
         let mut greeting_reply = [0u8; 2];
-        client_reader
-            .read_exact(&mut greeting_reply)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut greeting_reply).await.unwrap();
         assert_eq!(greeting_reply, [SOCKS5_VERSION, METHOD_NO_AUTH]);
 
         // Read CONNECT reply — should be REP_COMMAND_NOT_SUPPORTED.
         let mut reply_header = [0u8; 4];
-        client_reader
-            .read_exact(&mut reply_header)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut reply_header).await.unwrap();
         assert_eq!(reply_header[0], SOCKS5_VERSION);
         assert_eq!(
             reply_header[1], REP_COMMAND_NOT_SUPPORTED,
@@ -842,18 +830,12 @@ mod tests {
 
         // Read greeting reply.
         let mut greeting_reply = [0u8; 2];
-        client_reader
-            .read_exact(&mut greeting_reply)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut greeting_reply).await.unwrap();
         assert_eq!(greeting_reply, [SOCKS5_VERSION, METHOD_NO_AUTH]);
 
         // Read CONNECT reply — should be REP_CONNECTION_REFUSED.
         let mut reply_header = [0u8; 4];
-        client_reader
-            .read_exact(&mut reply_header)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut reply_header).await.unwrap();
         assert_eq!(reply_header[0], SOCKS5_VERSION);
         assert_eq!(
             reply_header[1], REP_CONNECTION_REFUSED,
@@ -958,24 +940,30 @@ mod tests {
             buf,
             vec![
                 0x05, 0x00, 0x00, 0x01, // VER, REP=succeeded, RSV, ATYP=IPv4
-                127, 0, 0, 1,           // address
-                0x1F, 0x90,             // port 8080 big-endian
+                127, 0, 0, 1, // address
+                0x1F, 0x90, // port 8080 big-endian
             ]
         );
 
         // Verify a connection-refused reply with domain.
         let mut buf = Vec::new();
         let domain_bytes = &[3, b'f', b'o', b'o']; // len=3 + "foo"
-        send_reply(&mut buf, REP_CONNECTION_REFUSED, ATYP_DOMAIN, domain_bytes, 443)
-            .await
-            .unwrap();
+        send_reply(
+            &mut buf,
+            REP_CONNECTION_REFUSED,
+            ATYP_DOMAIN,
+            domain_bytes,
+            443,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             buf,
             vec![
                 0x05, 0x05, 0x00, 0x03, // VER, REP=refused, RSV, ATYP=domain
-                3, b'f', b'o', b'o',    // domain
-                0x01, 0xBB,             // port 443 big-endian
+                3, b'f', b'o', b'o', // domain
+                0x01, 0xBB, // port 443 big-endian
             ]
         );
     }
@@ -1014,18 +1002,12 @@ mod tests {
 
         // Read greeting reply.
         let mut greeting_reply = [0u8; 2];
-        client_reader
-            .read_exact(&mut greeting_reply)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut greeting_reply).await.unwrap();
         assert_eq!(greeting_reply, [SOCKS5_VERSION, METHOD_NO_AUTH]);
 
         // Read CONNECT reply — should be REP_COMMAND_NOT_SUPPORTED.
         let mut reply_header = [0u8; 4];
-        client_reader
-            .read_exact(&mut reply_header)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut reply_header).await.unwrap();
         assert_eq!(reply_header[0], SOCKS5_VERSION);
         assert_eq!(
             reply_header[1], REP_COMMAND_NOT_SUPPORTED,
@@ -1074,17 +1056,11 @@ mod tests {
 
         // Read greeting reply.
         let mut greeting_reply = [0u8; 2];
-        client_reader
-            .read_exact(&mut greeting_reply)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut greeting_reply).await.unwrap();
 
         // Read and skip CONNECT reply.
         let mut reply_header = [0u8; 4];
-        client_reader
-            .read_exact(&mut reply_header)
-            .await
-            .unwrap();
+        client_reader.read_exact(&mut reply_header).await.unwrap();
         match reply_header[3] {
             ATYP_IPV4 => {
                 let mut skip = [0u8; 6];
