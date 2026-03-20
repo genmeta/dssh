@@ -3,7 +3,7 @@ use std::os::fd::AsRawFd;
 use genmeta_ssh::{ChannelEvent, SignalRequest, SshMessage, open_session_channel, run_session_request_loop};
 use h3x::codec::EncodeExt;
 use tokio::{
-    io::{self, AsyncRead, AsyncWrite},
+    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
 
@@ -60,6 +60,7 @@ where
                         tracing::info!(term = %req.term_type);
                         if want_reply {
                             writer.encode_one(&SshMessage::ChannelSuccess).await?;
+                            writer.flush().await?;
                         }
                         Ok(())
                     }
@@ -67,6 +68,7 @@ where
                         tracing::warn!("PTY allocation failed: {error}");
                         if want_reply {
                             writer.encode_one(&SshMessage::ChannelFailure).await?;
+                            writer.flush().await?;
                         }
                         Ok(())
                     }

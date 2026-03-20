@@ -94,10 +94,10 @@ pub fn checked_winsize(
 /// Returns `Ok(winsize)` or `Err(DimensionOverflow)`.
 pub fn validate_pty_dimensions(request: &PtyRequest) -> Result<libc::winsize, DimensionOverflow> {
     checked_winsize(
-        request.width_cols,
-        request.height_rows,
-        request.width_px,
-        request.height_px,
+        request.width_cols.into_inner() as u32,
+        request.height_rows.into_inner() as u32,
+        request.width_px.into_inner() as u32,
+        request.height_px.into_inner() as u32,
     )
 }
 
@@ -108,10 +108,10 @@ pub fn validate_window_change_dimensions(
     request: &WindowChangeRequest,
 ) -> Result<libc::winsize, DimensionOverflow> {
     checked_winsize(
-        request.width_cols,
-        request.height_rows,
-        request.width_px,
-        request.height_px,
+        request.width_cols.into_inner() as u32,
+        request.height_rows.into_inner() as u32,
+        request.width_px.into_inner() as u32,
+        request.height_px.into_inner() as u32,
     )
 }
 

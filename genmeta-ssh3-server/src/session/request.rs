@@ -188,7 +188,7 @@ where
         let exit_code = status.code().unwrap_or(255) as u32;
         let mut request_data = Vec::new();
         request_data
-            .encode_one(&ExitStatusRequest { exit_status: exit_code })
+            .encode_one(&ExitStatusRequest { exit_status: exit_code.into() })
             .await
             .map_err(io::Error::other)?;
         writer.encode_one(&SshMessage::ChannelRequest {
@@ -281,8 +281,8 @@ where
                             {
                                 tracing::warn!(
                                     error = %Report::from_error(&error),
-                                    width_cols = req.width_cols,
-                                    height_rows = req.height_rows,
+                                    width_cols = %req.width_cols,
+                                    height_rows = %req.height_rows,
                                     "window-change resize failed, keeping current size"
                                 );
                             }
@@ -330,7 +330,7 @@ where
         let exit_code = status.code().unwrap_or(255) as u32;
         let mut request_data = Vec::new();
         request_data
-            .encode_one(&ExitStatusRequest { exit_status: exit_code })
+            .encode_one(&ExitStatusRequest { exit_status: exit_code.into() })
             .await
             .map_err(io::Error::other)?;
         writer.encode_one(&SshMessage::ChannelRequest {
