@@ -18,6 +18,12 @@ bytes = "1"
 
 [dev-dependencies]
 genmeta-ssh3-server = { path = "../genmeta-ssh3-server" }
+futures = "0.3"
+gm-quic = { path = "../../gm-quic/gm-quic" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower-service = "0.3"
+tracing-appender = "0.2"
 
 [[bin]]
 name = "client"
