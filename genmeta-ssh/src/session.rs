@@ -8,11 +8,15 @@
 //! The main server process implements the trait and serves it; the child
 //! process uses the client to accept and open channels.
 
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{
+    future::Future,
+    path::PathBuf,
+    pin::{Pin, pin},
+};
 
 use crate::{
-    DEFAULT_MAX_MESSAGE_SIZE,
     codec::{SshBool, SshString, checked_remote_field_len},
+    constants::DEFAULT_MAX_MESSAGE_SIZE,
     message::SshMessage,
 };
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
@@ -23,6 +27,7 @@ use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
+use tracing::Instrument;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestAction {
@@ -39,14 +44,6 @@ pub enum SessionLoopAction {
     Eof,
     Close,
     Ignore,
-}
-
-async fn decode_request_payload<T>(request_data: &[u8]) -> io::Result<T>
-where
-    for<'a> T: DecodeFrom<&'a mut &'a [u8], Error = io::Error>,
-{
-    let mut reader = request_data;
-    reader.decode_one().await
 }
 
 pub async fn handle_request<W>(
@@ -67,7 +64,7 @@ where
 
     match request_type {
         "exec" => {
-            let command = decode_request_payload::<ExecRequest>(request_data).await?.command;
+            let command = request_data.decode::<ExecRequest>().await?.command;
             if want_reply {
                 writer.encode_one(&SshMessage::ChannelSuccess).await?;
             }
@@ -80,36 +77,36 @@ where
             Ok(Some(RequestAction::Shell))
         }
         "pty-req" => {
-            let req = decode_request_payload::<PtyRequest>(request_data).await?;
+            let req = request_data.decode::<PtyRequest>().await?;
             Ok(Some(RequestAction::AllocatePty(req, want_reply)))
         }
         "window-change" => {
-            let req = decode_request_payload::<WindowChangeRequest>(request_data).await?;
+            let req = request_data.decode::<WindowChangeRequest>().await?;
             if want_reply {
                 writer.encode_one(&SshMessage::ChannelSuccess).await?;
             }
             Ok(Some(RequestAction::WindowChange(req)))
         }
         "signal" => {
-            let req = decode_request_payload::<SignalRequest>(request_data).await?;
+            let req = request_data.decode::<SignalRequest>().await?;
             if want_reply {
                 writer.encode_one(&SshMessage::ChannelSuccess).await?;
             }
             Ok(Some(RequestAction::Signal(req)))
         }
         "subsystem" => {
-            let _req = decode_request_payload::<SubsystemRequest>(request_data).await?;
+            let _req = request_data.decode::<SubsystemRequest>().await?;
             if want_reply {
                 writer.encode_one(&SshMessage::ChannelFailure).await?;
             }
             Ok(None)
         }
         "exit-status" => {
-            let _req = decode_request_payload::<ExitStatusRequest>(request_data).await?;
+            let _req = request_data.decode::<ExitStatusRequest>().await?;
             Ok(None)
         }
         "exit-signal" => {
-            let _req = decode_request_payload::<ExitSignalRequest>(request_data).await?;
+            let _req = request_data.decode::<ExitSignalRequest>().await?;
             Ok(None)
         }
         _ => {
@@ -213,7 +210,7 @@ pub struct SubsystemRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitStatusRequest {
-    pub exit_status: u32,
+    pub exit_status: VarInt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,19 +224,19 @@ pub struct ExitSignalRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtyRequest {
     pub term_type: String,
-    pub width_cols: u32,
-    pub height_rows: u32,
-    pub width_px: u32,
-    pub height_px: u32,
+    pub width_cols: VarInt,
+    pub height_rows: VarInt,
+    pub width_px: VarInt,
+    pub height_px: VarInt,
     pub terminal_modes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowChangeRequest {
-    pub width_cols: u32,
-    pub height_rows: u32,
-    pub width_px: u32,
-    pub height_px: u32,
+    pub width_cols: VarInt,
+    pub height_rows: VarInt,
+    pub width_px: VarInt,
+    pub height_px: VarInt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,7 +247,10 @@ pub struct SignalRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelEvent {
     Data(Vec<u8>),
-    ExtendedData { data_type: VarInt, data: Vec<u8> },
+    ExtendedData {
+        data_type: VarInt,
+        data: Vec<u8>,
+    },
     Request {
         request_type: String,
         want_reply: bool,
@@ -264,7 +264,7 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ExecRequest {
     type Error = io::Error;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
+        let mut stream = pin!(stream);
         let len: VarInt = stream.decode_one().await?;
         let len = checked_remote_field_len(len.into_inner(), "exec command")?;
         let mut command = vec![0u8; len];
@@ -278,7 +278,7 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &ExecRequest {
     type Error = io::Error;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
+        let mut stream = pin!(stream);
         let len = VarInt::try_from(self.command.len() as u64)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
         stream.encode_one(len).await?;
@@ -291,10 +291,10 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SubsystemRequest {
     type Error = io::Error;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
+        let mut stream = pin!(stream);
         let subsystem_name: SshString = stream.decode_one().await?;
         Ok(Self {
-            subsystem_name: subsystem_name.0,
+            subsystem_name: subsystem_name.to_string(),
         })
     }
 }
@@ -303,11 +303,9 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ExitStatusRequest {
     type Error = io::Error;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
+        let mut stream = pin!(stream);
         let exit_status: VarInt = stream.decode_one().await?;
-        Ok(Self {
-            exit_status: exit_status.into_inner() as u32,
-        })
+        Ok(Self { exit_status })
     }
 }
 
@@ -316,10 +314,8 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &ExitStatusRequest {
     type Error = io::Error;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        let exit_status = VarInt::try_from(self.exit_status as u64)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-        stream.encode_one(exit_status).await?;
+        let mut stream = pin!(stream);
+        stream.encode_one(self.exit_status).await?;
         Ok(())
     }
 }
@@ -328,16 +324,16 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ExitSignalRequest {
     type Error = io::Error;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
+        let mut stream = pin!(stream);
         let signal_name: SshString = stream.decode_one().await?;
         let core_dumped: SshBool = stream.decode_one().await?;
         let error_message: SshString = stream.decode_one().await?;
         let language_tag: SshString = stream.decode_one().await?;
         Ok(Self {
-            signal_name: signal_name.0,
+            signal_name: signal_name.to_string(),
             core_dumped: core_dumped.0,
-            error_message: error_message.0,
-            language_tag: language_tag.0,
+            error_message: error_message.to_string(),
+            language_tag: language_tag.to_string(),
         })
     }
 }
@@ -347,11 +343,17 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &ExitSignalRequest {
     type Error = io::Error;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.signal_name.clone())).await?;
+        let mut stream = pin!(stream);
+        stream
+            .encode_one(SshString::from(self.signal_name.clone()))
+            .await?;
         stream.encode_one(SshBool(self.core_dumped)).await?;
-        stream.encode_one(SshString(self.error_message.clone())).await?;
-        stream.encode_one(SshString(self.language_tag.clone())).await?;
+        stream
+            .encode_one(SshString::from(self.error_message.clone()))
+            .await?;
+        stream
+            .encode_one(SshString::from(self.language_tag.clone()))
+            .await?;
         Ok(())
     }
 }
@@ -360,7 +362,7 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for PtyRequest {
     type Error = io::Error;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
+        let mut stream = pin!(stream);
         let term_type: SshString = stream.decode_one().await?;
         let width_cols: VarInt = stream.decode_one().await?;
         let height_rows: VarInt = stream.decode_one().await?;
@@ -371,11 +373,11 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for PtyRequest {
         let mut terminal_modes = vec![0u8; modes_len];
         stream.read_exact(&mut terminal_modes).await?;
         Ok(Self {
-            term_type: term_type.0,
-            width_cols: width_cols.into_inner() as u32,
-            height_rows: height_rows.into_inner() as u32,
-            width_px: width_px.into_inner() as u32,
-            height_px: height_px.into_inner() as u32,
+            term_type: term_type.to_string(),
+            width_cols,
+            height_rows,
+            width_px,
+            height_px,
             terminal_modes,
         })
     }
@@ -386,13 +388,21 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &PtyRequest {
     type Error = io::Error;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.term_type.clone())).await?;
-        stream.encode_one(VarInt::try_from(self.width_cols as u64).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?).await?;
-        stream.encode_one(VarInt::try_from(self.height_rows as u64).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?).await?;
-        stream.encode_one(VarInt::try_from(self.width_px as u64).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?).await?;
-        stream.encode_one(VarInt::try_from(self.height_px as u64).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?).await?;
-        stream.encode_one(VarInt::try_from(self.terminal_modes.len() as u64).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?).await?;
+        let mut stream = pin!(stream);
+        stream
+            .encode_one(SshString::from(self.term_type.clone()))
+            .await?;
+        stream.encode_one(self.width_cols).await?;
+        stream.encode_one(self.height_rows).await?;
+        stream.encode_one(self.width_px).await?;
+        stream.encode_one(self.height_px).await?;
+        stream
+            .encode_one(
+                VarInt::try_from(self.terminal_modes.len()).map_err(|_overflow| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "too many terminal modes")
+                })?,
+            )
+            .await?;
         stream.write_all(&self.terminal_modes).await?;
         Ok(())
     }
@@ -402,16 +412,16 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for WindowChangeRequest {
     type Error = io::Error;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
+        let mut stream = pin!(stream);
         let width_cols: VarInt = stream.decode_one().await?;
         let height_rows: VarInt = stream.decode_one().await?;
         let width_px: VarInt = stream.decode_one().await?;
         let height_px: VarInt = stream.decode_one().await?;
         Ok(Self {
-            width_cols: width_cols.into_inner() as u32,
-            height_rows: height_rows.into_inner() as u32,
-            width_px: width_px.into_inner() as u32,
-            height_px: height_px.into_inner() as u32,
+            width_cols,
+            height_rows,
+            width_px,
+            height_px,
         })
     }
 }
@@ -421,11 +431,11 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &WindowChangeRequest {
     type Error = io::Error;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(VarInt::try_from(self.width_cols as u64).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?).await?;
-        stream.encode_one(VarInt::try_from(self.height_rows as u64).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?).await?;
-        stream.encode_one(VarInt::try_from(self.width_px as u64).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?).await?;
-        stream.encode_one(VarInt::try_from(self.height_px as u64).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?).await?;
+        let mut stream = pin!(stream);
+        stream.encode_one(self.width_cols).await?;
+        stream.encode_one(self.height_rows).await?;
+        stream.encode_one(self.width_px).await?;
+        stream.encode_one(self.height_px).await?;
         Ok(())
     }
 }
@@ -434,10 +444,10 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SignalRequest {
     type Error = io::Error;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        let mut stream = std::pin::pin!(stream);
+        let mut stream = pin!(stream);
         let signal_name: SshString = stream.decode_one().await?;
         Ok(Self {
-            signal_name: signal_name.0,
+            signal_name: signal_name.to_string(),
         })
     }
 }
@@ -447,8 +457,10 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for &SignalRequest {
     type Error = io::Error;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        let mut stream = std::pin::pin!(stream);
-        stream.encode_one(SshString(self.signal_name.clone())).await?;
+        let mut stream = pin!(stream);
+        stream
+            .encode_one(SshString::from(self.signal_name.clone()))
+            .await?;
         Ok(())
     }
 }
@@ -477,14 +489,17 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let confirm = SshMessage::ChannelOpenConfirmation {
-        max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     };
     writer.encode_one(&confirm).await?;
 
     let (event_tx, event_rx) = mpsc::channel(64);
-    tokio::spawn(async move {
-        let _ = run_message_loop_with_sender(reader, event_tx).await;
-    });
+    tokio::spawn(
+        async move {
+            let _ = run_message_loop_with_sender(reader, event_tx).await;
+        }
+        .in_current_span(),
+    );
     Ok((event_rx, writer))
 }
 
@@ -623,8 +638,7 @@ where
     D: Deserializer<'de>,
 {
     let raw = u64::deserialize(deserializer)?;
-    let varint = VarInt::try_from(raw).map_err(serde::de::Error::custom)?;
-    Ok(StreamId(varint))
+    StreamId::try_from(raw).map_err(serde::de::Error::custom)
 }
 
 /// Serializable error type for RTC method returns.
@@ -817,8 +831,14 @@ pub trait Ssh3Transport: Sync {
     /// Accept an incoming channel from the remote peer.
     ///
     /// Returns `Ok(None)` when no more channels will arrive (connection closed).
-    async fn accept_channel(&self) -> Result<
-        Option<(crate::codec::ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+    async fn accept_channel(
+        &self,
+    ) -> Result<
+        Option<(
+            crate::codec::ChannelHeader,
+            remoc::rch::mpsc::Receiver<Vec<u8>>,
+            remoc::rch::mpsc::Sender<Vec<u8>>,
+        )>,
         TransportError,
     >;
 
@@ -829,7 +849,10 @@ pub trait Ssh3Transport: Sync {
         &self,
         header: Option<crate::codec::ChannelHeader>,
     ) -> Result<
-        (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+        (
+            remoc::rch::mpsc::Receiver<Vec<u8>>,
+            remoc::rch::mpsc::Sender<Vec<u8>>,
+        ),
         TransportError,
     >;
 }
@@ -925,14 +948,30 @@ mod tests {
         // Create a trivial one to verify the generated type exists and is Send.
         struct Dummy;
         impl Ssh3Transport for Dummy {
-            async fn accept_channel(&self) -> Result<
-                Option<(crate::codec::ChannelHeader, remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>)>,
+            async fn accept_channel(
+                &self,
+            ) -> Result<
+                Option<(
+                    crate::codec::ChannelHeader,
+                    remoc::rch::mpsc::Receiver<Vec<u8>>,
+                    remoc::rch::mpsc::Sender<Vec<u8>>,
+                )>,
                 TransportError,
-            > { Ok(None) }
-            async fn open_channel(&self, _: Option<crate::codec::ChannelHeader>) -> Result<
-                (remoc::rch::mpsc::Receiver<Vec<u8>>, remoc::rch::mpsc::Sender<Vec<u8>>),
+            > {
+                Ok(None)
+            }
+            async fn open_channel(
+                &self,
+                _: Option<crate::codec::ChannelHeader>,
+            ) -> Result<
+                (
+                    remoc::rch::mpsc::Receiver<Vec<u8>>,
+                    remoc::rch::mpsc::Sender<Vec<u8>>,
+                ),
                 TransportError,
-            > { Err(TransportError::Other("dummy".into())) }
+            > {
+                Err(TransportError::Other("dummy".into()))
+            }
         }
         fn assert_send<T: Send>() {}
         assert_send::<Ssh3TransportServerShared<Dummy>>();
@@ -952,5 +991,4 @@ mod tests {
             assert_eq!(err.to_string(), decoded.to_string());
         }
     }
-
 }
