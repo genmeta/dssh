@@ -5,14 +5,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-h3x = { path = "../../h3x" }
+h3x = { path = "../../h3x", features = ["serde"] }
 http = "1"
 snafu = "0.9"
 tracing = "0.1"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "io-util"] }
 base64 = "0.22"
-remoc = { version = "0.18", default-features = false, features = ["remoc_macro", "rtc", "serde", "default-codec-json"] }
+remoc = { version = "0.18", default-features = false, features = [
+    "remoc_macro",
+    "rtc",
+    "serde",
+    "default-codec-json",
+] }
 serde = { version = "1", features = ["derive"] }
 futures = "0.3"
 
