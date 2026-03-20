@@ -1,8 +1,13 @@
 use crate::{
-    CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE, ForwardedStreamlocalRequest,
-    ForwardedTcpipRequest, SshMessage, codec::ChannelHeader,
+    codec::ChannelHeader,
+    constants::{CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE},
+    forward::{ForwardedStreamlocalRequest, ForwardedTcpipRequest},
+    message::SshMessage,
 };
-use h3x::{codec::{DecodeExt, EncodeExt}, stream_id::StreamId};
+use h3x::{
+    codec::{DecodeExt, EncodeExt},
+    stream_id::StreamId,
+};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
 pub async fn relay<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
@@ -18,8 +23,8 @@ where
 pub fn forwarded_tcpip_header(conversation_id: StreamId) -> ChannelHeader {
     ChannelHeader {
         signal_value: CHANNEL_SIGNAL_VALUE,
-        conversation_id: conversation_id.into_inner(),
-        channel_type: "forwarded-tcpip".to_string(),
+        conversation_id,
+        channel_type: "forwarded-tcpip".into(),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     }
 }
@@ -39,10 +44,10 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     writer
-        .encode_one(&ForwardedTcpipRequest {
-            connected_address: connected_addr.to_string(),
+        .encode_one(ForwardedTcpipRequest {
+            connected_address: connected_addr.to_string().into(),
             connected_port: connected_port.into(),
-            originator_address: originator_addr.to_string(),
+            originator_address: originator_addr.to_string().into(),
             originator_port: originator_port.into(),
         })
         .await?;
@@ -70,8 +75,8 @@ where
 pub fn forwarded_streamlocal_header(conversation_id: StreamId) -> ChannelHeader {
     ChannelHeader {
         signal_value: CHANNEL_SIGNAL_VALUE,
-        conversation_id: conversation_id.into_inner(),
-        channel_type: "forwarded-streamlocal@openssh.com".to_string(),
+        conversation_id,
+        channel_type: "forwarded-streamlocal@openssh.com".into(),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
     }
 }
@@ -88,8 +93,8 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     writer
-        .encode_one(&ForwardedStreamlocalRequest {
-            socket_path: socket_path.to_string(),
+        .encode_one(ForwardedStreamlocalRequest {
+            socket_path: socket_path.to_string().into(),
         })
         .await?;
     writer.flush().await?;
