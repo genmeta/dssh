@@ -15,25 +15,59 @@ use std::{
 };
 
 use crate::{
-    codec::{SshBool, SshString, checked_remote_field_len},
+    channel::{ChannelMessage, ChannelRequest},
+    codec::{CodecError, SshBool, SshBytes, SshString},
     constants::DEFAULT_MAX_MESSAGE_SIZE,
-    message::SshMessage,
+    message::{MessageError, SshMessage},
 };
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use snafu::{ResultExt, Snafu};
 use tokio::{
-    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
 use tracing::Instrument;
 
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub), module)]
+pub enum SessionCodecError {
+    #[snafu(display("session codec failed"))]
+    Codec { source: CodecError },
+
+    #[snafu(display("session stream read failed"))]
+    ReadIo { source: std::io::Error },
+
+    #[snafu(display("session stream write failed"))]
+    WriteIo { source: std::io::Error },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub), module)]
+pub enum SessionProtocolError {
+    #[snafu(display("session message codec failed"))]
+    Message { source: MessageError },
+
+    #[snafu(display("session operation failed while {operation}"))]
+    Io {
+        operation: &'static str,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("session stream write failed"))]
+    WriteIo { source: std::io::Error },
+
+    #[snafu(display("session stream shutdown failed"))]
+    ShutdownIo { source: std::io::Error },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestAction {
-    Exec(Vec<u8>),
+    Exec(SshBytes),
     Shell,
-    AllocatePty(PtyRequest, bool),
+    AllocatePty(PtyRequest, SshBool),
     WindowChange(WindowChangeRequest),
     Signal(SignalRequest),
 }
@@ -47,99 +81,108 @@ pub enum SessionLoopAction {
 }
 
 pub async fn handle_request<W>(
-    event: &ChannelEvent,
+    request: ChannelRequest,
     writer: &mut W,
-) -> io::Result<Option<RequestAction>>
+) -> Result<Option<RequestAction>, SessionProtocolError>
 where
     W: AsyncWrite + Send + Unpin,
 {
-    let (request_type, want_reply, request_data) = match event {
-        ChannelEvent::Request {
-            request_type,
+    match request {
+        ChannelRequest::Exec {
             want_reply,
-            request_data,
-        } => (request_type.as_str(), *want_reply, request_data.as_slice()),
-        _ => return Ok(None),
-    };
-
-    match request_type {
-        "exec" => {
-            let command = request_data.decode::<ExecRequest>().await?.command;
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelSuccess).await?;
+            request,
+        } => {
+            if want_reply.0 {
+                writer
+                    .encode_one(SshMessage::Channel(ChannelMessage::Success))
+                    .await
+                    .context(session_protocol_error::MessageSnafu)?;
             }
-            Ok(Some(RequestAction::Exec(command)))
+            Ok(Some(RequestAction::Exec(request.command.clone())))
         }
-        "shell" => {
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelSuccess).await?;
+        ChannelRequest::Shell { want_reply } => {
+            if want_reply.0 {
+                writer
+                    .encode_one(SshMessage::Channel(ChannelMessage::Success))
+                    .await
+                    .context(session_protocol_error::MessageSnafu)?;
             }
             Ok(Some(RequestAction::Shell))
         }
-        "pty-req" => {
-            let req = request_data.decode::<PtyRequest>().await?;
-            Ok(Some(RequestAction::AllocatePty(req, want_reply)))
-        }
-        "window-change" => {
-            let req = request_data.decode::<WindowChangeRequest>().await?;
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelSuccess).await?;
+        ChannelRequest::PtyReq {
+            want_reply,
+            request,
+        } => Ok(Some(RequestAction::AllocatePty(request.clone(), want_reply.clone()))),
+        ChannelRequest::WindowChange(request) => Ok(Some(RequestAction::WindowChange(request.clone()))),
+        ChannelRequest::Signal {
+            want_reply,
+            request,
+        } => {
+            if want_reply.0 {
+                writer
+                    .encode_one(SshMessage::Channel(ChannelMessage::Success))
+                    .await
+                    .context(session_protocol_error::MessageSnafu)?;
             }
-            Ok(Some(RequestAction::WindowChange(req)))
+            Ok(Some(RequestAction::Signal(request.clone())))
         }
-        "signal" => {
-            let req = request_data.decode::<SignalRequest>().await?;
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelSuccess).await?;
-            }
-            Ok(Some(RequestAction::Signal(req)))
-        }
-        "subsystem" => {
-            let _req = request_data.decode::<SubsystemRequest>().await?;
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelFailure).await?;
+        ChannelRequest::Subsystem { want_reply, .. } => {
+            if want_reply.0 {
+                writer
+                    .encode_one(SshMessage::Channel(ChannelMessage::Failure))
+                    .await
+                    .context(session_protocol_error::MessageSnafu)?;
             }
             Ok(None)
         }
-        "exit-status" => {
-            let _req = request_data.decode::<ExitStatusRequest>().await?;
-            Ok(None)
-        }
-        "exit-signal" => {
-            let _req = request_data.decode::<ExitSignalRequest>().await?;
-            Ok(None)
-        }
-        _ => {
-            if want_reply {
-                writer.encode_one(&SshMessage::ChannelFailure).await?;
+        ChannelRequest::ExitStatus(_) | ChannelRequest::ExitSignal(_) => Ok(None),
+        ChannelRequest::Unknown { want_reply, .. } => {
+            if want_reply.0 {
+                writer
+                    .encode_one(SshMessage::Channel(ChannelMessage::Failure))
+                    .await
+                    .context(session_protocol_error::MessageSnafu)?;
             }
             Ok(None)
         }
     }
 }
 
-pub async fn handle_session_loop_event<W>(
-    event: ChannelEvent,
+pub async fn handle_session_loop_message<W>(
+    message: ChannelMessage,
     writer: &mut W,
-) -> io::Result<SessionLoopAction>
+) -> Result<SessionLoopAction, SessionProtocolError>
 where
     W: AsyncWrite + Send + Unpin,
 {
-    match event {
-        ChannelEvent::Request { .. } => Ok(match handle_request(&event, writer).await? {
+    match message {
+        ChannelMessage::Request(request) => Ok(match handle_request(request, writer).await? {
             Some(action) => SessionLoopAction::Request(action),
             None => SessionLoopAction::Ignore,
         }),
-        ChannelEvent::Eof => {
-            writer.encode_one(&SshMessage::ChannelEof).await?;
-            writer.shutdown().await?;
+        ChannelMessage::Eof => {
+            writer
+                .encode_one(SshMessage::Channel(ChannelMessage::Eof))
+                .await
+                .context(session_protocol_error::MessageSnafu)?;
+            writer
+                .shutdown()
+                .await
+                .context(session_protocol_error::ShutdownIoSnafu)?;
             Ok(SessionLoopAction::Eof)
         }
-        ChannelEvent::Close => {
-            writer.encode_one(&SshMessage::ChannelClose).await?;
+        ChannelMessage::Close => {
+            writer
+                .encode_one(SshMessage::Channel(ChannelMessage::Close))
+                .await
+                .context(session_protocol_error::MessageSnafu)?;
             Ok(SessionLoopAction::Close)
         }
-        ChannelEvent::Data(_) | ChannelEvent::ExtendedData { .. } => Ok(SessionLoopAction::Ignore),
+        ChannelMessage::Data(_) | ChannelMessage::ExtendedData { .. } => Ok(SessionLoopAction::Ignore),
+        ChannelMessage::OpenConfirmation { .. }
+        | ChannelMessage::OpenFailure(_)
+        | ChannelMessage::Success
+        | ChannelMessage::Failure => Ok(SessionLoopAction::Ignore),
     }
 }
 
@@ -200,12 +243,12 @@ pub struct ChildBootstrap {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecRequest {
-    pub command: Vec<u8>,
+    pub command: SshBytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubsystemRequest {
-    pub subsystem_name: String,
+    pub subsystem_name: SshString,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,20 +258,20 @@ pub struct ExitStatusRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitSignalRequest {
-    pub signal_name: String,
-    pub core_dumped: bool,
-    pub error_message: String,
-    pub language_tag: String,
+    pub signal_name: SshString,
+    pub core_dumped: SshBool,
+    pub error_message: SshString,
+    pub language_tag: SshString,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtyRequest {
-    pub term_type: String,
+    pub term_type: SshString,
     pub width_cols: VarInt,
     pub height_rows: VarInt,
     pub width_px: VarInt,
     pub height_px: VarInt,
-    pub terminal_modes: Vec<u8>,
+    pub terminal_modes: SshBytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,182 +284,153 @@ pub struct WindowChangeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignalRequest {
-    pub signal_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelEvent {
-    Data(Vec<u8>),
-    ExtendedData {
-        data_type: VarInt,
-        data: Vec<u8>,
-    },
-    Request {
-        request_type: String,
-        want_reply: bool,
-        request_data: Vec<u8>,
-    },
-    Eof,
-    Close,
+    pub signal_name: SshString,
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for ExecRequest {
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
-        let len: VarInt = stream.decode_one().await?;
-        let len = checked_remote_field_len(len.into_inner(), "exec command")?;
-        let mut command = vec![0u8; len];
-        stream.read_exact(&mut command).await?;
-        Ok(Self { command })
+        Ok(Self {
+            command: stream.decode_one().await.context(session_codec_error::CodecSnafu)?,
+        })
     }
 }
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for &ExecRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for ExecRequest {
     type Output = ();
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        let len = VarInt::try_from(self.command.len() as u64)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-        stream.encode_one(len).await?;
-        stream.write_all(&self.command).await?;
+        stream.encode_one(self.command).await.context(session_codec_error::CodecSnafu)?;
         Ok(())
     }
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for SubsystemRequest {
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
-        let subsystem_name: SshString = stream.decode_one().await?;
         Ok(Self {
-            subsystem_name: subsystem_name.to_string(),
+            subsystem_name: stream.decode_one().await.context(session_codec_error::CodecSnafu)?,
         })
     }
 }
 
+impl<S: AsyncWrite + Send> EncodeInto<S> for SubsystemRequest {
+    type Output = ();
+    type Error = SessionCodecError;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = pin!(stream);
+        stream
+            .encode_one(self.subsystem_name)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
+        Ok(())
+    }
+}
+
 impl<S: AsyncRead + Send> DecodeFrom<S> for ExitStatusRequest {
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
-        let exit_status: VarInt = stream.decode_one().await?;
+        let exit_status: VarInt = stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?;
         Ok(Self { exit_status })
     }
 }
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for &ExitStatusRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for ExitStatusRequest {
     type Output = ();
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        stream.encode_one(self.exit_status).await?;
+        stream.encode_one(self.exit_status).await.context(session_codec_error::WriteIoSnafu)?;
         Ok(())
     }
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for ExitSignalRequest {
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
-        let signal_name: SshString = stream.decode_one().await?;
-        let core_dumped: SshBool = stream.decode_one().await?;
-        let error_message: SshString = stream.decode_one().await?;
-        let language_tag: SshString = stream.decode_one().await?;
+        let signal_name: SshString = stream.decode_one().await.context(session_codec_error::CodecSnafu)?;
+        let core_dumped: SshBool = stream.decode_one().await.context(session_codec_error::CodecSnafu)?;
+        let error_message: SshString = stream.decode_one().await.context(session_codec_error::CodecSnafu)?;
+        let language_tag: SshString = stream.decode_one().await.context(session_codec_error::CodecSnafu)?;
         Ok(Self {
-            signal_name: signal_name.to_string(),
-            core_dumped: core_dumped.0,
-            error_message: error_message.to_string(),
-            language_tag: language_tag.to_string(),
+            signal_name,
+            core_dumped,
+            error_message,
+            language_tag,
         })
     }
 }
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for &ExitSignalRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for ExitSignalRequest {
     type Output = ();
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        stream
-            .encode_one(SshString::from(self.signal_name.clone()))
-            .await?;
-        stream.encode_one(SshBool(self.core_dumped)).await?;
-        stream
-            .encode_one(SshString::from(self.error_message.clone()))
-            .await?;
-        stream
-            .encode_one(SshString::from(self.language_tag.clone()))
-            .await?;
+        stream.encode_one(self.signal_name).await.context(session_codec_error::CodecSnafu)?;
+        stream.encode_one(self.core_dumped).await.context(session_codec_error::CodecSnafu)?;
+        stream.encode_one(self.error_message).await.context(session_codec_error::CodecSnafu)?;
+        stream.encode_one(self.language_tag).await.context(session_codec_error::CodecSnafu)?;
         Ok(())
     }
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for PtyRequest {
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
-        let term_type: SshString = stream.decode_one().await?;
-        let width_cols: VarInt = stream.decode_one().await?;
-        let height_rows: VarInt = stream.decode_one().await?;
-        let width_px: VarInt = stream.decode_one().await?;
-        let height_px: VarInt = stream.decode_one().await?;
-        let modes_len: VarInt = stream.decode_one().await?;
-        let modes_len = checked_remote_field_len(modes_len.into_inner(), "pty terminal modes")?;
-        let mut terminal_modes = vec![0u8; modes_len];
-        stream.read_exact(&mut terminal_modes).await?;
         Ok(Self {
-            term_type: term_type.to_string(),
-            width_cols,
-            height_rows,
-            width_px,
-            height_px,
-            terminal_modes,
+            term_type: stream.decode_one().await.context(session_codec_error::CodecSnafu)?,
+            width_cols: stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?,
+            height_rows: stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?,
+            width_px: stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?,
+            height_px: stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?,
+            terminal_modes: stream.decode_one().await.context(session_codec_error::CodecSnafu)?,
         })
     }
 }
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for &PtyRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for PtyRequest {
     type Output = ();
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
+        stream.encode_one(self.term_type).await.context(session_codec_error::CodecSnafu)?;
+        stream.encode_one(self.width_cols).await.context(session_codec_error::WriteIoSnafu)?;
+        stream.encode_one(self.height_rows).await.context(session_codec_error::WriteIoSnafu)?;
+        stream.encode_one(self.width_px).await.context(session_codec_error::WriteIoSnafu)?;
+        stream.encode_one(self.height_px).await.context(session_codec_error::WriteIoSnafu)?;
         stream
-            .encode_one(SshString::from(self.term_type.clone()))
-            .await?;
-        stream.encode_one(self.width_cols).await?;
-        stream.encode_one(self.height_rows).await?;
-        stream.encode_one(self.width_px).await?;
-        stream.encode_one(self.height_px).await?;
-        stream
-            .encode_one(
-                VarInt::try_from(self.terminal_modes.len()).map_err(|_overflow| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "too many terminal modes")
-                })?,
-            )
-            .await?;
-        stream.write_all(&self.terminal_modes).await?;
+            .encode_one(self.terminal_modes)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
         Ok(())
     }
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for WindowChangeRequest {
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
-        let width_cols: VarInt = stream.decode_one().await?;
-        let height_rows: VarInt = stream.decode_one().await?;
-        let width_px: VarInt = stream.decode_one().await?;
-        let height_px: VarInt = stream.decode_one().await?;
+        let width_cols: VarInt = stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?;
+        let height_rows: VarInt = stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?;
+        let width_px: VarInt = stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?;
+        let height_px: VarInt = stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?;
         Ok(Self {
             width_cols,
             height_rows,
@@ -426,41 +440,38 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for WindowChangeRequest {
     }
 }
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for &WindowChangeRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for WindowChangeRequest {
     type Output = ();
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        stream.encode_one(self.width_cols).await?;
-        stream.encode_one(self.height_rows).await?;
-        stream.encode_one(self.width_px).await?;
-        stream.encode_one(self.height_px).await?;
+        stream.encode_one(self.width_cols).await.context(session_codec_error::WriteIoSnafu)?;
+        stream.encode_one(self.height_rows).await.context(session_codec_error::WriteIoSnafu)?;
+        stream.encode_one(self.width_px).await.context(session_codec_error::WriteIoSnafu)?;
+        stream.encode_one(self.height_px).await.context(session_codec_error::WriteIoSnafu)?;
         Ok(())
     }
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for SignalRequest {
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
-        let signal_name: SshString = stream.decode_one().await?;
         Ok(Self {
-            signal_name: signal_name.to_string(),
+            signal_name: stream.decode_one().await.context(session_codec_error::CodecSnafu)?,
         })
     }
 }
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for &SignalRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for SignalRequest {
     type Output = ();
-    type Error = io::Error;
+    type Error = SessionCodecError;
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        stream
-            .encode_one(SshString::from(self.signal_name.clone()))
-            .await?;
+        stream.encode_one(self.signal_name).await.context(session_codec_error::CodecSnafu)?;
         Ok(())
     }
 }
@@ -483,15 +494,18 @@ pub fn encode_exit_status(exit_code: u32) -> Vec<u8> {
 pub async fn open_session_channel<R, W>(
     reader: R,
     mut writer: W,
-) -> io::Result<(mpsc::Receiver<ChannelEvent>, W)>
+) -> Result<(mpsc::Receiver<ChannelMessage>, W), SessionProtocolError>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let confirm = SshMessage::ChannelOpenConfirmation {
+    let confirm = SshMessage::Channel(ChannelMessage::OpenConfirmation {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-    };
-    writer.encode_one(&confirm).await?;
+    });
+    writer
+        .encode_one(confirm)
+        .await
+        .context(session_protocol_error::MessageSnafu)?;
 
     let (event_tx, event_rx) = mpsc::channel(64);
     tokio::spawn(
@@ -504,7 +518,7 @@ where
 }
 
 pub async fn run_session_request_loop<W, S, ExecFn, ShellFn, PtyFn, ResizeFn, SignalFn>(
-    mut event_rx: mpsc::Receiver<ChannelEvent>,
+    mut event_rx: mpsc::Receiver<ChannelMessage>,
     mut writer: W,
     mut state: S,
     mut allocate_pty: PtyFn,
@@ -512,23 +526,23 @@ pub async fn run_session_request_loop<W, S, ExecFn, ShellFn, PtyFn, ResizeFn, Si
     mut run_exec: ExecFn,
     mut run_shell: ShellFn,
     mut on_signal: SignalFn,
-) -> io::Result<()>
+ ) -> Result<(), SessionProtocolError>
 where
     W: AsyncWrite + Send + Unpin + 'static,
     ExecFn: for<'a> FnMut(
-        Vec<u8>,
+        SshBytes,
         &'a mut W,
-        mpsc::Receiver<ChannelEvent>,
+        mpsc::Receiver<ChannelMessage>,
         &'a mut S,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>,
     ShellFn: for<'a> FnMut(
         &'a mut W,
-        mpsc::Receiver<ChannelEvent>,
+        mpsc::Receiver<ChannelMessage>,
         &'a mut S,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>,
     PtyFn: for<'a> FnMut(
         PtyRequest,
-        bool,
+        SshBool,
         &'a mut W,
         &'a mut S,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>,
@@ -541,24 +555,44 @@ where
         &'a mut S,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>,
 {
-    while let Some(event) = event_rx.recv().await {
-        match handle_session_loop_event(event, &mut writer).await? {
+    while let Some(message) = event_rx.recv().await {
+        match handle_session_loop_message(message, &mut writer).await? {
             SessionLoopAction::Request(action) => match action {
                 RequestAction::Exec(command) => {
-                    run_exec(command, &mut writer, event_rx, &mut state).await?;
+                    run_exec(command, &mut writer, event_rx, &mut state)
+                        .await
+                        .context(session_protocol_error::IoSnafu {
+                            operation: "running exec request",
+                        })?;
                     return Ok(());
                 }
                 RequestAction::Shell => {
-                    run_shell(&mut writer, event_rx, &mut state).await?;
+                    run_shell(&mut writer, event_rx, &mut state)
+                        .await
+                        .context(session_protocol_error::IoSnafu {
+                            operation: "running shell request",
+                        })?;
                     return Ok(());
                 }
                 RequestAction::AllocatePty(req, want_reply) => {
-                    allocate_pty(req, want_reply, &mut writer, &mut state).await?;
+                    allocate_pty(req, want_reply, &mut writer, &mut state)
+                        .await
+                        .context(session_protocol_error::IoSnafu {
+                            operation: "allocating pty",
+                        })?;
                 }
                 RequestAction::WindowChange(req) => {
-                    set_window_size(req, &mut state).await?;
+                    set_window_size(req, &mut state)
+                        .await
+                        .context(session_protocol_error::IoSnafu {
+                            operation: "changing window size",
+                        })?;
                 }
-                RequestAction::Signal(req) => on_signal(req, &mut state).await?,
+                RequestAction::Signal(req) => on_signal(req, &mut state)
+                    .await
+                    .context(session_protocol_error::IoSnafu {
+                        operation: "handling signal request",
+                    })?,
             },
             SessionLoopAction::Eof | SessionLoopAction::Close => break,
             SessionLoopAction::Ignore => {}
@@ -570,53 +604,38 @@ where
 
 pub async fn run_message_loop_with_sender<R>(
     mut reader: R,
-    event_tx: mpsc::Sender<ChannelEvent>,
-) -> io::Result<()>
+    event_tx: mpsc::Sender<ChannelMessage>,
+) -> Result<(), SessionProtocolError>
 where
     R: AsyncRead + Send + Unpin,
 {
     loop {
         let msg = match reader.decode_one::<SshMessage>().await {
             Ok(msg) => msg,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(MessageError::ReadIo {
+                source,
+            }) if source.kind() == io::ErrorKind::UnexpectedEof => {
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(SessionProtocolError::Message { source: e }),
         };
 
         match msg {
-            SshMessage::ChannelData { data } => {
-                let _ = event_tx.send(ChannelEvent::Data(data)).await;
+            SshMessage::Channel(message @ ChannelMessage::Data(_))
+            | SshMessage::Channel(message @ ChannelMessage::ExtendedData { .. })
+            | SshMessage::Channel(message @ ChannelMessage::Request(_))
+            | SshMessage::Channel(message @ ChannelMessage::Eof)
+            | SshMessage::Channel(message @ ChannelMessage::Close) => {
+                let is_close = matches!(message, ChannelMessage::Close);
+                let _ = event_tx.send(message).await;
+                if is_close {
+                    return Ok(());
+                }
             }
-            SshMessage::ChannelExtendedData { data_type, data } => {
-                let _ = event_tx
-                    .send(ChannelEvent::ExtendedData { data_type, data })
-                    .await;
-            }
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                let _ = event_tx
-                    .send(ChannelEvent::Request {
-                        request_type,
-                        want_reply,
-                        request_data,
-                    })
-                    .await;
-            }
-            SshMessage::ChannelEof => {
-                let _ = event_tx.send(ChannelEvent::Eof).await;
-            }
-            SshMessage::ChannelClose => {
-                let _ = event_tx.send(ChannelEvent::Close).await;
-                return Ok(());
-            }
-            SshMessage::ChannelSuccess => {
+            SshMessage::Channel(ChannelMessage::Success) => {
                 tracing::debug!("received ChannelSuccess(99)");
             }
-            SshMessage::ChannelFailure => {
+            SshMessage::Channel(ChannelMessage::Failure) => {
                 tracing::debug!("received ChannelFailure(100)");
             }
             other => {
@@ -835,7 +854,7 @@ pub trait Ssh3Transport: Sync {
         &self,
     ) -> Result<
         Option<(
-            crate::codec::ChannelHeader,
+            crate::channel::ChannelHeader,
             remoc::rch::mpsc::Receiver<Vec<u8>>,
             remoc::rch::mpsc::Sender<Vec<u8>>,
         )>,
@@ -847,7 +866,7 @@ pub trait Ssh3Transport: Sync {
     /// If `header` is `None`, no header is written to the underlying stream.
     async fn open_channel(
         &self,
-        header: Option<crate::codec::ChannelHeader>,
+        header: Option<crate::channel::ChannelHeader>,
     ) -> Result<
         (
             remoc::rch::mpsc::Receiver<Vec<u8>>,
@@ -952,7 +971,7 @@ mod tests {
                 &self,
             ) -> Result<
                 Option<(
-                    crate::codec::ChannelHeader,
+                    crate::channel::ChannelHeader,
                     remoc::rch::mpsc::Receiver<Vec<u8>>,
                     remoc::rch::mpsc::Sender<Vec<u8>>,
                 )>,
@@ -962,7 +981,7 @@ mod tests {
             }
             async fn open_channel(
                 &self,
-                _: Option<crate::codec::ChannelHeader>,
+                _: Option<crate::channel::ChannelHeader>,
             ) -> Result<
                 (
                     remoc::rch::mpsc::Receiver<Vec<u8>>,

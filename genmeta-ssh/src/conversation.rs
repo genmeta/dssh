@@ -5,281 +5,232 @@
 //!
 //! [`LocalConversation`] is the server-side implementation that wraps the
 //! conversation stream plus an mpsc receiver for dispatched channel streams.
-#![allow(dead_code)]
 
-use std::{
-    future::Future,
-    ops::DerefMut,
-    pin::{Pin, pin},
-    sync::Arc,
-};
+use std::future::Future;
 
-use bytes::BytesMut;
 use h3x::{
-    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
+    codec::{DecodeExt, EncodeExt},
+    quic::{self, GetStreamIdExt, ReadStream, WriteStream},
     stream_id::StreamId,
-    varint::VarInt,
 };
-use tokio::{
-    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
-    sync::mpsc,
+use snafu::{ResultExt, Snafu};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+use crate::{
+    GlobalRequest,
+    channel::RequestSuccess,
+    forward::ForwardError,
+    message::MessageError,
+    message::SshMessage,
 };
 
-use crate::codec::{ChannelHeader, SshBool, SshBytes, SshString};
-use crate::constants::CHANNEL_SIGNAL_VALUE;
+const SSH_MSG_REQUEST_SUCCESS: h3x::varint::VarInt = h3x::varint::VarInt::from_u32(81);
+const SSH_MSG_REQUEST_FAILURE: h3x::varint::VarInt = h3x::varint::VarInt::from_u32(82);
 
-// ---------------------------------------------------------------------------
-// SSH message type constants (subset used by conversation)
-// ---------------------------------------------------------------------------
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub), module)]
+pub enum ConversationError {
+    #[snafu(display("conversation stream read failed"))]
+    ReadIo { source: std::io::Error },
 
-const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
-const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
-const SSH_MSG_REQUEST_FAILURE: VarInt = VarInt::from_u32(82);
+    #[snafu(display("conversation stream write failed"))]
+    WriteIo { source: std::io::Error },
 
-type OpenBiFuture<R, W> = Pin<Box<dyn Future<Output = io::Result<(R, W)>> + Send>>;
-type OpenBiOpener<R, W> = dyn Fn() -> OpenBiFuture<R, W> + Send + Sync;
+    #[snafu(display("conversation message codec failed"))]
+    Message { source: MessageError },
+
+    #[snafu(display("conversation forward codec failed"))]
+    Forward { source: ForwardError },
+
+    #[snafu(display("global request failed"))]
+    GlobalRequestFailed,
+
+    #[snafu(display("unexpected control-stream reply type"))]
+    UnexpectedControlReplyType { message_type: u64 },
+
+    #[snafu(display("unexpected control-stream request"))]
+    UnexpectedControlRequest { message: String },
+}
 
 // ---------------------------------------------------------------------------
 // Conversation trait
 // ---------------------------------------------------------------------------
 
-/// The SSH3 session abstraction over a QUIC CONNECT stream.
-pub(crate) trait Conversation {
-    type Read: AsyncRead + Send + Unpin;
-    type Write: AsyncWrite + Send + Unpin;
-
+pub trait ManageSessionStream {
+    type StreamReader: AsyncRead + ReadStream + Unpin;
+    type StreamWriter: AsyncWrite + WriteStream + Unpin;
     type Error;
 
-    /// Open a new channel by writing a [`ChannelHeader`] to a fresh
-    /// bidirectional stream.
-    ///
-    /// Returns the read/write halves of the new stream (after the header
-    /// has been written to the write half).
-    fn open_channel(
+    fn open_stream(
         &self,
-        channel_type: SshString,
-        max_message_size: VarInt,
-    ) -> impl Future<Output = Result<(Self::Read, Self::Write), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Self::Error>> + Send;
 
-    /// Accept a channel that was dispatched by the protocol layer.
-    ///
-    /// Returns `None` when the dispatch channel is closed.
-    #[allow(clippy::type_complexity)]
-    fn accept_channel(
+    fn accept_stream(
         &self,
-    ) -> impl Future<Output = Option<Result<(ChannelHeader, Self::Read, Self::Write), Self::Error>>> + Send;
-
-    /// Send an SSH_MSG_GLOBAL_REQUEST on the conversation stream.
-    ///
-    /// If `want_reply` is true, waits for SSH_MSG_REQUEST_SUCCESS(81) or
-    /// SSH_MSG_REQUEST_FAILURE(82) and returns the reply data or an error.
-    fn send_global_request(
-        &self,
-        global_request: GlobalRequest,
-    ) -> impl Future<Output = Result<Option<BytesMut>, Self::Error>> + Send;
-
-    /// Receive an SSH_MSG_GLOBAL_REQUEST from the conversation stream.
-    fn recv_global_request(
-        &self,
-    ) -> impl Future<Output = Result<GlobalRequest, Self::Error>> + Send;
-
-    /// The QUIC stream ID of the CONNECT stream that carries this conversation.
-    fn conversation_id(&self) -> StreamId;
+    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Self::Error>> + Send;
 }
 
-// ---------------------------------------------------------------------------
-// GlobalRequest — decoded SSH_MSG_GLOBAL_REQUEST message
-// ---------------------------------------------------------------------------
+mod chmoc {
+    use h3x::{
+        codec::{SinkWriter, StreamReader},
+        dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
+        quic,
+        remoc::quic::{ReadStreamClient, WriteStreamClient},
+    };
 
-/// A decoded SSH_MSG_GLOBAL_REQUEST(80) message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GlobalRequest {
-    pub request_type: SshString,
-    pub want_reply: SshBool,
-    pub data: SshBytes,
-}
+    #[remoc::rtc::remote]
+    trait ManageSessionStream {
+        async fn open_stream(
+            &self,
+        ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError>;
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for GlobalRequest {
-    type Output = ();
-    type Error = io::Error;
+        async fn accept_stream(
+            &self,
+        ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError>;
+    }
 
-    /// Encode SSH_MSG_GLOBAL_REQUEST(80) onto a stream.
-    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
-        let mut stream = pin!(stream);
-        stream.encode_one(SSH_MSG_GLOBAL_REQUEST).await?;
-        stream.encode_one(self.request_type).await?;
-        stream.encode_one(self.want_reply).await?;
-        stream.encode_one(self.data).await?;
-        Ok(())
+    impl super::ManageSessionStream for ManageSessionStreamClient {
+        type StreamReader = StreamReader<BoxDynQuicStreamReader>;
+
+        type StreamWriter = SinkWriter<BoxDynQuicStreamWriter>;
+
+        type Error = quic::ConnectionError;
+
+        async fn open_stream(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+            ManageSessionStream::open_stream(self).await.map(|(r, w)| {
+                let r = StreamReader::new(r.into_boxed_quic());
+                let w = SinkWriter::new(w.into_boxed_quic());
+                (r, w)
+            })
+        }
+
+        async fn accept_stream(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+            ManageSessionStream::accept_stream(self)
+                .await
+                .map(|(r, w)| {
+                    let r = StreamReader::new(r.into_boxed_quic());
+                    let w = SinkWriter::new(w.into_boxed_quic());
+                    (r, w)
+                })
+        }
     }
 }
-
-impl GlobalRequest {
-    /// Decode SSH_MSG_GLOBAL_REQUEST(80) body from a stream.
-    ///
-    /// Assumes the message type varint (80) has already been consumed.
-    pub async fn decode_body<S: AsyncRead + Send>(stream: S) -> Result<Self, io::Error> {
-        let mut stream = pin!(stream);
-        Ok(GlobalRequest {
-            request_type: stream.decode_one().await?,
-            want_reply: stream.decode_one().await?,
-            data: stream.decode_one().await?,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Reply helpers
-// ---------------------------------------------------------------------------
-
-// /// Encode SSH_MSG_REQUEST_SUCCESS(81) with optional data.
-// pub(crate) async fn encode_request_success<S: AsyncWrite + Send + Unpin>(
-//     stream: &mut S,
-//     data: &[u8],
-// ) -> Result<(), io::Error> {
-//     SSH_MSG_REQUEST_SUCCESS.encode_into(&mut *stream).await?;
-//     SshBytes(data.to_vec()).encode_into(&mut *stream).await?;
-//     Ok(())
-// }
-
-// /// Encode SSH_MSG_REQUEST_FAILURE(82) — no payload.
-// pub(crate) async fn encode_request_failure<S: AsyncWrite + Send + Unpin>(
-//     stream: &mut S,
-// ) -> Result<(), io::Error> {
-//     SSH_MSG_REQUEST_FAILURE.encode_into(&mut *stream).await?;
-//     Ok(())
-// }
 
 // ---------------------------------------------------------------------------
 // LocalConversation
 // ---------------------------------------------------------------------------
 
-/// Server-side conversation backed by a CONNECT stream and an mpsc dispatch
-/// queue for inbound channels.
-#[allow(clippy::type_complexity)]
-pub(crate) struct LocalConversation<R, W>
-where
-    R: AsyncRead + Send + Unpin,
-    W: AsyncWrite + Send + Unpin,
-{
-    conversation_id: StreamId,
-    /// Read half of the conversation (CONNECT) stream.
-    conversation_reader: tokio::sync::Mutex<R>,
-    /// Write half of the conversation (CONNECT) stream.
-    conversation_writer: tokio::sync::Mutex<W>,
-    /// Receiver for dispatched channel streams.
-    channel_rx: tokio::sync::Mutex<mpsc::Receiver<(ChannelHeader, R, W)>>,
-    opener: Arc<OpenBiOpener<R, W>>,
+pub struct Conversation<M: ManageSessionStream> {
+    id: StreamId,
+    control_stream_reader: M::StreamReader,
+    control_stream_writer: M::StreamWriter,
+    _manage_stream: M,
 }
 
-impl<R, W> LocalConversation<R, W>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-{
-    /// Create a new `LocalConversation`.
-    pub fn new<O>(
-        conversation_id: StreamId,
-        conversation_reader: R,
-        conversation_writer: W,
-        channel_rx: mpsc::Receiver<(ChannelHeader, R, W)>,
-        opener: O,
-    ) -> Self
-    where
-        O: Fn() -> OpenBiFuture<R, W> + Send + Sync + 'static,
-    {
-        Self {
-            conversation_id,
-            conversation_reader: tokio::sync::Mutex::new(conversation_reader),
-            conversation_writer: tokio::sync::Mutex::new(conversation_writer),
-            channel_rx: tokio::sync::Mutex::new(channel_rx),
-            opener: Arc::new(opener),
-        }
-    }
-}
-
-impl<R, W> Conversation for LocalConversation<R, W>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-{
-    type Read = R;
-    type Write = W;
-    type Error = io::Error;
-
-    async fn open_channel(
-        &self,
-        channel_type: SshString,
-        max_message_size: VarInt,
-    ) -> io::Result<(Self::Read, Self::Write)> {
-        let (read, mut write) = (self.opener.as_ref())().await?;
-
-        write
-            .encode_one(ChannelHeader {
-                signal_value: CHANNEL_SIGNAL_VALUE,
-                conversation_id: self.conversation_id,
-                channel_type,
-                max_message_size,
-            })
-            .await?;
-
-        Ok((read, write))
+impl<M: ManageSessionStream> Conversation<M> {
+    pub async fn new(
+        mut control_stream_reader: M::StreamReader,
+        control_stream_writer: M::StreamWriter,
+        manage_stream: M,
+    ) -> Result<Self, quic::StreamError> {
+        Ok(Self {
+            id: StreamId(control_stream_reader.stream_id().await?),
+            control_stream_reader,
+            control_stream_writer,
+            _manage_stream: manage_stream,
+        })
     }
 
-    async fn accept_channel(&self) -> Option<io::Result<(ChannelHeader, Self::Read, Self::Write)>> {
-        self.channel_rx.lock().await.recv().await.map(Ok)
+    pub fn id(&self) -> StreamId {
+        self.id
     }
 
-    async fn send_global_request(&self, req: GlobalRequest) -> io::Result<Option<BytesMut>> {
-        // Write the request on the conversation stream.
-        {
-            let mut writer = self.conversation_writer.lock().await;
-            // req.encode_into(&mut *writer).await?;
-            writer.deref_mut().encode_one(req.clone()).await?;
+    pub async fn send_global_request(
+        &mut self,
+        request: GlobalRequest,
+    ) -> Result<Option<RequestSuccess>, ConversationError> {
+        let want_reply = request.want_reply().0;
+        let expects_bound_port = matches!(request, GlobalRequest::TcpipForward { .. });
+        self.control_stream_writer
+            .encode_one(SshMessage::GlobalRequest(request))
+            .await
+            .context(conversation_error::MessageSnafu)?;
+        self.control_stream_writer
+            .flush()
+            .await
+            .context(conversation_error::WriteIoSnafu)?;
 
-            match req.want_reply {
-                SshBool(true) => writer.flush().await?,
-                SshBool(false) => return Ok(None),
-            }
+        if !want_reply {
+            return Ok(None);
         }
 
-        // Read the reply from the conversation stream.
-        let mut reader = self.conversation_reader.lock().await;
-        let msg_type: VarInt = reader.deref_mut().decode_one().await?;
-
+        let msg_type = self
+            .control_stream_reader
+            .decode_one::<h3x::varint::VarInt>()
+            .await
+            .context(conversation_error::ReadIoSnafu)?;
         match msg_type {
-            v if v == SSH_MSG_REQUEST_SUCCESS => {
-                let payload = SshBytes::decode_from(&mut *reader).await?;
-                Ok(Some(payload.into()))
+            SSH_MSG_REQUEST_SUCCESS => {
+                let success = if expects_bound_port {
+                    RequestSuccess::TcpipForward(
+                        self.control_stream_reader
+                            .decode_one()
+                            .await
+                            .context(conversation_error::ForwardSnafu)?,
+                    )
+                } else {
+                    RequestSuccess::Empty
+                };
+                Ok(Some(success))
             }
-            v if v == SSH_MSG_REQUEST_FAILURE => Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "global request rejected",
-            )),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected message type {other} in global request reply"),
-            )),
+            SSH_MSG_REQUEST_FAILURE => Err(ConversationError::GlobalRequestFailed),
+            other => Err(ConversationError::UnexpectedControlReplyType {
+                message_type: other.into_inner(),
+            }),
         }
     }
 
-    async fn recv_global_request(&self) -> io::Result<GlobalRequest> {
-        let mut reader = self.conversation_reader.lock().await;
-        let msg_type: VarInt = reader.deref_mut().decode_one().await?;
-        let msg_type = msg_type.into_inner();
-
-        if msg_type != SSH_MSG_GLOBAL_REQUEST.into_inner() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected SSH_MSG_GLOBAL_REQUEST(80), got message type {msg_type}"),
-            ));
+    pub async fn recv_global_request(&mut self) -> Result<GlobalRequest, ConversationError> {
+        match self
+            .control_stream_reader
+            .decode_one::<SshMessage>()
+            .await
+            .context(conversation_error::MessageSnafu)?
+        {
+            SshMessage::GlobalRequest(request) => Ok(request),
+            other => Err(ConversationError::UnexpectedControlRequest {
+                message: format!("{other:?}"),
+            }),
         }
-
-        GlobalRequest::decode_body(&mut *reader).await
     }
 
-    fn conversation_id(&self) -> StreamId {
-        self.conversation_id
+    pub async fn send_request_success(
+        &mut self,
+        success: RequestSuccess,
+    ) -> Result<(), ConversationError> {
+        self.control_stream_writer
+            .encode_one(SshMessage::RequestSuccess(success))
+            .await
+            .context(conversation_error::MessageSnafu)?;
+        self.control_stream_writer
+            .flush()
+            .await
+            .context(conversation_error::WriteIoSnafu)
+    }
+
+    pub async fn send_request_failure(&mut self) -> Result<(), ConversationError> {
+        self.control_stream_writer
+            .encode_one(SshMessage::RequestFailure)
+            .await
+            .context(conversation_error::MessageSnafu)?;
+        self.control_stream_writer
+            .flush()
+            .await
+            .context(conversation_error::WriteIoSnafu)
     }
 }
 

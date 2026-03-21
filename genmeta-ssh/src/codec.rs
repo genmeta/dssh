@@ -7,27 +7,58 @@ use std::{fmt, ops::Deref, pin::pin};
 
 use bytes::{Bytes, BytesMut};
 use h3x::{
-    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
-    stream_id::StreamId,
+    codec::{DecodeFrom, EncodeInto},
     varint::VarInt,
 };
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use snafu::{ResultExt, Snafu};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub), module)]
+pub enum CodecError {
+    #[snafu(display("field length does not fit in usize"))]
+    FieldLengthOverflow { field_name: &'static str, length: u64 },
+
+    #[snafu(display("field length exceeds maximum"))]
+    FieldTooLarge {
+        field_name: &'static str,
+        length: usize,
+        maximum: usize,
+    },
+
+    #[snafu(display("ssh string too long"))]
+    SshStringTooLong,
+
+    #[snafu(display("ssh bytes too long"))]
+    SshBytesTooLong,
+
+    #[snafu(display("invalid ssh string utf-8"))]
+    InvalidSshStringUtf8 { source: std::string::FromUtf8Error },
+
+    #[snafu(display("invalid ssh bool byte"))]
+    InvalidSshBoolByte { byte: u8 },
+
+    #[snafu(display("stream read failed"))]
+    ReadIo { source: std::io::Error },
+
+    #[snafu(display("stream write failed"))]
+    WriteIo { source: std::io::Error },
+}
 
 pub const MAX_REMOTE_FIELD_SIZE: usize = 1 << 20;
 
-pub fn checked_remote_field_len(len: u64, field_name: &'static str) -> io::Result<usize> {
-    let len = usize::try_from(len).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{field_name} length does not fit in usize: {len}"),
-        )
+pub fn checked_remote_field_len(len: u64, field_name: &'static str) -> Result<usize, CodecError> {
+    let len = usize::try_from(len).map_err(|_| CodecError::FieldLengthOverflow {
+        field_name,
+        length: len,
     })?;
 
     if len > MAX_REMOTE_FIELD_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{field_name} length {len} exceeds maximum {MAX_REMOTE_FIELD_SIZE}"),
-        ));
+        return Err(CodecError::FieldTooLarge {
+            field_name,
+            length: len,
+            maximum: MAX_REMOTE_FIELD_SIZE,
+        });
     }
 
     Ok(len)
@@ -95,15 +126,14 @@ impl From<SshString> for Bytes {
 
 /// Raw bytes encoded as varint length-prefix + raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SshBytes(Bytes);
+pub struct SshBytes(Bytes);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawRemainder(Bytes);
 
 impl SshBytes {
     pub const fn from_static(bytes: &'static [u8]) -> Self {
         SshBytes(Bytes::from_static(bytes))
-    }
-
-    pub(crate) fn into_vec(self) -> Vec<u8> {
-        self.0.to_vec()
     }
 }
 
@@ -143,18 +173,33 @@ impl From<SshBytes> for BytesMut {
     }
 }
 
+impl AsRef<Bytes> for RawRemainder {
+    fn as_ref(&self) -> &Bytes {
+        &self.0
+    }
+}
+
+impl From<Bytes> for RawRemainder {
+    fn from(bytes: Bytes) -> Self {
+        RawRemainder(bytes)
+    }
+}
+
+impl From<Vec<u8>> for RawRemainder {
+    fn from(vec: Vec<u8>) -> Self {
+        RawRemainder(Bytes::from(vec))
+    }
+}
+
+impl From<RawRemainder> for Bytes {
+    fn from(value: RawRemainder) -> Self {
+        value.0
+    }
+}
+
 /// A boolean encoded as a single byte: `0x00` for false, `0x01` for true.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshBool(pub bool);
-
-/// SSH3 channel header, encoded field-by-field using QUIC varints and SSH strings.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ChannelHeader {
-    pub signal_value: VarInt,
-    pub conversation_id: StreamId,
-    pub channel_type: SshString,
-    pub max_message_size: VarInt,
-}
 
 // ---------------------------------------------------------------------------
 // SshString
@@ -162,30 +207,27 @@ pub struct ChannelHeader {
 
 impl<S: AsyncWrite + Send> EncodeInto<S> for SshString {
     type Output = ();
-    type Error = io::Error;
+    type Error = CodecError;
 
-    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+    async fn encode_into(self, stream: S) -> Result<(), CodecError> {
         let mut stream = pin!(stream);
-        let len = VarInt::try_from(self.0.len()).map_err(|_overflow| {
-            io::Error::new(io::ErrorKind::InvalidInput, "ssh string too long")
-        })?;
-        len.encode_into(&mut stream).await?;
-        stream.write_all(self.as_bytes()).await?;
+        let len = VarInt::try_from(self.0.len()).map_err(|_overflow| CodecError::SshStringTooLong)?;
+        len.encode_into(&mut stream).await.context(codec_error::WriteIoSnafu)?;
+        stream.write_all(self.as_bytes()).await.context(codec_error::WriteIoSnafu)?;
         Ok(())
     }
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for SshString {
-    type Error = io::Error;
+    type Error = CodecError;
 
-    async fn decode_from(stream: S) -> Result<Self, io::Error> {
+    async fn decode_from(stream: S) -> Result<Self, CodecError> {
         let mut stream = pin!(stream);
-        let len = VarInt::decode_from(&mut stream).await?;
+        let len = VarInt::decode_from(&mut stream).await.context(codec_error::ReadIoSnafu)?;
         let len = checked_remote_field_len(len.into_inner(), "ssh string")?;
         let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await?;
-        let string = String::from_utf8(buf)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        stream.read_exact(&mut buf).await.context(codec_error::ReadIoSnafu)?;
+        let string = String::from_utf8(buf).context(codec_error::InvalidSshStringUtf8Snafu)?;
         Ok(string.into())
     }
 }
@@ -196,27 +238,26 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshString {
 
 impl<S: AsyncWrite + Send> EncodeInto<S> for SshBytes {
     type Output = ();
-    type Error = io::Error;
+    type Error = CodecError;
 
-    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+    async fn encode_into(self, stream: S) -> Result<(), CodecError> {
         let mut stream = pin!(stream);
-        let len = VarInt::try_from(self.0.len() as u64)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        len.encode_into(&mut stream).await?;
-        stream.write_all(&self.0).await?;
+        let len = VarInt::try_from(self.0.len() as u64).map_err(|_| CodecError::SshBytesTooLong)?;
+        len.encode_into(&mut stream).await.context(codec_error::WriteIoSnafu)?;
+        stream.write_all(&self.0).await.context(codec_error::WriteIoSnafu)?;
         Ok(())
     }
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for SshBytes {
-    type Error = io::Error;
+    type Error = CodecError;
 
-    async fn decode_from(stream: S) -> Result<Self, io::Error> {
+    async fn decode_from(stream: S) -> Result<Self, CodecError> {
         let mut stream = pin!(stream);
-        let len = VarInt::decode_from(&mut stream).await?;
+        let len = VarInt::decode_from(&mut stream).await.context(codec_error::ReadIoSnafu)?;
         let len = checked_remote_field_len(len.into_inner(), "ssh bytes")?;
         let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await?;
+        stream.read_exact(&mut buf).await.context(codec_error::ReadIoSnafu)?;
         Ok(buf.into())
     }
 }
@@ -227,72 +268,29 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshBytes {
 
 impl<S: AsyncWrite + Send> EncodeInto<S> for SshBool {
     type Output = ();
-    type Error = io::Error;
+    type Error = CodecError;
 
-    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
+    async fn encode_into(self, stream: S) -> Result<(), CodecError> {
         let mut stream = pin!(stream);
-        stream.write_u8(if self.0 { 0x01 } else { 0x00 }).await?;
-        Ok(())
-    }
-}
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for &SshBool {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
-        let mut stream = pin!(stream);
-        stream.write_u8(if self.0 { 0x01 } else { 0x00 }).await?;
+        stream
+            .write_u8(if self.0 { 0x01 } else { 0x00 })
+            .await
+            .context(codec_error::WriteIoSnafu)?;
         Ok(())
     }
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for SshBool {
-    type Error = io::Error;
+    type Error = CodecError;
 
-    async fn decode_from(stream: S) -> Result<Self, io::Error> {
+    async fn decode_from(stream: S) -> Result<Self, CodecError> {
         let mut stream = pin!(stream);
-        let byte = stream.read_u8().await?;
+        let byte = stream.read_u8().await.context(codec_error::ReadIoSnafu)?;
         match byte {
             0x00 => Ok(SshBool(false)),
             0x01 => Ok(SshBool(true)),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid bool byte: 0x{other:02x}"),
-            )),
+            other => Err(CodecError::InvalidSshBoolByte { byte: other }),
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ChannelHeader (encode by reference, decode returns owned)
-// ---------------------------------------------------------------------------
-
-impl<S: AsyncWrite + Send> EncodeInto<S> for ChannelHeader {
-    type Output = ();
-    type Error = io::Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), io::Error> {
-        let mut stream = pin!(stream);
-        stream.encode_one(self.signal_value).await?;
-        stream.encode_one(self.conversation_id).await?;
-        stream.encode_one(self.channel_type).await?;
-        stream.encode_one(self.max_message_size).await?;
-        Ok(())
-    }
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for ChannelHeader {
-    type Error = io::Error;
-
-    async fn decode_from(stream: S) -> Result<Self, io::Error> {
-        let mut stream = pin!(stream);
-        Ok(ChannelHeader {
-            signal_value: stream.decode_one().await?,
-            conversation_id: stream.decode_one().await?,
-            channel_type: stream.decode_one().await?,
-            max_message_size: stream.decode_one().await?,
-        })
     }
 }
 

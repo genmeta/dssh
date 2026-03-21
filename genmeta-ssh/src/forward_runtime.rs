@@ -1,14 +1,28 @@
 use crate::{
-    codec::ChannelHeader,
-    constants::{CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE},
+    channel::{ChannelHeader, ChannelMessage, ChannelOpenBody},
+    constants::DEFAULT_MAX_MESSAGE_SIZE,
     forward::{ForwardedStreamlocalRequest, ForwardedTcpipRequest},
-    message::SshMessage,
+    message::{MessageError, SshMessage},
 };
-use h3x::{
-    codec::{DecodeExt, EncodeExt},
-    stream_id::StreamId,
-};
+use h3x::{codec::DecodeExt, stream_id::StreamId};
+use snafu::{ResultExt, Snafu};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub), module)]
+pub enum ForwardRuntimeError {
+    #[snafu(display("forward runtime I/O failed"))]
+    Io { source: std::io::Error },
+
+    #[snafu(display("forward relay task failed"))]
+    RelayTaskJoin { source: tokio::task::JoinError },
+
+    #[snafu(display("forward runtime message decode failed"))]
+    Message { source: MessageError },
+
+    #[snafu(display("unexpected channel open response"))]
+    UnexpectedChannelOpenResponse { message: String },
+}
 
 pub async fn relay<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
 where
@@ -20,100 +34,99 @@ where
     Ok(n)
 }
 
-pub fn forwarded_tcpip_header(conversation_id: StreamId) -> ChannelHeader {
+pub fn forwarded_tcpip_header(
+    session_id: StreamId,
+    connected_address: &str,
+    connected_port: u16,
+    originator_address: &str,
+    originator_port: u16,
+) -> ChannelHeader {
     ChannelHeader {
-        signal_value: CHANNEL_SIGNAL_VALUE,
-        conversation_id,
-        channel_type: "forwarded-tcpip".into(),
+        session_id,
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        body: ChannelOpenBody::ForwardedTcpip(ForwardedTcpipRequest {
+            connected_address: connected_address.to_string().into(),
+            connected_port: (connected_port as u32).into(),
+            originator_address: originator_address.to_string().into(),
+            originator_port: (originator_port as u32).into(),
+        }),
     }
 }
 
 pub async fn finish_forwarded_tcpip_channel<R, W, S>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
     tcp_stream: S,
-    connected_addr: &str,
-    connected_port: u16,
-    originator_addr: &str,
-    originator_port: u16,
-) -> io::Result<()>
+) -> Result<(), ForwardRuntimeError>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    writer
-        .encode_one(ForwardedTcpipRequest {
-            connected_address: connected_addr.to_string().into(),
-            connected_port: connected_port.into(),
-            originator_address: originator_addr.to_string().into(),
-            originator_port: originator_port.into(),
-        })
-        .await?;
-    writer.flush().await?;
-
-    let response: SshMessage = reader.decode_one().await?;
+    let response: SshMessage = reader.decode_one().await.context(forward_runtime_error::MessageSnafu)?;
     match response {
-        SshMessage::ChannelOpenConfirmation { .. } => {}
-        SshMessage::ChannelOpenFailure { .. } => return Ok(()),
+        SshMessage::Channel(ChannelMessage::OpenConfirmation { .. }) => {}
+        SshMessage::Channel(ChannelMessage::OpenFailure(..)) => return Ok(()),
         other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected ChannelOpenConfirmation or ChannelOpenFailure, got {other:?}"),
-            ));
+            return Err(ForwardRuntimeError::UnexpectedChannelOpenResponse {
+                message: format!("{other:?}"),
+            });
         }
     }
 
     let (stream_reader, stream_writer) = tokio::io::split(tcp_stream);
     let q2t = tokio::spawn(relay(reader, stream_writer));
     let t2q = tokio::spawn(relay(stream_reader, writer));
-    let _ = tokio::join!(q2t, t2q);
+    let (q2t_result, t2q_result) = tokio::join!(q2t, t2q);
+    q2t_result
+        .context(forward_runtime_error::RelayTaskJoinSnafu)?
+        .context(forward_runtime_error::IoSnafu)?;
+    t2q_result
+        .context(forward_runtime_error::RelayTaskJoinSnafu)?
+        .context(forward_runtime_error::IoSnafu)?;
     Ok(())
 }
 
-pub fn forwarded_streamlocal_header(conversation_id: StreamId) -> ChannelHeader {
+pub fn forwarded_streamlocal_header(session_id: StreamId, socket_path: &str) -> ChannelHeader {
     ChannelHeader {
-        signal_value: CHANNEL_SIGNAL_VALUE,
-        conversation_id,
-        channel_type: "forwarded-streamlocal@openssh.com".into(),
+        session_id,
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        body: ChannelOpenBody::ForwardedStreamlocal(ForwardedStreamlocalRequest {
+            socket_path: socket_path.to_string().into(),
+        }),
     }
 }
 
 pub async fn finish_forwarded_streamlocal_channel<R, W, S>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
     unix_stream: S,
-    socket_path: &str,
-) -> io::Result<()>
+) -> Result<(), ForwardRuntimeError>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    writer
-        .encode_one(ForwardedStreamlocalRequest {
-            socket_path: socket_path.to_string().into(),
-        })
-        .await?;
-    writer.flush().await?;
-
-    let response: SshMessage = reader.decode_one().await?;
+    let response: SshMessage = reader.decode_one().await.context(forward_runtime_error::MessageSnafu)?;
     match response {
-        SshMessage::ChannelOpenConfirmation { .. } => {}
-        SshMessage::ChannelOpenFailure { .. } => return Ok(()),
+        SshMessage::Channel(ChannelMessage::OpenConfirmation { .. }) => {}
+        SshMessage::Channel(ChannelMessage::OpenFailure(..)) => return Ok(()),
         other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected ChannelOpenConfirmation or ChannelOpenFailure, got {other:?}"),
-            ));
+            return Err(ForwardRuntimeError::UnexpectedChannelOpenResponse {
+                message: format!("{other:?}"),
+            });
         }
     }
 
     let (stream_reader, stream_writer) = tokio::io::split(unix_stream);
     let q2u = tokio::spawn(relay(reader, stream_writer));
     let u2q = tokio::spawn(relay(stream_reader, writer));
-    let _ = tokio::join!(q2u, u2q);
+    let (q2u_result, u2q_result) = tokio::join!(q2u, u2q);
+    q2u_result
+        .context(forward_runtime_error::RelayTaskJoinSnafu)?
+        .context(forward_runtime_error::IoSnafu)?;
+    u2q_result
+        .context(forward_runtime_error::RelayTaskJoinSnafu)?
+        .context(forward_runtime_error::IoSnafu)?;
     Ok(())
 }
