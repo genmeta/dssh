@@ -4,7 +4,7 @@ use crate::{
     forward::{ForwardedStreamlocalRequest, ForwardedTcpipRequest},
     message::{MessageError, SshMessage},
 };
-use h3x::{codec::DecodeExt, stream_id::StreamId};
+use h3x::{codec::DecodeExt, stream_id::StreamId, varint::VarInt};
 use snafu::{ResultExt, Snafu};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -20,8 +20,8 @@ pub enum ForwardRuntimeError {
     #[snafu(display("forward runtime message decode failed"))]
     Message { source: MessageError },
 
-    #[snafu(display("unexpected channel open response"))]
-    UnexpectedChannelOpenResponse { message: String },
+    #[snafu(display("unexpected channel open response type {message_type}"))]
+    UnexpectedChannelOpenResponse { message_type: VarInt },
 }
 
 pub async fn relay<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
@@ -69,7 +69,7 @@ where
         SshMessage::Channel(ChannelMessage::OpenFailure(..)) => return Ok(()),
         other => {
             return Err(ForwardRuntimeError::UnexpectedChannelOpenResponse {
-                message: format!("{other:?}"),
+                message_type: other.message_type(),
             });
         }
     }
@@ -113,7 +113,7 @@ where
         SshMessage::Channel(ChannelMessage::OpenFailure(..)) => return Ok(()),
         other => {
             return Err(ForwardRuntimeError::UnexpectedChannelOpenResponse {
-                message: format!("{other:?}"),
+                message_type: other.message_type(),
             });
         }
     }

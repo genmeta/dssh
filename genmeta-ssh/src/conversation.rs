@@ -17,11 +17,8 @@ use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    GlobalRequestNotice, GlobalRequestPayload, GlobalRequestRequest,
-    channel::RequestSuccess,
-    forward::ForwardError,
-    message::MessageError,
-    message::SshMessage,
+    GlobalRequestNotice, GlobalRequestPayload, GlobalRequestRequest, channel::RequestSuccess,
+    forward::ForwardError, message::MessageError, message::SshMessage,
 };
 
 const SSH_MSG_REQUEST_SUCCESS: h3x::varint::VarInt = h3x::varint::VarInt::from_u32(81);
@@ -45,23 +42,14 @@ pub enum ConversationError {
     #[snafu(display("global request failed"))]
     GlobalRequestFailed,
 
-    #[snafu(display("unexpected control-stream reply type"))]
-    UnexpectedControlReplyType { message_type: u64 },
+    #[snafu(display("unexpected control-stream reply type {message_type}"))]
+    UnexpectedControlReplyType { message_type: h3x::varint::VarInt },
 
-    #[snafu(display("unexpected control-stream request"))]
-    UnexpectedControlRequest { message: String },
+    #[snafu(display("unexpected control-stream request type {message_type}"))]
+    UnexpectedControlRequest { message_type: h3x::varint::VarInt },
 
-    #[snafu(display("expected request-success reply payload"))]
-    UnexpectedRequestSuccessPayload,
-
-    #[snafu(display("mismatched global request reply payload"))]
-    MismatchedGlobalRequestReply { request_type: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GlobalRequestReply {
-    TcpipForward(crate::TcpipForwardReply),
-    Unknown(RequestSuccess),
+    #[snafu(display("mismatched global request reply payload for request type {request_type}"))]
+    MismatchedGlobalRequestReply { request_type: crate::SshString },
 }
 
 pub enum IncomingGlobal<'a, M: ManageSessionStream> {
@@ -80,33 +68,33 @@ impl<'a, M: ManageSessionStream> IncomingGlobalRequest<'a, M> {
         self.request.request()
     }
 
-    pub async fn success(self, reply: GlobalRequestReply) -> Result<(), ConversationError> {
+    pub async fn success(self, reply: RequestSuccess) -> Result<(), ConversationError> {
         self.validate_reply(&reply)?;
         self.conv.send_request_success(reply).await
     }
 
     pub async fn success_empty(self) -> Result<(), ConversationError> {
-        self.success(GlobalRequestReply::Unknown(RequestSuccess::Empty)).await
+        self.success(RequestSuccess::Empty).await
     }
 
     pub async fn success_tcpip_forward(
         self,
         reply: crate::TcpipForwardReply,
     ) -> Result<(), ConversationError> {
-        self.success(GlobalRequestReply::TcpipForward(reply)).await
+        self.success(RequestSuccess::TcpipForward(reply)).await
     }
 
     pub async fn failure(self) -> Result<(), ConversationError> {
         self.conv.send_request_failure().await
     }
 
-    fn validate_reply(&self, reply: &GlobalRequestReply) -> Result<(), ConversationError> {
+    fn validate_reply(&self, reply: &RequestSuccess) -> Result<(), ConversationError> {
         match (self.request.request(), reply) {
             (GlobalRequestPayload::TcpipForward(_), _) => Ok(()),
-            (_, GlobalRequestReply::Unknown(_)) => Ok(()),
-            (request, GlobalRequestReply::TcpipForward(_)) => {
+            (_, RequestSuccess::Empty | RequestSuccess::Unknown(_)) => Ok(()),
+            (request, RequestSuccess::TcpipForward(_)) => {
                 Err(ConversationError::MismatchedGlobalRequestReply {
-                    request_type: request.request_type().to_string(),
+                    request_type: request.request_type(),
                 })
             }
         }
@@ -213,7 +201,7 @@ impl<M: ManageSessionStream> Conversation<M> {
     pub async fn request(
         &mut self,
         request: GlobalRequestRequest,
-    ) -> Result<GlobalRequestReply, ConversationError> {
+    ) -> Result<RequestSuccess, ConversationError> {
         let expects_bound_port = matches!(request.request(), GlobalRequestPayload::TcpipForward(_));
         self.control_stream_writer
             .encode_one(SshMessage::GlobalRequest(request.into_wire()))
@@ -232,27 +220,24 @@ impl<M: ManageSessionStream> Conversation<M> {
         match msg_type {
             SSH_MSG_REQUEST_SUCCESS => {
                 if expects_bound_port {
-                    Ok(GlobalRequestReply::TcpipForward(
+                    Ok(RequestSuccess::TcpipForward(
                         self.control_stream_reader
                             .decode_one()
                             .await
                             .context(conversation_error::ForwardSnafu)?,
                     ))
                 } else {
-                    Ok(GlobalRequestReply::Unknown(RequestSuccess::Empty))
+                    Ok(RequestSuccess::Empty)
                 }
             }
             SSH_MSG_REQUEST_FAILURE => Err(ConversationError::GlobalRequestFailed),
             other => Err(ConversationError::UnexpectedControlReplyType {
-                message_type: other.into_inner(),
+                message_type: other,
             }),
         }
     }
 
-    pub async fn notify(
-        &mut self,
-        notice: GlobalRequestNotice,
-    ) -> Result<(), ConversationError> {
+    pub async fn notify(&mut self, notice: GlobalRequestNotice) -> Result<(), ConversationError> {
         self.control_stream_writer
             .encode_one(SshMessage::GlobalRequest(notice.into_wire()))
             .await
@@ -282,19 +267,15 @@ impl<M: ManageSessionStream> Conversation<M> {
                 }
             }
             other => Err(ConversationError::UnexpectedControlRequest {
-                message: format!("{other:?}"),
+                message_type: other.message_type(),
             }),
         }
     }
 
     async fn send_request_success(
         &mut self,
-        reply: GlobalRequestReply,
+        success: RequestSuccess,
     ) -> Result<(), ConversationError> {
-        let success = match reply {
-            GlobalRequestReply::TcpipForward(reply) => RequestSuccess::TcpipForward(reply),
-            GlobalRequestReply::Unknown(success) => success,
-        };
         self.control_stream_writer
             .encode_one(SshMessage::RequestSuccess(success))
             .await

@@ -39,8 +39,8 @@ pub enum MessageError {
     #[snafu(display("channel message codec failed"))]
     Channel { source: ChannelError },
 
-    #[snafu(display("unknown ssh message type"))]
-    UnknownMessageType { message_type: u64 },
+    #[snafu(display("unknown ssh message type {message_type}"))]
+    UnknownMessageType { message_type: VarInt },
 }
 
 const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
@@ -62,6 +62,27 @@ pub enum SshMessage {
     RequestSuccess(RequestSuccess),
     RequestFailure,
     Channel(ChannelMessage),
+}
+
+impl SshMessage {
+    pub fn message_type(&self) -> VarInt {
+        match self {
+            SshMessage::GlobalRequest(_) => SSH_MSG_GLOBAL_REQUEST,
+            SshMessage::RequestSuccess(_) => SSH_MSG_REQUEST_SUCCESS,
+            SshMessage::RequestFailure => SSH_MSG_REQUEST_FAILURE,
+            SshMessage::Channel(channel) => match channel {
+                ChannelMessage::OpenConfirmation { .. } => SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
+                ChannelMessage::OpenFailure(_) => SSH_MSG_CHANNEL_OPEN_FAILURE,
+                ChannelMessage::Data(_) => SSH_MSG_CHANNEL_DATA,
+                ChannelMessage::ExtendedData { .. } => SSH_MSG_CHANNEL_EXTENDED_DATA,
+                ChannelMessage::Eof => SSH_MSG_CHANNEL_EOF,
+                ChannelMessage::Close => SSH_MSG_CHANNEL_CLOSE,
+                ChannelMessage::Request(_) => SSH_MSG_CHANNEL_REQUEST,
+                ChannelMessage::Success => SSH_MSG_CHANNEL_SUCCESS,
+                ChannelMessage::Failure => SSH_MSG_CHANNEL_FAILURE,
+            },
+        }
+    }
 }
 
 impl<S: AsyncWrite + Send> EncodeInto<S> for SshMessage {
@@ -281,7 +302,7 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshMessage {
             SSH_MSG_CHANNEL_SUCCESS => Ok(Self::Channel(ChannelMessage::Success)),
             SSH_MSG_CHANNEL_FAILURE => Ok(Self::Channel(ChannelMessage::Failure)),
             other => Err(MessageError::UnknownMessageType {
-                message_type: other.into_inner(),
+                message_type: other,
             }),
         }
     }

@@ -40,10 +40,10 @@ pub enum ChannelError {
     #[snafu(display("channel stream write failed"))]
     WriteIo { source: std::io::Error },
 
-    #[snafu(display("unexpected channel signal value"))]
-    UnexpectedSignalValue { signal_value: u64 },
+    #[snafu(display("unexpected channel signal value {signal_value}"))]
+    UnexpectedSignalValue { signal_value: VarInt },
 
-    #[snafu(display("unknown body is unavailable for encoding"))]
+    #[snafu(display("unknown body is unavailable for encoding for {kind}"))]
     UnknownBodyUnavailable { kind: &'static str },
 }
 
@@ -244,7 +244,7 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ChannelHeader {
         let signal_value: VarInt = stream.decode_one().await.context(channel_error::ReadIoSnafu)?;
         if signal_value != CHANNEL_SIGNAL_VALUE {
             return Err(ChannelError::UnexpectedSignalValue {
-                signal_value: signal_value.into_inner(),
+                signal_value,
             });
         }
 
