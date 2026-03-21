@@ -430,6 +430,101 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ChannelRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalRequestPayload {
+    TcpipForward(crate::forward::TcpipForwardRequest),
+    CancelTcpipForward(crate::forward::CancelTcpipForwardRequest),
+    StreamlocalForward(crate::forward::StreamlocalForwardRequest),
+    CancelStreamlocalForward(crate::forward::CancelStreamlocalForwardRequest),
+    Unknown {
+        request_type: SshString,
+        body: UnknownBody,
+    },
+}
+
+impl GlobalRequestPayload {
+    pub fn request_type(&self) -> SshString {
+        match self {
+            Self::TcpipForward(_) => SshString::from_static("tcpip-forward"),
+            Self::CancelTcpipForward(_) => SshString::from_static("cancel-tcpip-forward"),
+            Self::StreamlocalForward(_) => {
+                SshString::from_static("streamlocal-forward@openssh.com")
+            }
+            Self::CancelStreamlocalForward(_) => {
+                SshString::from_static("cancel-streamlocal-forward@openssh.com")
+            }
+            Self::Unknown { request_type, .. } => request_type.clone(),
+        }
+    }
+
+    async fn encode_payload<S: AsyncWrite + Send>(&self, stream: S) -> Result<(), ChannelError> {
+        let mut stream = pin!(stream);
+        match self {
+            Self::TcpipForward(request) => {
+                stream
+                    .encode_one(request.clone())
+                    .await
+                    .context(channel_error::ForwardSnafu)?;
+                Ok(())
+            }
+            Self::CancelTcpipForward(request) => {
+                stream
+                    .encode_one(request.clone())
+                    .await
+                    .context(channel_error::ForwardSnafu)?;
+                Ok(())
+            }
+            Self::StreamlocalForward(request) => {
+                stream
+                    .encode_one(request.clone())
+                    .await
+                    .context(channel_error::ForwardSnafu)?;
+                Ok(())
+            }
+            Self::CancelStreamlocalForward(request) => {
+                stream
+                    .encode_one(request.clone())
+                    .await
+                    .context(channel_error::ForwardSnafu)?;
+                Ok(())
+            }
+            Self::Unknown { body, .. } => {
+                let data = body.clone().into_raw("unknown global request")?;
+                stream
+                    .write_all(data.as_ref().as_ref())
+                    .await
+                    .context(channel_error::WriteIoSnafu)?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn decode_payload<S: AsyncRead + Send>(
+        request_type: SshString,
+        stream: S,
+    ) -> Result<Self, ChannelError> {
+        let mut stream = pin!(stream);
+        Ok(match &*request_type {
+            "tcpip-forward" => {
+                Self::TcpipForward(stream.decode_one().await.context(channel_error::ForwardSnafu)?)
+            }
+            "cancel-tcpip-forward" => Self::CancelTcpipForward(
+                stream.decode_one().await.context(channel_error::ForwardSnafu)?,
+            ),
+            "streamlocal-forward@openssh.com" => Self::StreamlocalForward(
+                stream.decode_one().await.context(channel_error::ForwardSnafu)?,
+            ),
+            "cancel-streamlocal-forward@openssh.com" => Self::CancelStreamlocalForward(
+                stream.decode_one().await.context(channel_error::ForwardSnafu)?,
+            ),
+            _ => Self::Unknown {
+                request_type,
+                body: UnknownBody::Unavailable,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GlobalRequest {
     TcpipForward {
         want_reply: SshBool,
@@ -455,18 +550,59 @@ pub enum GlobalRequest {
 }
 
 impl GlobalRequest {
-    pub fn request_type(&self) -> SshString {
-        match self {
-            Self::TcpipForward { .. } => SshString::from_static("tcpip-forward"),
-            Self::CancelTcpipForward { .. } => SshString::from_static("cancel-tcpip-forward"),
-            Self::StreamlocalForward { .. } => {
-                SshString::from_static("streamlocal-forward@openssh.com")
+    pub fn from_payload(payload: GlobalRequestPayload, want_reply: SshBool) -> Self {
+        match payload {
+            GlobalRequestPayload::TcpipForward(request) => Self::TcpipForward {
+                want_reply,
+                request,
+            },
+            GlobalRequestPayload::CancelTcpipForward(request) => Self::CancelTcpipForward {
+                want_reply,
+                request,
+            },
+            GlobalRequestPayload::StreamlocalForward(request) => Self::StreamlocalForward {
+                want_reply,
+                request,
+            },
+            GlobalRequestPayload::CancelStreamlocalForward(request) => {
+                Self::CancelStreamlocalForward {
+                    want_reply,
+                    request,
+                }
             }
-            Self::CancelStreamlocalForward { .. } => {
-                SshString::from_static("cancel-streamlocal-forward@openssh.com")
-            }
-            Self::Unknown { request_type, .. } => request_type.clone(),
+            GlobalRequestPayload::Unknown { request_type, body } => Self::Unknown {
+                request_type,
+                want_reply,
+                body,
+            },
         }
+    }
+
+    pub fn payload(&self) -> GlobalRequestPayload {
+        match self {
+            Self::TcpipForward { request, .. } => GlobalRequestPayload::TcpipForward(request.clone()),
+            Self::CancelTcpipForward { request, .. } => {
+                GlobalRequestPayload::CancelTcpipForward(request.clone())
+            }
+            Self::StreamlocalForward { request, .. } => {
+                GlobalRequestPayload::StreamlocalForward(request.clone())
+            }
+            Self::CancelStreamlocalForward { request, .. } => {
+                GlobalRequestPayload::CancelStreamlocalForward(request.clone())
+            }
+            Self::Unknown {
+                request_type,
+                body,
+                ..
+            } => GlobalRequestPayload::Unknown {
+                request_type: request_type.clone(),
+                body: body.clone(),
+            },
+        }
+    }
+
+    pub fn request_type(&self) -> SshString {
+        self.payload().request_type()
     }
 
     pub fn want_reply(&self) -> SshBool {
@@ -480,40 +616,67 @@ impl GlobalRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalRequestRequest {
+    request: GlobalRequestPayload,
+}
+
+impl GlobalRequestRequest {
+    pub fn new(request: GlobalRequestPayload) -> Self {
+        Self { request }
+    }
+
+    pub fn request(&self) -> &GlobalRequestPayload {
+        &self.request
+    }
+
+    pub fn into_request(self) -> GlobalRequestPayload {
+        self.request
+    }
+
+    pub fn into_wire(self) -> GlobalRequest {
+        GlobalRequest::from_payload(self.request, SshBool(true))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalRequestNotice {
+    request: GlobalRequestPayload,
+}
+
+impl GlobalRequestNotice {
+    pub fn new(request: GlobalRequestPayload) -> Self {
+        Self { request }
+    }
+
+    pub fn request(&self) -> &GlobalRequestPayload {
+        &self.request
+    }
+
+    pub fn into_request(self) -> GlobalRequestPayload {
+        self.request
+    }
+
+    pub fn into_wire(self) -> GlobalRequest {
+        GlobalRequest::from_payload(self.request, SshBool(false))
+    }
+}
+
 impl<S: AsyncWrite + Send> EncodeInto<S> for GlobalRequest {
     type Output = ();
     type Error = ChannelError;
 
     async fn encode_into(self, stream: S) -> Result<(), ChannelError> {
         let mut stream = pin!(stream);
-        stream.encode_one(self.request_type()).await.context(channel_error::CodecSnafu)?;
-        stream.encode_one(self.want_reply()).await.context(channel_error::CodecSnafu)?;
-        match self {
-            Self::TcpipForward { request, .. } => {
-                stream.encode_one(request).await.context(channel_error::ForwardSnafu)?;
-                Ok(())
-            }
-            Self::CancelTcpipForward { request, .. } => {
-                stream.encode_one(request).await.context(channel_error::ForwardSnafu)?;
-                Ok(())
-            }
-            Self::StreamlocalForward { request, .. } => {
-                stream.encode_one(request).await.context(channel_error::ForwardSnafu)?;
-                Ok(())
-            }
-            Self::CancelStreamlocalForward { request, .. } => {
-                stream.encode_one(request).await.context(channel_error::ForwardSnafu)?;
-                Ok(())
-            }
-            Self::Unknown { body, .. } => {
-                let data = body.into_raw("unknown global request")?;
-                stream
-                    .write_all(data.as_ref().as_ref())
-                    .await
-                    .context(channel_error::WriteIoSnafu)?;
-                Ok(())
-            }
-        }
+        stream
+            .encode_one(self.request_type())
+            .await
+            .context(channel_error::CodecSnafu)?;
+        stream
+            .encode_one(self.want_reply())
+            .await
+            .context(channel_error::CodecSnafu)?;
+        self.payload().encode_payload(&mut stream).await
     }
 }
 
@@ -524,29 +687,8 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for GlobalRequest {
         let mut stream = pin!(stream);
         let request_type: SshString = stream.decode_one().await.context(channel_error::CodecSnafu)?;
         let want_reply: SshBool = stream.decode_one().await.context(channel_error::CodecSnafu)?;
-        Ok(match &*request_type {
-            "tcpip-forward" => Self::TcpipForward {
-                want_reply,
-                request: stream.decode_one().await.context(channel_error::ForwardSnafu)?,
-            },
-            "cancel-tcpip-forward" => Self::CancelTcpipForward {
-                want_reply,
-                request: stream.decode_one().await.context(channel_error::ForwardSnafu)?,
-            },
-            "streamlocal-forward@openssh.com" => Self::StreamlocalForward {
-                want_reply,
-                request: stream.decode_one().await.context(channel_error::ForwardSnafu)?,
-            },
-            "cancel-streamlocal-forward@openssh.com" => Self::CancelStreamlocalForward {
-                want_reply,
-                request: stream.decode_one().await.context(channel_error::ForwardSnafu)?,
-            },
-            _ => Self::Unknown {
-                request_type,
-                want_reply,
-                body: UnknownBody::Unavailable,
-            },
-        })
+        let request = GlobalRequestPayload::decode_payload(request_type, &mut stream).await?;
+        Ok(Self::from_payload(request, want_reply))
     }
 }
 

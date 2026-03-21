@@ -182,32 +182,32 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshMessage {
         match msg_type {
             SSH_MSG_GLOBAL_REQUEST => {
                 let request_type: SshString = stream.decode_one().await.context(message_error::CodecSnafu)?;
-                let want_reply = stream.decode_one().await.context(message_error::CodecSnafu)?;
-                Ok(Self::GlobalRequest(match &*request_type {
-                    "tcpip-forward" => GlobalRequest::TcpipForward {
-                        want_reply,
-                        request: stream.decode_one().await.context(message_error::ForwardSnafu)?,
-                    },
-                    "cancel-tcpip-forward" => GlobalRequest::CancelTcpipForward {
-                        want_reply,
-                        request: stream.decode_one().await.context(message_error::ForwardSnafu)?,
-                    },
-                    "streamlocal-forward@openssh.com" => GlobalRequest::StreamlocalForward {
-                        want_reply,
-                        request: stream.decode_one().await.context(message_error::ForwardSnafu)?,
-                    },
-                    "cancel-streamlocal-forward@openssh.com" => {
-                        GlobalRequest::CancelStreamlocalForward {
-                            want_reply,
-                            request: stream.decode_one().await.context(message_error::ForwardSnafu)?,
-                        }
-                    }
-                    _ => GlobalRequest::Unknown {
+                let want_reply: crate::codec::SshBool = stream
+                    .decode_one()
+                    .await
+                    .context(message_error::CodecSnafu)?;
+                let request = match &*request_type {
+                    "tcpip-forward" => crate::channel::GlobalRequestPayload::TcpipForward(
+                        stream.decode_one().await.context(message_error::ForwardSnafu)?,
+                    ),
+                    "cancel-tcpip-forward" => crate::channel::GlobalRequestPayload::CancelTcpipForward(
+                        stream.decode_one().await.context(message_error::ForwardSnafu)?,
+                    ),
+                    "streamlocal-forward@openssh.com" => crate::channel::GlobalRequestPayload::StreamlocalForward(
+                        stream.decode_one().await.context(message_error::ForwardSnafu)?,
+                    ),
+                    "cancel-streamlocal-forward@openssh.com" => crate::channel::GlobalRequestPayload::CancelStreamlocalForward(
+                        stream.decode_one().await.context(message_error::ForwardSnafu)?,
+                    ),
+                    _ => crate::channel::GlobalRequestPayload::Unknown {
                         request_type,
-                        want_reply,
                         body: UnknownBody::Unavailable,
                     },
-                }))
+                };
+                Ok(Self::GlobalRequest(crate::channel::GlobalRequest::from_payload(
+                    request,
+                    want_reply,
+                )))
             }
             SSH_MSG_REQUEST_SUCCESS => Ok(Self::RequestSuccess(RequestSuccess::Unknown(
                 UnknownBody::Unavailable,
