@@ -32,10 +32,12 @@ pub use conversation::{
     RespondChannelSuccessError, RespondFailureError, RespondSuccessError, SendChannelNoticeError,
     SendChannelRequestError, SendNotifyError, SendRequestError, SessionPoisonedError,
     WantReplyChannelRequest, WantReplyGlobalRequest, WriteChannelCloseError,
-    WriteChannelDataError, WriteChannelEofError, WriteChannelOpenConfirmationError,
+    WriteChannelDataError, WriteChannelEofError, WriteChannelExtendedDataError,
+    WriteChannelOpenConfirmationError,
     WriteChannelOpenError, WriteChannelOpenFailureError, read_channel_event,
     read_channel_open_response, send_channel_notice, send_channel_request, write_channel_close,
-    write_channel_data, write_channel_eof, write_channel_open, write_channel_open_confirmation,
+    write_channel_data, write_channel_eof, write_channel_extended_data,
+    write_channel_open, write_channel_open_confirmation,
     write_channel_open_failure,
 };
 pub use error::{Ssh3Error, ssh3_error};

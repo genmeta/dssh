@@ -77,6 +77,9 @@ const SSH_MSG_CHANNEL_REQUEST: VarInt = VarInt::from_u32(98);
 const SSH_MSG_CHANNEL_SUCCESS: VarInt = VarInt::from_u32(99);
 const SSH_MSG_CHANNEL_FAILURE: VarInt = VarInt::from_u32(100);
 
+/// SSH extended data type for stderr (RFC 4254 Section 5.2).
+pub const SSH_EXTENDED_DATA_STDERR: VarInt = VarInt::from_u32(1);
+
 // ===========================================================================
 // Error types
 // ===========================================================================
@@ -298,6 +301,20 @@ pub enum WriteChannelDataError {
     #[snafu(display("failed to encode channel data payload"))]
     EncodeData { source: CodecError },
     #[snafu(display("failed to flush channel stream after data"))]
+    Flush { source: std::io::Error },
+}
+
+/// Error from [`write_channel_extended_data`].
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum WriteChannelExtendedDataError {
+    #[snafu(display("failed to encode extended data message type"))]
+    EncodeMessageType { source: std::io::Error },
+    #[snafu(display("failed to encode extended data type field"))]
+    EncodeDataType { source: std::io::Error },
+    #[snafu(display("failed to encode extended data payload"))]
+    EncodeData { source: CodecError },
+    #[snafu(display("failed to flush channel stream after extended data"))]
     Flush { source: std::io::Error },
 }
 
@@ -1612,6 +1629,35 @@ where
         .encode_one(SSH_MSG_CHANNEL_DATA)
         .await
         .context(EncodeMessageTypeSnafu)?;
+    writer.encode_one(data).await.context(EncodeDataSnafu)?;
+    AsyncWriteExt::flush(writer)
+        .await
+        .context(FlushSnafu)?;
+    Ok(())
+}
+
+/// Write channel extended data (`SSH_MSG_CHANNEL_EXTENDED_DATA`) to a stream.
+///
+/// `data_type` distinguishes the data substream (e.g. `1` for stderr per
+/// RFC 4254 Section 5.2).
+pub async fn write_channel_extended_data<W>(
+    writer: &mut W,
+    data_type: VarInt,
+    data: SshBytes,
+) -> Result<(), WriteChannelExtendedDataError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    use write_channel_extended_data_error::*;
+
+    writer
+        .encode_one(SSH_MSG_CHANNEL_EXTENDED_DATA)
+        .await
+        .context(EncodeMessageTypeSnafu)?;
+    writer
+        .encode_one(data_type)
+        .await
+        .context(EncodeDataTypeSnafu)?;
     writer.encode_one(data).await.context(EncodeDataSnafu)?;
     AsyncWriteExt::flush(writer)
         .await

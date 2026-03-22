@@ -1,4 +1,4 @@
-//! SSH3 session types and transport trait for cross-process communication.
+//! SSH3 session types, PTY, signal handling, and transport traits.
 //!
 //! The [`Ssh3Transport`] trait is marked with `#[remoc::rtc::remote]`, which generates:
 //! - [`Ssh3TransportClient`] — serializable proxy sent to the child process
@@ -7,6 +7,10 @@
 //!
 //! The main server process implements the trait and serves it; the child
 //! process uses the client to accept and open channels.
+
+pub mod process;
+pub mod pty;
+pub mod signal;
 
 use std::{
     future::Future,

@@ -677,6 +677,7 @@ dependencies = [
  "futures",
  "h3x",
  "http",
+ "nix 0.29.0",
  "remoc",
  "serde",
  "serde_json",
