@@ -490,6 +490,32 @@ pub trait NotifyChannelRequest {
 }
 
 // ===========================================================================
+// EmptyPayload — zero-sized type for encoding/decoding nothing
+// ===========================================================================
+
+/// A zero-sized payload for channel types or responses that carry no
+/// additional data (e.g. `"session"` channel open, channel success).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyPayload;
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for EmptyPayload {
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    async fn encode_into(self, _stream: S) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for EmptyPayload {
+    type Error = std::convert::Infallible;
+
+    async fn decode_from(_stream: S) -> Result<Self, Self::Error> {
+        Ok(EmptyPayload)
+    }
+}
+
+// ===========================================================================
 // ManageSessionStream trait
 // ===========================================================================
 

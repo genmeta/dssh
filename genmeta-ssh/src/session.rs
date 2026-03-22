@@ -18,6 +18,7 @@ use crate::{
     channel::{ChannelMessage, ChannelRequest},
     codec::{CodecError, SshBool, SshBytes, SshString},
     constants::DEFAULT_MAX_MESSAGE_SIZE,
+    conversation::{EmptyPayload, NotifyChannelRequest, WantReplyChannelRequest},
     message::{MessageError, SshMessage},
 };
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
@@ -473,6 +474,157 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for SignalRequest {
         let mut stream = pin!(stream);
         stream.encode_one(self.signal_name).await.context(session_codec_error::CodecSnafu)?;
         Ok(())
+    }
+}
+
+// ===========================================================================
+// WantReplyChannelRequest / NotifyChannelRequest implementations
+// ===========================================================================
+
+/// Channel request `"pty-req"` — allocate a pseudo-terminal.
+#[derive(Debug, Clone)]
+pub struct PtyChannelRequest {
+    pub payload: PtyRequest,
+}
+
+impl WantReplyChannelRequest for PtyChannelRequest {
+    type Success = EmptyPayload;
+    type Payload = PtyRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("pty-req")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Channel request `"exec"` — execute a command.
+#[derive(Debug, Clone)]
+pub struct ExecChannelRequest {
+    pub payload: ExecRequest,
+}
+
+impl WantReplyChannelRequest for ExecChannelRequest {
+    type Success = EmptyPayload;
+    type Payload = ExecRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("exec")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Channel request `"shell"` — start an interactive shell.
+#[derive(Debug, Clone)]
+pub struct ShellChannelRequest;
+
+impl WantReplyChannelRequest for ShellChannelRequest {
+    type Success = EmptyPayload;
+    type Payload = EmptyPayload;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("shell")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &EmptyPayload
+    }
+}
+
+/// Channel request `"subsystem"` — start a subsystem.
+#[derive(Debug, Clone)]
+pub struct SubsystemChannelRequest {
+    pub payload: SubsystemRequest,
+}
+
+impl WantReplyChannelRequest for SubsystemChannelRequest {
+    type Success = EmptyPayload;
+    type Payload = SubsystemRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("subsystem")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Channel request `"signal"` — send a signal to the remote process.
+#[derive(Debug, Clone)]
+pub struct SignalChannelRequest {
+    pub payload: SignalRequest,
+}
+
+impl WantReplyChannelRequest for SignalChannelRequest {
+    type Success = EmptyPayload;
+    type Payload = SignalRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("signal")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Channel notification `"window-change"` — terminal size changed (no reply).
+#[derive(Debug, Clone)]
+pub struct WindowChangeChannelNotice {
+    pub payload: WindowChangeRequest,
+}
+
+impl NotifyChannelRequest for WindowChangeChannelNotice {
+    type Payload = WindowChangeRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("window-change")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Channel notification `"exit-status"` — process exited (no reply).
+#[derive(Debug, Clone)]
+pub struct ExitStatusChannelNotice {
+    pub payload: ExitStatusRequest,
+}
+
+impl NotifyChannelRequest for ExitStatusChannelNotice {
+    type Payload = ExitStatusRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("exit-status")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Channel notification `"exit-signal"` — process killed by signal (no reply).
+#[derive(Debug, Clone)]
+pub struct ExitSignalChannelNotice {
+    pub payload: ExitSignalRequest,
+}
+
+impl NotifyChannelRequest for ExitSignalChannelNotice {
+    type Payload = ExitSignalRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("exit-signal")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
     }
 }
 

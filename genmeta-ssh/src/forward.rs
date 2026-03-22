@@ -1,4 +1,5 @@
 use crate::codec::{CodecError, SshString};
+use crate::conversation::{ChannelOpen, EmptyPayload, WantReplyGlobalRequest};
 use h3x::{
     codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
     varint::VarInt,
@@ -275,5 +276,245 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ForwardedStreamlocalRequest {
         let socket_path = stream.decode_one().await.context(forward_error::CodecSnafu)?;
         let _: SshString = stream.decode_one().await.context(forward_error::CodecSnafu)?;
         Ok(Self { socket_path })
+    }
+}
+
+// ===========================================================================
+// DirectStreamlocalRequest — channel open payload for direct-streamlocal
+// ===========================================================================
+
+/// Channel open payload for `"direct-streamlocal@openssh.com"`.
+///
+/// Wire format: `socket_path(SshString) + reserved(SshString, empty) + reserved(VarInt, 0)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectStreamlocalRequest {
+    pub socket_path: SshString,
+}
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for DirectStreamlocalRequest {
+    type Output = ();
+    type Error = ForwardError;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        stream
+            .encode_one(self.socket_path)
+            .await
+            .context(forward_error::CodecSnafu)?;
+        stream
+            .encode_one(SshString::from_static(""))
+            .await
+            .context(forward_error::CodecSnafu)?;
+        stream
+            .encode_one(VarInt::from_u32(0))
+            .await
+            .context(forward_error::WriteIoSnafu)?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for DirectStreamlocalRequest {
+    type Error = ForwardError;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = std::pin::pin!(stream);
+        let socket_path = stream.decode_one().await.context(forward_error::CodecSnafu)?;
+        let _: SshString = stream.decode_one().await.context(forward_error::CodecSnafu)?;
+        let _: VarInt = stream.decode_one().await.context(forward_error::ReadIoSnafu)?;
+        Ok(Self { socket_path })
+    }
+}
+
+// ===========================================================================
+// ChannelOpen implementations
+// ===========================================================================
+
+/// Channel open for `"session"` — no extra payload.
+#[derive(Debug, Clone)]
+pub struct SessionChannelOpen;
+
+impl ChannelOpen for SessionChannelOpen {
+    type Payload = EmptyPayload;
+
+    fn channel_type(&self) -> SshString {
+        SshString::from_static("session")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &EmptyPayload
+    }
+}
+
+/// Channel open for `"direct-tcpip"`.
+#[derive(Debug, Clone)]
+pub struct DirectTcpipChannelOpen {
+    pub payload: DirectTcpipRequest,
+}
+
+impl ChannelOpen for DirectTcpipChannelOpen {
+    type Payload = DirectTcpipRequest;
+
+    fn channel_type(&self) -> SshString {
+        SshString::from_static("direct-tcpip")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Channel open for `"forwarded-tcpip"`.
+#[derive(Debug, Clone)]
+pub struct ForwardedTcpipChannelOpen {
+    pub payload: ForwardedTcpipRequest,
+}
+
+impl ChannelOpen for ForwardedTcpipChannelOpen {
+    type Payload = ForwardedTcpipRequest;
+
+    fn channel_type(&self) -> SshString {
+        SshString::from_static("forwarded-tcpip")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Channel open for `"direct-streamlocal@openssh.com"`.
+#[derive(Debug, Clone)]
+pub struct DirectStreamlocalChannelOpen {
+    pub payload: DirectStreamlocalRequest,
+}
+
+impl ChannelOpen for DirectStreamlocalChannelOpen {
+    type Payload = DirectStreamlocalRequest;
+
+    fn channel_type(&self) -> SshString {
+        SshString::from_static("direct-streamlocal@openssh.com")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Channel open for `"forwarded-streamlocal@openssh.com"`.
+#[derive(Debug, Clone)]
+pub struct ForwardedStreamlocalChannelOpen {
+    pub payload: ForwardedStreamlocalRequest,
+}
+
+impl ChannelOpen for ForwardedStreamlocalChannelOpen {
+    type Payload = ForwardedStreamlocalRequest;
+
+    fn channel_type(&self) -> SshString {
+        SshString::from_static("forwarded-streamlocal@openssh.com")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Channel open for `"socks5"` — no extra payload.
+#[derive(Debug, Clone)]
+pub struct Socks5ChannelOpen;
+
+impl ChannelOpen for Socks5ChannelOpen {
+    type Payload = EmptyPayload;
+
+    fn channel_type(&self) -> SshString {
+        SshString::from_static("socks5")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &EmptyPayload
+    }
+}
+
+// ===========================================================================
+// WantReplyGlobalRequest implementations for forwarding
+// ===========================================================================
+
+/// Global request `"tcpip-forward"` — asks the server to listen on a port.
+///
+/// Success response contains the allocated port.
+#[derive(Debug, Clone)]
+pub struct TcpipForwardGlobalRequest {
+    pub payload: TcpipForwardRequest,
+}
+
+impl WantReplyGlobalRequest for TcpipForwardGlobalRequest {
+    type Success = TcpipForwardReply;
+    type Payload = TcpipForwardRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("tcpip-forward")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Global request `"cancel-tcpip-forward"` — stops listening on a port.
+///
+/// Success response carries no data.
+#[derive(Debug, Clone)]
+pub struct CancelTcpipForwardGlobalRequest {
+    pub payload: CancelTcpipForwardRequest,
+}
+
+impl WantReplyGlobalRequest for CancelTcpipForwardGlobalRequest {
+    type Success = EmptyPayload;
+    type Payload = CancelTcpipForwardRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("cancel-tcpip-forward")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Global request `"streamlocal-forward@openssh.com"` — asks the server
+/// to listen on a Unix domain socket.
+#[derive(Debug, Clone)]
+pub struct StreamlocalForwardGlobalRequest {
+    pub payload: StreamlocalForwardRequest,
+}
+
+impl WantReplyGlobalRequest for StreamlocalForwardGlobalRequest {
+    type Success = EmptyPayload;
+    type Payload = StreamlocalForwardRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("streamlocal-forward@openssh.com")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
+/// Global request `"cancel-streamlocal-forward@openssh.com"` — stops
+/// listening on a Unix domain socket.
+#[derive(Debug, Clone)]
+pub struct CancelStreamlocalForwardGlobalRequest {
+    pub payload: CancelStreamlocalForwardRequest,
+}
+
+impl WantReplyGlobalRequest for CancelStreamlocalForwardGlobalRequest {
+    type Success = EmptyPayload;
+    type Payload = CancelStreamlocalForwardRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("cancel-streamlocal-forward@openssh.com")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
     }
 }
