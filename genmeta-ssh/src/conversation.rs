@@ -52,7 +52,6 @@ use std::sync::Arc;
 
 use h3x::{
     codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
-    quic::{self, GetStreamIdExt, ReadStream, WriteStream},
     stream_id::StreamId,
     varint::VarInt,
 };
@@ -183,10 +182,6 @@ where
 {
     #[snafu(display("failed to open new stream"))]
     OpenStream { source: ME },
-    #[snafu(display("failed to encode channel signal value"))]
-    EncodeSignalValue { source: std::io::Error },
-    #[snafu(display("failed to encode session id"))]
-    EncodeSessionId { source: std::io::Error },
     #[snafu(display("failed to encode max message size"))]
     EncodeMaxMessageSize { source: std::io::Error },
     #[snafu(display("failed to encode channel type string"))]
@@ -206,14 +201,6 @@ where
 {
     #[snafu(display("failed to accept incoming stream"))]
     AcceptStream { source: ME },
-    #[snafu(display("failed to decode channel signal value"))]
-    DecodeSignalValue { source: std::io::Error },
-    #[snafu(display("unexpected channel signal value {signal_value}"))]
-    UnexpectedSignalValue { signal_value: VarInt },
-    #[snafu(display("failed to decode session id"))]
-    DecodeSessionId { source: std::io::Error },
-    #[snafu(display("session id mismatch: expected {expected}, got {actual}"))]
-    SessionIdMismatch { expected: VarInt, actual: VarInt },
     #[snafu(display("failed to decode max message size"))]
     DecodeMaxMessageSize { source: std::io::Error },
     #[snafu(display("failed to decode channel type string"))]
@@ -614,10 +601,15 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for EmptyPayload {
 // ManageSessionStream trait
 // ===========================================================================
 
-pub trait ManageSessionStream {
-    type StreamReader: AsyncRead + ReadStream + Unpin;
-    type StreamWriter: AsyncWrite + WriteStream + Unpin;
-    type Error;
+/// Trait for managing QUIC stream creation and acceptance.
+///
+/// Implementations handle the transport-specific framing (e.g. SSH3 signal
+/// value and session ID). The [`Conversation`] receives streams already
+/// positioned past transport framing.
+pub trait ManageSessionStream: Send + Sync {
+    type StreamReader: AsyncRead + Unpin + Send;
+    type StreamWriter: AsyncWrite + Unpin + Send;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn open_stream(
         &self,
@@ -779,13 +771,14 @@ pub struct Conversation<M: ManageSessionStream> {
 }
 
 impl<M: ManageSessionStream> Conversation<M> {
-    pub async fn new(
-        mut control_stream_reader: M::StreamReader,
+    pub fn new(
+        id: StreamId,
+        control_stream_reader: M::StreamReader,
         control_stream_writer: M::StreamWriter,
         manage_stream: M,
-    ) -> Result<Self, quic::StreamError> {
-        Ok(Self {
-            id: StreamId(control_stream_reader.stream_id().await?),
+    ) -> Self {
+        Self {
+            id,
             shared: Arc::new(ConversationShared {
                 reader: OrderedAccess::new(control_stream_reader),
                 writer: OrderedAccess::new(control_stream_writer),
@@ -794,7 +787,7 @@ impl<M: ManageSessionStream> Conversation<M> {
                 auto_failures: std::sync::Mutex::new(BTreeSet::new()),
             }),
             _manage_stream: manage_stream,
-        })
+        }
     }
 
     pub fn id(&self) -> StreamId {
@@ -1012,12 +1005,14 @@ impl<M: ManageSessionStream> Conversation<M> {
     // Channel operations
     // -----------------------------------------------------------------------
 
-    /// Open a new channel by creating a QUIC stream and encoding the channel
-    /// header directly onto it.
+    /// Open a new channel.
+    ///
+    /// The transport framing (signal value and session ID) is written by the
+    /// [`ManageSessionStream`] implementation. This method writes the remaining
+    /// channel header fields: `max_message_size`, `channel_type`, and the
+    /// type-specific payload.
     ///
     /// Returns the (reader, writer) pair for subsequent channel communication.
-    /// The caller owns the streams and can encode/decode channel messages
-    /// directly.
     pub async fn open_channel<C, PE>(
         &self,
         channel: &C,
@@ -1026,7 +1021,6 @@ impl<M: ManageSessionStream> Conversation<M> {
     where
         C: ChannelOpen,
         PE: std::error::Error + Send + Sync + 'static,
-        M::Error: std::error::Error + Send + Sync + 'static,
         for<'w> C::Payload: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = PE>,
     {
         use open_channel_error::*;
@@ -1037,14 +1031,6 @@ impl<M: ManageSessionStream> Conversation<M> {
             .await
             .context(OpenStreamSnafu)?;
 
-        writer
-            .encode_one(CHANNEL_SIGNAL_VALUE)
-            .await
-            .context(EncodeSignalValueSnafu)?;
-        writer
-            .encode_one(self.id)
-            .await
-            .context(EncodeSessionIdSnafu)?;
         writer
             .encode_one(max_message_size)
             .await
@@ -1066,7 +1052,12 @@ impl<M: ManageSessionStream> Conversation<M> {
         Ok((reader, writer))
     }
 
-    /// Accept an incoming channel by reading and validating the channel header.
+    /// Accept an incoming channel.
+    ///
+    /// The transport framing (signal value and session ID) has already been
+    /// consumed by the [`ManageSessionStream`] implementation. This method
+    /// reads the remaining channel header fields: `max_message_size` and
+    /// `channel_type`.
     ///
     /// Returns an [`IncomingChannel`] holding the channel type string and the
     /// stream pair. The caller inspects the type string and then calls
@@ -1074,8 +1065,6 @@ impl<M: ManageSessionStream> Conversation<M> {
     pub async fn accept_channel(
         &self,
     ) -> Result<IncomingChannel<M>, AcceptChannelError<M::Error>>
-    where
-        M::Error: std::error::Error + Send + Sync + 'static,
     {
         use accept_channel_error::*;
 
@@ -1084,25 +1073,6 @@ impl<M: ManageSessionStream> Conversation<M> {
             .accept_stream()
             .await
             .context(AcceptStreamSnafu)?;
-
-        let signal_value: VarInt = reader
-            .decode_one()
-            .await
-            .context(DecodeSignalValueSnafu)?;
-        if signal_value != CHANNEL_SIGNAL_VALUE {
-            return Err(AcceptChannelError::UnexpectedSignalValue { signal_value });
-        }
-
-        let session_id: StreamId = reader
-            .decode_one()
-            .await
-            .context(DecodeSessionIdSnafu)?;
-        if session_id != self.id {
-            return Err(AcceptChannelError::SessionIdMismatch {
-                expected: self.id.0,
-                actual: session_id.0,
-            });
-        }
 
         let max_message_size: VarInt = reader
             .decode_one()
@@ -2112,9 +2082,12 @@ mod tests {
         // remote reads ← local writes
         let (remote_reader, local_writer) = make_half(stream_id);
 
-        let conv = Conversation::new(local_reader, local_writer, TestManageStream)
-            .await
-            .expect("conversation should be created");
+        let conv = Conversation::new(
+            StreamId(stream_id),
+            local_reader,
+            local_writer,
+            TestManageStream,
+        );
         (conv, remote_reader, remote_writer)
     }
 
@@ -3296,9 +3269,12 @@ mod tests {
             }
         }
 
-        let conv = Conversation::new(local_reader, local_writer, ArcManage(Arc::clone(&manage)))
-            .await
-            .expect("conversation should be created");
+        let conv = Conversation::new(
+            StreamId(stream_id),
+            local_reader,
+            local_writer,
+            ArcManage(Arc::clone(&manage)),
+        );
         (conv, remote_reader, remote_writer, manage)
     }
 
@@ -3381,15 +3357,10 @@ mod tests {
             .await
             .expect("open_channel should succeed");
 
-        // The remote side should see: signal_value, session_id, max_msg_size,
-        // channel_type string, then the payload (SshString).
+        // The remote side should see: max_msg_size, channel_type string,
+        // then the payload (SshString). Signal value and session ID are
+        // handled by ManageSessionStream, not written by Conversation.
         let mut rr = ch_remote_reader;
-
-        let signal: VarInt = rr.decode_one().await.unwrap();
-        assert_eq!(signal, CHANNEL_SIGNAL_VALUE);
-
-        let sid: StreamId = rr.decode_one().await.unwrap();
-        assert_eq!(sid, conv.id());
 
         let mms: VarInt = rr.decode_one().await.unwrap();
         assert_eq!(mms, max_msg_size);
@@ -3410,10 +3381,9 @@ mod tests {
         let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
         let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
 
-        // Remote encodes a channel header.
+        // Remote encodes channel data starting at max_message_size
+        // (signal value and session ID are handled by ManageSessionStream).
         let mut rw = ch_remote_writer;
-        rw.encode_one(CHANNEL_SIGNAL_VALUE).await.unwrap();
-        rw.encode_one(conv.id()).await.unwrap();
         let max_msg_size = VarInt::from_u32(1 << 20);
         rw.encode_one(max_msg_size).await.unwrap();
         rw
@@ -3452,10 +3422,9 @@ mod tests {
         let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
         let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
 
-        // Remote sends a "session" channel with no extra payload.
+        // Remote sends channel data starting at max_message_size
+        // (signal value and session ID are handled by ManageSessionStream).
         let mut rw = ch_remote_writer;
-        rw.encode_one(CHANNEL_SIGNAL_VALUE).await.unwrap();
-        rw.encode_one(conv.id()).await.unwrap();
         rw.encode_one(VarInt::from_u32(1 << 20)).await.unwrap();
         rw
             .encode_one(SshString::from_static("session"))
@@ -3470,53 +3439,6 @@ mod tests {
 
         // Use into_streams since session has no payload.
         let (_reader, _writer) = incoming.into_streams();
-    }
-
-    #[tokio::test]
-    async fn accept_channel_wrong_signal_value() {
-        let (conv, _remote_reader, _remote_writer, manage) =
-            make_channel_conversation().await;
-
-        let ch_stream_id = VarInt::from_u32(400);
-        let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
-        let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
-
-        // Send wrong signal value.
-        let mut rw = ch_remote_writer;
-        rw.encode_one(VarInt::from_u32(0xBAD)).await.unwrap();
-        AsyncWriteExt::flush(&mut rw).await.unwrap();
-
-        manage.provide_accept_stream(ch_local_reader, ch_local_writer);
-
-        let result = conv.accept_channel().await;
-        assert!(matches!(
-            result,
-            Err(AcceptChannelError::UnexpectedSignalValue { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn accept_channel_session_id_mismatch() {
-        let (conv, _remote_reader, _remote_writer, manage) =
-            make_channel_conversation().await;
-
-        let ch_stream_id = VarInt::from_u32(500);
-        let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
-        let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
-
-        // Send correct signal value but wrong session ID.
-        let mut rw = ch_remote_writer;
-        rw.encode_one(CHANNEL_SIGNAL_VALUE).await.unwrap();
-        rw.encode_one(VarInt::from_u32(9999)).await.unwrap(); // wrong ID
-        AsyncWriteExt::flush(&mut rw).await.unwrap();
-
-        manage.provide_accept_stream(ch_local_reader, ch_local_writer);
-
-        let result = conv.accept_channel().await;
-        assert!(matches!(
-            result,
-            Err(AcceptChannelError::SessionIdMismatch { .. })
-        ));
     }
 
     #[tokio::test]
@@ -3535,13 +3457,9 @@ mod tests {
             .await
             .expect("open session channel should succeed");
 
-        // Verify remote sees correct header.
+        // Verify remote sees the channel header (signal value and session ID
+        // are written by ManageSessionStream, not by Conversation).
         let mut rr = ch_remote_reader;
-        let signal: VarInt = rr.decode_one().await.unwrap();
-        assert_eq!(signal, CHANNEL_SIGNAL_VALUE);
-
-        let sid: StreamId = rr.decode_one().await.unwrap();
-        assert_eq!(sid, conv.id());
 
         let mms: VarInt = rr.decode_one().await.unwrap();
         assert_eq!(mms, VarInt::from_u32(1 << 20));
@@ -3581,19 +3499,17 @@ mod tests {
         }
 
         let conv_a = Conversation::new(
+            StreamId(stream_id),
             ctrl_a_reader,
             ctrl_a_writer,
             ArcManage2(Arc::clone(&manage_a)),
-        )
-        .await
-        .unwrap();
+        );
         let conv_b = Conversation::new(
+            StreamId(stream_id),
             ctrl_b_reader,
             ctrl_b_writer,
             ArcManage2(Arc::clone(&manage_b)),
-        )
-        .await
-        .unwrap();
+        );
 
         // Create the channel stream: A opens, B accepts.
         // A's open_stream returns (ch_a_reader, ch_a_writer).

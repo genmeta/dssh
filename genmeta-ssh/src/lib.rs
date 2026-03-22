@@ -10,6 +10,7 @@ pub mod error;
 pub mod forward;
 pub mod forward_runtime;
 pub mod message;
+pub mod protocol;
 pub mod session;
 
 pub use auth::{AuthCredential, AuthScheme, parse_authorization_header};
