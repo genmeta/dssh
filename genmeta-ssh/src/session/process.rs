@@ -10,7 +10,7 @@
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
-use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
@@ -210,12 +210,14 @@ where
     let pid = child.id().map(|id| Pid::from_raw(id as i32));
 
     // Wrap PTY master in async file, then split for concurrent read/write.
+    // Keep the raw fd for window-change ioctl (safe: file lives until end of function).
+    let master_raw_fd = pty.master.as_raw_fd();
     let master_file = std::fs::File::from(pty.master);
     let master_tokio = tokio::fs::File::from(master_file);
     let (mut master_reader, master_writer) = tokio::io::split(master_tokio);
 
     // Input relay: channel → PTY master + signal/window-change handling.
-    let input_handle = tokio::spawn(relay_input_pty(channel_reader, master_writer, pid));
+    let input_handle = tokio::spawn(relay_input_pty(channel_reader, master_writer, pid, master_raw_fd));
 
     // Output relay: PTY master → channel data.
     // EIO is expected when the child exits (slave side closes).
@@ -363,6 +365,7 @@ async fn relay_input_pty<R>(
     mut channel_reader: R,
     mut pty_writer: impl AsyncWrite + Unpin + Send,
     pid: Option<Pid>,
+    master_raw_fd: RawFd,
 ) where
     R: AsyncRead + Unpin + Send,
 {
@@ -378,7 +381,7 @@ async fn relay_input_pty<R>(
                 }
             }
             ChannelEvent::Request(incoming) => {
-                if !handle_pty_request(incoming, pid).await {
+                if !handle_pty_request(incoming, pid, master_raw_fd).await {
                     break;
                 }
             }
@@ -417,6 +420,7 @@ async fn handle_piped_request<R: AsyncRead + Unpin + Send>(
 async fn handle_pty_request<R: AsyncRead + Unpin + Send>(
     incoming: crate::conversation::IncomingChannelRequest<'_, R>,
     pid: Option<Pid>,
+    master_raw_fd: RawFd,
 ) -> bool {
     match &**incoming.request_type() {
         "signal" => {
@@ -427,13 +431,17 @@ async fn handle_pty_request<R: AsyncRead + Unpin + Send>(
             true
         }
         "window-change" => {
-            let Ok((_req, _responder)) = incoming.decode_payload::<WindowChangeRequest, SessionCodecError>().await else {
+            let Ok((req, _responder)) = incoming.decode_payload::<WindowChangeRequest, SessionCodecError>().await else {
                 return false;
             };
-            // Window-change requires the PTY master fd, which the input relay
-            // doesn't own. The caller should handle this via a channel or by
-            // restructuring. For now, we log and continue.
-            // TODO: wire up PTY master fd for window-change
+            if let Err(e) = super::pty::set_window_size_raw(master_raw_fd, &req) {
+                tracing::warn!(
+                    error = %e,
+                    cols = %req.width_cols,
+                    rows = %req.height_rows,
+                    "window-change resize failed"
+                );
+            }
             true
         }
         _ => {

@@ -104,9 +104,17 @@ pub fn allocate_pty(request: &PtyRequest) -> Result<PtyPair, PtyError> {
 ///
 /// Returns `Err` if any dimension overflows `u16` or if the ioctl fails.
 pub fn set_window_size(master: &impl AsRawFd, request: &WindowChangeRequest) -> Result<(), PtyError> {
+    set_window_size_raw(master.as_raw_fd(), request)
+}
+
+/// Update the terminal window size via a raw file descriptor.
+///
+/// # Safety
+/// The caller must ensure `fd` is a valid open PTY master file descriptor.
+pub fn set_window_size_raw(fd: std::os::fd::RawFd, request: &WindowChangeRequest) -> Result<(), PtyError> {
     let ws = winsize_from_resize(request).context(DimensionSnafu)?;
     // SAFETY: TIOCSWINSZ writes the winsize struct to the terminal driver.
-    unsafe { tiocswinsz(master.as_raw_fd(), &ws as *const libc::winsize) }.context(OsSnafu)?;
+    unsafe { tiocswinsz(fd, &ws as *const libc::winsize) }.context(OsSnafu)?;
     Ok(())
 }
 
