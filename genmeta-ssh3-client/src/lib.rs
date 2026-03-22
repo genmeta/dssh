@@ -10,7 +10,7 @@ pub mod socks5;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 pub use genmeta_ssh::SSH_VERSION;
-use h3x::codec::{DecodeExt, EncodeExt, SinkWriter, StreamReader};
+use h3x::codec::{SinkWriter, StreamReader};
 use h3x::gm_quic::H3Client;
 use h3x::message::stream::{ReadStream, WriteStream};
 use h3x::qpack::field::Protocol;
@@ -47,7 +47,7 @@ pub async fn run_env_client() -> Result<(), Box<dyn std::error::Error>> {
     let connection = ssh3.connect(&client).await?;
     if let Ok(command) = std::env::var("SSH3_EXEC") {
         let mut channel = connection
-            .open_exec_channel(command.as_bytes(), true)
+            .open_exec_channel(command.as_bytes())
             .await?;
         channel.send_eof().await?;
         let exit = print_session_events(channel.reader()).await?;
@@ -90,11 +90,9 @@ async fn run_env_shell(
         .unwrap_or(24);
 
     channel
-        .send_pty_request(&term, width_cols, height_rows, 0, 0, &[], true)
+        .send_pty_request(&term, width_cols, height_rows, 0, 0, &[])
         .await?;
-    channel.expect_success().await?;
-    channel.send_shell_request(true).await?;
-    channel.expect_success().await?;
+    channel.send_shell_request().await?;
 
     let (mut reader, mut writer) = channel.into_parts();
     let stdin_task = tokio::spawn(async move {
@@ -103,18 +101,17 @@ async fn run_env_shell(
         loop {
             let read = stdin.read(&mut buf).await?;
             if read == 0 {
-                writer
-                    .encode_one(&genmeta_ssh::SshMessage::ChannelEof)
+                genmeta_ssh::write_channel_eof(&mut writer)
                     .await
-                    .map_err(io::Error::other)?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                 return Ok::<(), io::Error>(());
             }
-            writer
-                .encode_one(&genmeta_ssh::SshMessage::ChannelData {
-                    data: buf[..read].to_vec(),
-                })
-                .await
-                .map_err(io::Error::other)?;
+            genmeta_ssh::write_channel_data(
+                &mut writer,
+                genmeta_ssh::codec::SshBytes::from(buf[..read].to_vec()),
+            )
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))?;
         }
     });
 
@@ -136,23 +133,16 @@ where
     let mut stderr = tokio::io::stderr();
     let mut exit_status = None;
 
-    loop {
-        let message = match reader.decode_one::<genmeta_ssh::SshMessage>().await {
-            Ok(message) => message,
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(Box::new(error)),
-        };
-        if let Some(event) = session::message_to_session_event(message).await? {
-            match event {
-                session::SessionEvent::Stdout(data) => stdout.write_all(&data).await?,
-                session::SessionEvent::Stderr(data) => stderr.write_all(&data).await?,
-                session::SessionEvent::ExitStatus(code) => exit_status = Some(code),
-                session::SessionEvent::ExitSignal { .. } => exit_status = Some(255),
-                session::SessionEvent::Close => break,
-                session::SessionEvent::Eof
-                | session::SessionEvent::Success
-                | session::SessionEvent::Failure => {}
-            }
+    while let Some(event) = session::read_session_event(reader).await? {
+        match event {
+            session::SessionEvent::Stdout(data) => stdout.write_all(&data).await?,
+            session::SessionEvent::Stderr(data) => stderr.write_all(&data).await?,
+            session::SessionEvent::ExitStatus(code) => exit_status = Some(code),
+            session::SessionEvent::ExitSignal { .. } => exit_status = Some(255),
+            session::SessionEvent::Close => break,
+            session::SessionEvent::Eof
+            | session::SessionEvent::Success
+            | session::SessionEvent::Failure => {}
         }
     }
 
@@ -418,8 +408,7 @@ where
             self.connection
                 .open_bi()
                 .await
-                .map_err(|source| session::ClientSessionError::Io {
-                    operation: "opening session channel stream",
+                .map_err(|source| session::ClientSessionError::OpenStream {
                     source: io::Error::other(source),
                 })?;
         session::open_session_channel(
@@ -433,31 +422,23 @@ where
     pub async fn open_exec_channel(
         &self,
         command: &[u8],
-        want_reply: bool,
     ) -> Result<
         session::SessionChannel<StreamReader<C::StreamReader>, SinkWriter<C::StreamWriter>>,
         session::ClientSessionError,
     > {
         let mut channel = self.open_session_channel().await?;
-        channel.send_exec_request(command, want_reply).await?;
-        if want_reply {
-            channel.expect_success().await?;
-        }
+        channel.send_exec_request(command).await?;
         Ok(channel)
     }
 
     pub async fn open_shell_channel(
         &self,
-        want_reply: bool,
     ) -> Result<
         session::SessionChannel<StreamReader<C::StreamReader>, SinkWriter<C::StreamWriter>>,
         session::ClientSessionError,
     > {
         let mut channel = self.open_session_channel().await?;
-        channel.send_shell_request(want_reply).await?;
-        if want_reply {
-            channel.expect_success().await?;
-        }
+        channel.send_shell_request().await?;
         Ok(channel)
     }
 }

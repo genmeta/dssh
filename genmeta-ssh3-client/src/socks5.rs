@@ -15,14 +15,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use genmeta_ssh::SshMessage;
-use h3x::codec::DecodeFrom;
+use genmeta_ssh::{
+    ChannelOpenResponse, DEFAULT_MAX_MESSAGE_SIZE, DirectTcpipChannelOpen, DirectTcpipRequest,
+    read_channel_open_response, write_channel_open,
+};
 use h3x::stream_id::StreamId;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-
-use crate::forward::write_direct_tcpip_channel_open;
 
 // ---- SOCKS5 constants (RFC 1928) ----
 
@@ -230,21 +230,31 @@ where
         factory.open_stream().await?
     };
 
-    // Write the direct-tcpip channel open header + request_data.
-    write_direct_tcpip_channel_open(
+    // Write the direct-tcpip channel open header.
+    let session_id = StreamId::try_from(conversation_id).map_err(io::Error::other)?;
+    let channel = DirectTcpipChannelOpen {
+        payload: DirectTcpipRequest {
+            dest_host: dest_addr.clone().into(),
+            dest_port: (dest_port as u32).into(),
+            originator_host: "127.0.0.1".to_owned().into(),
+            originator_port: 0u32.into(),
+        },
+    };
+    write_channel_open(
         &mut ch_writer,
-        StreamId::try_from(conversation_id).map_err(io::Error::other)?,
-        &dest_addr,
-        dest_port as u32,
-        "127.0.0.1",
-        0,
+        session_id,
+        DEFAULT_MAX_MESSAGE_SIZE,
+        &channel,
     )
-    .await?;
+    .await
+    .map_err(|e| io::Error::other(e.to_string()))?;
 
     // Read the server's response: ChannelOpenConfirmation or ChannelOpenFailure.
-    let response = SshMessage::decode_from(&mut ch_reader).await?;
-    match response {
-        SshMessage::ChannelOpenConfirmation { .. } => {
+    match read_channel_open_response(&mut ch_reader)
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?
+    {
+        ChannelOpenResponse::Confirmation { .. } => {
             // Success — send SOCKS5 success reply.
             send_reply(
                 &mut writer,
@@ -255,24 +265,11 @@ where
             )
             .await?;
         }
-        SshMessage::ChannelOpenFailure { .. } => {
+        ChannelOpenResponse::Failure(_) => {
             // Failure — send SOCKS5 connection refused reply.
             send_reply(
                 &mut writer,
                 REP_CONNECTION_REFUSED,
-                atyp,
-                &dest_atyp_bytes,
-                dest_port,
-            )
-            .await?;
-            writer.shutdown().await?;
-            return Ok(());
-        }
-        other => {
-            tracing::warn!(?other, "unexpected SSH3 message during channel open");
-            send_reply(
-                &mut writer,
-                REP_GENERAL_FAILURE,
                 atyp,
                 &dest_atyp_bytes,
                 dest_port,
