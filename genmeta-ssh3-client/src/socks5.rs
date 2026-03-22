@@ -309,9 +309,8 @@ async fn send_reply<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh::ChannelHeader;
-    use genmeta_ssh::SshMessage;
-    use h3x::codec::EncodeInto;
+    use genmeta_ssh::{ChannelHeader, ChannelMessage, ChannelOpenBody, ChannelOpenFailure, SshMessage};
+    use h3x::codec::{DecodeFrom, EncodeInto};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -377,31 +376,22 @@ mod tests {
         buf
     }
 
-    /// Simulate the SSH3 server side: read channel header + request_data, then
-    /// respond with ChannelOpenConfirmation, then echo all data back.
+    /// Simulate the SSH3 server side: read channel header (including payload),
+    /// then respond with ChannelOpenConfirmation, then echo all data back.
     async fn simulate_server_echo(
         mut server_reader: DuplexStream,
         mut server_writer: DuplexStream,
     ) {
-        // Read the channel header the client wrote.
+        // Read the full channel header (includes channel type + payload).
         let header = ChannelHeader::decode_from(&mut server_reader)
             .await
             .unwrap();
-        assert_eq!(header.channel_type, "direct-tcpip");
-
-        // Read request_data fields (dest_host, dest_port, originator_host, originator_port).
-        use genmeta_ssh::SshString;
-        use h3x::codec::DecodeExt;
-        use h3x::varint::VarInt;
-        let _dest_host = SshString::decode_from(&mut server_reader).await.unwrap();
-        let _dest_port: VarInt = server_reader.decode_one().await.unwrap();
-        let _orig_host = SshString::decode_from(&mut server_reader).await.unwrap();
-        let _orig_port: VarInt = server_reader.decode_one().await.unwrap();
+        assert!(matches!(header.body, ChannelOpenBody::DirectTcpip(_)));
 
         // Send ChannelOpenConfirmation.
-        SshMessage::ChannelOpenConfirmation {
+        SshMessage::Channel(ChannelMessage::OpenConfirmation {
             max_message_size: h3x::varint::VarInt::from(TEST_MAX_MESSAGE_SIZE as u32),
-        }
+        })
         .encode_into(&mut server_writer)
         .await
         .unwrap();
@@ -418,25 +408,16 @@ mod tests {
         mut server_reader: DuplexStream,
         mut server_writer: DuplexStream,
     ) {
-        // Read the channel header.
+        // Read the full channel header (includes channel type + payload).
         let _header = ChannelHeader::decode_from(&mut server_reader)
             .await
             .unwrap();
 
-        // Read request_data fields.
-        use genmeta_ssh::SshString;
-        use h3x::codec::DecodeExt;
-        use h3x::varint::VarInt;
-        let _dest_host = SshString::decode_from(&mut server_reader).await.unwrap();
-        let _dest_port: VarInt = server_reader.decode_one().await.unwrap();
-        let _orig_host = SshString::decode_from(&mut server_reader).await.unwrap();
-        let _orig_port: VarInt = server_reader.decode_one().await.unwrap();
-
         // Send ChannelOpenFailure.
-        SshMessage::ChannelOpenFailure {
+        SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
             reason_code: h3x::varint::VarInt::from(2u8), // SSH_OPEN_CONNECT_FAILED
-            description: "connection refused by server".to_string(),
-        }
+            description: "connection refused by server".into(),
+        }))
         .encode_into(&mut server_writer)
         .await
         .unwrap();

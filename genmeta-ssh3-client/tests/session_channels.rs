@@ -24,7 +24,7 @@ fn client_exec_channel_runs_command() {
         assert_eq!(connection.conversation_id(), 0, "conversation id should match the first CONNECT request stream id");
 
         let mut channel = connection
-            .open_exec_channel(b"echo hello-from-client", true)
+            .open_exec_channel(b"echo hello-from-client")
             .await
             .expect("open_exec_channel should succeed");
         channel.send_eof().await.expect("sending eof should succeed");

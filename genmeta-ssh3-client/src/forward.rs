@@ -57,8 +57,8 @@ mod tests {
     async fn tcpip_forward_request_roundtrip() {
         let data = encode_tcpip_forward_request("0.0.0.0", 8080).await.unwrap();
         let decoded: TcpipForwardRequest = data.as_slice().decode_one().await.unwrap();
-        assert_eq!(decoded.bind_address, "0.0.0.0");
-        assert_eq!(decoded.bind_port, 8080);
+        assert_eq!(&*decoded.bind_address, "0.0.0.0");
+        assert_eq!(decoded.bind_port.into_inner(), 8080);
     }
 
     #[tokio::test]

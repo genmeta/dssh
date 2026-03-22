@@ -498,11 +498,14 @@ pub fn exit_signal_to_legacy_status(event: SessionEvent) -> SessionEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh::SshMessage;
     use genmeta_ssh::{
-        CHANNEL_SIGNAL_VALUE, ExecRequest, ExitSignalRequest, ExitStatusRequest, PtyRequest,
-        SignalRequest, WindowChangeRequest, encode_exit_status,
+        ChannelHeader, ChannelMessage, ChannelOpenBody,
+        ChannelRequest as SshChannelRequest,
+        ExecRequest, ExitSignalRequest, ExitStatusRequest,
+        PtyRequest, SshMessage, WindowChangeRequest,
+        encode_exit_status,
     };
+    use genmeta_ssh::codec::{SshBool, SshBytes};
     use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
     use tokio::io::{AsyncReadExt, duplex};
 
@@ -521,13 +524,13 @@ mod tests {
 
     #[tokio::test]
     async fn exec_request_data_roundtrip() {
-        let data = encode_request_data(&ExecRequest {
-            command: b"echo hello".to_vec(),
+        let data = encode_request_data(ExecRequest {
+            command: SshBytes::from(b"echo hello".to_vec()),
         })
         .await
         .unwrap();
         let req = ExecRequest::decode_from(data.as_slice()).await.unwrap();
-        assert_eq!(req.command, b"echo hello");
+        assert_eq!(req.command.as_ref(), &b"echo hello"[..]);
     }
 
     #[tokio::test]
@@ -539,12 +542,10 @@ mod tests {
             let header = ChannelHeader::decode_from(&mut server_reader)
                 .await
                 .unwrap();
-            assert_eq!(header.signal_value, CHANNEL_SIGNAL_VALUE);
-            assert_eq!(header.conversation_id, 77);
-            assert_eq!(header.channel_type, "session");
-            SshMessage::ChannelOpenConfirmation {
+            assert!(matches!(header.body, ChannelOpenBody::Session));
+            SshMessage::Channel(ChannelMessage::OpenConfirmation {
                 max_message_size: VarInt::from(4096u32),
-            }
+            })
             .encode_into(&mut server_writer)
             .await
             .unwrap();
@@ -567,10 +568,10 @@ mod tests {
             let _header = ChannelHeader::decode_from(&mut server_reader)
                 .await
                 .unwrap();
-            SshMessage::ChannelOpenFailure {
+            SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
                 reason_code: VarInt::from(3u8),
                 description: "denied".into(),
-            }
+            }))
             .encode_into(&mut server_writer)
             .await
             .unwrap();
@@ -579,13 +580,13 @@ mod tests {
         let err = open_session_channel(client_reader, client_writer, 1)
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            ClientSessionError::ChannelOpenFailure {
-                reason_code: 3,
-                description,
-            } if description == "denied"
-        ));
+        match err {
+            ClientSessionError::ChannelOpenRejected { failure } => {
+                assert_eq!(failure.reason_code, VarInt::from(3u8));
+                assert_eq!(&*failure.description, "denied");
+            }
+            other => panic!("expected ChannelOpenRejected, got {other:?}"),
+        }
 
         server.await.unwrap();
     }
@@ -596,8 +597,8 @@ mod tests {
 
     #[tokio::test]
     async fn exec_request_data_hex_dump() {
-        let data = encode_request_data(&ExecRequest {
-            command: b"hi".to_vec(),
+        let data = encode_request_data(ExecRequest {
+            command: SshBytes::from(b"hi".to_vec()),
         })
         .await
         .unwrap();
@@ -611,35 +612,39 @@ mod tests {
 
     #[tokio::test]
     async fn exec_remote_command() {
-        let (mut writer, mut reader) = duplex(8192);
-        send_exec_request(&mut writer, b"echo hello", true)
-            .await
-            .unwrap();
-        drop(writer);
+        let (client_reader, mut server_writer) = duplex(8192);
+        let (mut server_reader, client_writer) = duplex(8192);
 
-        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
-        match msg {
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                assert_eq!(request_type, "exec");
-                assert!(want_reply);
-                // Verify request_data decodes to "echo hello"
-                let req = ExecRequest::decode_from(request_data.as_slice())
-                    .await
-                    .unwrap();
-                assert_eq!(req.command, b"echo hello");
+        let server = tokio::spawn(async move {
+            let msg = SshMessage::decode_from(&mut server_reader).await.unwrap();
+            match msg {
+                SshMessage::Channel(ChannelMessage::Request(
+                    SshChannelRequest::Exec { want_reply, request },
+                )) => {
+                    assert!(want_reply.0);
+                    assert_eq!(request.command.as_ref(), &b"echo hello"[..]);
+                }
+                other => panic!("expected exec ChannelRequest, got {other:?}"),
             }
-            other => panic!("expected ChannelRequest, got {other:?}"),
-        }
+            SshMessage::Channel(ChannelMessage::Success)
+                .encode_into(&mut server_writer)
+                .await
+                .unwrap();
+        });
+
+        let mut channel = SessionChannel {
+            reader: client_reader,
+            writer: client_writer,
+            max_message_size: VarInt::from(1024u32),
+        };
+        channel.send_exec_request(b"echo hello").await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn exec_request_data_allows_non_utf8_bytes() {
-        let data = encode_request_data(&ExecRequest {
-            command: vec![0x66, 0x6f, 0xff],
+        let data = encode_request_data(ExecRequest {
+            command: SshBytes::from(vec![0x66, 0x6f, 0xff]),
         })
         .await
         .unwrap();
@@ -659,23 +664,32 @@ mod tests {
 
     #[tokio::test]
     async fn shell_request() {
-        let (mut writer, mut reader) = duplex(8192);
-        send_shell_request(&mut writer, true).await.unwrap();
-        drop(writer);
+        let (client_reader, mut server_writer) = duplex(8192);
+        let (mut server_reader, client_writer) = duplex(8192);
 
-        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
-        match msg {
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                assert_eq!(request_type, "shell");
-                assert!(want_reply);
-                assert!(request_data.is_empty());
+        let server = tokio::spawn(async move {
+            let msg = SshMessage::decode_from(&mut server_reader).await.unwrap();
+            match msg {
+                SshMessage::Channel(ChannelMessage::Request(
+                    SshChannelRequest::Shell { want_reply },
+                )) => {
+                    assert!(want_reply.0);
+                }
+                other => panic!("expected shell ChannelRequest, got {other:?}"),
             }
-            other => panic!("expected ChannelRequest, got {other:?}"),
-        }
+            SshMessage::Channel(ChannelMessage::Success)
+                .encode_into(&mut server_writer)
+                .await
+                .unwrap();
+        });
+
+        let mut channel = SessionChannel {
+            reader: client_reader,
+            writer: client_writer,
+            max_message_size: VarInt::from(1024u32),
+        };
+        channel.send_shell_request().await.unwrap();
+        server.await.unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -684,25 +698,25 @@ mod tests {
 
     #[tokio::test]
     async fn pty_request_roundtrip() {
-        let data = encode_request_data(&PtyRequest {
+        let data = encode_request_data(PtyRequest {
             term_type: "xterm-256color".into(),
-            width_cols: 80,
-            height_rows: 24,
-            width_px: 640,
-            height_px: 480,
-            terminal_modes: vec![0x01, 0x00, 0x00, 0x00, 0x03],
+            width_cols: 80u32.into(),
+            height_rows: 24u32.into(),
+            width_px: 640u32.into(),
+            height_px: 480u32.into(),
+            terminal_modes: SshBytes::from(vec![0x01, 0x00, 0x00, 0x00, 0x03]),
         })
         .await
         .unwrap();
 
         // Parse with server's parser
         let parsed = PtyRequest::decode_from(data.as_slice()).await.unwrap();
-        assert_eq!(parsed.term_type, "xterm-256color");
-        assert_eq!(parsed.width_cols, 80);
-        assert_eq!(parsed.height_rows, 24);
-        assert_eq!(parsed.width_px, 640);
-        assert_eq!(parsed.height_px, 480);
-        assert_eq!(parsed.terminal_modes, vec![0x01, 0x00, 0x00, 0x00, 0x03]);
+        assert_eq!(&*parsed.term_type, "xterm-256color");
+        assert_eq!(parsed.width_cols, VarInt::from(80u32));
+        assert_eq!(parsed.height_rows, VarInt::from(24u32));
+        assert_eq!(parsed.width_px, VarInt::from(640u32));
+        assert_eq!(parsed.height_px, VarInt::from(480u32));
+        assert_eq!(parsed.terminal_modes.as_ref(), &[0x01u8, 0x00, 0x00, 0x00, 0x03][..]);
     }
 
     // -------------------------------------------------------------------
@@ -711,11 +725,11 @@ mod tests {
 
     #[tokio::test]
     async fn window_change_roundtrip() {
-        let data = encode_request_data(&WindowChangeRequest {
-            width_cols: 120,
-            height_rows: 40,
-            width_px: 960,
-            height_px: 800,
+        let data = encode_request_data(WindowChangeRequest {
+            width_cols: 120u32.into(),
+            height_rows: 40u32.into(),
+            width_px: 960u32.into(),
+            height_px: 800u32.into(),
         })
         .await
         .unwrap();
@@ -723,10 +737,10 @@ mod tests {
         let parsed = WindowChangeRequest::decode_from(data.as_slice())
             .await
             .unwrap();
-        assert_eq!(parsed.width_cols, 120);
-        assert_eq!(parsed.height_rows, 40);
-        assert_eq!(parsed.width_px, 960);
-        assert_eq!(parsed.height_px, 800);
+        assert_eq!(parsed.width_cols, VarInt::from(120u32));
+        assert_eq!(parsed.height_rows, VarInt::from(40u32));
+        assert_eq!(parsed.width_px, VarInt::from(960u32));
+        assert_eq!(parsed.height_px, VarInt::from(800u32));
     }
 
     // -------------------------------------------------------------------
@@ -735,10 +749,13 @@ mod tests {
 
     #[tokio::test]
     async fn channel_data_to_stdout() {
-        let msg = SshMessage::ChannelData {
-            data: b"hello\n".to_vec(),
-        };
-        let event = message_to_session_event(msg).await.unwrap();
+        let (mut writer, mut reader) = duplex(8192);
+        SshMessage::Channel(ChannelMessage::Data(SshBytes::from(b"hello\n".to_vec())))
+            .encode_into(&mut writer)
+            .await
+            .unwrap();
+        drop(writer);
+        let event = read_session_event(&mut reader).await.unwrap();
         assert_eq!(event, Some(SessionEvent::Stdout(b"hello\n".to_vec())));
     }
 
@@ -748,11 +765,16 @@ mod tests {
 
     #[tokio::test]
     async fn stderr_via_extended_data() {
-        let msg = SshMessage::ChannelExtendedData {
+        let (mut writer, mut reader) = duplex(8192);
+        SshMessage::Channel(ChannelMessage::ExtendedData {
             data_type: VarInt::from(1u8),
-            data: b"error output".to_vec(),
-        };
-        let event = message_to_session_event(msg).await.unwrap();
+            data: SshBytes::from(b"error output".to_vec()),
+        })
+        .encode_into(&mut writer)
+        .await
+        .unwrap();
+        drop(writer);
+        let event = read_session_event(&mut reader).await.unwrap();
         assert_eq!(event, Some(SessionEvent::Stderr(b"error output".to_vec())));
     }
 
@@ -762,15 +784,17 @@ mod tests {
 
     #[tokio::test]
     async fn exit_status_extraction() {
-        let request_data = encode_request_data(&ExitStatusRequest { exit_status: 42 })
-            .await
-            .unwrap();
-        let msg = SshMessage::ChannelRequest {
-            request_type: "exit-status".into(),
-            want_reply: false,
-            request_data,
-        };
-        let event = message_to_session_event(msg).await.unwrap();
+        let (mut writer, mut reader) = duplex(8192);
+        SshMessage::Channel(ChannelMessage::Request(SshChannelRequest::ExitStatus(
+            ExitStatusRequest {
+                exit_status: VarInt::from(42u32),
+            },
+        )))
+        .encode_into(&mut writer)
+        .await
+        .unwrap();
+        drop(writer);
+        let event = read_session_event(&mut reader).await.unwrap();
         assert_eq!(event, Some(SessionEvent::ExitStatus(42)));
     }
 
@@ -780,14 +804,16 @@ mod tests {
 
     #[tokio::test]
     async fn exit_status_zero() {
-        let request_data = encode_request_data(&ExitStatusRequest { exit_status: 0 })
-            .await
-            .unwrap();
+        let request_data = encode_request_data(ExitStatusRequest {
+            exit_status: VarInt::from(0u32),
+        })
+        .await
+        .unwrap();
         let code = ExitStatusRequest::decode_from(request_data.as_slice())
             .await
             .unwrap()
             .exit_status;
-        assert_eq!(code, 0);
+        assert_eq!(code, VarInt::from(0u32));
     }
 
     // -------------------------------------------------------------------
@@ -796,14 +822,16 @@ mod tests {
 
     #[tokio::test]
     async fn exit_status_255() {
-        let request_data = encode_request_data(&ExitStatusRequest { exit_status: 255 })
-            .await
-            .unwrap();
+        let request_data = encode_request_data(ExitStatusRequest {
+            exit_status: VarInt::from(255u32),
+        })
+        .await
+        .unwrap();
         let code = ExitStatusRequest::decode_from(request_data.as_slice())
             .await
             .unwrap()
             .exit_status;
-        assert_eq!(code, 255);
+        assert_eq!(code, VarInt::from(255u32));
     }
 
     // -------------------------------------------------------------------
@@ -831,14 +859,21 @@ mod tests {
 
     #[tokio::test]
     async fn eof_and_close_events() {
-        let eof_event = message_to_session_event(SshMessage::ChannelEof)
+        let (mut writer, mut reader) = duplex(8192);
+        SshMessage::Channel(ChannelMessage::Eof)
+            .encode_into(&mut writer)
             .await
             .unwrap();
+        SshMessage::Channel(ChannelMessage::Close)
+            .encode_into(&mut writer)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let eof_event = read_session_event(&mut reader).await.unwrap();
         assert_eq!(eof_event, Some(SessionEvent::Eof));
 
-        let close_event = message_to_session_event(SshMessage::ChannelClose)
-            .await
-            .unwrap();
+        let close_event = read_session_event(&mut reader).await.unwrap();
         assert_eq!(close_event, Some(SessionEvent::Close));
     }
 
@@ -848,14 +883,21 @@ mod tests {
 
     #[tokio::test]
     async fn success_and_failure_events() {
-        let success = message_to_session_event(SshMessage::ChannelSuccess)
+        let (mut writer, mut reader) = duplex(8192);
+        SshMessage::Channel(ChannelMessage::Success)
+            .encode_into(&mut writer)
             .await
             .unwrap();
+        SshMessage::Channel(ChannelMessage::Failure)
+            .encode_into(&mut writer)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let success = read_session_event(&mut reader).await.unwrap();
         assert_eq!(success, Some(SessionEvent::Success));
 
-        let failure = message_to_session_event(SshMessage::ChannelFailure)
-            .await
-            .unwrap();
+        let failure = read_session_event(&mut reader).await.unwrap();
         assert_eq!(failure, Some(SessionEvent::Failure));
     }
 
@@ -875,34 +917,31 @@ mod tests {
 
         // Server writes responses
         let server_task = tokio::spawn(async move {
-            SshMessage::ChannelSuccess
+            SshMessage::Channel(ChannelMessage::Success)
                 .encode_into(&mut server_writer)
                 .await
                 .unwrap();
-            SshMessage::ChannelData {
-                data: b"hello\n".to_vec(),
-            }
+            SshMessage::Channel(ChannelMessage::Data(SshBytes::from(
+                b"hello\n".to_vec(),
+            )))
             .encode_into(&mut server_writer)
             .await
             .unwrap();
 
-            let exit_data = encode_request_data(&ExitStatusRequest { exit_status: 0 })
-                .await
-                .unwrap();
-            SshMessage::ChannelRequest {
-                request_type: "exit-status".into(),
-                want_reply: false,
-                request_data: exit_data,
-            }
+            SshMessage::Channel(ChannelMessage::Request(SshChannelRequest::ExitStatus(
+                ExitStatusRequest {
+                    exit_status: VarInt::from(0u32),
+                },
+            )))
             .encode_into(&mut server_writer)
             .await
             .unwrap();
 
-            SshMessage::ChannelEof
+            SshMessage::Channel(ChannelMessage::Eof)
                 .encode_into(&mut server_writer)
                 .await
                 .unwrap();
-            SshMessage::ChannelClose
+            SshMessage::Channel(ChannelMessage::Close)
                 .encode_into(&mut server_writer)
                 .await
                 .unwrap();
@@ -913,13 +952,9 @@ mod tests {
         // Client reads and converts to SessionEvents
         let mut events = Vec::new();
         loop {
-            match SshMessage::decode_from(&mut client_reader).await {
-                Ok(msg) => {
-                    if let Some(event) = message_to_session_event(msg).await.unwrap() {
-                        events.push(event);
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            match read_session_event(&mut client_reader).await {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -944,30 +979,38 @@ mod tests {
 
     #[tokio::test]
     async fn send_pty_request_wire_format() {
-        let (mut writer, mut reader) = duplex(8192);
-        send_pty_request(&mut writer, "xterm", 80, 24, 0, 0, &[], true)
+        let (client_reader, mut server_writer) = duplex(8192);
+        let (mut server_reader, client_writer) = duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let msg = SshMessage::decode_from(&mut server_reader).await.unwrap();
+            match msg {
+                SshMessage::Channel(ChannelMessage::Request(
+                    SshChannelRequest::PtyReq { want_reply, request },
+                )) => {
+                    assert!(want_reply.0);
+                    assert_eq!(&*request.term_type, "xterm");
+                    assert_eq!(request.width_cols, VarInt::from(80u32));
+                    assert_eq!(request.height_rows, VarInt::from(24u32));
+                }
+                other => panic!("expected pty-req ChannelRequest, got {other:?}"),
+            }
+            SshMessage::Channel(ChannelMessage::Success)
+                .encode_into(&mut server_writer)
+                .await
+                .unwrap();
+        });
+
+        let mut channel = SessionChannel {
+            reader: client_reader,
+            writer: client_writer,
+            max_message_size: VarInt::from(1024u32),
+        };
+        channel
+            .send_pty_request("xterm", 80, 24, 0, 0, &[])
             .await
             .unwrap();
-        drop(writer);
-
-        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
-        match msg {
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                assert_eq!(request_type, "pty-req");
-                assert!(want_reply);
-                let parsed = PtyRequest::decode_from(request_data.as_slice())
-                    .await
-                    .unwrap();
-                assert_eq!(parsed.term_type, "xterm");
-                assert_eq!(parsed.width_cols, 80);
-                assert_eq!(parsed.height_rows, 24);
-            }
-            other => panic!("expected ChannelRequest, got {other:?}"),
-        }
+        server.await.unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -976,56 +1019,56 @@ mod tests {
 
     #[tokio::test]
     async fn send_window_change_wire_format() {
-        let (mut writer, mut reader) = duplex(8192);
-        send_window_change(&mut writer, 120, 40, 960, 800)
+        let (client_reader, _server_writer) = duplex(8192);
+        let (mut server_reader, client_writer) = duplex(8192);
+
+        let mut channel = SessionChannel {
+            reader: client_reader,
+            writer: client_writer,
+            max_message_size: VarInt::from(1024u32),
+        };
+        channel
+            .send_window_change(120, 40, 960, 800)
             .await
             .unwrap();
-        drop(writer);
+        drop(channel);
 
-        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
+        let msg = SshMessage::decode_from(&mut server_reader).await.unwrap();
         match msg {
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                assert_eq!(request_type, "window-change");
-                assert!(!want_reply, "window-change must have want_reply=false");
-                let parsed = WindowChangeRequest::decode_from(request_data.as_slice())
-                    .await
-                    .unwrap();
-                assert_eq!(parsed.width_cols, 120);
-                assert_eq!(parsed.height_rows, 40);
-                assert_eq!(parsed.width_px, 960);
-                assert_eq!(parsed.height_px, 800);
+            SshMessage::Channel(ChannelMessage::Request(
+                SshChannelRequest::WindowChange(request),
+            )) => {
+                assert_eq!(request.width_cols, VarInt::from(120u32));
+                assert_eq!(request.height_rows, VarInt::from(40u32));
+                assert_eq!(request.width_px, VarInt::from(960u32));
+                assert_eq!(request.height_px, VarInt::from(800u32));
             }
-            other => panic!("expected ChannelRequest, got {other:?}"),
+            other => panic!("expected window-change ChannelRequest, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn send_signal_request_wire_format() {
-        let (mut writer, mut reader) = duplex(8192);
-        send_signal_request(&mut writer, "TERM", false)
-            .await
-            .unwrap();
-        drop(writer);
+        let (client_reader, _server_writer) = duplex(8192);
+        let (mut server_reader, client_writer) = duplex(8192);
 
-        let msg = SshMessage::decode_from(&mut reader).await.unwrap();
+        let mut channel = SessionChannel {
+            reader: client_reader,
+            writer: client_writer,
+            max_message_size: VarInt::from(1024u32),
+        };
+        channel.send_signal("TERM", false).await.unwrap();
+        drop(channel);
+
+        let msg = SshMessage::decode_from(&mut server_reader).await.unwrap();
         match msg {
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                assert_eq!(request_type, "signal");
-                assert!(!want_reply);
-                let parsed = SignalRequest::decode_from(request_data.as_slice())
-                    .await
-                    .unwrap();
-                assert_eq!(parsed.signal_name, "TERM");
+            SshMessage::Channel(ChannelMessage::Request(
+                SshChannelRequest::Signal { want_reply, request },
+            )) => {
+                assert!(!want_reply.0);
+                assert_eq!(&*request.signal_name, "TERM");
             }
-            other => panic!("expected ChannelRequest, got {other:?}"),
+            other => panic!("expected signal ChannelRequest, got {other:?}"),
         }
     }
 
@@ -1044,18 +1087,18 @@ mod tests {
         drop(channel);
 
         let data = SshMessage::decode_from(&mut peer_reader).await.unwrap();
-        assert_eq!(
-            data,
-            SshMessage::ChannelData {
-                data: b"hello".to_vec(),
+        match data {
+            SshMessage::Channel(ChannelMessage::Data(bytes)) => {
+                assert_eq!(bytes.as_ref(), &b"hello"[..]);
             }
-        );
+            other => panic!("expected channel data, got {other:?}"),
+        }
         let eof = SshMessage::decode_from(&mut peer_reader).await.unwrap();
-        assert_eq!(eof, SshMessage::ChannelEof);
+        assert!(matches!(eof, SshMessage::Channel(ChannelMessage::Eof)));
     }
 
     #[tokio::test]
-    async fn session_channel_expect_success_consumes_reply() {
+    async fn session_channel_recv_event_returns_success() {
         let (mut server_writer, client_reader) = duplex(8192);
         let (other_reader, other_writer) = duplex(8192);
         let mut channel = SessionChannel {
@@ -1064,13 +1107,14 @@ mod tests {
             max_message_size: VarInt::from(1024u32),
         };
 
-        SshMessage::ChannelSuccess
+        SshMessage::Channel(ChannelMessage::Success)
             .encode_into(&mut server_writer)
             .await
             .unwrap();
         drop(server_writer);
 
-        channel.expect_success().await.unwrap();
+        let event = channel.recv_event().await.unwrap();
+        assert_eq!(event, Some(SessionEvent::Success));
         drop(other_reader);
     }
 
@@ -1083,16 +1127,16 @@ mod tests {
         let (mut server_writer, mut client_reader) = duplex(8192);
 
         // Server sends stdout then stderr
-        SshMessage::ChannelData {
-            data: b"stdout data".to_vec(),
-        }
+        SshMessage::Channel(ChannelMessage::Data(SshBytes::from(
+            b"stdout data".to_vec(),
+        )))
         .encode_into(&mut server_writer)
         .await
         .unwrap();
-        SshMessage::ChannelExtendedData {
+        SshMessage::Channel(ChannelMessage::ExtendedData {
             data_type: VarInt::from(1u8),
-            data: b"stderr data".to_vec(),
-        }
+            data: SshBytes::from(b"stderr data".to_vec()),
+        })
         .encode_into(&mut server_writer)
         .await
         .unwrap();
@@ -1103,17 +1147,13 @@ mod tests {
         let mut stderr = Vec::new();
 
         loop {
-            match SshMessage::decode_from(&mut client_reader).await {
-                Ok(msg) => {
-                    if let Some(event) = message_to_session_event(msg).await.unwrap() {
-                        match event {
-                            SessionEvent::Stdout(data) => stdout.extend(data),
-                            SessionEvent::Stderr(data) => stderr.extend(data),
-                            _ => {}
-                        }
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            match read_session_event(&mut client_reader).await {
+                Ok(Some(event)) => match event {
+                    SessionEvent::Stdout(data) => stdout.extend(data),
+                    SessionEvent::Stderr(data) => stderr.extend(data),
+                    _ => {}
+                },
+                Ok(None) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -1128,20 +1168,20 @@ mod tests {
 
     #[tokio::test]
     async fn exit_signal_decodes_to_exit_signal_event() {
-        let request_data = encode_request_data(&ExitSignalRequest {
-            signal_name: "TERM".into(),
-            core_dumped: false,
-            error_message: "terminated".into(),
-            language_tag: "en".into(),
-        })
+        let (mut writer, mut reader) = duplex(8192);
+        SshMessage::Channel(ChannelMessage::Request(SshChannelRequest::ExitSignal(
+            ExitSignalRequest {
+                signal_name: "TERM".into(),
+                core_dumped: SshBool(false),
+                error_message: "terminated".into(),
+                language_tag: "en".into(),
+            },
+        )))
+        .encode_into(&mut writer)
         .await
         .unwrap();
-        let msg = SshMessage::ChannelRequest {
-            request_type: "exit-signal".into(),
-            want_reply: false,
-            request_data,
-        };
-        let event = message_to_session_event(msg).await.unwrap();
+        drop(writer);
+        let event = read_session_event(&mut reader).await.unwrap();
         assert_eq!(
             event,
             Some(SessionEvent::ExitSignal {
@@ -1155,20 +1195,20 @@ mod tests {
 
     #[tokio::test]
     async fn exit_signal_with_core_dump() {
-        let request_data = encode_request_data(&ExitSignalRequest {
-            signal_name: "SEGV".into(),
-            core_dumped: true,
-            error_message: "segfault".into(),
-            language_tag: String::new(),
-        })
+        let (mut writer, mut reader) = duplex(8192);
+        SshMessage::Channel(ChannelMessage::Request(SshChannelRequest::ExitSignal(
+            ExitSignalRequest {
+                signal_name: "SEGV".into(),
+                core_dumped: SshBool(true),
+                error_message: "segfault".into(),
+                language_tag: "".into(),
+            },
+        )))
+        .encode_into(&mut writer)
         .await
         .unwrap();
-        let msg = SshMessage::ChannelRequest {
-            request_type: "exit-signal".into(),
-            want_reply: false,
-            request_data,
-        };
-        let event = message_to_session_event(msg).await.unwrap();
+        drop(writer);
+        let event = read_session_event(&mut reader).await.unwrap();
         assert_eq!(
             event,
             Some(SessionEvent::ExitSignal {
@@ -1187,15 +1227,17 @@ mod tests {
     #[tokio::test]
     async fn exit_status_still_decodes_correctly() {
         for code in [0u32, 1, 42, 127, 255] {
-            let request_data = encode_request_data(&ExitStatusRequest { exit_status: code })
-                .await
-                .unwrap();
-            let msg = SshMessage::ChannelRequest {
-                request_type: "exit-status".into(),
-                want_reply: false,
-                request_data,
-            };
-            let event = message_to_session_event(msg).await.unwrap();
+            let (mut writer, mut reader) = duplex(8192);
+            SshMessage::Channel(ChannelMessage::Request(SshChannelRequest::ExitStatus(
+                ExitStatusRequest {
+                    exit_status: VarInt::from(code),
+                },
+            )))
+            .encode_into(&mut writer)
+            .await
+            .unwrap();
+            drop(writer);
+            let event = read_session_event(&mut reader).await.unwrap();
             assert_eq!(event, Some(SessionEvent::ExitStatus(code)));
         }
     }
