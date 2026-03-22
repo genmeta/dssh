@@ -8,6 +8,7 @@
 //! The main server process implements the trait and serves it; the child
 //! process uses the client to accept and open channels.
 
+pub mod client;
 pub mod process;
 pub mod pty;
 pub mod signal;
