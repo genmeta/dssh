@@ -24,7 +24,10 @@ pub use constants::{
     CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION, SUPPORTED_SSH_VERSIONS,
 };
 pub use conversation::{
-    Conversation, ConversationError, IncomingGlobal, IncomingGlobalRequest, ManageSessionStream,
+    AcceptError, Conversation, DecodedGlobalRequest, IncomingGlobal, IncomingGlobalNotice,
+    IncomingGlobalRequest, ManageSessionStream, NotifyGlobalRequest, RespondFailureError,
+    RespondSuccessError, SendNotifyError, SendRequestError, SessionPoisonedError,
+    WantReplyGlobalRequest,
 };
 pub use error::{Ssh3Error, ssh3_error};
 pub use forward::{
