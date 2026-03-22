@@ -170,11 +170,12 @@ where
 // forwarded-streamlocal@openssh.com channel request_data encoding
 // ---------------------------------------------------------------------------
 
-/// Encode forwarded-streamlocal@openssh.com channel request_data fields onto a stream.
-///
-/// Fields:
-/// - socket_path: SshString
-/// - reserved: SshString (empty)
+// Encode forwarded-streamlocal@openssh.com channel request_data fields onto a stream.
+//
+// Fields:
+// - socket_path: SshString
+// - reserved: SshString (empty)
+
 // ---------------------------------------------------------------------------
 // ReverseStreamlocalForwarder
 // ---------------------------------------------------------------------------

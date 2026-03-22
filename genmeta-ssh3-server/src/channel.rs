@@ -120,6 +120,7 @@ async fn write_global_reply<W: AsyncWrite + Send + Unpin>(
 }
 
 /// Encode a raw global-request message onto a stream.
+#[cfg(test)]
 async fn encode_raw_global_request<W: AsyncWrite + Send + Unpin>(
     writer: &mut W,
     request_type: &str,

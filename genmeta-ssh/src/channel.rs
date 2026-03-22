@@ -352,7 +352,7 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for ChannelRequest {
             Self::Shell { .. } => Ok(()),
             Self::Subsystem { request, .. } => {
                 stream
-                    .encode_one(SshString::from(request.subsystem_name.clone()))
+                    .encode_one(request.subsystem_name.clone())
                     .await
                     .context(channel_error::CodecSnafu)?;
                 Ok(())

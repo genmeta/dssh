@@ -73,13 +73,14 @@ async fn abort_listener_entry(entry: ReverseTcpListenerEntry) {
 // forwarded-tcpip channel request_data encoding/decoding
 // ---------------------------------------------------------------------------
 
-/// Encode forwarded-tcpip channel request_data fields onto a stream.
-///
-/// Fields (RFC 4254 §7.2):
-/// - connected_address: SshString
-/// - connected_port: VarInt
-/// - originator_address: SshString
-/// - originator_port: VarInt
+// Encode forwarded-tcpip channel request_data fields onto a stream.
+//
+// Fields (RFC 4254 §7.2):
+// - connected_address: SshString
+// - connected_port: VarInt
+// - originator_address: SshString
+// - originator_port: VarInt
+
 // ---------------------------------------------------------------------------
 // ReverseTcpForwarder
 // ---------------------------------------------------------------------------
