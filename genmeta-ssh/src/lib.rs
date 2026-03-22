@@ -16,16 +16,16 @@ pub use auth::{AuthCredential, AuthScheme, parse_authorization_header};
 pub use byte_channel::{ChannelReader, ChannelWriter};
 pub use channel::{
     ChannelHeader, ChannelMessage, ChannelOpenBody, ChannelOpenFailure, ChannelRequest,
-    ChannelType, GlobalRequest, GlobalRequestNotice, GlobalRequestPayload, GlobalRequestRequest,
-    RequestSuccess,
+    ChannelType,
 };
 pub use codec::{SshBool, SshString};
 pub use constants::{
     CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION, SUPPORTED_SSH_VERSIONS,
 };
 pub use conversation::{
-    AcceptError, Conversation, DecodedGlobalRequest, IncomingGlobal, IncomingGlobalNotice,
-    IncomingGlobalRequest, ManageSessionStream, NotifyGlobalRequest, RespondFailureError,
+    AcceptChannelError, AcceptError, ChannelOpen, Conversation, DecodedGlobalRequest,
+    IncomingChannel, IncomingGlobal, IncomingGlobalNotice, IncomingGlobalRequest,
+    ManageSessionStream, NotifyGlobalRequest, OpenChannelError, RespondFailureError,
     RespondSuccessError, SendNotifyError, SendRequestError, SessionPoisonedError,
     WantReplyGlobalRequest,
 };

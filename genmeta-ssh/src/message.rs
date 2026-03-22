@@ -9,12 +9,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
     channel::{
-        ChannelError, ChannelMessage, ChannelOpenFailure, ChannelRequest, GlobalRequest,
-        RequestSuccess,
+        ChannelError, ChannelMessage, ChannelOpenFailure, ChannelRequest,
         UnknownBody,
     },
     codec::{CodecError, SshString},
-    forward::ForwardError,
     session::SessionCodecError,
 };
 
@@ -23,9 +21,6 @@ use crate::{
 pub enum MessageError {
     #[snafu(display("message codec failed"))]
     Codec { source: CodecError },
-
-    #[snafu(display("message forward codec failed"))]
-    Forward { source: ForwardError },
 
     #[snafu(display("message session codec failed"))]
     SessionCodec { source: SessionCodecError },
@@ -43,9 +38,6 @@ pub enum MessageError {
     UnknownMessageType { message_type: VarInt },
 }
 
-const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
-const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
-const SSH_MSG_REQUEST_FAILURE: VarInt = VarInt::from_u32(82);
 const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: VarInt = VarInt::from_u32(91);
 const SSH_MSG_CHANNEL_OPEN_FAILURE: VarInt = VarInt::from_u32(92);
 const SSH_MSG_CHANNEL_DATA: VarInt = VarInt::from_u32(94);
@@ -56,20 +48,19 @@ const SSH_MSG_CHANNEL_REQUEST: VarInt = VarInt::from_u32(98);
 const SSH_MSG_CHANNEL_SUCCESS: VarInt = VarInt::from_u32(99);
 const SSH_MSG_CHANNEL_FAILURE: VarInt = VarInt::from_u32(100);
 
+/// SSH channel message, decoded from a per-channel QUIC stream.
+///
+/// Global requests are no longer part of this enum — they are handled
+/// directly by [`Conversation`](crate::conversation::Conversation) using
+/// trait-based encoding/decoding on the control stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshMessage {
-    GlobalRequest(GlobalRequest),
-    RequestSuccess(RequestSuccess),
-    RequestFailure,
     Channel(ChannelMessage),
 }
 
 impl SshMessage {
     pub fn message_type(&self) -> VarInt {
         match self {
-            SshMessage::GlobalRequest(_) => SSH_MSG_GLOBAL_REQUEST,
-            SshMessage::RequestSuccess(_) => SSH_MSG_REQUEST_SUCCESS,
-            SshMessage::RequestFailure => SSH_MSG_REQUEST_FAILURE,
             SshMessage::Channel(channel) => match channel {
                 ChannelMessage::OpenConfirmation { .. } => SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
                 ChannelMessage::OpenFailure(_) => SSH_MSG_CHANNEL_OPEN_FAILURE,
@@ -92,26 +83,6 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for SshMessage {
     async fn encode_into(self, stream: S) -> Result<(), MessageError> {
         let mut stream = pin!(stream);
         match self {
-            SshMessage::GlobalRequest(request) => {
-                stream
-                    .encode_one(SSH_MSG_GLOBAL_REQUEST)
-                    .await
-                    .context(message_error::WriteIoSnafu)?;
-                stream.encode_one(request).await.context(message_error::ChannelSnafu)?;
-            }
-            SshMessage::RequestSuccess(success) => {
-                stream
-                    .encode_one(SSH_MSG_REQUEST_SUCCESS)
-                    .await
-                    .context(message_error::WriteIoSnafu)?;
-                stream.encode_one(success).await.context(message_error::ChannelSnafu)?;
-            }
-            SshMessage::RequestFailure => {
-                stream
-                    .encode_one(SSH_MSG_REQUEST_FAILURE)
-                    .await
-                    .context(message_error::WriteIoSnafu)?;
-            }
             SshMessage::Channel(message) => match message {
                 ChannelMessage::OpenConfirmation { max_message_size } => {
                     stream
@@ -201,39 +172,6 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshMessage {
             .await
             .context(message_error::ReadIoSnafu)?;
         match msg_type {
-            SSH_MSG_GLOBAL_REQUEST => {
-                let request_type: SshString = stream.decode_one().await.context(message_error::CodecSnafu)?;
-                let want_reply: crate::codec::SshBool = stream
-                    .decode_one()
-                    .await
-                    .context(message_error::CodecSnafu)?;
-                let request = match &*request_type {
-                    "tcpip-forward" => crate::channel::GlobalRequestPayload::TcpipForward(
-                        stream.decode_one().await.context(message_error::ForwardSnafu)?,
-                    ),
-                    "cancel-tcpip-forward" => crate::channel::GlobalRequestPayload::CancelTcpipForward(
-                        stream.decode_one().await.context(message_error::ForwardSnafu)?,
-                    ),
-                    "streamlocal-forward@openssh.com" => crate::channel::GlobalRequestPayload::StreamlocalForward(
-                        stream.decode_one().await.context(message_error::ForwardSnafu)?,
-                    ),
-                    "cancel-streamlocal-forward@openssh.com" => crate::channel::GlobalRequestPayload::CancelStreamlocalForward(
-                        stream.decode_one().await.context(message_error::ForwardSnafu)?,
-                    ),
-                    _ => crate::channel::GlobalRequestPayload::Unknown {
-                        request_type,
-                        body: UnknownBody::Unavailable,
-                    },
-                };
-                Ok(Self::GlobalRequest(crate::channel::GlobalRequest::from_payload(
-                    request,
-                    want_reply,
-                )))
-            }
-            SSH_MSG_REQUEST_SUCCESS => Ok(Self::RequestSuccess(RequestSuccess::Unknown(
-                UnknownBody::Unavailable,
-            ))),
-            SSH_MSG_REQUEST_FAILURE => Ok(Self::RequestFailure),
             SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
                 let max_message_size = stream.decode_one().await.context(message_error::ReadIoSnafu)?;
                 Ok(Self::Channel(ChannelMessage::OpenConfirmation { max_message_size }))

@@ -61,6 +61,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::codec::{CodecError, SshBool, SshString};
+use crate::constants::CHANNEL_SIGNAL_VALUE;
 
 const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
 const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
@@ -159,6 +160,53 @@ pub enum RespondFailureError {
     Flush { source: std::io::Error },
     #[snafu(display("session has been poisoned"))]
     SessionPoisoned,
+}
+
+/// Error from [`Conversation::open_channel`].
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum OpenChannelError<ME, PE>
+where
+    ME: std::error::Error + Send + Sync + 'static,
+    PE: std::error::Error + Send + Sync + 'static,
+{
+    #[snafu(display("failed to open new stream"))]
+    OpenStream { source: ME },
+    #[snafu(display("failed to encode channel signal value"))]
+    EncodeSignalValue { source: std::io::Error },
+    #[snafu(display("failed to encode session id"))]
+    EncodeSessionId { source: std::io::Error },
+    #[snafu(display("failed to encode max message size"))]
+    EncodeMaxMessageSize { source: std::io::Error },
+    #[snafu(display("failed to encode channel type string"))]
+    EncodeChannelType { source: CodecError },
+    #[snafu(display("failed to encode channel open payload"))]
+    EncodePayload { source: PE },
+    #[snafu(display("failed to flush channel stream after open"))]
+    Flush { source: std::io::Error },
+}
+
+/// Error from [`Conversation::accept_channel`].
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum AcceptChannelError<ME>
+where
+    ME: std::error::Error + Send + Sync + 'static,
+{
+    #[snafu(display("failed to accept incoming stream"))]
+    AcceptStream { source: ME },
+    #[snafu(display("failed to decode channel signal value"))]
+    DecodeSignalValue { source: std::io::Error },
+    #[snafu(display("unexpected channel signal value {signal_value}"))]
+    UnexpectedSignalValue { signal_value: VarInt },
+    #[snafu(display("failed to decode session id"))]
+    DecodeSessionId { source: std::io::Error },
+    #[snafu(display("session id mismatch: expected {expected}, got {actual}"))]
+    SessionIdMismatch { expected: VarInt, actual: VarInt },
+    #[snafu(display("failed to decode max message size"))]
+    DecodeMaxMessageSize { source: std::io::Error },
+    #[snafu(display("failed to decode channel type string"))]
+    DecodeChannelType { source: CodecError },
 }
 
 // ===========================================================================
@@ -288,6 +336,29 @@ pub trait NotifyGlobalRequest {
     fn request_type(&self) -> SshString;
 
     /// Reference to the payload.
+    fn payload(&self) -> &Self::Payload;
+}
+
+// ===========================================================================
+// Channel open trait
+// ===========================================================================
+
+/// A channel type that can be opened.
+///
+/// Implementors define the channel-type-specific payload. The channel type
+/// name (e.g. `"session"`, `"direct-tcpip"`) is returned by
+/// [`channel_type`](Self::channel_type) and written as an SSH string in the
+/// channel header. Encode/decode bounds on `Payload` are checked at the
+/// call site against the concrete stream types.
+pub trait ChannelOpen {
+    /// Channel-type-specific payload (e.g. `DirectTcpipRequest` for
+    /// `"direct-tcpip"`). Types without extra payload can use `()`.
+    type Payload: Clone;
+
+    /// The SSH channel type name.
+    fn channel_type(&self) -> SshString;
+
+    /// Reference to the channel-type-specific payload.
     fn payload(&self) -> &Self::Payload;
 }
 
@@ -687,6 +758,173 @@ impl<M: ManageSessionStream> Conversation<M> {
                 shared: Arc::clone(&self.shared),
             }))
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Channel operations
+    // -----------------------------------------------------------------------
+
+    /// Open a new channel by creating a QUIC stream and encoding the channel
+    /// header directly onto it.
+    ///
+    /// Returns the (reader, writer) pair for subsequent channel communication.
+    /// The caller owns the streams and can encode/decode channel messages
+    /// directly.
+    pub async fn open_channel<C, PE>(
+        &self,
+        channel: &C,
+        max_message_size: VarInt,
+    ) -> Result<(M::StreamReader, M::StreamWriter), OpenChannelError<M::Error, PE>>
+    where
+        C: ChannelOpen,
+        PE: std::error::Error + Send + Sync + 'static,
+        M::Error: std::error::Error + Send + Sync + 'static,
+        for<'w> C::Payload: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = PE>,
+    {
+        use open_channel_error::*;
+
+        let (reader, mut writer) = self
+            ._manage_stream
+            .open_stream()
+            .await
+            .context(OpenStreamSnafu)?;
+
+        writer
+            .encode_one(CHANNEL_SIGNAL_VALUE)
+            .await
+            .context(EncodeSignalValueSnafu)?;
+        writer
+            .encode_one(self.id)
+            .await
+            .context(EncodeSessionIdSnafu)?;
+        writer
+            .encode_one(max_message_size)
+            .await
+            .context(EncodeMaxMessageSizeSnafu)?;
+        writer
+            .encode_one(channel.channel_type())
+            .await
+            .context(EncodeChannelTypeSnafu)?;
+        channel
+            .payload()
+            .clone()
+            .encode_into(&mut writer)
+            .await
+            .context(EncodePayloadSnafu)?;
+        AsyncWriteExt::flush(&mut writer)
+            .await
+            .context(FlushSnafu)?;
+
+        Ok((reader, writer))
+    }
+
+    /// Accept an incoming channel by reading and validating the channel header.
+    ///
+    /// Returns an [`IncomingChannel`] holding the channel type string and the
+    /// stream pair. The caller inspects the type string and then calls
+    /// [`IncomingChannel::decode_payload`] to decode the type-specific payload.
+    pub async fn accept_channel(
+        &self,
+    ) -> Result<IncomingChannel<M>, AcceptChannelError<M::Error>>
+    where
+        M::Error: std::error::Error + Send + Sync + 'static,
+    {
+        use accept_channel_error::*;
+
+        let (mut reader, writer) = self
+            ._manage_stream
+            .accept_stream()
+            .await
+            .context(AcceptStreamSnafu)?;
+
+        let signal_value: VarInt = reader
+            .decode_one()
+            .await
+            .context(DecodeSignalValueSnafu)?;
+        if signal_value != CHANNEL_SIGNAL_VALUE {
+            return Err(AcceptChannelError::UnexpectedSignalValue { signal_value });
+        }
+
+        let session_id: StreamId = reader
+            .decode_one()
+            .await
+            .context(DecodeSessionIdSnafu)?;
+        if session_id != self.id {
+            return Err(AcceptChannelError::SessionIdMismatch {
+                expected: self.id.0,
+                actual: session_id.0,
+            });
+        }
+
+        let max_message_size: VarInt = reader
+            .decode_one()
+            .await
+            .context(DecodeMaxMessageSizeSnafu)?;
+        let channel_type: SshString = reader
+            .decode_one()
+            .await
+            .context(DecodeChannelTypeSnafu)?;
+
+        Ok(IncomingChannel {
+            channel_type,
+            max_message_size,
+            reader,
+            writer,
+        })
+    }
+}
+
+// ===========================================================================
+// Incoming channel
+// ===========================================================================
+
+/// An incoming channel whose header has been read and validated.
+///
+/// The caller inspects [`channel_type`](Self::channel_type) to determine what
+/// kind of channel was opened, then calls [`decode_payload`](Self::decode_payload)
+/// to decode the channel-type-specific payload and obtain the stream pair.
+///
+/// Unlike global requests, channels have independent streams. Dropping this
+/// struct simply closes the streams — it does **not** poison the session.
+pub struct IncomingChannel<M: ManageSessionStream> {
+    channel_type: SshString,
+    max_message_size: VarInt,
+    reader: M::StreamReader,
+    writer: M::StreamWriter,
+}
+
+impl<M: ManageSessionStream> IncomingChannel<M> {
+    /// The SSH channel type string sent by the remote (e.g. `"session"`).
+    pub fn channel_type(&self) -> &SshString {
+        &self.channel_type
+    }
+
+    /// The maximum message size for this channel.
+    pub fn max_message_size(&self) -> VarInt {
+        self.max_message_size
+    }
+
+    /// Decode the channel-type-specific payload from the stream, consuming
+    /// `self`.
+    ///
+    /// Returns the decoded payload together with the (reader, writer) pair
+    /// for subsequent channel communication.
+    pub async fn decode_payload<T, DE>(
+        mut self,
+    ) -> Result<(T, M::StreamReader, M::StreamWriter), DE>
+    where
+        T: for<'r> DecodeFrom<&'r mut M::StreamReader, Error = DE>,
+    {
+        let value = T::decode_from(&mut self.reader).await?;
+        Ok((value, self.reader, self.writer))
+    }
+
+    /// Skip payload decoding and directly return the stream pair.
+    ///
+    /// Useful for channel types that carry no additional payload (e.g.
+    /// `"session"` channels).
+    pub fn into_streams(self) -> (M::StreamReader, M::StreamWriter) {
+        (self.reader, self.writer)
     }
 }
 
@@ -1260,7 +1498,7 @@ mod tests {
             assert!(want_reply);
             // Read payload
             let payload: SshString = remote_reader.decode_one().await.unwrap();
-            assert_eq!(&*payload, "hello");
+            assert_eq!(payload.as_ref() as &[u8], b"hello");
             // Send success with value 99
             remote_send_success(&mut remote_writer, 99).await;
         });
@@ -1309,7 +1547,7 @@ mod tests {
         assert_eq!(&*req_type, "test-notice");
         assert!(!want_reply);
         let payload: SshString = remote_reader.decode_one().await.unwrap();
-        assert_eq!(&*payload, "world");
+        assert_eq!(payload.as_ref() as &[u8], b"world");
     }
 
     // -- accept() tests -----------------------------------------------------
@@ -2202,5 +2440,442 @@ mod tests {
         assert_eq!(rt.as_ref() as &[u8], b"empty");
         assert!(wr);
         // No payload bytes to read
+    }
+
+    // =======================================================================
+    // Channel tests
+    // =======================================================================
+
+    // -- Channel-capable ManageSessionStream ---------------------------------
+
+    use tokio::sync::mpsc as tokio_mpsc;
+
+    /// A ManageSessionStream impl that delivers pre-created stream pairs via
+    /// channels, allowing tests to control what the "remote" sends/receives.
+    struct ChannelManageStream {
+        /// Sender for streams returned by open_stream().
+        open_tx: tokio_mpsc::UnboundedSender<(MockReader, MockWriter)>,
+        open_rx: std::sync::Mutex<tokio_mpsc::UnboundedReceiver<(MockReader, MockWriter)>>,
+        /// Sender for streams returned by accept_stream().
+        accept_tx: tokio_mpsc::UnboundedSender<(MockReader, MockWriter)>,
+        accept_rx: std::sync::Mutex<tokio_mpsc::UnboundedReceiver<(MockReader, MockWriter)>>,
+    }
+
+    impl ChannelManageStream {
+        fn new() -> Self {
+            let (open_tx, open_rx) = tokio_mpsc::unbounded_channel();
+            let (accept_tx, accept_rx) = tokio_mpsc::unbounded_channel();
+            Self {
+                open_tx,
+                open_rx: std::sync::Mutex::new(open_rx),
+                accept_tx,
+                accept_rx: std::sync::Mutex::new(accept_rx),
+            }
+        }
+
+        /// Enqueue a stream pair that open_stream() will return.
+        fn provide_open_stream(&self, reader: MockReader, writer: MockWriter) {
+            self.open_tx.send((reader, writer)).unwrap();
+        }
+
+        /// Enqueue a stream pair that accept_stream() will return.
+        fn provide_accept_stream(&self, reader: MockReader, writer: MockWriter) {
+            self.accept_tx.send((reader, writer)).unwrap();
+        }
+    }
+
+    impl ManageSessionStream for ChannelManageStream {
+        type StreamReader = MockReader;
+        type StreamWriter = MockWriter;
+        type Error = std::convert::Infallible;
+
+        async fn open_stream(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+            let pair = self.open_rx.lock().unwrap().try_recv()
+                .expect("no open_stream pair provided");
+            Ok(pair)
+        }
+
+        async fn accept_stream(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+            let pair = self.accept_rx.lock().unwrap().try_recv()
+                .expect("no accept_stream pair provided");
+            Ok(pair)
+        }
+    }
+
+    /// Create a Conversation backed by ChannelManageStream plus the control
+    /// stream remote ends.
+    async fn make_channel_conversation() -> (
+        Conversation<impl ManageSessionStream<StreamReader = MockReader, StreamWriter = MockWriter, Error = std::convert::Infallible>>,
+        MockReader,
+        MockWriter,
+        Arc<ChannelManageStream>,
+    ) {
+        let stream_id = VarInt::from_u32(42);
+        let (local_reader, remote_writer) = make_half(stream_id);
+        let (remote_reader, local_writer) = make_half(stream_id);
+
+        let manage = Arc::new(ChannelManageStream::new());
+
+        // We need to pass the manage stream by value. Create a wrapper that
+        // delegates to the Arc'd version.
+        struct ArcManage(Arc<ChannelManageStream>);
+        impl ManageSessionStream for ArcManage {
+            type StreamReader = MockReader;
+            type StreamWriter = MockWriter;
+            type Error = std::convert::Infallible;
+
+            async fn open_stream(
+                &self,
+            ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+                self.0.open_stream().await
+            }
+
+            async fn accept_stream(
+                &self,
+            ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+                self.0.accept_stream().await
+            }
+        }
+
+        let conv = Conversation::new(local_reader, local_writer, ArcManage(Arc::clone(&manage)))
+            .await
+            .expect("conversation should be created");
+        (conv, remote_reader, remote_writer, manage)
+    }
+
+    // -- Test ChannelOpen implementation ------------------------------------
+
+    /// A test channel type: "test-channel" with SshString payload.
+    struct TestChannel {
+        payload: TestPayload,
+    }
+
+    impl ChannelOpen for TestChannel {
+        type Payload = TestPayload;
+
+        fn channel_type(&self) -> SshString {
+            SshString::from_static("test-channel")
+        }
+
+        fn payload(&self) -> &Self::Payload {
+            &self.payload
+        }
+    }
+
+    /// A session channel with no extra payload.
+    struct SessionChannel;
+
+    /// Empty payload that encodes nothing.
+    #[derive(Clone)]
+    struct EmptyChannelPayload;
+
+    impl<S: AsyncWrite + Send> EncodeInto<S> for EmptyChannelPayload {
+        type Output = ();
+        type Error = std::io::Error;
+
+        async fn encode_into(self, _stream: S) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl<S: AsyncRead + Send> DecodeFrom<S> for EmptyChannelPayload {
+        type Error = std::io::Error;
+
+        async fn decode_from(_stream: S) -> Result<Self, Self::Error> {
+            Ok(EmptyChannelPayload)
+        }
+    }
+
+    impl ChannelOpen for SessionChannel {
+        type Payload = EmptyChannelPayload;
+
+        fn channel_type(&self) -> SshString {
+            SshString::from_static("session")
+        }
+
+        fn payload(&self) -> &Self::Payload {
+            &EmptyChannelPayload
+        }
+    }
+
+    // -- Channel tests ------------------------------------------------------
+
+    #[tokio::test]
+    async fn open_channel_roundtrip() {
+        let (conv, _remote_reader, _remote_writer, manage) =
+            make_channel_conversation().await;
+
+        // Create a channel stream pair: the "channel reader/writer" that the
+        // remote side will use.
+        let ch_stream_id = VarInt::from_u32(100);
+        let (ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
+        let (ch_local_reader, _ch_remote_writer) = make_half(ch_stream_id);
+        manage.provide_open_stream(ch_local_reader, ch_local_writer);
+
+        let max_msg_size = VarInt::from_u32(1 << 20);
+        let channel = TestChannel {
+            payload: TestPayload(SshString::from_static("hello")),
+        };
+
+        let (_reader, _writer) = conv
+            .open_channel(&channel, max_msg_size)
+            .await
+            .expect("open_channel should succeed");
+
+        // The remote side should see: signal_value, session_id, max_msg_size,
+        // channel_type string, then the payload (SshString).
+        let mut rr = ch_remote_reader;
+
+        let signal: VarInt = rr.decode_one().await.unwrap();
+        assert_eq!(signal, CHANNEL_SIGNAL_VALUE);
+
+        let sid: StreamId = rr.decode_one().await.unwrap();
+        assert_eq!(sid, conv.id());
+
+        let mms: VarInt = rr.decode_one().await.unwrap();
+        assert_eq!(mms, max_msg_size);
+
+        let ct: SshString = rr.decode_one().await.unwrap();
+        assert_eq!(ct.as_ref() as &[u8], b"test-channel");
+
+        let payload: SshString = rr.decode_one().await.unwrap();
+        assert_eq!(payload.as_ref() as &[u8], b"hello");
+    }
+
+    #[tokio::test]
+    async fn accept_channel_roundtrip() {
+        let (conv, _remote_reader, _remote_writer, manage) =
+            make_channel_conversation().await;
+
+        let ch_stream_id = VarInt::from_u32(200);
+        let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
+        let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
+
+        // Remote encodes a channel header.
+        let mut rw = ch_remote_writer;
+        rw.encode_one(CHANNEL_SIGNAL_VALUE).await.unwrap();
+        rw.encode_one(conv.id()).await.unwrap();
+        let max_msg_size = VarInt::from_u32(1 << 20);
+        rw.encode_one(max_msg_size).await.unwrap();
+        rw
+            .encode_one(SshString::from_static("test-channel"))
+            .await
+            .unwrap();
+        rw
+            .encode_one(SshString::from_static("world"))
+            .await
+            .unwrap();
+        AsyncWriteExt::flush(&mut rw).await.unwrap();
+
+        // accept_stream will return the local side of the channel
+        manage.provide_accept_stream(ch_local_reader, ch_local_writer);
+
+        let incoming = conv.accept_channel().await.expect("accept_channel should succeed");
+
+        assert_eq!(incoming.channel_type().as_ref() as &[u8], b"test-channel");
+        assert_eq!(incoming.max_message_size(), max_msg_size);
+
+        // Decode the channel-type-specific payload.
+        let (payload, _reader, _writer): (SshString, _, _) = incoming
+            .decode_payload()
+            .await
+            .expect("decode_payload should succeed");
+
+        assert_eq!(payload.as_ref() as &[u8], b"world");
+    }
+
+    #[tokio::test]
+    async fn accept_channel_session_no_payload() {
+        let (conv, _remote_reader, _remote_writer, manage) =
+            make_channel_conversation().await;
+
+        let ch_stream_id = VarInt::from_u32(300);
+        let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
+        let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
+
+        // Remote sends a "session" channel with no extra payload.
+        let mut rw = ch_remote_writer;
+        rw.encode_one(CHANNEL_SIGNAL_VALUE).await.unwrap();
+        rw.encode_one(conv.id()).await.unwrap();
+        rw.encode_one(VarInt::from_u32(1 << 20)).await.unwrap();
+        rw
+            .encode_one(SshString::from_static("session"))
+            .await
+            .unwrap();
+        AsyncWriteExt::flush(&mut rw).await.unwrap();
+
+        manage.provide_accept_stream(ch_local_reader, ch_local_writer);
+
+        let incoming = conv.accept_channel().await.unwrap();
+        assert_eq!(incoming.channel_type().as_ref() as &[u8], b"session");
+
+        // Use into_streams since session has no payload.
+        let (_reader, _writer) = incoming.into_streams();
+    }
+
+    #[tokio::test]
+    async fn accept_channel_wrong_signal_value() {
+        let (conv, _remote_reader, _remote_writer, manage) =
+            make_channel_conversation().await;
+
+        let ch_stream_id = VarInt::from_u32(400);
+        let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
+        let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
+
+        // Send wrong signal value.
+        let mut rw = ch_remote_writer;
+        rw.encode_one(VarInt::from_u32(0xBAD)).await.unwrap();
+        AsyncWriteExt::flush(&mut rw).await.unwrap();
+
+        manage.provide_accept_stream(ch_local_reader, ch_local_writer);
+
+        let result = conv.accept_channel().await;
+        assert!(matches!(
+            result,
+            Err(AcceptChannelError::UnexpectedSignalValue { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_channel_session_id_mismatch() {
+        let (conv, _remote_reader, _remote_writer, manage) =
+            make_channel_conversation().await;
+
+        let ch_stream_id = VarInt::from_u32(500);
+        let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
+        let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
+
+        // Send correct signal value but wrong session ID.
+        let mut rw = ch_remote_writer;
+        rw.encode_one(CHANNEL_SIGNAL_VALUE).await.unwrap();
+        rw.encode_one(VarInt::from_u32(9999)).await.unwrap(); // wrong ID
+        AsyncWriteExt::flush(&mut rw).await.unwrap();
+
+        manage.provide_accept_stream(ch_local_reader, ch_local_writer);
+
+        let result = conv.accept_channel().await;
+        assert!(matches!(
+            result,
+            Err(AcceptChannelError::SessionIdMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_channel_session_no_payload() {
+        let (conv, _remote_reader, _remote_writer, manage) =
+            make_channel_conversation().await;
+
+        let ch_stream_id = VarInt::from_u32(600);
+        let (ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
+        let (ch_local_reader, _ch_remote_writer) = make_half(ch_stream_id);
+
+        manage.provide_open_stream(ch_local_reader, ch_local_writer);
+
+        let (_reader, _writer) = conv
+            .open_channel(&SessionChannel, VarInt::from_u32(1 << 20))
+            .await
+            .expect("open session channel should succeed");
+
+        // Verify remote sees correct header.
+        let mut rr = ch_remote_reader;
+        let signal: VarInt = rr.decode_one().await.unwrap();
+        assert_eq!(signal, CHANNEL_SIGNAL_VALUE);
+
+        let sid: StreamId = rr.decode_one().await.unwrap();
+        assert_eq!(sid, conv.id());
+
+        let mms: VarInt = rr.decode_one().await.unwrap();
+        assert_eq!(mms, VarInt::from_u32(1 << 20));
+
+        let ct: SshString = rr.decode_one().await.unwrap();
+        assert_eq!(ct.as_ref() as &[u8], b"session");
+        // No payload bytes follow.
+    }
+
+    #[tokio::test]
+    async fn open_and_accept_channel_full_roundtrip() {
+        // Test open on one side, accept on the other.
+        let stream_id = VarInt::from_u32(42);
+
+        // Create two conversations sharing a control stream.
+        let (ctrl_a_reader, ctrl_b_writer) = make_half(stream_id);
+        let (ctrl_b_reader, ctrl_a_writer) = make_half(stream_id);
+
+        let manage_a = Arc::new(ChannelManageStream::new());
+        let manage_b = Arc::new(ChannelManageStream::new());
+
+        struct ArcManage2(Arc<ChannelManageStream>);
+        impl ManageSessionStream for ArcManage2 {
+            type StreamReader = MockReader;
+            type StreamWriter = MockWriter;
+            type Error = std::convert::Infallible;
+            async fn open_stream(
+                &self,
+            ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+                self.0.open_stream().await
+            }
+            async fn accept_stream(
+                &self,
+            ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+                self.0.accept_stream().await
+            }
+        }
+
+        let conv_a = Conversation::new(
+            ctrl_a_reader,
+            ctrl_a_writer,
+            ArcManage2(Arc::clone(&manage_a)),
+        )
+        .await
+        .unwrap();
+        let conv_b = Conversation::new(
+            ctrl_b_reader,
+            ctrl_b_writer,
+            ArcManage2(Arc::clone(&manage_b)),
+        )
+        .await
+        .unwrap();
+
+        // Create the channel stream: A opens, B accepts.
+        // A's open_stream returns (ch_a_reader, ch_a_writer).
+        // B's accept_stream returns (ch_b_reader, ch_b_writer).
+        // We need ch_a_writer → ch_b_reader and ch_b_writer → ch_a_reader.
+        let ch_id = VarInt::from_u32(700);
+        let (ch_b_reader, ch_a_writer) = make_half(ch_id);
+        let (ch_a_reader, ch_b_writer) = make_half(ch_id);
+
+        manage_a.provide_open_stream(ch_a_reader, ch_a_writer);
+        manage_b.provide_accept_stream(ch_b_reader, ch_b_writer);
+
+        let max_msg = VarInt::from_u32(1 << 20);
+        let channel = TestChannel {
+            payload: TestPayload(SshString::from_static("roundtrip")),
+        };
+
+        // A opens the channel.
+        let (_a_reader, _a_writer) = conv_a
+            .open_channel(&channel, max_msg)
+            .await
+            .expect("A should open channel");
+
+        // B accepts the channel.
+        let incoming = conv_b
+            .accept_channel()
+            .await
+            .expect("B should accept channel");
+
+        assert_eq!(incoming.channel_type().as_ref() as &[u8], b"test-channel");
+        assert_eq!(incoming.max_message_size(), max_msg);
+
+        let (payload, _b_reader, _b_writer): (SshString, _, _) = incoming
+            .decode_payload()
+            .await
+            .expect("B should decode payload");
+
+        assert_eq!(payload.as_ref() as &[u8], b"roundtrip");
     }
 }
