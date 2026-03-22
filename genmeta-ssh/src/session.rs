@@ -574,6 +574,24 @@ impl WantReplyChannelRequest for SignalChannelRequest {
     }
 }
 
+/// Channel notification `"signal"` — send signal without expecting reply.
+#[derive(Debug, Clone)]
+pub struct SignalChannelNotice {
+    pub payload: SignalRequest,
+}
+
+impl NotifyChannelRequest for SignalChannelNotice {
+    type Payload = SignalRequest;
+
+    fn request_type(&self) -> SshString {
+        SshString::from_static("signal")
+    }
+
+    fn payload(&self) -> &Self::Payload {
+        &self.payload
+    }
+}
+
 /// Channel notification `"window-change"` — terminal size changed (no reply).
 #[derive(Debug, Clone)]
 pub struct WindowChangeChannelNotice {

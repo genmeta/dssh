@@ -23,14 +23,19 @@ pub use constants::{
     CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION, SUPPORTED_SSH_VERSIONS,
 };
 pub use conversation::{
-    AcceptChannelError, AcceptError, ChannelEvent, ChannelOpen, ChannelResponder, Conversation,
-    DecodedGlobalRequest, EmptyPayload, IncomingChannel, IncomingChannelRequest, IncomingGlobal,
-    IncomingGlobalNotice, IncomingGlobalRequest, ManageSessionStream, NotifyChannelRequest,
-    NotifyGlobalRequest, OpenChannelError, ReadChannelEventError, RespondChannelFailureError,
+    AcceptChannelError, AcceptError, ChannelEvent, ChannelOpen, ChannelOpenResponse,
+    ChannelResponder, Conversation, DecodedGlobalRequest, EmptyPayload, IncomingChannel,
+    IncomingChannelRequest, IncomingGlobal, IncomingGlobalNotice, IncomingGlobalRequest,
+    ManageSessionStream, NotifyChannelRequest, NotifyGlobalRequest, OpenChannelError,
+    ReadChannelEventError, ReadChannelOpenResponseError, RespondChannelFailureError,
     RespondChannelSuccessError, RespondFailureError, RespondSuccessError, SendChannelNoticeError,
     SendChannelRequestError, SendNotifyError, SendRequestError, SessionPoisonedError,
-    WantReplyChannelRequest, WantReplyGlobalRequest, read_channel_event, send_channel_notice,
-    send_channel_request,
+    WantReplyChannelRequest, WantReplyGlobalRequest, WriteChannelCloseError,
+    WriteChannelDataError, WriteChannelEofError, WriteChannelOpenConfirmationError,
+    WriteChannelOpenError, WriteChannelOpenFailureError, read_channel_event,
+    read_channel_open_response, send_channel_notice, send_channel_request, write_channel_close,
+    write_channel_data, write_channel_eof, write_channel_open, write_channel_open_confirmation,
+    write_channel_open_failure,
 };
 pub use error::{Ssh3Error, ssh3_error};
 pub use forward::{
@@ -51,9 +56,9 @@ pub use session::{
     AuthResult, ChildBootstrap, ExecChannelRequest, ExecRequest, ExitSignalChannelNotice,
     ExitSignalRequest, ExitStatusChannelNotice, ExitStatusRequest, PtyChannelRequest, PtyRequest,
     RequestAction, SessionError, SessionInit, SessionLoopAction, ShellChannelRequest,
-    SignalChannelRequest, SignalRequest, Ssh3Transport, Ssh3TransportClient, Ssh3TransportServer,
-    Ssh3TransportServerShared, SubsystemChannelRequest, SubsystemRequest, TransportError,
-    WindowChangeChannelNotice, WindowChangeRequest, encode_exit_status, handle_request,
-    handle_session_loop_message, open_session_channel, run_message_loop_with_sender,
+    SignalChannelNotice, SignalChannelRequest, SignalRequest, Ssh3Transport, Ssh3TransportClient,
+    Ssh3TransportServer, Ssh3TransportServerShared, SubsystemChannelRequest, SubsystemRequest,
+    TransportError, WindowChangeChannelNotice, WindowChangeRequest, encode_exit_status,
+    handle_request, handle_session_loop_message, open_session_channel, run_message_loop_with_sender,
     run_session_request_loop,
 };
