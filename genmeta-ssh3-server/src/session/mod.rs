@@ -1,6 +1,6 @@
 use std::os::fd::AsRawFd;
 
-use genmeta_ssh::{ChannelEvent, SignalRequest, SshMessage, open_session_channel, run_session_request_loop};
+use genmeta_ssh::{ChannelMessage, SignalRequest, SshMessage, open_session_channel, run_session_request_loop};
 use h3x::codec::EncodeExt;
 use tokio::{
     io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -29,16 +29,18 @@ where
 pub async fn handle_server_session_channel<R, W>(
     reader: R,
     writer: W,
-) -> io::Result<(mpsc::Receiver<ChannelEvent>, W)>
+) -> io::Result<(mpsc::Receiver<ChannelMessage>, W)>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    open_session_channel(reader, writer).await
+    open_session_channel(reader, writer)
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 pub async fn session_request_loop<W>(
-    event_rx: mpsc::Receiver<ChannelEvent>,
+    event_rx: mpsc::Receiver<ChannelMessage>,
     writer: W,
 ) -> io::Result<()>
 where
@@ -58,16 +60,18 @@ where
                     Ok(pair) => {
                         state.pty_pair = Some(pair);
                         tracing::info!(term = %req.term_type);
-                        if want_reply {
-                            writer.encode_one(&SshMessage::ChannelSuccess).await?;
+                        if want_reply.0 {
+                            writer.encode_one(SshMessage::Channel(ChannelMessage::Success)).await
+                                .map_err(|e| io::Error::other(e.to_string()))?;
                             writer.flush().await?;
                         }
                         Ok(())
                     }
                     Err(error) => {
                         tracing::warn!("PTY allocation failed: {error}");
-                        if want_reply {
-                            writer.encode_one(&SshMessage::ChannelFailure).await?;
+                        if want_reply.0 {
+                            writer.encode_one(SshMessage::Channel(ChannelMessage::Failure)).await
+                                .map_err(|e| io::Error::other(e.to_string()))?;
                             writer.flush().await?;
                         }
                         Ok(())
@@ -89,7 +93,7 @@ where
             Box::pin(async move {
                 let shell = std::env::var_os("SHELL")
                     .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"));
-                run_exec(shell.as_os_str(), &command, writer, event_rx, state.pty_pair.take()).await
+                run_exec(shell.as_os_str(), command.as_ref().as_ref(), writer, event_rx, state.pty_pair.take()).await
             })
         },
         |writer, event_rx, state| {
@@ -102,4 +106,5 @@ where
         |_signal: SignalRequest, _state| Box::pin(async move { Ok(()) }),
     )
     .await
+    .map_err(|e| io::Error::other(e.to_string()))
 }

@@ -214,16 +214,17 @@ async fn send_reply_with_bound_addr<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh::ChannelHeader;
+    use genmeta_ssh::{ChannelHeader, ChannelOpenBody};
+    use h3x::stream_id::StreamId;
+    use h3x::varint::VarInt;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn test_header() -> ChannelHeader {
         ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "socks5".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId::try_from(1u64).unwrap(),
+            max_message_size: VarInt::from(1u32 << 20),
+            body: ChannelOpenBody::Socks5,
         }
     }
 

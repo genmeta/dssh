@@ -249,11 +249,11 @@ impl Ssh3Protocol {
                     return Ok(StreamVerdict::Accepted);
                 }
             };
-            registry.get(&header.conversation_id.into_inner()).and_then(|slot| {
+            registry.get(&header.session_id.into_inner()).and_then(|slot| {
                 let state = match slot.state() {
                     Ok(state) => state,
                     Err(error) => {
-                        tracing::warn!(error = %Report::from_error(error), conversation_id = %header.conversation_id, "failed to inspect conversation state");
+                        tracing::warn!(error = %Report::from_error(error), conversation_id = %header.session_id, "failed to inspect conversation state");
                         return None;
                     }
                 };
@@ -270,7 +270,7 @@ impl Ssh3Protocol {
             }
         } else {
             tracing::warn!(
-                conversation_id = %header.conversation_id,
+                conversation_id = %header.session_id,
                 "no registered conversation for stream, dropping"
             );
         }
@@ -543,6 +543,7 @@ impl<C: quic::Connection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use genmeta_ssh::ChannelOpenBody;
     use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
     use h3x::stream_id::StreamId;
     use tokio::io::{AsyncReadExt, duplex};
@@ -561,7 +562,7 @@ mod tests {
     /// Helper: encode a ChannelHeader into raw bytes.
     async fn encode_channel_header(header: &ChannelHeader) -> Vec<u8> {
         let (mut w, mut r) = duplex(4096);
-        header.encode_into(&mut w).await.unwrap();
+        header.clone().encode_into(&mut w).await.unwrap();
         drop(w);
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).await.unwrap();
@@ -583,7 +584,7 @@ mod tests {
     /// success, None if the conversation is not registered.
     async fn simulate_dispatch(protocol: &Ssh3Protocol, header: &ChannelHeader) -> bool {
         let registry = protocol.registry.lock().unwrap();
-        registry.contains_key(&header.conversation_id)
+        registry.contains_key(&header.session_id.into_inner())
     }
 
     #[tokio::test]
@@ -645,10 +646,9 @@ mod tests {
             .unwrap();
 
         let header = ChannelHeader {
-            signal_value: SSH3_SIGNAL_VALUE,
-            conversation_id: 12345,
-            channel_type: "session".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId::try_from(12345u64).unwrap(),
+            max_message_size: VarInt::from(1u32 << 20),
+            body: ChannelOpenBody::Session,
         };
 
         // Verify the conversation is registered.
@@ -665,10 +665,9 @@ mod tests {
             .unwrap();
         drop(w);
         let decoded = ChannelHeader::decode_from(&mut r).await.unwrap();
-        assert_eq!(decoded.signal_value, SSH3_SIGNAL_VALUE);
-        assert_eq!(decoded.conversation_id, 12345);
-        assert_eq!(decoded.channel_type, "session");
-        assert_eq!(decoded.max_message_size, 1 << 20);
+        assert_eq!(decoded.session_id, StreamId::try_from(12345u64).unwrap());
+        assert_eq!(decoded.body, ChannelOpenBody::Session);
+        assert_eq!(decoded.max_message_size, VarInt::from(1u32 << 20));
     }
 
     #[tokio::test]
@@ -677,10 +676,9 @@ mod tests {
         // No conversation registered for id 9999.
 
         let header = ChannelHeader {
-            signal_value: SSH3_SIGNAL_VALUE,
-            conversation_id: 9999,
-            channel_type: "session".into(),
-            max_message_size: 65535,
+            session_id: StreamId::try_from(9999u64).unwrap(),
+            max_message_size: VarInt::from(65535u32),
+            body: ChannelOpenBody::Session,
         };
 
         // Should not panic — just returns false (not registered).
@@ -690,10 +688,10 @@ mod tests {
     #[tokio::test]
     async fn signal_value_detection() {
         // Verify SSH3 signal value constant.
-        assert_eq!(SSH3_SIGNAL_VALUE, 0xaf3627e6);
+        assert_eq!(SSH3_SIGNAL_VALUE, 0xaf3627e6u64);
 
         // Encode as varint and verify it's 8 bytes.
-        let encoded = encode_varint(SSH3_SIGNAL_VALUE as u64).await;
+        let encoded = encode_varint(SSH3_SIGNAL_VALUE.into_inner()).await;
         assert_eq!(encoded.len(), 8);
 
         // Verify the 8-byte encoding matches expected.
@@ -757,10 +755,9 @@ mod tests {
     #[tokio::test]
     async fn channel_header_with_ssh3_signal_roundtrip() {
         let header = ChannelHeader {
-            signal_value: SSH3_SIGNAL_VALUE,
-            conversation_id: 42,
-            channel_type: "session".into(),
-            max_message_size: 65535,
+            session_id: StreamId::try_from(42u64).unwrap(),
+            max_message_size: VarInt::from(65535u32),
+            body: ChannelOpenBody::Session,
         };
         let data = encode_channel_header(&header).await;
 

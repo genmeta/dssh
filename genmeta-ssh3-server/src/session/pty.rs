@@ -172,7 +172,9 @@ pub fn set_window_size(master_fd: RawFd, request: &WindowChangeRequest) -> Resul
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    use genmeta_ssh::codec::SshBytes;
     use h3x::codec::{DecodeExt, EncodeExt};
+    use h3x::varint::VarInt;
     use genmeta_ssh::SignalRequest;
 
     // -------------------------------------------------------------------
@@ -183,15 +185,15 @@ mod tests {
     async fn parse_pty_request_roundtrip() {
         let original = PtyRequest {
             term_type: "xterm-256color".into(),
-            width_cols: 80,
-            height_rows: 24,
-            width_px: 640,
-            height_px: 480,
-            terminal_modes: vec![0x01, 0x00, 0x00, 0x00, 0x03],
+            width_cols: VarInt::from(80u32),
+            height_rows: VarInt::from(24u32),
+            width_px: VarInt::from(640u32),
+            height_px: VarInt::from(480u32),
+            terminal_modes: SshBytes::from(vec![0x01, 0x00, 0x00, 0x00, 0x03]),
         };
 
         let mut encoded = Vec::new();
-        encoded.encode_one(&original).await.unwrap();
+        encoded.encode_one(original.clone()).await.unwrap();
         let mut reader = encoded.as_slice();
         let parsed: PtyRequest = reader.decode_one().await.unwrap();
 
@@ -210,14 +212,14 @@ mod tests {
     #[tokio::test]
     async fn window_change_codec_roundtrip() {
         let original = WindowChangeRequest {
-            width_cols: 120,
-            height_rows: 40,
-            width_px: 960,
-            height_px: 800,
+            width_cols: VarInt::from(120u32),
+            height_rows: VarInt::from(40u32),
+            width_px: VarInt::from(960u32),
+            height_px: VarInt::from(800u32),
         };
 
         let mut encoded = Vec::new();
-        encoded.encode_one(&original).await.unwrap();
+        encoded.encode_one(original.clone()).await.unwrap();
         let mut reader = encoded.as_slice();
         let parsed: WindowChangeRequest = reader.decode_one().await.unwrap();
 
@@ -238,11 +240,11 @@ mod tests {
         };
 
         let mut encoded = Vec::new();
-        encoded.encode_one(&original).await.unwrap();
+        encoded.encode_one(original.clone()).await.unwrap();
         let mut reader = encoded.as_slice();
         let parsed: SignalRequest = reader.decode_one().await.unwrap();
 
-        assert_eq!(parsed.signal_name, "INT");
+        assert_eq!(parsed.signal_name, original.signal_name);
     }
 
     // -------------------------------------------------------------------
@@ -253,11 +255,11 @@ mod tests {
     fn allocate_pty_succeeds() {
         let request = PtyRequest {
             term_type: "xterm".into(),
-            width_cols: 80,
-            height_rows: 24,
-            width_px: 0,
-            height_px: 0,
-            terminal_modes: vec![],
+            width_cols: VarInt::from(80u32),
+            height_rows: VarInt::from(24u32),
+            width_px: VarInt::from(0u32),
+            height_px: VarInt::from(0u32),
+            terminal_modes: SshBytes::from(vec![]),
         };
 
         let pair = allocate_pty(&request).unwrap();
@@ -277,20 +279,20 @@ mod tests {
     fn set_window_size_on_allocated_pty() {
         let request = PtyRequest {
             term_type: "vt100".into(),
-            width_cols: 80,
-            height_rows: 24,
-            width_px: 0,
-            height_px: 0,
-            terminal_modes: vec![],
+            width_cols: VarInt::from(80u32),
+            height_rows: VarInt::from(24u32),
+            width_px: VarInt::from(0u32),
+            height_px: VarInt::from(0u32),
+            terminal_modes: SshBytes::from(vec![]),
         };
 
         let pair = allocate_pty(&request).unwrap();
 
         let resize = WindowChangeRequest {
-            width_cols: 120,
-            height_rows: 40,
-            width_px: 960,
-            height_px: 800,
+            width_cols: VarInt::from(120u32),
+            height_rows: VarInt::from(40u32),
+            width_px: VarInt::from(960u32),
+            height_px: VarInt::from(800u32),
         };
 
         // set_window_size should succeed on a valid PTY master FD.
@@ -313,22 +315,22 @@ mod tests {
     async fn pty_request_codec_empty_terminal_modes() {
         let original = PtyRequest {
             term_type: "dumb".into(),
-            width_cols: 40,
-            height_rows: 10,
-            width_px: 0,
-            height_px: 0,
-            terminal_modes: vec![],
+            width_cols: VarInt::from(40u32),
+            height_rows: VarInt::from(10u32),
+            width_px: VarInt::from(0u32),
+            height_px: VarInt::from(0u32),
+            terminal_modes: SshBytes::from(vec![]),
         };
 
         let mut encoded = Vec::new();
-        encoded.encode_one(&original).await.unwrap();
+        encoded.encode_one(original.clone()).await.unwrap();
         let mut reader = encoded.as_slice();
         let parsed: PtyRequest = reader.decode_one().await.unwrap();
 
-        assert_eq!(parsed.term_type, "dumb");
-        assert_eq!(parsed.width_cols, 40);
-        assert_eq!(parsed.height_rows, 10);
-        assert!(parsed.terminal_modes.is_empty());
+        assert_eq!(parsed.term_type, original.term_type);
+        assert_eq!(parsed.width_cols, VarInt::from(40u32));
+        assert_eq!(parsed.height_rows, VarInt::from(10u32));
+        assert!(parsed.terminal_modes.as_ref().is_empty());
     }
 
     // -------------------------------------------------------------------
@@ -339,13 +341,13 @@ mod tests {
     async fn signal_codec_various_names() {
         for name in &["TERM", "KILL", "HUP", "USR1", "USR2", "QUIT"] {
             let original = SignalRequest {
-                signal_name: name.to_string(),
+                signal_name: (*name).into(),
             };
             let mut encoded = Vec::new();
-            encoded.encode_one(&original).await.unwrap();
+            encoded.encode_one(original.clone()).await.unwrap();
             let mut reader = encoded.as_slice();
             let parsed: SignalRequest = reader.decode_one().await.unwrap();
-            assert_eq!(parsed.signal_name, *name);
+            assert_eq!(parsed.signal_name, original.signal_name);
         }
     }
 
@@ -357,11 +359,11 @@ mod tests {
     fn allocate_pty_initial_size() {
         let request = PtyRequest {
             term_type: "xterm".into(),
-            width_cols: 132,
-            height_rows: 43,
-            width_px: 1056,
-            height_px: 688,
-            terminal_modes: vec![],
+            width_cols: VarInt::from(132u32),
+            height_rows: VarInt::from(43u32),
+            width_px: VarInt::from(1056u32),
+            height_px: VarInt::from(688u32),
+            terminal_modes: SshBytes::from(vec![]),
         };
 
         let pair = allocate_pty(&request).unwrap();
@@ -429,11 +431,11 @@ mod tests {
     fn allocate_pty_rejects_overflow() {
         let request = PtyRequest {
             term_type: "xterm".into(),
-            width_cols: u16::MAX as u32 + 1,
-            height_rows: 24,
-            width_px: 0,
-            height_px: 0,
-            terminal_modes: vec![],
+            width_cols: VarInt::from(u16::MAX as u32 + 1),
+            height_rows: VarInt::from(24u32),
+            width_px: VarInt::from(0u32),
+            height_px: VarInt::from(0u32),
+            terminal_modes: SshBytes::from(vec![]),
         };
         let err = allocate_pty(&request).unwrap_err();
         match err {
@@ -449,19 +451,19 @@ mod tests {
     fn set_window_size_rejects_overflow() {
         let pty_req = PtyRequest {
             term_type: "xterm".into(),
-            width_cols: 80,
-            height_rows: 24,
-            width_px: 0,
-            height_px: 0,
-            terminal_modes: vec![],
+            width_cols: VarInt::from(80u32),
+            height_rows: VarInt::from(24u32),
+            width_px: VarInt::from(0u32),
+            height_px: VarInt::from(0u32),
+            terminal_modes: SshBytes::from(vec![]),
         };
         let pair = allocate_pty(&pty_req).unwrap();
 
         let resize = WindowChangeRequest {
-            width_cols: 80,
-            height_rows: u16::MAX as u32 + 1,
-            width_px: 0,
-            height_px: 0,
+            width_cols: VarInt::from(80u32),
+            height_rows: VarInt::from(u16::MAX as u32 + 1),
+            width_px: VarInt::from(0u32),
+            height_px: VarInt::from(0u32),
         };
         let err = set_window_size(pair.master.as_raw_fd(), &resize).unwrap_err();
         match err {

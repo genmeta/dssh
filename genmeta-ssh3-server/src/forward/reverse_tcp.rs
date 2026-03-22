@@ -141,15 +141,19 @@ impl ReverseTcpForwarder {
                         let port = actual_port;
                         let conv_id = conversation_id;
                         let connection_handle = tokio::spawn(async move {
-                            let header = forwarded_tcpip_header(conv_id);
+                            let header = forwarded_tcpip_header(
+                                conv_id,
+                                &addr,
+                                port,
+                                &peer_addr.ip().to_string(),
+                                peer_addr.port(),
+                            );
                             match transport.open_channel(Some(header)).await {
                                 Ok((from_remote_rx, to_remote_tx)) => {
                                     let reader = ChannelReader::new(from_remote_rx);
                                     let writer = ChannelWriter::new(to_remote_tx);
                                     if let Err(e) = finish_forwarded_tcpip_channel(
                                         reader, writer, tcp_stream,
-                                        &addr, port,
-                                        &peer_addr.ip().to_string(), peer_addr.port(),
                                     ).await {
                                         tracing::warn!(
                                             error = %Report::from_error(&e),
@@ -272,18 +276,17 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let header = forwarded_tcpip_header(conversation_id);
-    writer.encode_one(header).await?;
-    finish_forwarded_tcpip_channel(
-        reader,
-        writer,
-        tcp_stream,
+    let header = forwarded_tcpip_header(
+        conversation_id,
         connected_addr,
         connected_port,
         originator_addr,
         originator_port,
-    )
-    .await
+    );
+    writer.encode_one(header).await.map_err(io::Error::other)?;
+    finish_forwarded_tcpip_channel(reader, writer, tcp_stream)
+        .await
+        .map_err(io::Error::other)
 }
 
 // ---------------------------------------------------------------------------
@@ -294,15 +297,18 @@ where
 mod tests {
     use super::*;
     use genmeta_ssh::{
-        CHANNEL_SIGNAL_VALUE,
+        ChannelMessage,
+        ChannelOpenBody,
+        ChannelOpenFailure,
         DEFAULT_MAX_MESSAGE_SIZE,
-        codec::ChannelHeader,
+        ChannelHeader,
+        SshMessage,
         codec::SshString,
-        message::SshMessage,
     };
     use genmeta_ssh::{CancelTcpipForwardRequest, TcpipForwardReply, TcpipForwardRequest};
     use genmeta_ssh::{Ssh3Transport, Ssh3TransportServerShared, TransportError};
     use h3x::codec::{DecodeExt, DecodeFrom, EncodeInto};
+    use h3x::stream_id::StreamId;
     use h3x::varint::VarInt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
@@ -427,10 +433,10 @@ mod tests {
     async fn tcpip_forward_request_roundtrip() {
         let req = TcpipForwardRequest {
             bind_address: "0.0.0.0".into(),
-            bind_port: 8080,
+            bind_port: VarInt::from(8080u32),
         };
         let mut bytes = Vec::new();
-        bytes.encode_one(&req).await.unwrap();
+        bytes.encode_one(req.clone()).await.unwrap();
         let decoded: TcpipForwardRequest = bytes.as_slice().decode_one().await.unwrap();
         assert_eq!(decoded, req);
     }
@@ -443,10 +449,10 @@ mod tests {
     async fn tcpip_forward_request_hex_dump() {
         let req = TcpipForwardRequest {
             bind_address: "hi".into(),
-            bind_port: 22,
+            bind_port: VarInt::from(22u8),
         };
         let mut bytes = Vec::new();
-        bytes.encode_one(&req).await.unwrap();
+        bytes.encode_one(req).await.unwrap();
         // "hi": varint(2)=0x02, b"hi"=[0x68, 0x69]
         // port 22: varint(22) = 1-byte [0x16]
         assert_eq!(
@@ -463,10 +469,10 @@ mod tests {
     async fn cancel_tcpip_forward_request_roundtrip() {
         let req = CancelTcpipForwardRequest {
             bind_address: "127.0.0.1".into(),
-            bind_port: 3000,
+            bind_port: VarInt::from(3000u32),
         };
         let mut bytes = Vec::new();
-        bytes.encode_one(&req).await.unwrap();
+        bytes.encode_one(req.clone()).await.unwrap();
         let decoded: CancelTcpipForwardRequest = bytes.as_slice().decode_one().await.unwrap();
         assert_eq!(decoded, req);
     }
@@ -478,10 +484,10 @@ mod tests {
     #[tokio::test]
     async fn tcpip_forward_reply_roundtrip() {
         let reply = TcpipForwardReply {
-            allocated_port: 49152,
+            allocated_port: VarInt::from(49152u32),
         };
         let mut bytes = Vec::new();
-        bytes.encode_one(&reply).await.unwrap();
+        bytes.encode_one(reply.clone()).await.unwrap();
         let decoded: TcpipForwardReply = bytes.as_slice().decode_one().await.unwrap();
         assert_eq!(decoded, reply);
     }
@@ -740,30 +746,26 @@ mod tests {
             .unwrap();
         });
 
-        // Client side: read ChannelHeader.
+        // Client side: read ChannelHeader (includes request_data in body).
         let header = ChannelHeader::decode_from(&mut client_reader).await.unwrap();
-        assert_eq!(header.signal_value, CHANNEL_SIGNAL_VALUE);
-        assert_eq!(header.conversation_id, 42);
-        assert_eq!(header.channel_type, "forwarded-tcpip");
+        assert_eq!(header.session_id, StreamId(VarInt::from(42u8)));
         assert_eq!(header.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
-
-        // Client side: read request_data fields.
-        let connected_addr = SshString::decode_from(&mut client_reader).await.unwrap();
-        let connected_port: VarInt = client_reader.decode_one().await.unwrap();
-        let originator_addr = SshString::decode_from(&mut client_reader).await.unwrap();
-        let originator_port: VarInt = client_reader.decode_one().await.unwrap();
-
-        assert_eq!(connected_addr, SshString("192.168.1.100".into()));
-        assert_eq!(connected_port.into_inner(), 80);
-        assert_eq!(originator_addr, SshString("10.0.0.1".into()));
-        assert_eq!(originator_port.into_inner(), 54321);
+        match &header.body {
+            ChannelOpenBody::ForwardedTcpip(req) => {
+                assert_eq!(req.connected_address, SshString::from("192.168.1.100"));
+                assert_eq!(req.connected_port.into_inner(), 80);
+                assert_eq!(req.originator_address, SshString::from("10.0.0.1"));
+                assert_eq!(req.originator_port.into_inner(), 54321);
+            }
+            other => panic!("expected ForwardedTcpip body, got {other:?}"),
+        }
 
         // Client side: send ChannelOpenConfirmation, then data, then close.
         let client_handle = tokio::spawn(async move {
             let mut client_writer = client_writer;
-            let confirm = SshMessage::ChannelOpenConfirmation {
-                max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
-            };
+            let confirm = SshMessage::Channel(ChannelMessage::OpenConfirmation {
+                max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            });
             confirm.encode_into(&mut client_writer).await.unwrap();
 
             // Send data through the channel (raw bytes, no wrapping).
@@ -820,18 +822,14 @@ mod tests {
             .unwrap();
         });
 
-        // Client side: read the header and request_data (drain them).
+        // Client side: read the header (includes request_data in body).
         let _header = ChannelHeader::decode_from(&mut client_reader).await.unwrap();
-        let _connected_addr = SshString::decode_from(&mut client_reader).await.unwrap();
-        let _connected_port: VarInt = client_reader.decode_one().await.unwrap();
-        let _originator_addr = SshString::decode_from(&mut client_reader).await.unwrap();
-        let _originator_port: VarInt = client_reader.decode_one().await.unwrap();
 
         // Client side: send ChannelOpenFailure to reject the channel.
-        let failure = SshMessage::ChannelOpenFailure {
+        let failure = SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
             reason_code: VarInt::from(1u8),
             description: "administratively prohibited".into(),
-        };
+        }));
         failure.encode_into(&mut client_writer).await.unwrap();
         client_writer.flush().await.unwrap();
         drop(client_writer);

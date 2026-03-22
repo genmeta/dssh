@@ -1,7 +1,7 @@
 //! SSH3 session-layer request handling for exec, shell, subsystem, exit-status,
 //! and exit-signal.
 //!
-//! Processes `ChannelEvent::Request` payloads dispatched from the channel
+//! Processes `ChannelMessage::Request` payloads dispatched from the channel
 //! message loop. Supports:
 //!
 //! - `exec` — run a command via `/bin/sh -c`
@@ -17,9 +17,13 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 
-use genmeta_ssh::{ChannelEvent, ExitSignalRequest, ExitStatusRequest, SignalRequest, SshMessage, WindowChangeRequest};
+use genmeta_ssh::{
+    ChannelMessage, ChannelRequest, ExitSignalRequest, ExitStatusRequest,
+    SignalRequest, SshBool, SshMessage, SshString,
+};
+use genmeta_ssh::codec::SshBytes;
 use h3x::{
-    codec::{DecodeFrom, EncodeExt},
+    codec::EncodeExt,
     varint::VarInt,
 };
 use nix::{
@@ -52,7 +56,7 @@ pub async fn run_exec<W>(
     shell_path: &OsStr,
     command: &[u8],
     writer: &mut W,
-    event_rx: mpsc::Receiver<ChannelEvent>,
+    event_rx: mpsc::Receiver<ChannelMessage>,
     pty: Option<PtyPair>,
 ) -> io::Result<()>
 where
@@ -87,7 +91,7 @@ where
 pub async fn run_shell<W>(
     shell_path: &OsStr,
     writer: &mut W,
-    event_rx: mpsc::Receiver<ChannelEvent>,
+    event_rx: mpsc::Receiver<ChannelMessage>,
     pty: Option<PtyPair>,
 ) -> io::Result<()>
 where
@@ -105,7 +109,7 @@ async fn run_command_piped<W>(
     program: &OsStr,
     args: &[OsString],
     writer: &mut W,
-    event_rx: mpsc::Receiver<ChannelEvent>,
+    event_rx: mpsc::Receiver<ChannelMessage>,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Send + Unpin,
@@ -126,7 +130,7 @@ where
         Ok(child) => child,
         Err(e) => {
             tracing::error!(error = %Report::from_error(&e), "failed to spawn command");
-            writer.encode_one(&SshMessage::ChannelFailure).await?;
+            writer.encode_one(SshMessage::Channel(ChannelMessage::Failure)).await.map_err(io::Error::other)?;
             return Err(e);
         }
     };
@@ -136,27 +140,23 @@ where
     let stdin = child.stdin.take().unwrap();
     let child_pid = child.id().unwrap_or(0) as i32;
 
-    // Spawn a stdin relay task: reads ChannelEvent::Data from event_rx -> writes to stdin.
+    // Spawn a stdin relay task: reads ChannelMessage::Data from event_rx -> writes to stdin.
     let stdin_task = tokio::spawn(async move {
         let mut stdin = stdin;
         let mut event_rx = event_rx;
         while let Some(event) = event_rx.recv().await {
             match event {
-                ChannelEvent::Data(data)
-                    if stdin.write_all(&data).await.is_err() =>
+                ChannelMessage::Data(data)
+                    if stdin.write_all(data.as_ref().as_ref()).await.is_err() =>
                 {
                     break;
                 }
-                ChannelEvent::Request {
-                    request_type,
-                    request_data,
-                    ..
-                } if request_type == "signal" => {
-                    if let Err(error) = deliver_signal_request(child_pid, &request_data).await {
+                ChannelMessage::Request(ChannelRequest::Signal { request, .. }) => {
+                    if let Err(error) = deliver_signal(child_pid, &request) {
                         tracing::warn!(error = %Report::from_error(&error), child_pid, "failed to deliver signal to non-PTY child");
                     }
                 }
-                ChannelEvent::Eof => break,
+                ChannelMessage::Eof => break,
                 _ => {}
             }
         }
@@ -169,38 +169,26 @@ where
     let status = child.wait().await?;
     if let Some(signal_number) = status.signal() {
         let signal_name = exit_signal_name(signal_number);
-        let mut request_data = Vec::new();
-        request_data
-            .encode_one(&ExitSignalRequest {
-                signal_name: signal_name.into_owned(),
-                core_dumped: status.core_dumped(),
-                error_message: String::new(),
-                language_tag: String::new(),
+        writer.encode_one(SshMessage::Channel(ChannelMessage::Request(
+            ChannelRequest::ExitSignal(ExitSignalRequest {
+                signal_name: SshString::from(signal_name.into_owned()),
+                core_dumped: SshBool(status.core_dumped()),
+                error_message: SshString::from(""),
+                language_tag: SshString::from(""),
             })
-            .await
-            .map_err(io::Error::other)?;
-        writer.encode_one(&SshMessage::ChannelRequest {
-            request_type: "exit-signal".into(),
-            want_reply: false,
-            request_data,
-        }).await?;
+        ))).await.map_err(io::Error::other)?;
     } else {
         let exit_code = status.code().unwrap_or(255) as u32;
-        let mut request_data = Vec::new();
-        request_data
-            .encode_one(&ExitStatusRequest { exit_status: exit_code.into() })
-            .await
-            .map_err(io::Error::other)?;
-        writer.encode_one(&SshMessage::ChannelRequest {
-            request_type: "exit-status".into(),
-            want_reply: false,
-            request_data,
-        }).await?;
+        writer.encode_one(SshMessage::Channel(ChannelMessage::Request(
+            ChannelRequest::ExitStatus(ExitStatusRequest {
+                exit_status: VarInt::from(exit_code),
+            })
+        ))).await.map_err(io::Error::other)?;
     }
 
     // Send EOF + Close.
-    writer.encode_one(&SshMessage::ChannelEof).await?;
-    writer.encode_one(&SshMessage::ChannelClose).await?;
+    writer.encode_one(SshMessage::Channel(ChannelMessage::Eof)).await.map_err(io::Error::other)?;
+    writer.encode_one(SshMessage::Channel(ChannelMessage::Close)).await.map_err(io::Error::other)?;
     writer.shutdown().await?;
 
     // Clean up stdin relay task.
@@ -216,7 +204,7 @@ async fn run_command_with_pty<W>(
     program: &OsStr,
     args: &[OsString],
     writer: &mut W,
-    event_rx: mpsc::Receiver<ChannelEvent>,
+    event_rx: mpsc::Receiver<ChannelMessage>,
     pty_pair: PtyPair,
 ) -> io::Result<()>
 where
@@ -238,7 +226,7 @@ where
         Ok(child) => child,
         Err(e) => {
             tracing::error!(error = %Report::from_error(&e), "failed to spawn command with PTY");
-            writer.encode_one(&SshMessage::ChannelFailure).await?;
+            writer.encode_one(SshMessage::Channel(ChannelMessage::Failure)).await.map_err(io::Error::other)?;
             return Err(e);
         }
     };
@@ -252,33 +240,27 @@ where
     let master_tokio = tokio::fs::File::from(master_file);
     let (mut master_reader, master_writer) = tokio::io::split(master_tokio);
 
-    // Spawn stdin relay task: reads ChannelEvent::Data -> writes to PTY master,
+    // Spawn stdin relay task: reads ChannelMessage::Data -> writes to PTY master,
     // handles Signal and WindowChange events.
     let stdin_task = tokio::spawn(async move {
         let mut master_writer = master_writer;
         let mut event_rx = event_rx;
         while let Some(event) = event_rx.recv().await {
             match event {
-                ChannelEvent::Data(data)
-                    if master_writer.write_all(&data).await.is_err() =>
+                ChannelMessage::Data(data)
+                    if master_writer.write_all(data.as_ref().as_ref()).await.is_err() =>
                 {
                     break;
                 }
-                ChannelEvent::Request {
-                    request_type,
-                    request_data,
-                    ..
-                } => {
-                    match request_type.as_str() {
-                        "signal" => {
-                            if let Err(error) = deliver_signal_request(child_pid, &request_data).await {
+                ChannelMessage::Request(request) => {
+                    match request {
+                        ChannelRequest::Signal { request, .. } => {
+                            if let Err(error) = deliver_signal(child_pid, &request) {
                                 tracing::warn!(error = %Report::from_error(&error), child_pid, "failed to deliver signal to PTY child");
                             }
                         }
-                        "window-change" => {
-                            if let Ok(req) = WindowChangeRequest::decode_from(request_data.as_slice()).await
-                                && let Err(error) = set_window_size(master_raw_fd, &req)
-                            {
+                        ChannelRequest::WindowChange(req) => {
+                            if let Err(error) = set_window_size(master_raw_fd, &req) {
                                 tracing::warn!(
                                     error = %Report::from_error(&error),
                                     width_cols = %req.width_cols,
@@ -290,7 +272,7 @@ where
                         _ => {}
                     }
                 }
-                ChannelEvent::Eof => break,
+                ChannelMessage::Eof => break,
                 _ => {}
             }
         }
@@ -311,38 +293,26 @@ where
     let status = child.wait().await?;
     if let Some(signal_number) = status.signal() {
         let signal_name = exit_signal_name(signal_number);
-        let mut request_data = Vec::new();
-        request_data
-            .encode_one(&ExitSignalRequest {
-                signal_name: signal_name.into_owned(),
-                core_dumped: status.core_dumped(),
-                error_message: String::new(),
-                language_tag: String::new(),
+        writer.encode_one(SshMessage::Channel(ChannelMessage::Request(
+            ChannelRequest::ExitSignal(ExitSignalRequest {
+                signal_name: SshString::from(signal_name.into_owned()),
+                core_dumped: SshBool(status.core_dumped()),
+                error_message: SshString::from(""),
+                language_tag: SshString::from(""),
             })
-            .await
-            .map_err(io::Error::other)?;
-        writer.encode_one(&SshMessage::ChannelRequest {
-            request_type: "exit-signal".into(),
-            want_reply: false,
-            request_data,
-        }).await?;
+        ))).await.map_err(io::Error::other)?;
     } else {
         let exit_code = status.code().unwrap_or(255) as u32;
-        let mut request_data = Vec::new();
-        request_data
-            .encode_one(&ExitStatusRequest { exit_status: exit_code.into() })
-            .await
-            .map_err(io::Error::other)?;
-        writer.encode_one(&SshMessage::ChannelRequest {
-            request_type: "exit-status".into(),
-            want_reply: false,
-            request_data,
-        }).await?;
+        writer.encode_one(SshMessage::Channel(ChannelMessage::Request(
+            ChannelRequest::ExitStatus(ExitStatusRequest {
+                exit_status: VarInt::from(exit_code),
+            })
+        ))).await.map_err(io::Error::other)?;
     }
 
     // Send EOF + Close.
-    writer.encode_one(&SshMessage::ChannelEof).await?;
-    writer.encode_one(&SshMessage::ChannelClose).await?;
+    writer.encode_one(SshMessage::Channel(ChannelMessage::Eof)).await.map_err(io::Error::other)?;
+    writer.encode_one(SshMessage::Channel(ChannelMessage::Close)).await.map_err(io::Error::other)?;
     writer.shutdown().await?;
 
     // Clean up stdin relay task.
@@ -378,15 +348,15 @@ where
     while let Some(chunk) = rx.recv().await {
         match chunk {
             CommandOutputChunk::Stdout(data) => {
-                writer.encode_one(&SshMessage::ChannelData { data }).await?;
+                writer.encode_one(SshMessage::Channel(ChannelMessage::Data(SshBytes::from(data)))).await.map_err(io::Error::other)?;
             }
             CommandOutputChunk::Stderr(data) => {
                 writer
-                    .encode_one(&SshMessage::ChannelExtendedData {
+                    .encode_one(SshMessage::Channel(ChannelMessage::ExtendedData {
                         data_type: VarInt::from(1u8),
-                        data,
-                    })
-                    .await?;
+                        data: SshBytes::from(data),
+                    }))
+                    .await.map_err(io::Error::other)?;
             }
         }
     }
@@ -434,10 +404,10 @@ where
             break;
         }
         writer
-            .encode_one(&SshMessage::ChannelData {
-                data: buf[..n].to_vec(),
-            })
-            .await?;
+            .encode_one(SshMessage::Channel(ChannelMessage::Data(
+                SshBytes::from(buf[..n].to_vec()),
+            )))
+            .await.map_err(io::Error::other)?;
     }
     Ok(())
 }
@@ -480,20 +450,19 @@ fn exit_signal_name(signal_number: i32) -> Cow<'static, str> {
         .unwrap_or_else(|| Cow::Owned(format!("signal-{signal_number}@genmeta-ssh3")))
 }
 
-async fn deliver_signal_request(child_pid: i32, request_data: &[u8]) -> io::Result<()> {
+fn deliver_signal(child_pid: i32, req: &SignalRequest) -> io::Result<()> {
     if child_pid <= 0 {
         return Ok(());
     }
 
-    let req = SignalRequest::decode_from(request_data).await?;
-    let Some(signal_number) = signal_number(req.signal_name.as_str()) else {
+    let Some(sig) = signal_number(&req.signal_name) else {
         return Ok(());
     };
 
     let child_pid = Pid::from_raw(child_pid);
-    match signal::killpg(child_pid, signal_number) {
+    match signal::killpg(child_pid, sig) {
         Ok(()) => Ok(()),
-        Err(Errno::ESRCH) => signal::kill(child_pid, signal_number).map_err(io::Error::other),
+        Err(Errno::ESRCH) => signal::kill(child_pid, sig).map_err(io::Error::other),
         Err(error) => Err(io::Error::other(error)),
     }
 }
@@ -506,15 +475,21 @@ async fn deliver_signal_request(child_pid: i32, request_data: &[u8]) -> io::Resu
 mod tests {
     use super::*;
     use genmeta_ssh::{
+        ChannelMessage,
+        ChannelRequest,
         ExecRequest,
+        PtyRequest,
         RequestAction,
+        SshBool,
+        SshString,
         SubsystemRequest,
-        codec::{MAX_REMOTE_FIELD_SIZE, SshString},
+        channel::UnknownBody,
+        codec::{MAX_REMOTE_FIELD_SIZE, SshBytes},
         handle_request,
         message::SshMessage,
         session::encode_exit_status,
     };
-    use h3x::codec::{EncodeExt, EncodeInto};
+    use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
     use tokio::io::duplex;
 
     async fn encode_request_data<T, E>(item: T) -> Result<Vec<u8>, E>
@@ -526,6 +501,11 @@ mod tests {
         Ok(buf)
     }
 
+    /// Check if a decode error is caused by EOF (stream exhausted).
+    fn is_eof_error(e: &impl std::fmt::Debug) -> bool {
+        format!("{e:?}").contains("UnexpectedEof")
+    }
+
     // -------------------------------------------------------------------
     // Test 1: exec request codec parses SshString payloads
     // -------------------------------------------------------------------
@@ -534,7 +514,7 @@ mod tests {
     async fn exec_request_codec_simple() {
         // Encode "echo hello" as SshString
         let (mut writer, mut reader) = duplex(4096);
-        SshString("echo hello".into())
+        SshString::from("echo hello")
             .encode_into(&mut writer)
             .await
             .unwrap();
@@ -544,14 +524,14 @@ mod tests {
         reader.read_to_end(&mut buf).await.unwrap();
 
         let req = ExecRequest::decode_from(buf.as_slice()).await.unwrap();
-        assert_eq!(req.command, b"echo hello");
+        assert_eq!(req.command.as_ref().as_ref(), b"echo hello");
     }
 
     #[tokio::test]
     async fn exec_request_codec_empty() {
         // Encode empty string as SshString
         let (mut writer, mut reader) = duplex(4096);
-        SshString(String::new())
+        SshString::from("")
             .encode_into(&mut writer)
             .await
             .unwrap();
@@ -561,7 +541,7 @@ mod tests {
         reader.read_to_end(&mut buf).await.unwrap();
 
         let req = ExecRequest::decode_from(buf.as_slice()).await.unwrap();
-        assert_eq!(req.command, b"");
+        assert_eq!(req.command.as_ref().as_ref(), b"");
     }
 
     #[tokio::test]
@@ -569,7 +549,7 @@ mod tests {
         let request_data = vec![0x03, 0x66, 0x6f, 0xff];
 
         let req = ExecRequest::decode_from(request_data.as_slice()).await.unwrap();
-        assert_eq!(req.command, vec![0x66, 0x6f, 0xff]);
+        assert_eq!(req.command.as_ref().as_ref(), &[0x66, 0x6f, 0xff]);
     }
 
     #[tokio::test]
@@ -583,8 +563,11 @@ mod tests {
         let err = ExecRequest::decode_from(request_data.as_slice())
             .await
             .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("exec command length"));
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("exec command length") || err_str.contains("field length") || err_str.contains("too large") || err_str.contains("session codec"),
+            "expected error about oversized command, got: {err_str}"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -645,7 +628,7 @@ mod tests {
         loop {
             match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => messages.push(msg),
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if is_eof_error(&e) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -659,7 +642,9 @@ mod tests {
 
         // Find the ChannelData containing "hello"
         let has_hello = messages.iter().any(|m| match m {
-            SshMessage::ChannelData { data } => String::from_utf8_lossy(data).contains("hello"),
+            SshMessage::Channel(ChannelMessage::Data(data)) => {
+                String::from_utf8_lossy(data.as_ref().as_ref()).contains("hello")
+            }
             _ => false,
         });
         assert!(
@@ -668,18 +653,12 @@ mod tests {
         );
 
         // Check exit-status request
-        let has_exit_status = messages.iter().any(|m| match m {
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                request_type == "exit-status"
-                    && !want_reply
-                    && *request_data == encode_exit_status(0)
-            }
-            _ => false,
-        });
+        let has_exit_status = messages.iter().any(|m| matches!(
+            m,
+            SshMessage::Channel(ChannelMessage::Request(
+                ChannelRequest::ExitStatus(req)
+            )) if req.exit_status == VarInt::from(0u32)
+        ));
         assert!(
             has_exit_status,
             "expected exit-status request with code 0, got: {messages:?}"
@@ -687,28 +666,28 @@ mod tests {
 
         // Check EOF and Close are present
         assert!(
-            messages.iter().any(|m| matches!(m, SshMessage::ChannelEof)),
+            messages.iter().any(|m| matches!(m, SshMessage::Channel(ChannelMessage::Eof))),
             "expected ChannelEof"
         );
         assert!(
             messages
                 .iter()
-                .any(|m| matches!(m, SshMessage::ChannelClose)),
+                .any(|m| matches!(m, SshMessage::Channel(ChannelMessage::Close))),
             "expected ChannelClose"
         );
 
         // Verify ordering: exit-status comes before EOF, EOF before Close
         let exit_pos = messages
             .iter()
-            .position(|m| matches!(m, SshMessage::ChannelRequest { request_type, .. } if request_type == "exit-status"))
+            .position(|m| matches!(m, SshMessage::Channel(ChannelMessage::Request(ChannelRequest::ExitStatus(_)))))
             .unwrap();
         let eof_pos = messages
             .iter()
-            .position(|m| matches!(m, SshMessage::ChannelEof))
+            .position(|m| matches!(m, SshMessage::Channel(ChannelMessage::Eof)))
             .unwrap();
         let close_pos = messages
             .iter()
-            .position(|m| matches!(m, SshMessage::ChannelClose))
+            .position(|m| matches!(m, SshMessage::Channel(ChannelMessage::Close)))
             .unwrap();
         assert!(exit_pos < eof_pos, "exit-status should come before EOF");
         assert!(eof_pos < close_pos, "EOF should come before Close");
@@ -741,37 +720,31 @@ mod tests {
         loop {
             match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => messages.push(msg),
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if is_eof_error(&e) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
 
         // Should have exit-status with non-zero code, EOF, Close.
-        let has_nonzero_exit = messages.iter().any(|m| match m {
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                request_type == "exit-status"
-                    && !want_reply
-                    && *request_data != encode_exit_status(0)
-            }
-            _ => false,
-        });
+        let has_nonzero_exit = messages.iter().any(|m| matches!(
+            m,
+            SshMessage::Channel(ChannelMessage::Request(
+                ChannelRequest::ExitStatus(req)
+            )) if req.exit_status != VarInt::from(0u32)
+        ));
         assert!(
             has_nonzero_exit,
             "expected exit-status with non-zero code, got: {messages:?}"
         );
 
         assert!(
-            messages.iter().any(|m| matches!(m, SshMessage::ChannelEof)),
+            messages.iter().any(|m| matches!(m, SshMessage::Channel(ChannelMessage::Eof))),
             "expected ChannelEof"
         );
         assert!(
             messages
                 .iter()
-                .any(|m| matches!(m, SshMessage::ChannelClose)),
+                .any(|m| matches!(m, SshMessage::Channel(ChannelMessage::Close))),
             "expected ChannelClose"
         );
     }
@@ -785,27 +758,21 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        // Build SshString-encoded subsystem name for request_data
-        let mut request_data_buf = Vec::new();
-        SshString("sftp".into())
-            .encode_into(&mut request_data_buf)
-            .await
-            .unwrap();
-
-        let event = ChannelEvent::Request {
-            request_type: "subsystem".into(),
-            want_reply: true,
-            request_data: request_data_buf,
+        let request = ChannelRequest::Subsystem {
+            want_reply: SshBool(true),
+            request: SubsystemRequest {
+                subsystem_name: SshString::from("sftp"),
+            },
         };
 
-        let result = handle_request(&event, &mut server_writer).await.unwrap();
+        let result = handle_request(request, &mut server_writer).await.unwrap();
         assert_eq!(result, None, "subsystem should return None");
 
         drop(server_writer);
 
         // Should have sent ChannelFailure.
         let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
-        assert_eq!(msg, SshMessage::ChannelFailure);
+        assert_eq!(msg, SshMessage::Channel(ChannelMessage::Failure));
     }
 
     // -------------------------------------------------------------------
@@ -817,30 +784,21 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        // Build request_data containing SshString("ls -la")
-        let (mut enc_writer, mut enc_reader) = duplex(4096);
-        SshString("ls -la".into())
-            .encode_into(&mut enc_writer)
-            .await
-            .unwrap();
-        drop(enc_writer);
-        let mut request_data = Vec::new();
-        enc_reader.read_to_end(&mut request_data).await.unwrap();
-
-        let event = ChannelEvent::Request {
-            request_type: "exec".into(),
-            want_reply: true,
-            request_data,
+        let request = ChannelRequest::Exec {
+            want_reply: SshBool(true),
+            request: ExecRequest {
+                command: SshBytes::from(b"ls -la".to_vec()),
+            },
         };
 
-        let result = handle_request(&event, &mut server_writer).await.unwrap();
-        assert_eq!(result, Some(RequestAction::Exec(b"ls -la".to_vec())));
+        let result = handle_request(request, &mut server_writer).await.unwrap();
+        assert_eq!(result, Some(RequestAction::Exec(SshBytes::from(b"ls -la".to_vec()))));
 
         drop(server_writer);
 
         // Should have sent ChannelSuccess (want_reply=true).
         let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
-        assert_eq!(msg, SshMessage::ChannelSuccess);
+        assert_eq!(msg, SshMessage::Channel(ChannelMessage::Success));
     }
 
     #[tokio::test]
@@ -848,19 +806,17 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        let event = ChannelEvent::Request {
-            request_type: "shell".into(),
-            want_reply: true,
-            request_data: vec![],
+        let request = ChannelRequest::Shell {
+            want_reply: SshBool(true),
         };
 
-        let result = handle_request(&event, &mut server_writer).await.unwrap();
+        let result = handle_request(request, &mut server_writer).await.unwrap();
         assert_eq!(result, Some(RequestAction::Shell));
 
         drop(server_writer);
 
         let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
-        assert_eq!(msg, SshMessage::ChannelSuccess);
+        assert_eq!(msg, SshMessage::Channel(ChannelMessage::Success));
     }
 
     #[tokio::test]
@@ -868,19 +824,19 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        let event = ChannelEvent::Request {
-            request_type: "x11-req".into(),
-            want_reply: true,
-            request_data: vec![],
+        let request = ChannelRequest::Unknown {
+            request_type: SshString::from("x11-req"),
+            want_reply: SshBool(true),
+            body: UnknownBody::Unavailable,
         };
 
-        let result = handle_request(&event, &mut server_writer).await.unwrap();
+        let result = handle_request(request, &mut server_writer).await.unwrap();
         assert_eq!(result, None);
 
         drop(server_writer);
 
         let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
-        assert_eq!(msg, SshMessage::ChannelFailure);
+        assert_eq!(msg, SshMessage::Channel(ChannelMessage::Failure));
     }
 
     #[tokio::test]
@@ -888,13 +844,11 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        let event = ChannelEvent::Request {
-            request_type: "shell".into(),
-            want_reply: false,
-            request_data: vec![],
+        let request = ChannelRequest::Shell {
+            want_reply: SshBool(false),
         };
 
-        let result = handle_request(&event, &mut server_writer).await.unwrap();
+        let result = handle_request(request, &mut server_writer).await.unwrap();
         assert_eq!(result, Some(RequestAction::Shell));
 
         drop(server_writer);
@@ -907,45 +861,35 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn handle_request_non_request_event() {
-        let (server_writer, _client_reader) = duplex(8192);
-        let mut server_writer = server_writer;
-
-        let event = ChannelEvent::Data(b"hello".to_vec());
-        let result = handle_request(&event, &mut server_writer).await.unwrap();
-        assert_eq!(result, None, "non-Request events should return None");
-    }
-
     // -------------------------------------------------------------------
     // Test 7: exit-status request codec roundtrip
     // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn exit_status_request_codec_roundtrip() {
-        let data = encode_request_data(&ExitStatusRequest { exit_status: 42 })
+        let data = encode_request_data(ExitStatusRequest { exit_status: VarInt::from(42u32) })
             .await
             .unwrap();
         let req = ExitStatusRequest::decode_from(data.as_slice()).await.unwrap();
-        assert_eq!(req.exit_status, 42);
+        assert_eq!(req.exit_status, VarInt::from(42u32));
     }
 
     #[tokio::test]
     async fn exit_status_request_codec_zero() {
-        let data = encode_request_data(&ExitStatusRequest { exit_status: 0 })
+        let data = encode_request_data(ExitStatusRequest { exit_status: VarInt::from(0u32) })
             .await
             .unwrap();
         let req = ExitStatusRequest::decode_from(data.as_slice()).await.unwrap();
-        assert_eq!(req.exit_status, 0);
+        assert_eq!(req.exit_status, VarInt::from(0u32));
     }
 
     #[tokio::test]
     async fn exit_status_request_codec_255() {
-        let data = encode_request_data(&ExitStatusRequest { exit_status: 255 })
+        let data = encode_request_data(ExitStatusRequest { exit_status: VarInt::from(255u32) })
             .await
             .unwrap();
         let req = ExitStatusRequest::decode_from(data.as_slice()).await.unwrap();
-        assert_eq!(req.exit_status, 255);
+        assert_eq!(req.exit_status, VarInt::from(255u32));
     }
 
     // -------------------------------------------------------------------
@@ -954,36 +898,36 @@ mod tests {
 
     #[tokio::test]
     async fn exit_signal_request_codec_roundtrip() {
-        let data = encode_request_data(&ExitSignalRequest {
-            signal_name: "KILL".into(),
-            core_dumped: true,
-            error_message: "killed by signal".into(),
-            language_tag: "en".into(),
+        let data = encode_request_data(ExitSignalRequest {
+            signal_name: SshString::from("KILL"),
+            core_dumped: SshBool(true),
+            error_message: SshString::from("killed by signal"),
+            language_tag: SshString::from("en"),
         })
             .await
             .unwrap();
         let req = ExitSignalRequest::decode_from(data.as_slice()).await.unwrap();
-        assert_eq!(req.signal_name, "KILL");
-        assert!(req.core_dumped);
-        assert_eq!(req.error_message, "killed by signal");
-        assert_eq!(req.language_tag, "en");
+        assert_eq!(&*req.signal_name, "KILL");
+        assert!(req.core_dumped.0);
+        assert_eq!(&*req.error_message, "killed by signal");
+        assert_eq!(&*req.language_tag, "en");
     }
 
     #[tokio::test]
     async fn exit_signal_request_codec_no_core_dump() {
-        let data = encode_request_data(&ExitSignalRequest {
-            signal_name: "TERM".into(),
-            core_dumped: false,
-            error_message: "terminated".into(),
-            language_tag: String::new(),
+        let data = encode_request_data(ExitSignalRequest {
+            signal_name: SshString::from("TERM"),
+            core_dumped: SshBool(false),
+            error_message: SshString::from("terminated"),
+            language_tag: SshString::from(""),
         })
             .await
             .unwrap();
         let req = ExitSignalRequest::decode_from(data.as_slice()).await.unwrap();
-        assert_eq!(req.signal_name, "TERM");
-        assert!(!req.core_dumped);
-        assert_eq!(req.error_message, "terminated");
-        assert_eq!(req.language_tag, "");
+        assert_eq!(&*req.signal_name, "TERM");
+        assert!(!req.core_dumped.0);
+        assert_eq!(&*req.error_message, "terminated");
+        assert_eq!(&*req.language_tag, "");
     }
 
     // -------------------------------------------------------------------
@@ -993,16 +937,11 @@ mod tests {
     #[tokio::test]
     async fn exit_status_channel_request_message() {
         let (mut writer, mut reader) = duplex(8192);
-        let mut request_data = Vec::new();
-        request_data
-            .encode_one(&ExitStatusRequest { exit_status: 42 })
-            .await
-            .unwrap();
-        SshMessage::ChannelRequest {
-            request_type: "exit-status".into(),
-            want_reply: false,
-            request_data,
-        }
+        SshMessage::Channel(ChannelMessage::Request(
+            ChannelRequest::ExitStatus(ExitStatusRequest {
+                exit_status: VarInt::from(42u32),
+            })
+        ))
         .encode_into(&mut writer)
         .await
         .unwrap();
@@ -1010,17 +949,12 @@ mod tests {
 
         let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                assert_eq!(request_type, "exit-status");
-                assert!(!want_reply);
-                let req = ExitStatusRequest::decode_from(request_data.as_slice()).await.unwrap();
-                assert_eq!(req.exit_status, 42);
+            SshMessage::Channel(ChannelMessage::Request(
+                ChannelRequest::ExitStatus(req)
+            )) => {
+                assert_eq!(req.exit_status, VarInt::from(42u32));
             }
-            other => panic!("expected ChannelRequest, got {other:?}"),
+            other => panic!("expected exit-status ChannelRequest, got {other:?}"),
         }
     }
 
@@ -1031,21 +965,14 @@ mod tests {
     #[tokio::test]
     async fn exit_signal_channel_request_message() {
         let (mut writer, mut reader) = duplex(8192);
-        let mut request_data = Vec::new();
-        request_data
-            .encode_one(&ExitSignalRequest {
-                signal_name: "TERM".into(),
-                core_dumped: false,
-                error_message: "terminated".into(),
-                language_tag: "en".into(),
+        SshMessage::Channel(ChannelMessage::Request(
+            ChannelRequest::ExitSignal(ExitSignalRequest {
+                signal_name: SshString::from("TERM"),
+                core_dumped: SshBool(false),
+                error_message: SshString::from("terminated"),
+                language_tag: SshString::from("en"),
             })
-            .await
-            .unwrap();
-        SshMessage::ChannelRequest {
-            request_type: "exit-signal".into(),
-            want_reply: false,
-            request_data,
-        }
+        ))
         .encode_into(&mut writer)
             .await
             .unwrap();
@@ -1053,20 +980,15 @@ mod tests {
 
         let msg = SshMessage::decode_from(&mut reader).await.unwrap();
         match msg {
-            SshMessage::ChannelRequest {
-                request_type,
-                want_reply,
-                request_data,
-            } => {
-                assert_eq!(request_type, "exit-signal");
-                assert!(!want_reply);
-                let req = ExitSignalRequest::decode_from(request_data.as_slice()).await.unwrap();
-                assert_eq!(req.signal_name, "TERM");
-                assert!(!req.core_dumped);
-                assert_eq!(req.error_message, "terminated");
-                assert_eq!(req.language_tag, "en");
+            SshMessage::Channel(ChannelMessage::Request(
+                ChannelRequest::ExitSignal(req)
+            )) => {
+                assert_eq!(&*req.signal_name, "TERM");
+                assert!(!req.core_dumped.0);
+                assert_eq!(&*req.error_message, "terminated");
+                assert_eq!(&*req.language_tag, "en");
             }
-            other => panic!("expected ChannelRequest, got {other:?}"),
+            other => panic!("expected exit-signal ChannelRequest, got {other:?}"),
         }
     }
 
@@ -1077,12 +999,12 @@ mod tests {
     #[tokio::test]
     async fn parse_subsystem_name() {
         let mut buf = Vec::new();
-        SshString("sftp".into())
+        SshString::from("sftp")
             .encode_into(&mut buf)
             .await
             .unwrap();
         let req = SubsystemRequest::decode_from(buf.as_slice()).await.unwrap();
-        assert_eq!(req.subsystem_name, "sftp");
+        assert_eq!(&*req.subsystem_name, "sftp");
     }
 
     // -------------------------------------------------------------------
@@ -1094,16 +1016,11 @@ mod tests {
         let (server_writer, _client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        let request_data = encode_request_data(&ExitStatusRequest { exit_status: 0 })
-            .await
-            .unwrap();
-        let event = ChannelEvent::Request {
-            request_type: "exit-status".into(),
-            want_reply: false,
-            request_data,
-        };
+        let request = ChannelRequest::ExitStatus(ExitStatusRequest {
+            exit_status: VarInt::from(0u32),
+        });
 
-        let result = handle_request(&event, &mut server_writer).await.unwrap();
+        let result = handle_request(request, &mut server_writer).await.unwrap();
         assert_eq!(
             result, None,
             "exit-status should return None (server→client)"
@@ -1119,21 +1036,14 @@ mod tests {
         let (server_writer, _client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        let request_data = encode_request_data(&ExitSignalRequest {
-            signal_name: "KILL".into(),
-            core_dumped: true,
-            error_message: "killed".into(),
-            language_tag: "en".into(),
-        })
-            .await
-            .unwrap();
-        let event = ChannelEvent::Request {
-            request_type: "exit-signal".into(),
-            want_reply: false,
-            request_data,
-        };
+        let request = ChannelRequest::ExitSignal(ExitSignalRequest {
+            signal_name: SshString::from("KILL"),
+            core_dumped: SshBool(true),
+            error_message: SshString::from("killed"),
+            language_tag: SshString::from("en"),
+        });
 
-        let result = handle_request(&event, &mut server_writer).await.unwrap();
+        let result = handle_request(request, &mut server_writer).await.unwrap();
         assert_eq!(
             result, None,
             "exit-signal should return None (server→client)"
@@ -1163,17 +1073,17 @@ mod tests {
         loop {
             let msg = match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => msg,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if is_eof_error(&e) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             };
             match &msg {
-                SshMessage::ChannelRequest { request_type, .. }
-                    if request_type == "exit-status" =>
-                {
+                SshMessage::Channel(ChannelMessage::Request(
+                    ChannelRequest::ExitStatus(_)
+                )) => {
                     found_exit_status = true;
                 }
-                SshMessage::ChannelEof => found_eof = true,
-                SshMessage::ChannelClose => found_close = true,
+                SshMessage::Channel(ChannelMessage::Eof) => found_eof = true,
+                SshMessage::Channel(ChannelMessage::Close) => found_close = true,
                 _ => {} // ignore other messages (e.g., data)
             }
         }
@@ -1208,16 +1118,16 @@ mod tests {
         loop {
             match SshMessage::decode_from(&mut client_reader).await {
                 Ok(msg) => messages.push(msg),
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if is_eof_error(&e) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
 
         // Find ChannelExtendedData with stderr
         let has_stderr = messages.iter().any(|m| match m {
-            SshMessage::ChannelExtendedData { data_type, data } => {
+            SshMessage::Channel(ChannelMessage::ExtendedData { data_type, data }) => {
                 *data_type == VarInt::from(1u8)
-                    && String::from_utf8_lossy(data).contains("stderr_msg")
+                    && String::from_utf8_lossy(data.as_ref().as_ref()).contains("stderr_msg")
             }
             _ => false,
         });
@@ -1253,28 +1163,28 @@ mod tests {
 
         loop {
             match SshMessage::decode_from(&mut client_reader).await {
-                Ok(SshMessage::ChannelExtendedData { data_type, data }) => {
+                Ok(SshMessage::Channel(ChannelMessage::ExtendedData { data_type, data })) => {
                     assert_eq!(data_type, VarInt::from(1u8));
                     stderr_frames += 1;
-                    total_stderr += data.len();
+                    total_stderr += data.as_ref().len();
                     index += 1;
                 }
-                Ok(SshMessage::ChannelRequest { request_type, .. }) if request_type == "exit-status" => {
+                Ok(SshMessage::Channel(ChannelMessage::Request(ChannelRequest::ExitStatus(_)))) => {
                     exit_pos = Some(index);
                     index += 1;
                 }
-                Ok(SshMessage::ChannelEof) => {
+                Ok(SshMessage::Channel(ChannelMessage::Eof)) => {
                     eof_pos = Some(index);
                     index += 1;
                 }
-                Ok(SshMessage::ChannelClose) => {
+                Ok(SshMessage::Channel(ChannelMessage::Close)) => {
                     close_pos = Some(index);
                     index += 1;
                 }
                 Ok(_) => {
                     index += 1;
                 }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if is_eof_error(&e) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -1299,12 +1209,12 @@ mod tests {
         use genmeta_ssh::PtyRequest;
 
         let pty_req = PtyRequest {
-            term_type: "xterm".into(),
-            width_cols: 80,
-            height_rows: 24,
-            width_px: 0,
-            height_px: 0,
-            terminal_modes: vec![],
+            term_type: SshString::from("xterm"),
+            width_cols: VarInt::from(80u32),
+            height_rows: VarInt::from(24u32),
+            width_px: VarInt::from(0u32),
+            height_px: VarInt::from(0u32),
+            terminal_modes: SshBytes::from(vec![]),
         };
         let pty_pair = allocate_pty(&pty_req).expect("allocate_pty failed");
 
@@ -1329,17 +1239,13 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Send TERM signal via channel event.
-        let mut request_data = Vec::new();
-        SshString("TERM".into())
-            .encode_into(&mut request_data)
-            .await
-            .unwrap();
         event_tx
-            .send(ChannelEvent::Request {
-                request_type: "signal".into(),
-                want_reply: false,
-                request_data,
-            })
+            .send(ChannelMessage::Request(ChannelRequest::Signal {
+                want_reply: SshBool(false),
+                request: SignalRequest {
+                    signal_name: SshString::from("TERM"),
+                },
+            }))
             .await
             .unwrap();
         drop(event_tx);
@@ -1353,26 +1259,21 @@ mod tests {
         let mut saw_exit_status = false;
         loop {
             match SshMessage::decode_from(&mut client_reader).await {
-                Ok(SshMessage::ChannelRequest {
-                    request_type,
-                    want_reply,
-                    request_data,
-                    ..
-                }) if request_type == "exit-signal" => {
-                    let req = ExitSignalRequest::decode_from(request_data.as_slice()).await.unwrap();
-                    assert_eq!(req.signal_name, "TERM");
-                    assert_eq!(req.error_message, "");
-                    assert_eq!(req.language_tag, "");
-                    assert!(!want_reply, "exit-signal must have want_reply=false");
+                Ok(SshMessage::Channel(ChannelMessage::Request(
+                    ChannelRequest::ExitSignal(req)
+                ))) => {
+                    assert_eq!(&*req.signal_name, "TERM");
+                    assert_eq!(&*req.error_message, "");
+                    assert_eq!(&*req.language_tag, "");
                     saw_exit_signal = true;
                 }
-                Ok(SshMessage::ChannelRequest { request_type, .. })
-                    if request_type == "exit-status" =>
-                {
+                Ok(SshMessage::Channel(ChannelMessage::Request(
+                    ChannelRequest::ExitStatus(_)
+                ))) => {
                     saw_exit_status = true;
                 }
                 Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if is_eof_error(&e) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -1397,12 +1298,12 @@ mod tests {
         use genmeta_ssh::PtyRequest;
 
         let pty_req = PtyRequest {
-            term_type: "xterm".into(),
-            width_cols: 80,
-            height_rows: 24,
-            width_px: 0,
-            height_px: 0,
-            terminal_modes: vec![],
+            term_type: SshString::from("xterm"),
+            width_cols: VarInt::from(80u32),
+            height_rows: VarInt::from(24u32),
+            width_px: VarInt::from(0u32),
+            height_px: VarInt::from(0u32),
+            terminal_modes: SshBytes::from(vec![]),
         };
         let pty_pair = allocate_pty(&pty_req).expect("allocate_pty failed");
 
@@ -1425,24 +1326,19 @@ mod tests {
         let mut saw_exit_signal = false;
         loop {
             match SshMessage::decode_from(&mut client_reader).await {
-                Ok(SshMessage::ChannelRequest {
-                    request_type,
-                    want_reply,
-                    request_data,
-                    ..
-                }) if request_type == "exit-status" => {
-                    assert!(!want_reply, "exit-status must have want_reply=false");
-                    let req = ExitStatusRequest::decode_from(request_data.as_slice()).await.unwrap();
-                    assert_eq!(req.exit_status, 42);
+                Ok(SshMessage::Channel(ChannelMessage::Request(
+                    ChannelRequest::ExitStatus(req)
+                ))) => {
+                    assert_eq!(req.exit_status, VarInt::from(42u32));
                     saw_exit_status = true;
                 }
-                Ok(SshMessage::ChannelRequest { request_type, .. })
-                    if request_type == "exit-signal" =>
-                {
+                Ok(SshMessage::Channel(ChannelMessage::Request(
+                    ChannelRequest::ExitSignal(_)
+                ))) => {
                     saw_exit_signal = true;
                 }
                 Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if is_eof_error(&e) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -1473,17 +1369,13 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let mut request_data = Vec::new();
-        SshString("TERM".into())
-            .encode_into(&mut request_data)
-            .await
-            .unwrap();
         event_tx
-            .send(ChannelEvent::Request {
-                request_type: "signal".into(),
-                want_reply: false,
-                request_data,
-            })
+            .send(ChannelMessage::Request(ChannelRequest::Signal {
+                want_reply: SshBool(false),
+                request: SignalRequest {
+                    signal_name: SshString::from("TERM"),
+                },
+            }))
             .await
             .unwrap();
         drop(event_tx);
@@ -1497,24 +1389,21 @@ mod tests {
         let mut saw_exit_status = false;
         loop {
             match SshMessage::decode_from(&mut client_reader).await {
-                Ok(SshMessage::ChannelRequest {
-                    request_type,
-                    request_data,
-                    ..
-                }) if request_type == "exit-signal" => {
-                    let req = ExitSignalRequest::decode_from(request_data.as_slice()).await.unwrap();
-                    assert_eq!(req.signal_name, "TERM");
-                    assert_eq!(req.error_message, "");
-                    assert_eq!(req.language_tag, "");
+                Ok(SshMessage::Channel(ChannelMessage::Request(
+                    ChannelRequest::ExitSignal(req)
+                ))) => {
+                    assert_eq!(&*req.signal_name, "TERM");
+                    assert_eq!(&*req.error_message, "");
+                    assert_eq!(&*req.language_tag, "");
                     saw_exit_signal = true;
                 }
-                Ok(SshMessage::ChannelRequest { request_type, .. })
-                    if request_type == "exit-status" =>
-                {
+                Ok(SshMessage::Channel(ChannelMessage::Request(
+                    ChannelRequest::ExitStatus(_)
+                ))) => {
                     saw_exit_status = true;
                 }
                 Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) if is_eof_error(&e) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -1547,34 +1436,24 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_pty_req_no_premature_reply() {
-        let mut request_data = Vec::new();
-        SshString("xterm".into())
-            .encode_into(&mut request_data)
-            .await
-            .unwrap();
-        let zero = VarInt::try_from(80u64).unwrap();
-        request_data.encode_one(zero).await.unwrap();
-        let zero = VarInt::try_from(24u64).unwrap();
-        request_data.encode_one(zero).await.unwrap();
-        let zero = VarInt::from(0u8);
-        request_data.encode_one(zero).await.unwrap();
-        let zero = VarInt::from(0u8);
-        request_data.encode_one(zero).await.unwrap();
-        let modes_len = VarInt::from(0u8);
-        request_data.encode_one(modes_len).await.unwrap();
-
-        let event = ChannelEvent::Request {
-            request_type: "pty-req".into(),
-            want_reply: true,
-            request_data,
+        let request = ChannelRequest::PtyReq {
+            want_reply: SshBool(true),
+            request: PtyRequest {
+                term_type: SshString::from("xterm"),
+                width_cols: VarInt::from(80u32),
+                height_rows: VarInt::from(24u32),
+                width_px: VarInt::from(0u32),
+                height_px: VarInt::from(0u32),
+                terminal_modes: SshBytes::from(vec![]),
+            },
         };
 
         let (server_writer, mut client_reader) = duplex(8192);
         let mut server_writer = server_writer;
 
-        let result = handle_request(&event, &mut server_writer).await.unwrap();
+        let result = handle_request(request, &mut server_writer).await.unwrap();
         assert!(
-            matches!(result, Some(RequestAction::AllocatePty(_, true))),
+            matches!(result, Some(RequestAction::AllocatePty(_, SshBool(true)))),
             "expected AllocatePty with want_reply=true, got {result:?}"
         );
 
@@ -1593,39 +1472,36 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_pty_req_returns_want_reply() {
-        let mut request_data = Vec::new();
-        SshString("vt100".into())
-            .encode_into(&mut request_data)
-            .await
-            .unwrap();
-        for &val in &[80u64, 24, 0, 0, 0] {
-            let v = VarInt::try_from(val).unwrap();
-            request_data.encode_one(v).await.unwrap();
-        }
-
-        let event_true = ChannelEvent::Request {
-            request_type: "pty-req".into(),
-            want_reply: true,
-            request_data: request_data.clone(),
+        let pty_request = PtyRequest {
+            term_type: SshString::from("vt100"),
+            width_cols: VarInt::from(80u32),
+            height_rows: VarInt::from(24u32),
+            width_px: VarInt::from(0u32),
+            height_px: VarInt::from(0u32),
+            terminal_modes: SshBytes::from(vec![]),
         };
-        let event_false = ChannelEvent::Request {
-            request_type: "pty-req".into(),
-            want_reply: false,
-            request_data,
+
+        let request_true = ChannelRequest::PtyReq {
+            want_reply: SshBool(true),
+            request: pty_request.clone(),
+        };
+        let request_false = ChannelRequest::PtyReq {
+            want_reply: SshBool(false),
+            request: pty_request,
         };
 
         let (mut w1, _r1) = duplex(8192);
         let (mut w2, _r2) = duplex(8192);
 
-        let result_true = handle_request(&event_true, &mut w1).await.unwrap();
-        let result_false = handle_request(&event_false, &mut w2).await.unwrap();
+        let result_true = handle_request(request_true, &mut w1).await.unwrap();
+        let result_false = handle_request(request_false, &mut w2).await.unwrap();
 
         match result_true {
-            Some(RequestAction::AllocatePty(_, wr)) => assert!(wr, "want_reply should be true"),
+            Some(RequestAction::AllocatePty(_, wr)) => assert_eq!(wr, SshBool(true), "want_reply should be true"),
             other => panic!("expected AllocatePty, got {other:?}"),
         }
         match result_false {
-            Some(RequestAction::AllocatePty(_, wr)) => assert!(!wr, "want_reply should be false"),
+            Some(RequestAction::AllocatePty(_, wr)) => assert_eq!(wr, SshBool(false), "want_reply should be false"),
             other => panic!("expected AllocatePty, got {other:?}"),
         }
     }

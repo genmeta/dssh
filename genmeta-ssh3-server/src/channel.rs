@@ -14,7 +14,11 @@ use genmeta_ssh::{
     TcpipForwardReply, TcpipForwardRequest,
 };
 use genmeta_ssh::{Ssh3Transport as RemoteSsh3Transport, Ssh3TransportClient, TransportError};
-use genmeta_ssh::{codec::ChannelHeader, message::SshMessage};
+use genmeta_ssh::{
+    ChannelHeader, ChannelMessage, ChannelOpenBody, ChannelOpenFailure, SshBool, SshMessage,
+    SshString,
+};
+use genmeta_ssh::codec::SshBytes;
 use h3x::codec::{DecodeExt, EncodeExt};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
@@ -77,6 +81,68 @@ fn validate_global_request_port(bind_port: VarInt) -> io::Result<u16> {
     })
 }
 // ---------------------------------------------------------------------------
+// Global request wire-format constants & helpers
+// ---------------------------------------------------------------------------
+
+const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
+const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
+const SSH_MSG_REQUEST_FAILURE: VarInt = VarInt::from_u32(82);
+
+/// Decode the body fields of a global-request message from a stream.
+/// Call after the message-type `VarInt(80)` has already been consumed.
+async fn decode_global_request_body<R: AsyncRead + Send + Unpin>(
+    reader: &mut R,
+) -> io::Result<(String, bool, Vec<u8>)> {
+    let request_type: SshString = reader.decode_one().await.map_err(io::Error::other)?;
+    let want_reply: SshBool = reader.decode_one().await.map_err(io::Error::other)?;
+    let data: SshBytes = reader.decode_one().await.map_err(io::Error::other)?;
+    Ok((request_type.to_string(), want_reply.0, data.as_ref().as_ref().to_vec()))
+}
+
+/// Write a global-request reply (success or failure) to a stream.
+async fn write_global_reply<W: AsyncWrite + Send + Unpin>(
+    writer: &mut W,
+    reply: &GlobalRequestReply,
+) -> io::Result<()> {
+    match reply {
+        GlobalRequestReply::Success(data) => {
+            writer.encode_one(SSH_MSG_REQUEST_SUCCESS).await?;
+            writer
+                .encode_one(SshBytes::from(data.clone()))
+                .await
+                .map_err(io::Error::other)?;
+        }
+        GlobalRequestReply::Failure => {
+            writer.encode_one(SSH_MSG_REQUEST_FAILURE).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Encode a raw global-request message onto a stream.
+async fn encode_raw_global_request<W: AsyncWrite + Send + Unpin>(
+    writer: &mut W,
+    request_type: &str,
+    want_reply: bool,
+    data: Vec<u8>,
+) -> io::Result<()> {
+    writer.encode_one(SSH_MSG_GLOBAL_REQUEST).await?;
+    writer
+        .encode_one(SshString::from(request_type.to_string()))
+        .await
+        .map_err(io::Error::other)?;
+    writer
+        .encode_one(SshBool(want_reply))
+        .await
+        .map_err(io::Error::other)?;
+    writer
+        .encode_one(SshBytes::from(data))
+        .await
+        .map_err(io::Error::other)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Channel dispatch by type
 // ---------------------------------------------------------------------------
 
@@ -92,9 +158,11 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    match &*header.channel_type {
-        "session" => handle_session_channel(header, reader, writer).await,
-        "global-request" => reject_legacy_global_request_channel(writer).await,
+    match &header.body {
+        ChannelOpenBody::Session => handle_session_channel(header, reader, writer).await,
+        ChannelOpenBody::Unknown { channel_type } if &**channel_type == "global-request" => {
+            reject_legacy_global_request_channel(writer).await
+        }
         _ => handle_unknown_channel(header, writer).await,
     }
 }
@@ -103,11 +171,11 @@ async fn handle_unknown_channel<W>(_header: ChannelHeader, mut writer: W) -> io:
 where
     W: AsyncWrite + Send + Unpin,
 {
-    let failure = SshMessage::ChannelOpenFailure {
+    let failure = SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
         reason_code: VarInt::from(3u8),
-        description: "unknown channel type".into(),
-    };
-    writer.encode_one(&failure).await?;
+        description: SshString::from("unknown channel type"),
+    }));
+    writer.encode_one(failure).await.map_err(io::Error::other)?;
     Ok(())
 }
 
@@ -131,28 +199,16 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // Read a single GlobalRequest from the stream.
-    let msg: SshMessage = reader.decode_one().await?;
-
-    let SshMessage::GlobalRequest {
-        request_type,
-        want_reply,
-        data,
-    } = msg
-    else {
-        tracing::warn!("expected GlobalRequest on global-request channel, got {msg:?}");
+    let msg_type: VarInt = reader.decode_one().await?;
+    if msg_type != SSH_MSG_GLOBAL_REQUEST {
+        tracing::warn!("expected GlobalRequest(80) on global-request channel, got {msg_type:?}");
         return Ok(());
-    };
+    }
+    let (request_type, want_reply, data) = decode_global_request_body(&mut reader).await?;
 
     let reply = process_global_request(&request_type, &data, global_ctx).await?;
     if want_reply {
-        match reply {
-            GlobalRequestReply::Success(data) => {
-                writer
-                    .encode_one(&SshMessage::RequestSuccess { data })
-                    .await?
-            }
-            GlobalRequestReply::Failure => writer.encode_one(&SshMessage::RequestFailure).await?,
-        }
+        write_global_reply(&mut writer, &reply).await?;
         writer.flush().await?;
     }
 
@@ -174,7 +230,7 @@ pub async fn process_global_request(
 
     match request_type {
         "tcpip-forward" => {
-            let req: TcpipForwardRequest = data.decode_one().await?;
+            let req: TcpipForwardRequest = data.decode_one().await.map_err(io::Error::other)?;
             tracing::info!(
                 bind_address = &*req.bind_address,
                 bind_port = req.bind_port.into_inner(),
@@ -204,7 +260,8 @@ pub async fn process_global_request(
                         .encode_one(TcpipForwardReply {
                             allocated_port: VarInt::from(actual_port),
                         })
-                        .await?;
+                        .await
+                        .map_err(io::Error::other)?;
                     Ok(GlobalRequestReply::Success(reply_data))
                 }
                 Err(e) => {
@@ -214,7 +271,7 @@ pub async fn process_global_request(
             }
         }
         "cancel-tcpip-forward" => {
-            let req: CancelTcpipForwardRequest = data.decode_one().await?;
+            let req: CancelTcpipForwardRequest = data.decode_one().await.map_err(io::Error::other)?;
             tracing::info!(
                 bind_address = &*req.bind_address,
                 bind_port = req.bind_port.into_inner(),
@@ -239,7 +296,7 @@ pub async fn process_global_request(
             }
         }
         "streamlocal-forward@openssh.com" => {
-            let req: StreamlocalForwardRequest = data.decode_one().await?;
+            let req: StreamlocalForwardRequest = data.decode_one().await.map_err(io::Error::other)?;
             tracing::info!(
                 socket_path = &*req.socket_path,
                 "streamlocal-forward request"
@@ -257,7 +314,7 @@ pub async fn process_global_request(
             }
         }
         "cancel-streamlocal-forward@openssh.com" => {
-            let req: CancelStreamlocalForwardRequest = data.decode_one().await?;
+            let req: CancelStreamlocalForwardRequest = data.decode_one().await.map_err(io::Error::other)?;
             tracing::info!(
                 socket_path = &*req.socket_path,
                 "cancel-streamlocal-forward request"
@@ -283,11 +340,11 @@ pub async fn reject_legacy_global_request_channel<W>(mut writer: W) -> io::Resul
 where
     W: AsyncWrite + Send + Unpin,
 {
-    let failure = SshMessage::ChannelOpenFailure {
+    let failure = SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
         reason_code: VarInt::from(3u8),
-        description: "legacy global-request channel path rejected; use control stream".into(),
-    };
-    writer.encode_one(&failure).await?;
+        description: SshString::from("legacy global-request channel path rejected; use control stream"),
+    }));
+    writer.encode_one(failure).await.map_err(io::Error::other)?;
     writer.flush().await
 }
 
@@ -336,16 +393,7 @@ where
             match action {
                 ControlStreamAction::Reply { want_reply, reply } => {
                     if want_reply {
-                        match reply {
-                            GlobalRequestReply::Success(data) => {
-                                writer
-                                    .encode_one(&SshMessage::RequestSuccess { data })
-                                    .await?
-                            }
-                            GlobalRequestReply::Failure => {
-                                writer.encode_one(&SshMessage::RequestFailure).await?
-                            }
-                        }
+                        write_global_reply(&mut writer, &reply).await?;
                         writer.flush().await?;
                     }
                 }
@@ -359,8 +407,9 @@ where
     });
 
     loop {
-        let msg = match reader.decode_one::<SshMessage>().await {
-            Ok(msg) => msg,
+        // Read the message type VarInt; EOF means the stream is done.
+        let msg_type: VarInt = match reader.decode_one().await {
+            Ok(t) => t,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(error) => {
                 drop(action_tx);
@@ -369,15 +418,20 @@ where
             }
         };
 
-        let SshMessage::GlobalRequest {
-            request_type,
-            want_reply,
-            data,
-        } = msg
-        else {
+        if msg_type != SSH_MSG_GLOBAL_REQUEST {
             let _ = action_tx.send(ControlStreamAction::Close).await;
             break;
-        };
+        }
+
+        let (request_type, want_reply, data) =
+            match decode_global_request_body(reader).await {
+                Ok(t) => t,
+                Err(error) => {
+                    drop(action_tx);
+                    let _ = writer_task.await;
+                    return Err(error);
+                }
+            };
 
         if !readiness.load(Ordering::SeqCst) {
             let _ = action_tx
@@ -666,10 +720,9 @@ mod tests {
     use super::*;
     use crate::forward::reverse_tcp::ReverseTcpForwarder;
     use crate::forward::streamlocal::ReverseStreamlocalForwarder;
-    use genmeta_ssh::ChannelEvent;
-    use genmeta_ssh::{CancelTcpipForwardRequest, TcpipForwardRequest};
+    use genmeta_ssh::{CancelTcpipForwardRequest, ChannelRequest, ExecRequest, TcpipForwardRequest};
     use genmeta_ssh::{
-        DEFAULT_MAX_MESSAGE_SIZE, codec::ChannelHeader, message::SshMessage, open_session_channel,
+        DEFAULT_MAX_MESSAGE_SIZE, ChannelHeader, SshMessage, open_session_channel,
     };
     use genmeta_ssh::{
         Ssh3Transport as RemoteSessionTransport, Ssh3TransportClient, Ssh3TransportServerShared,
@@ -687,9 +740,28 @@ mod tests {
     /// Helper: encode messages into writer half, then drop to signal EOF.
     async fn encode_messages(mut writer: impl AsyncWrite + Send + Unpin, messages: &[SshMessage]) {
         for msg in messages {
-            msg.encode_into(&mut writer).await.unwrap();
+            writer.encode_one(msg.clone()).await.unwrap();
         }
         drop(writer);
+    }
+
+    /// Helper: decode a raw global-request reply from a reader.
+    #[derive(Debug, PartialEq, Eq)]
+    enum RawGlobalReply {
+        Success(Vec<u8>),
+        Failure,
+    }
+
+    async fn decode_raw_global_reply(reader: &mut (impl AsyncRead + Send + Unpin)) -> RawGlobalReply {
+        let msg_type: VarInt = reader.decode_one().await.unwrap();
+        if msg_type == SSH_MSG_REQUEST_SUCCESS {
+            let data: SshBytes = reader.decode_one().await.unwrap();
+            RawGlobalReply::Success(data.as_ref().as_ref().to_vec())
+        } else if msg_type == SSH_MSG_REQUEST_FAILURE {
+            RawGlobalReply::Failure
+        } else {
+            panic!("expected RequestSuccess(81) or RequestFailure(82), got {msg_type:?}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -702,20 +774,17 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "session".into(),
-            max_message_size: 65536,
+            session_id: StreamId(VarInt::from(1u8)),
+            max_message_size: VarInt::from(65536u32),
+            body: ChannelOpenBody::Session,
         };
 
         // Client sends: data → EOF → close
         let client_handle = tokio::spawn(async move {
             let messages = vec![
-                SshMessage::ChannelData {
-                    data: b"hello".to_vec(),
-                },
-                SshMessage::ChannelEof,
-                SshMessage::ChannelClose,
+                SshMessage::Channel(ChannelMessage::Data(SshBytes::from(b"hello".to_vec()))),
+                SshMessage::Channel(ChannelMessage::Eof),
+                SshMessage::Channel(ChannelMessage::Close),
             ];
             encode_messages(client_writer, &messages).await;
         });
@@ -730,11 +799,8 @@ mod tests {
         // Read the ChannelOpenConfirmation from the server
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
-            SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(
-                    max_message_size,
-                    VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32)
-                );
+            SshMessage::Channel(ChannelMessage::OpenConfirmation { max_message_size }) => {
+                assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -753,10 +819,9 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "unknown-type".into(),
-            max_message_size: 65536,
+            session_id: StreamId(VarInt::from(1u8)),
+            max_message_size: VarInt::from(65536u32),
+            body: ChannelOpenBody::Unknown { channel_type: SshString::from("unknown-type") },
         };
 
         handle_channel(header, server_reader, server_writer)
@@ -766,16 +831,16 @@ mod tests {
         // Read the ChannelOpenFailure from the server
         let failure = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match failure {
-            SshMessage::ChannelOpenFailure {
+            SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
                 reason_code,
                 description,
-            } => {
+            })) => {
                 assert_eq!(
                     reason_code,
                     VarInt::from(3u8),
                     "reason_code should be 3 (unknown channel type)"
                 );
-                assert_eq!(description, "unknown channel type");
+                assert_eq!(&*description, "unknown channel type");
             }
             other => panic!("expected ChannelOpenFailure, got {other:?}"),
         }
@@ -792,13 +857,11 @@ mod tests {
 
         // Send data then close
         let client_handle = tokio::spawn(async move {
-            SshMessage::ChannelData {
-                data: b"test-data".to_vec(),
-            }
-            .encode_into(&mut client_writer)
-            .await
-            .unwrap();
-            SshMessage::ChannelClose
+            SshMessage::Channel(ChannelMessage::Data(SshBytes::from(b"test-data".to_vec())))
+                .encode_into(&mut client_writer)
+                .await
+                .unwrap();
+            SshMessage::Channel(ChannelMessage::Close)
                 .encode_into(&mut client_writer)
                 .await
                 .unwrap();
@@ -814,16 +877,16 @@ mod tests {
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert!(matches!(
             confirm,
-            SshMessage::ChannelOpenConfirmation { .. }
+            SshMessage::Channel(ChannelMessage::OpenConfirmation { .. })
         ));
 
         // Receive the data event
         let event = event_rx.recv().await.unwrap();
-        assert_eq!(event, ChannelEvent::Data(b"test-data".to_vec()));
+        assert_eq!(event, ChannelMessage::Data(SshBytes::from(b"test-data".to_vec())));
 
         // Receive close event
         let event = event_rx.recv().await.unwrap();
-        assert_eq!(event, ChannelEvent::Close);
+        assert_eq!(event, ChannelMessage::Close);
 
         client_handle.await.unwrap();
     }
@@ -838,15 +901,16 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let client_handle = tokio::spawn(async move {
-            SshMessage::ChannelRequest {
-                request_type: "exec".into(),
-                want_reply: true,
-                request_data: b"ls -la".to_vec(),
-            }
+            SshMessage::Channel(ChannelMessage::Request(ChannelRequest::Exec {
+                want_reply: SshBool(true),
+                request: ExecRequest {
+                    command: SshBytes::from(b"ls -la".to_vec()),
+                },
+            }))
             .encode_into(&mut client_writer)
             .await
             .unwrap();
-            SshMessage::ChannelClose
+            SshMessage::Channel(ChannelMessage::Close)
                 .encode_into(&mut client_writer)
                 .await
                 .unwrap();
@@ -864,11 +928,12 @@ mod tests {
         let event = event_rx.recv().await.unwrap();
         assert_eq!(
             event,
-            ChannelEvent::Request {
-                request_type: "exec".into(),
-                want_reply: true,
-                request_data: b"ls -la".to_vec(),
-            }
+            ChannelMessage::Request(ChannelRequest::Exec {
+                want_reply: SshBool(true),
+                request: ExecRequest {
+                    command: SshBytes::from(b"ls -la".to_vec()),
+                },
+            })
         );
 
         client_handle.await.unwrap();
@@ -884,11 +949,11 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let client_handle = tokio::spawn(async move {
-            SshMessage::ChannelEof
+            SshMessage::Channel(ChannelMessage::Eof)
                 .encode_into(&mut client_writer)
                 .await
                 .unwrap();
-            SshMessage::ChannelClose
+            SshMessage::Channel(ChannelMessage::Close)
                 .encode_into(&mut client_writer)
                 .await
                 .unwrap();
@@ -904,11 +969,11 @@ mod tests {
 
         // Receive EOF event
         let event = event_rx.recv().await.unwrap();
-        assert_eq!(event, ChannelEvent::Eof);
+        assert_eq!(event, ChannelMessage::Eof);
 
         // Receive close event
         let event = event_rx.recv().await.unwrap();
-        assert_eq!(event, ChannelEvent::Close);
+        assert_eq!(event, ChannelMessage::Close);
 
         client_handle.await.unwrap();
     }
@@ -923,7 +988,7 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let client_handle = tokio::spawn(async move {
-            SshMessage::ChannelClose
+            SshMessage::Channel(ChannelMessage::Close)
                 .encode_into(&mut client_writer)
                 .await
                 .unwrap();
@@ -939,7 +1004,7 @@ mod tests {
 
         // Receive close event
         let event = event_rx.recv().await.unwrap();
-        assert_eq!(event, ChannelEvent::Close);
+        assert_eq!(event, ChannelMessage::Close);
 
         // Channel should be done — no more events
         assert!(event_rx.recv().await.is_none());
@@ -962,10 +1027,9 @@ mod tests {
             let (server_writer, mut client_reader) = duplex(8192);
 
             let header = ChannelHeader {
-                signal_value: 0xaf3627e6,
-                conversation_id: 1,
-                channel_type: channel_type.into(),
-                max_message_size: 65536,
+                session_id: StreamId(VarInt::from(1u8)),
+                max_message_size: VarInt::from(65536u32),
+                body: ChannelOpenBody::Unknown { channel_type: SshString::from(channel_type) },
             };
 
             let result = handle_channel(header, server_reader, server_writer).await;
@@ -977,7 +1041,11 @@ mod tests {
             // Should receive ChannelOpenFailure since no session_client.
             let failure = SshMessage::decode_from(&mut client_reader).await.unwrap();
             assert!(
-                matches!(failure, SshMessage::ChannelOpenFailure { reason_code, .. } if reason_code == VarInt::from(3u8)),
+                matches!(
+                    failure,
+                    SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure { reason_code, .. }))
+                    if reason_code == VarInt::from(3u8)
+                ),
                 "expected ChannelOpenFailure for {channel_type}, got {failure:?}"
             );
         }
@@ -993,14 +1061,14 @@ mod tests {
         let (server_writer, mut client_reader) = duplex(8192);
 
         let client_handle = tokio::spawn(async move {
-            SshMessage::ChannelExtendedData {
+            SshMessage::Channel(ChannelMessage::ExtendedData {
                 data_type: VarInt::from(1u8), // stderr
-                data: b"error output".to_vec(),
-            }
+                data: SshBytes::from(b"error output".to_vec()),
+            })
             .encode_into(&mut client_writer)
             .await
             .unwrap();
-            SshMessage::ChannelClose
+            SshMessage::Channel(ChannelMessage::Close)
                 .encode_into(&mut client_writer)
                 .await
                 .unwrap();
@@ -1018,9 +1086,9 @@ mod tests {
         let event = event_rx.recv().await.unwrap();
         assert_eq!(
             event,
-            ChannelEvent::ExtendedData {
+            ChannelMessage::ExtendedData {
                 data_type: VarInt::from(1u8),
-                data: b"error output".to_vec(),
+                data: SshBytes::from(b"error output".to_vec()),
             }
         );
 
@@ -1038,21 +1106,19 @@ mod tests {
 
         let client_handle = tokio::spawn(async move {
             // Send success and failure, then close
-            SshMessage::ChannelSuccess
+            SshMessage::Channel(ChannelMessage::Success)
                 .encode_into(&mut client_writer)
                 .await
                 .unwrap();
-            SshMessage::ChannelFailure
+            SshMessage::Channel(ChannelMessage::Failure)
                 .encode_into(&mut client_writer)
                 .await
                 .unwrap();
-            SshMessage::ChannelData {
-                data: b"after".to_vec(),
-            }
-            .encode_into(&mut client_writer)
-            .await
-            .unwrap();
-            SshMessage::ChannelClose
+            SshMessage::Channel(ChannelMessage::Data(SshBytes::from(b"after".to_vec())))
+                .encode_into(&mut client_writer)
+                .await
+                .unwrap();
+            SshMessage::Channel(ChannelMessage::Close)
                 .encode_into(&mut client_writer)
                 .await
                 .unwrap();
@@ -1069,11 +1135,11 @@ mod tests {
         // ChannelSuccess and ChannelFailure should NOT appear as events.
         // The next event should be the data message.
         let event = event_rx.recv().await.unwrap();
-        assert_eq!(event, ChannelEvent::Data(b"after".to_vec()));
+        assert_eq!(event, ChannelMessage::Data(SshBytes::from(b"after".to_vec())));
 
         // Then close
         let event = event_rx.recv().await.unwrap();
-        assert_eq!(event, ChannelEvent::Close);
+        assert_eq!(event, ChannelMessage::Close);
 
         client_handle.await.unwrap();
     }
@@ -1181,24 +1247,19 @@ mod tests {
         let mut client_writer = client_writer;
         let mut request_data = Vec::new();
         request_data
-            .encode_one(&TcpipForwardRequest {
-                bind_address: "127.0.0.1".into(),
-                bind_port: u16::MAX as u32 + 1,
+            .encode_one(TcpipForwardRequest {
+                bind_address: SshString::from("127.0.0.1"),
+                bind_port: VarInt::from(u16::MAX as u32 + 1),
             })
             .await
             .unwrap();
-        SshMessage::GlobalRequest {
-            request_type: "tcpip-forward".into(),
-            want_reply: true,
-            data: request_data,
-        }
-        .encode_into(&mut client_writer)
-        .await
-        .unwrap();
+        encode_raw_global_request(&mut client_writer, "tcpip-forward", true, request_data)
+            .await
+            .unwrap();
         drop(client_writer);
 
-        let reply = SshMessage::decode_from(&mut client_reader).await.unwrap();
-        assert!(matches!(reply, SshMessage::RequestFailure));
+        let reply = decode_raw_global_reply(&mut client_reader).await;
+        assert_eq!(reply, RawGlobalReply::Failure);
 
         server_handle.await.unwrap();
     }
@@ -1218,24 +1279,19 @@ mod tests {
         let mut client_writer = client_writer;
         let mut request_data = Vec::new();
         request_data
-            .encode_one(&CancelTcpipForwardRequest {
-                bind_address: "127.0.0.1".into(),
-                bind_port: u16::MAX as u32 + 1,
+            .encode_one(CancelTcpipForwardRequest {
+                bind_address: SshString::from("127.0.0.1"),
+                bind_port: VarInt::from(u16::MAX as u32 + 1),
             })
             .await
             .unwrap();
-        SshMessage::GlobalRequest {
-            request_type: "cancel-tcpip-forward".into(),
-            want_reply: true,
-            data: request_data,
-        }
-        .encode_into(&mut client_writer)
-        .await
-        .unwrap();
+        encode_raw_global_request(&mut client_writer, "cancel-tcpip-forward", true, request_data)
+            .await
+            .unwrap();
         drop(client_writer);
 
-        let reply = SshMessage::decode_from(&mut client_reader).await.unwrap();
-        assert!(matches!(reply, SshMessage::RequestFailure));
+        let reply = decode_raw_global_reply(&mut client_reader).await;
+        assert_eq!(reply, RawGlobalReply::Failure);
 
         server_handle.await.unwrap();
     }
@@ -1268,48 +1324,34 @@ mod tests {
             .unwrap();
         });
 
-        SshMessage::GlobalRequest {
-            request_type: "tcpip-forward".into(),
-            want_reply: true,
-            data: vec![],
-        }
-        .encode_into(&mut client_writer)
-        .await
-        .unwrap();
+        encode_raw_global_request(&mut client_writer, "tcpip-forward", true, vec![])
+            .await
+            .unwrap();
 
         let rejected = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            SshMessage::decode_from(&mut client_reader),
+            decode_raw_global_reply(&mut client_reader),
         )
         .await
-        .expect("pre-readiness rejection should arrive before deadline")
-        .unwrap();
-        assert!(matches!(rejected, SshMessage::RequestFailure));
+        .expect("pre-readiness rejection should arrive before deadline");
+        assert_eq!(rejected, RawGlobalReply::Failure);
         assert_eq!(handler_calls.load(AtomicOrdering::SeqCst), 0);
 
         readiness.store(true, Ordering::SeqCst);
-        SshMessage::GlobalRequest {
-            request_type: "tcpip-forward".into(),
-            want_reply: true,
-            data: vec![],
-        }
-        .encode_into(&mut client_writer)
-        .await
-        .unwrap();
+        encode_raw_global_request(&mut client_writer, "tcpip-forward", true, vec![])
+            .await
+            .unwrap();
         client_writer.shutdown().await.unwrap();
 
         let accepted = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            SshMessage::decode_from(&mut client_reader),
+            decode_raw_global_reply(&mut client_reader),
         )
         .await
-        .expect("post-readiness reply should arrive before deadline")
-        .unwrap();
+        .expect("post-readiness reply should arrive before deadline");
         assert_eq!(
             accepted,
-            SshMessage::RequestSuccess {
-                data: b"ok".to_vec()
-            }
+            RawGlobalReply::Success(b"ok".to_vec())
         );
         assert_eq!(handler_calls.load(AtomicOrdering::SeqCst), 1);
 
@@ -1340,21 +1382,14 @@ mod tests {
         });
 
         for request_type in ["first", "second"] {
-            SshMessage::GlobalRequest {
-                request_type: request_type.into(),
-                want_reply: true,
-                data: vec![],
-            }
-            .encode_into(&mut client_writer)
-            .await
-            .unwrap();
+            encode_raw_global_request(&mut client_writer, request_type, true, vec![])
+                .await
+                .unwrap();
 
-            let reply = SshMessage::decode_from(&mut client_reader).await.unwrap();
+            let reply = decode_raw_global_reply(&mut client_reader).await;
             assert_eq!(
                 reply,
-                SshMessage::RequestSuccess {
-                    data: request_type.as_bytes().to_vec(),
-                }
+                RawGlobalReply::Success(request_type.as_bytes().to_vec())
             );
         }
 
@@ -1400,47 +1435,33 @@ mod tests {
             .unwrap();
         });
 
-        SshMessage::GlobalRequest {
-            request_type: "first".into(),
-            want_reply: true,
-            data: vec![],
-        }
-        .encode_into(&mut client_writer)
-        .await
-        .unwrap();
-        SshMessage::GlobalRequest {
-            request_type: "second".into(),
-            want_reply: true,
-            data: vec![],
-        }
-        .encode_into(&mut client_writer)
-        .await
-        .unwrap();
+        encode_raw_global_request(&mut client_writer, "first", true, vec![])
+            .await
+            .unwrap();
+        encode_raw_global_request(&mut client_writer, "second", true, vec![])
+            .await
+            .unwrap();
 
         let rejected = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            SshMessage::decode_from(&mut client_reader),
+            decode_raw_global_reply(&mut client_reader),
         )
         .await
-        .expect("second in-flight request should be rejected before deadline")
-        .unwrap();
-        assert!(matches!(rejected, SshMessage::RequestFailure));
+        .expect("second in-flight request should be rejected before deadline");
+        assert_eq!(rejected, RawGlobalReply::Failure);
         assert_eq!(handler_calls.load(AtomicOrdering::SeqCst), 1);
 
         release_tx.send(()).unwrap();
 
         let first_reply = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            SshMessage::decode_from(&mut client_reader),
+            decode_raw_global_reply(&mut client_reader),
         )
         .await
-        .expect("first request should eventually complete")
-        .unwrap();
+        .expect("first request should eventually complete");
         assert_eq!(
             first_reply,
-            SshMessage::RequestSuccess {
-                data: b"first".to_vec(),
-            }
+            RawGlobalReply::Success(b"first".to_vec())
         );
 
         client_writer.shutdown().await.unwrap();
@@ -1461,10 +1482,10 @@ mod tests {
 
         let reply = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match reply {
-            SshMessage::ChannelOpenFailure {
+            SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
                 reason_code,
                 description,
-            } => {
+            })) => {
                 assert_eq!(reason_code, VarInt::from(3u8));
                 assert!(description.contains("control stream"));
             }

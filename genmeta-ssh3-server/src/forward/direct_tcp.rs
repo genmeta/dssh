@@ -17,7 +17,8 @@
 //! NOT wrapped in `SSH_MSG_CHANNEL_DATA(94)`.
 
 use genmeta_ssh::{
-    DEFAULT_MAX_MESSAGE_SIZE, codec::ChannelHeader, codec::SshString, message::SshMessage, relay,
+    ChannelHeader, ChannelMessage, ChannelOpenFailure, DEFAULT_MAX_MESSAGE_SIZE,
+    SshMessage, codec::SshString, relay,
 };
 use h3x::codec::{DecodeExt, EncodeExt};
 use h3x::varint::VarInt;
@@ -52,19 +53,19 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // Parse request_data fields (RFC 4254 §7.2).
-    let dest_host: SshString = reader.decode_one().await?;
+    let dest_host: SshString = reader.decode_one().await.map_err(io::Error::other)?;
     let dest_port: VarInt = reader.decode_one().await?;
-    let _originator_host: SshString = reader.decode_one().await?;
+    let _originator_host: SshString = reader.decode_one().await.map_err(io::Error::other)?;
     let _originator_port: VarInt = reader.decode_one().await?;
 
     let dest_port = match validate_port(dest_port.into_inner(), "destination port") {
         Ok(port) => port,
         Err(_) => {
-            let failure = SshMessage::ChannelOpenFailure {
+            let failure = SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
                 reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                 description: "destination port is out of range for a TCP port".into(),
-            };
-            writer.encode_one(&failure).await?;
+            }));
+            writer.encode_one(failure).await.map_err(io::Error::other)?;
             return Ok(());
         }
     };
@@ -79,20 +80,20 @@ where
                 error = %Report::from_error(&e),
                 "direct-tcpip connect failed"
             );
-            let failure = SshMessage::ChannelOpenFailure {
+            let failure = SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
                 reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                 description: "connect failed".into(),
-            };
-            writer.encode_one(&failure).await?;
+            }));
+            writer.encode_one(failure).await.map_err(io::Error::other)?;
             return Ok(());
         }
     };
 
     // Send ChannelOpenConfirmation(91).
-    let confirm = SshMessage::ChannelOpenConfirmation {
+    let confirm = SshMessage::Channel(ChannelMessage::OpenConfirmation {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-    };
-    writer.encode_one(&confirm).await?;
+    });
+    writer.encode_one(confirm).await.map_err(io::Error::other)?;
 
     // Bridge raw bytes bidirectionally between QUIC stream and TCP socket.
     // We spawn two tasks for true concurrency — this avoids deadlocks that
@@ -117,8 +118,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genmeta_ssh::{codec::SshString, message::SshMessage};
+    use genmeta_ssh::{ChannelMessage, ChannelOpenBody, ChannelOpenFailure, SshMessage, codec::SshString};
     use h3x::codec::{DecodeFrom, EncodeExt, EncodeInto};
+    use h3x::stream_id::StreamId;
     use h3x::varint::VarInt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::net::TcpListener;
@@ -131,12 +133,12 @@ mod tests {
         originator_port: u32,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
-        SshString(dest_host.to_owned())
+        SshString::from(dest_host.to_owned())
             .encode_into(&mut buf)
             .await
             .unwrap();
         buf.encode_one(VarInt::from(dest_port)).await.unwrap();
-        SshString(originator_host.to_owned())
+        SshString::from(originator_host.to_owned())
             .encode_into(&mut buf)
             .await
             .unwrap();
@@ -158,9 +160,9 @@ mod tests {
         let originator_host = SshString::decode_from(&mut reader).await.unwrap();
         let originator_port: VarInt = reader.decode_one().await.unwrap();
 
-        assert_eq!(dest_host, SshString("example.com".into()));
+        assert_eq!(dest_host, SshString::from("example.com"));
         assert_eq!(dest_port.into_inner(), 8080);
-        assert_eq!(originator_host, SshString("192.168.1.1".into()));
+        assert_eq!(originator_host, SshString::from("192.168.1.1"));
         assert_eq!(originator_port.into_inner(), 54321);
     }
 
@@ -208,10 +210,9 @@ mod tests {
             encode_request_data("127.0.0.1", addr.port() as u32, "127.0.0.1", 12345).await;
 
         let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "direct-tcpip".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(1u8)),
+            max_message_size: VarInt::from(1u32 << 20),
+            body: ChannelOpenBody::Session,
         };
 
         // client_writer → server_reader (QUIC read half)
@@ -236,11 +237,8 @@ mod tests {
         // Read ChannelOpenConfirmation from the server.
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
-            SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(
-                    max_message_size,
-                    VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32)
-                );
+            SshMessage::Channel(ChannelMessage::OpenConfirmation { max_message_size }) => {
+                assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -264,10 +262,9 @@ mod tests {
         let request_data = encode_request_data("127.0.0.1", 1, "127.0.0.1", 11111).await;
 
         let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "direct-tcpip".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(1u8)),
+            max_message_size: VarInt::from(1u32 << 20),
+            body: ChannelOpenBody::Session,
         };
 
         let (mut client_writer, server_reader) = duplex(8192);
@@ -285,10 +282,10 @@ mod tests {
         // Should receive ChannelOpenFailure(92) with reason_code=2.
         let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match msg {
-            SshMessage::ChannelOpenFailure {
+            SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
                 reason_code,
                 description,
-            } => {
+            })) => {
                 assert_eq!(
                     reason_code,
                     VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
@@ -312,10 +309,9 @@ mod tests {
             encode_request_data("127.0.0.1", overflow_port, "127.0.0.1", 11111).await;
 
         let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "direct-tcpip".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(1u8)),
+            max_message_size: VarInt::from(1u32 << 20),
+            body: ChannelOpenBody::Session,
         };
 
         let (mut client_writer, server_reader) = duplex(8192);
@@ -330,10 +326,10 @@ mod tests {
 
         let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match msg {
-            SshMessage::ChannelOpenFailure {
+            SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
                 reason_code,
                 description,
-            } => {
+            })) => {
                 assert_eq!(reason_code, VarInt::from(SSH_OPEN_CONNECT_FAILED as u8));
                 assert!(
                     description.contains("out of range"),
@@ -365,10 +361,9 @@ mod tests {
             encode_request_data("127.0.0.1", addr.port() as u32, "127.0.0.1", 22222).await;
 
         let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "direct-tcpip".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(1u8)),
+            max_message_size: VarInt::from(1u32 << 20),
+            body: ChannelOpenBody::Session,
         };
 
         let (mut client_writer, server_reader) = duplex(8192);
@@ -386,7 +381,7 @@ mod tests {
         // Read ChannelOpenConfirmation.
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         assert!(
-            matches!(confirm, SshMessage::ChannelOpenConfirmation { .. }),
+            matches!(confirm, SshMessage::Channel(ChannelMessage::OpenConfirmation { .. })),
             "expected ChannelOpenConfirmation, got {confirm:?}"
         );
 

@@ -9,9 +9,9 @@
 use genmeta_ssh::ChannelHeader;
 use genmeta_ssh::SshMessage;
 use genmeta_ssh::{
-    ChannelEvent, ChannelReader, ChannelWriter, RequestAction, SessionError, SessionInit,
-    SessionLoopAction, Ssh3Transport, Ssh3TransportClient, handle_session_loop_event,
-    open_session_channel,
+    ChannelMessage, ChannelOpenBody, ChannelReader, ChannelWriter, RequestAction, SessionError,
+    SessionInit, SessionLoopAction, Ssh3Transport, Ssh3TransportClient,
+    handle_session_loop_message, open_session_channel,
 };
 use h3x::codec::EncodeExt;
 use snafu::Report;
@@ -145,7 +145,7 @@ impl Ssh3Session {
         from_client: remoc::rch::mpsc::Receiver<Vec<u8>>,
         to_client: remoc::rch::mpsc::Sender<Vec<u8>>,
     ) {
-        let channel_type = header.channel_type.clone();
+        let channel_type = header.body.channel_name();
         let conversation_id = self.init.conversation_id;
         let session = self.clone();
         let span = tracing::info_span!(
@@ -175,29 +175,35 @@ impl Ssh3Session {
         let reader = ChannelReader::new(from_client);
         let writer = ChannelWriter::new(to_client);
 
-        match &*header.channel_type {
-            "session" => {
+        match &header.body {
+            ChannelOpenBody::Session => {
                 let (event_rx, writer) = open_session_channel(reader, writer)
                     .await
-                    .map_err(SessionError::from)?;
+                    .map_err(|e| SessionError::new(e.to_string()))?;
                 self.handle_session_requests(event_rx, writer).await
             }
-            "direct-tcpip" => crate::forward::direct_tcp::handle_direct_tcp(header, reader, writer)
-                .await
-                .map_err(SessionError::from),
-            "direct-streamlocal@openssh.com" => {
+            ChannelOpenBody::DirectTcpip(_) => {
+                crate::forward::direct_tcp::handle_direct_tcp(header, reader, writer)
+                    .await
+                    .map_err(SessionError::from)
+            }
+            ChannelOpenBody::DirectStreamlocal { .. } => {
                 crate::forward::streamlocal::handle_direct_streamlocal(header, reader, writer)
                     .await
                     .map_err(SessionError::from)
             }
-            "socks5" => crate::forward::socks5::handle_socks5(header, reader, writer)
-                .await
-                .map_err(SessionError::from),
-            "global-request" => reject_legacy_global_request_channel(writer)
-                .await
-                .map_err(SessionError::from),
-            other => {
-                tracing::warn!(channel_type = %other, "unknown channel type in child");
+            ChannelOpenBody::Socks5 => {
+                crate::forward::socks5::handle_socks5(header, reader, writer)
+                    .await
+                    .map_err(SessionError::from)
+            }
+            ChannelOpenBody::Unknown { channel_type } if &**channel_type == "global-request" => {
+                reject_legacy_global_request_channel(writer)
+                    .await
+                    .map_err(SessionError::from)
+            }
+            _ => {
+                tracing::warn!(channel_type = %header.body.channel_name(), "unknown channel type in child");
                 Err(SessionError::new("unknown channel type"))
             }
         }
@@ -205,7 +211,7 @@ impl Ssh3Session {
 
     async fn handle_session_requests<W>(
         &self,
-        mut event_rx: mpsc::Receiver<ChannelEvent>,
+        mut event_rx: mpsc::Receiver<ChannelMessage>,
         mut writer: W,
     ) -> Result<(), SessionError>
     where
@@ -214,15 +220,15 @@ impl Ssh3Session {
         let mut pty_pair: Option<PtyPair> = None;
 
         while let Some(event) = event_rx.recv().await {
-            match handle_session_loop_event(event, &mut writer)
+            match handle_session_loop_message(event, &mut writer)
                 .await
-                .map_err(SessionError::from)?
+                .map_err(|e| SessionError::new(e.to_string()))?
             {
                 SessionLoopAction::Request(action) => match action {
                     RequestAction::Exec(command) => {
                         run_exec(
                             self.init.shell.as_os_str(),
-                            &command,
+                            command.as_ref(),
                             &mut writer,
                             event_rx,
                             pty_pair.take(),
@@ -246,20 +252,20 @@ impl Ssh3Session {
                         Ok(pair) => {
                             pty_pair = Some(pair);
                             tracing::info!(term = %req.term_type, "PTY allocated");
-                            if want_reply {
+                            if want_reply.0 {
                                 writer
-                                    .encode_one(&SshMessage::ChannelSuccess)
+                                    .encode_one(SshMessage::Channel(ChannelMessage::Success))
                                     .await
-                                    .map_err(SessionError::from)?;
+                                    .map_err(|e| SessionError::new(e.to_string()))?;
                             }
                         }
                         Err(error) => {
                             tracing::warn!(error = %Report::from_error(&error), "PTY allocation failed");
-                            if want_reply {
+                            if want_reply.0 {
                                 writer
-                                    .encode_one(&SshMessage::ChannelFailure)
+                                    .encode_one(SshMessage::Channel(ChannelMessage::Failure))
                                     .await
-                                    .map_err(SessionError::from)?;
+                                    .map_err(|e| SessionError::new(e.to_string()))?;
                             }
                         }
                     },
@@ -297,9 +303,13 @@ impl Ssh3Session {
 mod tests {
     use super::*;
     use genmeta_ssh;
-    use genmeta_ssh::TransportError;
+    use genmeta_ssh::{
+        ChannelOpenFailure, ChannelRequest, ChannelType, ExecRequest, SshBool, TransportError,
+    };
+    use genmeta_ssh::codec::SshBytes;
     use h3x::codec::{DecodeFrom, EncodeInto};
     use h3x::stream_id::StreamId;
+    use h3x::varint::VarInt;
     use std::path::PathBuf;
     use std::sync::Arc as StdArc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -584,7 +594,7 @@ mod tests {
     /// Helper: encode an SshMessage into raw bytes (via tokio duplex).
     async fn encode_msg_to_bytes(msg: &SshMessage) -> Vec<u8> {
         let (mut w, mut r) = tokio::io::duplex(4096);
-        msg.encode_into(&mut w).await.unwrap();
+        msg.clone().encode_into(&mut w).await.unwrap();
         drop(w);
         let mut buf = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf)
@@ -596,7 +606,7 @@ mod tests {
     /// Helper: encode an SshString into raw bytes.
     async fn encode_ssh_string_to_bytes(s: &str) -> Vec<u8> {
         let (mut w, mut r) = tokio::io::duplex(4096);
-        genmeta_ssh::SshString(s.into())
+        genmeta_ssh::SshString::from(s.to_string())
             .encode_into(&mut w)
             .await
             .unwrap();
@@ -646,10 +656,9 @@ mod tests {
         let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);
 
         let header = ChannelHeader {
-            signal_value: 0,
-            conversation_id: 42,
-            channel_type: "session".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(42u32)),
+            max_message_size: VarInt::from_u32(1 << 20),
+            body: ChannelOpenBody::Session,
         };
 
         let session = Ssh3Session::new(
@@ -661,13 +670,13 @@ mod tests {
 
         tokio::task::yield_now().await;
 
-        // Build the exec ChannelRequest: request_data is SshString("echo hello").
-        let request_data = encode_ssh_string_to_bytes("echo hello").await;
-        let exec_msg = SshMessage::ChannelRequest {
-            request_type: "exec".into(),
-            want_reply: true,
-            request_data,
-        };
+        // Build the exec ChannelRequest.
+        let exec_msg = SshMessage::Channel(ChannelMessage::Request(ChannelRequest::Exec {
+            want_reply: SshBool(true),
+            request: ExecRequest {
+                command: SshBytes::from(b"echo hello".to_vec()),
+            },
+        }));
         let exec_bytes = encode_msg_to_bytes(&exec_msg).await;
 
         from_tx.send(exec_bytes).await.unwrap();
@@ -678,14 +687,14 @@ mod tests {
         // 1. First message: ChannelOpenConfirmation(91)
         let msg = recv_message(&mut to_rx, &mut leftover).await;
         assert!(
-            matches!(msg, SshMessage::ChannelOpenConfirmation { .. }),
+            matches!(msg, SshMessage::Channel(ChannelMessage::OpenConfirmation { .. })),
             "expected ChannelOpenConfirmation, got {msg:?}"
         );
 
         // 2. Second message: ChannelSuccess (reply to want_reply=true exec request)
         let msg = recv_message(&mut to_rx, &mut leftover).await;
         assert!(
-            matches!(msg, SshMessage::ChannelSuccess),
+            matches!(msg, SshMessage::Channel(ChannelMessage::Success)),
             "expected ChannelSuccess, got {msg:?}"
         );
 
@@ -700,28 +709,28 @@ mod tests {
             let result =
                 tokio::time::timeout_at(deadline, recv_message(&mut to_rx, &mut leftover)).await;
             match result {
-                Ok(SshMessage::ChannelData { data }) => {
-                    let output = String::from_utf8_lossy(&data);
+                Ok(SshMessage::Channel(ChannelMessage::Data(data))) => {
+                    let output = String::from_utf8_lossy(data.as_ref());
                     assert!(
                         output.contains("hello"),
                         "expected 'hello' in output, got: {output:?}"
                     );
                     got_data = true;
                 }
-                Ok(SshMessage::ChannelRequest { request_type, .. })
-                    if request_type == "exit-status" =>
+                Ok(SshMessage::Channel(ChannelMessage::Request(ref req)))
+                    if &*req.request_type() == "exit-status" =>
                 {
                     got_exit_status = true;
                 }
-                Ok(SshMessage::ChannelEof) => {
+                Ok(SshMessage::Channel(ChannelMessage::Eof)) => {
                     got_eof = true;
                 }
-                Ok(SshMessage::ChannelClose) => {
+                Ok(SshMessage::Channel(ChannelMessage::Close)) => {
                     _got_close = true;
                     break;
                 }
                 Ok(other) => {
-                    if !matches!(other, SshMessage::ChannelExtendedData { .. }) {
+                    if !matches!(other, SshMessage::Channel(ChannelMessage::ExtendedData { .. })) {
                         panic!("unexpected message: {other:?}");
                     }
                 }
@@ -743,10 +752,9 @@ mod tests {
     #[tokio::test]
     async fn handle_channel_rejects_unknown_type() {
         let header = ChannelHeader {
-            signal_value: 0,
-            conversation_id: 42,
-            channel_type: "bogus-type".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(42u32)),
+            max_message_size: VarInt::from_u32(1 << 20),
+            body: ChannelOpenBody::Unknown { channel_type: "bogus-type".into() },
         };
 
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
@@ -766,10 +774,14 @@ mod tests {
     #[tokio::test]
     async fn handle_channel_dispatches_direct_tcpip() {
         let header = ChannelHeader {
-            signal_value: 0,
-            conversation_id: 42,
-            channel_type: "direct-tcpip".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(42u32)),
+            max_message_size: VarInt::from_u32(1 << 20),
+            body: ChannelOpenBody::DirectTcpip(genmeta_ssh::DirectTcpipRequest {
+                dest_host: "127.0.0.1".into(),
+                dest_port: VarInt::from(8080u16),
+                originator_host: "127.0.0.1".into(),
+                originator_port: VarInt::from(12345u16),
+            }),
         };
 
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
@@ -793,10 +805,9 @@ mod tests {
     #[tokio::test]
     async fn handle_channel_global_request_is_explicitly_rejected() {
         let header = ChannelHeader {
-            signal_value: 0,
-            conversation_id: 42,
-            channel_type: "global-request".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(42u32)),
+            max_message_size: VarInt::from_u32(1 << 20),
+            body: ChannelOpenBody::Unknown { channel_type: "global-request".into() },
         };
 
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
@@ -812,10 +823,10 @@ mod tests {
         let mut leftover = Vec::new();
         let msg = recv_message(&mut to_rx, &mut leftover).await;
         match msg {
-            SshMessage::ChannelOpenFailure {
+            SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
                 reason_code,
                 description,
-            } => {
+            })) => {
                 assert_eq!(reason_code, h3x::varint::VarInt::from(3u8));
                 assert!(description.contains("control stream"));
             }
@@ -830,10 +841,9 @@ mod tests {
         let (to_tx, mut to_rx) = remoc::rch::mpsc::channel(16);
 
         let header = ChannelHeader {
-            signal_value: 0,
-            conversation_id: 42,
-            channel_type: "session".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(42u32)),
+            max_message_size: VarInt::from_u32(1 << 20),
+            body: ChannelOpenBody::Session,
         };
 
         let session = Ssh3Session::new(
@@ -848,10 +858,10 @@ mod tests {
         let mut leftover = Vec::new();
         let msg = recv_message(&mut to_rx, &mut leftover).await;
         match msg {
-            SshMessage::ChannelOpenConfirmation { max_message_size } => {
+            SshMessage::Channel(ChannelMessage::OpenConfirmation { max_message_size }) => {
                 assert_eq!(
                     max_message_size,
-                    h3x::varint::VarInt::from(genmeta_ssh::DEFAULT_MAX_MESSAGE_SIZE as u32),
+                    genmeta_ssh::DEFAULT_MAX_MESSAGE_SIZE,
                     "max_message_size should match DEFAULT_MAX_MESSAGE_SIZE"
                 );
             }
@@ -870,10 +880,9 @@ mod tests {
         use genmeta_ssh::Ssh3Transport;
 
         let header = ChannelHeader {
-            signal_value: 0,
-            conversation_id: 77,
-            channel_type: "session".into(),
-            max_message_size: 4096,
+            session_id: StreamId(VarInt::from(77u32)),
+            max_message_size: VarInt::from_u32(4096),
+            body: ChannelOpenBody::Session,
         };
 
         let (from_tx, from_rx) = remoc::rch::mpsc::channel(16);
@@ -884,9 +893,9 @@ mod tests {
         // accept_channel via RTC should return the same header.
         let result = client.accept_channel().await.unwrap();
         let (got_header, mut got_rx, got_tx) = result.expect("expected Some channel");
-        assert_eq!(got_header.conversation_id, 77);
-        assert_eq!(got_header.channel_type, "session");
-        assert_eq!(got_header.max_message_size, 4096);
+        assert_eq!(got_header.session_id, StreamId(VarInt::from(77u32)));
+        assert!(matches!(got_header.body, ChannelOpenBody::Session));
+        assert_eq!(got_header.max_message_size, VarInt::from_u32(4096));
 
         // Verify data flows: send through got_tx, receive via to_rx.
         got_tx.send(b"hello".to_vec()).await.unwrap();
@@ -955,10 +964,14 @@ mod tests {
         });
 
         let header = ChannelHeader {
-            signal_value: 0,
-            conversation_id: 88,
-            channel_type: "direct-tcpip".into(),
-            max_message_size: 8192,
+            session_id: StreamId(VarInt::from(88u32)),
+            max_message_size: VarInt::from_u32(8192),
+            body: ChannelOpenBody::DirectTcpip(genmeta_ssh::DirectTcpipRequest {
+                dest_host: "127.0.0.1".into(),
+                dest_port: VarInt::from(80u16),
+                originator_host: "127.0.0.1".into(),
+                originator_port: VarInt::from(12345u16),
+            }),
         };
 
         let (mut rx, tx) = client.open_channel(Some(header)).await.unwrap();
@@ -966,8 +979,8 @@ mod tests {
         // Verify the mock received the header.
         let captured = mock_ref.opened.lock().await.take();
         let captured = captured.expect("mock should have received header");
-        assert_eq!(captured.conversation_id, 88);
-        assert_eq!(captured.channel_type, "direct-tcpip");
+        assert_eq!(captured.session_id, StreamId(VarInt::from(88u32)));
+        assert_eq!(captured.body.channel_type(), ChannelType::DirectTcpip);
 
         // Verify data flows through the channels.
         tx.send(b"ping".to_vec()).await.unwrap();

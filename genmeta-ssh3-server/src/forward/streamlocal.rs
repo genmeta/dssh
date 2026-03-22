@@ -32,8 +32,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use genmeta_ssh::{
-    ChannelReader, ChannelWriter, DEFAULT_MAX_MESSAGE_SIZE, codec::ChannelHeader, codec::SshString,
-    finish_forwarded_streamlocal_channel, forwarded_streamlocal_header, message::SshMessage, relay,
+    ChannelHeader, ChannelMessage, ChannelOpenFailure, ChannelReader, ChannelWriter,
+    DEFAULT_MAX_MESSAGE_SIZE, SshMessage, codec::SshString,
+    finish_forwarded_streamlocal_channel, forwarded_streamlocal_header, relay,
 };
 use genmeta_ssh::{Ssh3Transport, Ssh3TransportClient};
 use h3x::codec::{DecodeExt, EncodeExt};
@@ -115,8 +116,8 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // Parse request_data fields.
-    let socket_path: SshString = reader.decode_one().await?;
-    let _reserved_string: SshString = reader.decode_one().await?;
+    let socket_path: SshString = reader.decode_one().await.map_err(io::Error::other)?;
+    let _reserved_string: SshString = reader.decode_one().await.map_err(io::Error::other)?;
     let _reserved_uint32: VarInt = reader.decode_one().await?;
 
     // Attempt Unix socket connection.
@@ -128,20 +129,20 @@ where
                 error = %Report::from_error(&e),
                 "direct-streamlocal connect failed"
             );
-            let failure = SshMessage::ChannelOpenFailure {
+            let failure = SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
                 reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
                 description: "connect failed".into(),
-            };
-            writer.encode_one(&failure).await?;
+            }));
+            writer.encode_one(failure).await.map_err(io::Error::other)?;
             return Ok(());
         }
     };
 
     // Send ChannelOpenConfirmation(91).
-    let confirm = SshMessage::ChannelOpenConfirmation {
+    let confirm = SshMessage::Channel(ChannelMessage::OpenConfirmation {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-    };
-    writer.encode_one(&confirm).await?;
+    });
+    writer.encode_one(confirm).await.map_err(io::Error::other)?;
 
     // Bridge raw bytes bidirectionally between QUIC stream and Unix socket.
     let (unix_reader, unix_writer) = unix_stream.into_split();
@@ -229,14 +230,13 @@ impl ReverseStreamlocalForwarder {
                             let path = socket_path_clone.clone();
                             let conv_id = conversation_id;
                             let connection_handle = tokio::spawn(async move {
-                            let header = forwarded_streamlocal_header(conv_id);
+                            let header = forwarded_streamlocal_header(conv_id, &path);
                             match transport.open_channel(Some(header)).await {
                                 Ok((from_remote_rx, to_remote_tx)) => {
                                     let reader = ChannelReader::new(from_remote_rx);
                                     let writer = ChannelWriter::new(to_remote_tx);
                                     if let Err(e) = finish_forwarded_streamlocal_channel(
                                         reader, writer, unix_stream,
-                                        &path,
                                     ).await {
                                         tracing::warn!(
                                             error = %Report::from_error(&e),
@@ -365,9 +365,11 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let header = forwarded_streamlocal_header(conversation_id);
-    writer.encode_one(header).await?;
-    finish_forwarded_streamlocal_channel(reader, writer, unix_stream, socket_path).await
+    let header = forwarded_streamlocal_header(conversation_id, socket_path);
+    writer.encode_one(header).await.map_err(io::Error::other)?;
+    finish_forwarded_streamlocal_channel(reader, writer, unix_stream)
+        .await
+        .map_err(io::Error::other)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,14 +380,15 @@ where
 mod tests {
     use super::*;
     use genmeta_ssh::{
-        CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE, codec::ChannelHeader, codec::SshString,
-        message::SshMessage,
+        ChannelMessage, ChannelOpenBody, ChannelOpenFailure,
+        DEFAULT_MAX_MESSAGE_SIZE, ChannelHeader, SshMessage, codec::SshString,
     };
     use genmeta_ssh::{CancelStreamlocalForwardRequest, StreamlocalForwardRequest};
     use genmeta_ssh::{
         Ssh3Transport, Ssh3TransportClient, Ssh3TransportServerShared, TransportError,
     };
     use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
+    use h3x::stream_id::StreamId;
     use h3x::varint::VarInt;
     use remoc::rtc::ServerShared;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -519,11 +522,11 @@ mod tests {
         reserved_uint32: u32,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
-        SshString(socket_path.to_owned())
+        SshString::from(socket_path.to_owned())
             .encode_into(&mut buf)
             .await
             .unwrap();
-        SshString(reserved_string.to_owned())
+        SshString::from(reserved_string.to_owned())
             .encode_into(&mut buf)
             .await
             .unwrap();
@@ -544,8 +547,8 @@ mod tests {
         let reserved_string = SshString::decode_from(&mut reader).await.unwrap();
         let reserved_uint32: VarInt = reader.decode_one().await.unwrap();
 
-        assert_eq!(socket_path, SshString("/var/run/app.sock".into()));
-        assert_eq!(reserved_string, SshString("".into()));
+        assert_eq!(socket_path, SshString::from("/var/run/app.sock"));
+        assert_eq!(reserved_string, SshString::from(""));
         assert_eq!(reserved_uint32.into_inner(), 0);
     }
 
@@ -590,10 +593,9 @@ mod tests {
         let request_data = encode_request_data(&sock_path, "", 0).await;
 
         let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "direct-streamlocal@openssh.com".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(1u8)),
+            max_message_size: VarInt::from(1u32 << 20),
+            body: ChannelOpenBody::Session,
         };
 
         let (mut client_writer, server_reader) = duplex(8192);
@@ -616,11 +618,8 @@ mod tests {
         // Read ChannelOpenConfirmation from the server.
         let confirm = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match confirm {
-            SshMessage::ChannelOpenConfirmation { max_message_size } => {
-                assert_eq!(
-                    max_message_size,
-                    VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32)
-                );
+            SshMessage::Channel(ChannelMessage::OpenConfirmation { max_message_size }) => {
+                assert_eq!(max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
             }
             other => panic!("expected ChannelOpenConfirmation, got {other:?}"),
         }
@@ -650,10 +649,9 @@ mod tests {
         let request_data = encode_request_data(&sock_path, "", 0).await;
 
         let header = ChannelHeader {
-            signal_value: 0xaf3627e6,
-            conversation_id: 1,
-            channel_type: "direct-streamlocal@openssh.com".into(),
-            max_message_size: 1 << 20,
+            session_id: StreamId(VarInt::from(1u8)),
+            max_message_size: VarInt::from(1u32 << 20),
+            body: ChannelOpenBody::Session,
         };
 
         let (mut client_writer, server_reader) = duplex(8192);
@@ -671,10 +669,10 @@ mod tests {
         // Should receive ChannelOpenFailure(92) with reason_code=2.
         let msg = SshMessage::decode_from(&mut client_reader).await.unwrap();
         match msg {
-            SshMessage::ChannelOpenFailure {
+            SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
                 reason_code,
                 description,
-            } => {
+            })) => {
                 assert_eq!(
                     reason_code,
                     VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
@@ -699,7 +697,7 @@ mod tests {
             socket_path: "/var/run/my.sock".into(),
         };
         let mut bytes = Vec::new();
-        bytes.encode_one(&req).await.unwrap();
+        bytes.encode_one(req.clone()).await.unwrap();
         let decoded: StreamlocalForwardRequest = bytes.as_slice().decode_one().await.unwrap();
         assert_eq!(decoded, req);
     }
@@ -714,7 +712,7 @@ mod tests {
             socket_path: "/tmp/agent.sock".into(),
         };
         let mut bytes = Vec::new();
-        bytes.encode_one(&req).await.unwrap();
+        bytes.encode_one(req.clone()).await.unwrap();
         let decoded: CancelStreamlocalForwardRequest = bytes.as_slice().decode_one().await.unwrap();
         assert_eq!(decoded, req);
     }
@@ -955,28 +953,25 @@ mod tests {
             .unwrap();
         });
 
-        // Client side: read ChannelHeader.
+        // Client side: read ChannelHeader (includes request_data in body).
         let header = ChannelHeader::decode_from(&mut client_reader)
             .await
             .unwrap();
-        assert_eq!(header.signal_value, CHANNEL_SIGNAL_VALUE);
-        assert_eq!(header.conversation_id, 42);
-        assert_eq!(header.channel_type, "forwarded-streamlocal@openssh.com");
+        assert_eq!(header.session_id, StreamId(VarInt::from(42u8)));
         assert_eq!(header.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
-
-        // Client side: read request_data fields.
-        let received_path = SshString::decode_from(&mut client_reader).await.unwrap();
-        let reserved_string = SshString::decode_from(&mut client_reader).await.unwrap();
-
-        assert_eq!(received_path, SshString(sock_path.clone()));
-        assert_eq!(reserved_string, SshString("".into()));
+        match &header.body {
+            ChannelOpenBody::ForwardedStreamlocal(req) => {
+                assert_eq!(req.socket_path, SshString::from(sock_path.clone()));
+            }
+            other => panic!("expected ForwardedStreamlocal body, got {other:?}"),
+        }
 
         // Client side: send ChannelOpenConfirmation, then data, then close.
         let client_handle = tokio::spawn(async move {
             let mut client_writer = client_writer;
-            let confirm = SshMessage::ChannelOpenConfirmation {
-                max_message_size: VarInt::from(DEFAULT_MAX_MESSAGE_SIZE as u32),
-            };
+            let confirm = SshMessage::Channel(ChannelMessage::OpenConfirmation {
+                max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            });
             confirm.encode_into(&mut client_writer).await.unwrap();
 
             // Send data through the channel (raw bytes, no wrapping).
