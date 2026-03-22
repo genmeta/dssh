@@ -51,7 +51,7 @@ pub type Ssh3StreamWriter = SinkWriter<BoxWriteStream>;
 
 /// A routed bidirectional stream after the protocol layer has consumed
 /// the signal value and session ID.
-type RoutedBiStream = (Ssh3StreamReader, Ssh3StreamWriter);
+pub type RoutedBiStream = (Ssh3StreamReader, Ssh3StreamWriter);
 
 type Registry = Arc<std::sync::Mutex<HashMap<u64, mpsc::Sender<RoutedBiStream>>>>;
 

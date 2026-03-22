@@ -53,6 +53,10 @@ pub use forward_runtime::{
     forwarded_streamlocal_header, forwarded_tcpip_header, relay,
 };
 pub use message::SshMessage;
+pub use protocol::{
+    ConversationHandle, HandleError, RegisterError, RoutedBiStream, Ssh3Protocol,
+    Ssh3ProtocolFactory, Ssh3StreamReader, Ssh3StreamWriter,
+};
 pub use session::{
     AuthResult, ChildBootstrap, ExecChannelRequest, ExecRequest, ExitSignalChannelNotice,
     ExitSignalRequest, ExitStatusChannelNotice, ExitStatusRequest, PtyChannelRequest, PtyRequest,
