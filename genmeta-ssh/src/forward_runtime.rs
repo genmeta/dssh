@@ -53,40 +53,6 @@ pub fn forwarded_tcpip_header(
     }
 }
 
-pub async fn finish_forwarded_tcpip_channel<R, W, S>(
-    mut reader: R,
-    writer: W,
-    tcp_stream: S,
-) -> Result<(), ForwardRuntimeError>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-{
-    let response: SshMessage = reader.decode_one().await.context(forward_runtime_error::MessageSnafu)?;
-    match response {
-        SshMessage::Channel(ChannelMessage::OpenConfirmation { .. }) => {}
-        SshMessage::Channel(ChannelMessage::OpenFailure(..)) => return Ok(()),
-        other => {
-            return Err(ForwardRuntimeError::UnexpectedChannelOpenResponse {
-                message_type: other.message_type(),
-            });
-        }
-    }
-
-    let (stream_reader, stream_writer) = tokio::io::split(tcp_stream);
-    let q2t = tokio::spawn(relay(reader, stream_writer));
-    let t2q = tokio::spawn(relay(stream_reader, writer));
-    let (q2t_result, t2q_result) = tokio::join!(q2t, t2q);
-    q2t_result
-        .context(forward_runtime_error::RelayTaskJoinSnafu)?
-        .context(forward_runtime_error::IoSnafu)?;
-    t2q_result
-        .context(forward_runtime_error::RelayTaskJoinSnafu)?
-        .context(forward_runtime_error::IoSnafu)?;
-    Ok(())
-}
-
 pub fn forwarded_streamlocal_header(session_id: StreamId, socket_path: &str) -> ChannelHeader {
     ChannelHeader {
         session_id,
@@ -97,10 +63,14 @@ pub fn forwarded_streamlocal_header(session_id: StreamId, socket_path: &str) -> 
     }
 }
 
-pub async fn finish_forwarded_streamlocal_channel<R, W, S>(
+/// Wait for channel open confirmation, then relay bytes bidirectionally
+/// between the channel stream and the provided I/O stream.
+///
+/// Works for any forwarded channel type (TCP, streamlocal, etc.).
+pub async fn finish_forwarded_channel<R, W, S>(
     mut reader: R,
     writer: W,
-    unix_stream: S,
+    stream: S,
 ) -> Result<(), ForwardRuntimeError>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -118,15 +88,41 @@ where
         }
     }
 
-    let (stream_reader, stream_writer) = tokio::io::split(unix_stream);
-    let q2u = tokio::spawn(relay(reader, stream_writer));
-    let u2q = tokio::spawn(relay(stream_reader, writer));
-    let (q2u_result, u2q_result) = tokio::join!(q2u, u2q);
-    q2u_result
-        .context(forward_runtime_error::RelayTaskJoinSnafu)?
+    let (stream_reader, stream_writer) = tokio::io::split(stream);
+    let ch2s = tokio::spawn(relay(reader, stream_writer));
+    let s2ch = tokio::spawn(relay(stream_reader, writer));
+    let (r1, r2) = tokio::join!(ch2s, s2ch);
+    r1.context(forward_runtime_error::RelayTaskJoinSnafu)?
         .context(forward_runtime_error::IoSnafu)?;
-    u2q_result
-        .context(forward_runtime_error::RelayTaskJoinSnafu)?
+    r2.context(forward_runtime_error::RelayTaskJoinSnafu)?
         .context(forward_runtime_error::IoSnafu)?;
     Ok(())
+}
+
+/// Backwards compatibility alias.
+pub async fn finish_forwarded_tcpip_channel<R, W, S>(
+    reader: R,
+    writer: W,
+    tcp_stream: S,
+) -> Result<(), ForwardRuntimeError>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    finish_forwarded_channel(reader, writer, tcp_stream).await
+}
+
+/// Backwards compatibility alias.
+pub async fn finish_forwarded_streamlocal_channel<R, W, S>(
+    reader: R,
+    writer: W,
+    unix_stream: S,
+) -> Result<(), ForwardRuntimeError>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    finish_forwarded_channel(reader, writer, unix_stream).await
 }

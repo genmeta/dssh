@@ -51,8 +51,8 @@ pub use forward::{
     TcpipForwardReply, TcpipForwardRequest,
 };
 pub use forward_runtime::{
-    finish_forwarded_streamlocal_channel, finish_forwarded_tcpip_channel,
-    forwarded_streamlocal_header, forwarded_tcpip_header, relay,
+    finish_forwarded_channel, finish_forwarded_streamlocal_channel,
+    finish_forwarded_tcpip_channel, forwarded_streamlocal_header, forwarded_tcpip_header, relay,
 };
 pub use message::SshMessage;
 pub use protocol::{
