@@ -1,7 +1,8 @@
 //! SSH3 client: connect to an SSH3 server via Extended CONNECT.
 //!
-//! Provides [`Ssh3Client`] for establishing an SSH3 connection over HTTP/3,
-//! and [`Ssh3Connection`] for opening channels on the established connection.
+//! Provides [`Ssh3Client`] for establishing an SSH3 connection over HTTP/3.
+//! The [`connect`](Ssh3Client::connect) method returns a
+//! [`Conversation<ConversationHandle>`] directly.
 
 use base64::engine::{Engine, general_purpose::STANDARD};
 use h3x::qpack::field::Protocol;
@@ -11,14 +12,10 @@ use http::{HeaderValue, Method, StatusCode};
 use http_body_util::Empty;
 use snafu::{ResultExt, Snafu};
 
-use crate::constants::{DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION};
-use crate::conversation::{
-    Conversation, OpenChannelError, SshChannelReader, SshChannelWriter,
-};
-use crate::forward::SessionChannelOpen;
+use crate::constants::SSH_VERSION;
+use crate::conversation::Conversation;
 use crate::protocol::{
-    ConversationHandle, HandleError, RegisterError, Ssh3Protocol,
-    Ssh3StreamReader, Ssh3StreamWriter,
+    ConversationHandle, RegisterError, Ssh3Protocol,
 };
 
 /// Well-known path for SSH3 Extended CONNECT requests.
@@ -97,12 +94,12 @@ impl Ssh3Client {
 
     /// Connect to the SSH3 server via Extended CONNECT.
     ///
-    /// Returns an [`Ssh3Connection`] on success, which can be used to
-    /// open session and forwarding channels.
+    /// Returns a [`Conversation<ConversationHandle>`] on success, which can be
+    /// used to open session/forwarding channels and send global requests.
     pub async fn connect<C>(
         &self,
         client: &h3x::client::Client<C>,
-    ) -> Result<Ssh3Connection, ConnectError>
+    ) -> Result<Conversation<ConversationHandle>, ConnectError>
     where
         C: h3x::quic::Connect + Sync,
         C::Error: Send + Sync,
@@ -223,63 +220,18 @@ impl Ssh3Client {
         let control_reader = read_stream.into_box_reader();
         let control_writer = write_stream.into_box_writer();
 
-        let conversation = Conversation::new(session_id, control_reader, control_writer, handle);
-
-        Ok(Ssh3Connection {
+        let conversation = Conversation::new(
+            session_id,
             server_version,
-            conversation,
-        })
+            control_reader,
+            control_writer,
+            handle,
+        );
+
+        Ok(conversation)
     }
 }
 
-/// An established SSH3 connection.
-///
-/// Wraps a [`Conversation<ConversationHandle>`] that manages the control
-/// stream (global requests/notifications) and channel lifecycle.
-///
-/// Use [`open_session`](Ssh3Connection::open_session) to create session
-/// channels, or [`conversation`](Ssh3Connection::conversation) for direct
-/// access to the underlying conversation.
-pub struct Ssh3Connection {
-    server_version: String,
-    conversation: Conversation<ConversationHandle>,
-}
-
-impl Ssh3Connection {
-    pub fn server_version(&self) -> &str {
-        &self.server_version
-    }
-
-    pub fn conversation_id(&self) -> u64 {
-        self.conversation.id().into_inner()
-    }
-
-    /// Returns a reference to the underlying [`Conversation`].
-    ///
-    /// Use this for reverse forwarding, global requests, or any other
-    /// operation that requires direct conversation access.
-    pub fn conversation(&self) -> &Conversation<ConversationHandle> {
-        &self.conversation
-    }
-
-    /// Open a session channel and return a [`ClientSession`](crate::session::client::ClientSession).
-    pub async fn open_session(
-        &self,
-    ) -> Result<
-        crate::session::client::ClientSession<Ssh3StreamReader, Ssh3StreamWriter>,
-        OpenChannelError<HandleError, std::convert::Infallible>,
-    > {
-        let (reader, writer) = self
-            .conversation
-            .open_channel(&SessionChannelOpen, DEFAULT_MAX_MESSAGE_SIZE)
-            .await?;
-
-        Ok(crate::session::client::ClientSession::new(
-            SshChannelReader::new(reader),
-            SshChannelWriter::new(writer),
-        ))
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -59,7 +59,7 @@ pub use message::{MessageError, SSH_MSG_CHANNEL_DATA, SSH_MSG_CHANNEL_EXTENDED_D
     SSH_MSG_CHANNEL_SUCCESS, SSH_MSG_CHANNEL_FAILURE, SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
     SSH_MSG_CHANNEL_OPEN_FAILURE};
 pub use client::{
-    ConnectError, Ssh3Client, Ssh3Connection, SSH3_CONNECT_PATH,
+    ConnectError, Ssh3Client, SSH3_CONNECT_PATH,
     encode_basic_auth,
 };
 pub use protocol::{

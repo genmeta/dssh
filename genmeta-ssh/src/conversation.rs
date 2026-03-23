@@ -821,6 +821,7 @@ impl ConversationShared {
 
 pub struct Conversation<M: ManageSessionStream> {
     id: StreamId,
+    peer_version: String,
     shared: Arc<ConversationShared>,
     _manage_stream: M,
 }
@@ -828,12 +829,14 @@ pub struct Conversation<M: ManageSessionStream> {
 impl<M: ManageSessionStream> Conversation<M> {
     pub fn new(
         id: StreamId,
+        peer_version: impl Into<String>,
         control_stream_reader: impl AsyncRead + Unpin + Send + 'static,
         control_stream_writer: impl AsyncWrite + Unpin + Send + 'static,
         manage_stream: M,
     ) -> Self {
         Self {
             id,
+            peer_version: peer_version.into(),
             shared: Arc::new(ConversationShared {
                 reader: OrderedAccess::new(Box::pin(control_stream_reader)),
                 writer: OrderedAccess::new(Box::pin(control_stream_writer)),
@@ -847,6 +850,10 @@ impl<M: ManageSessionStream> Conversation<M> {
 
     pub fn id(&self) -> StreamId {
         self.id
+    }
+
+    pub fn peer_version(&self) -> &str {
+        &self.peer_version
     }
 
     /// Send a global request that expects a reply and wait for the response.
@@ -2177,6 +2184,7 @@ mod tests {
 
         let conv = Conversation::new(
             StreamId(stream_id),
+            "test-version",
             local_reader,
             local_writer,
             TestManageStream,
@@ -3364,6 +3372,7 @@ mod tests {
 
         let conv = Conversation::new(
             StreamId(stream_id),
+            "test-version",
             local_reader,
             local_writer,
             ArcManage(Arc::clone(&manage)),
@@ -3614,12 +3623,14 @@ mod tests {
 
         let conv_a = Conversation::new(
             StreamId(stream_id),
+            "test-version",
             ctrl_a_reader,
             ctrl_a_writer,
             ArcManage2(Arc::clone(&manage_a)),
         );
         let conv_b = Conversation::new(
             StreamId(stream_id),
+            "test-version",
             ctrl_b_reader,
             ctrl_b_writer,
             ArcManage2(Arc::clone(&manage_b)),
