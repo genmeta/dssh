@@ -1,3 +1,7 @@
+pub mod direct;
+pub mod reverse;
+pub mod socks5;
+
 use crate::{
     channel::{ChannelHeader, ChannelMessage, ChannelOpenBody},
     constants::DEFAULT_MAX_MESSAGE_SIZE,

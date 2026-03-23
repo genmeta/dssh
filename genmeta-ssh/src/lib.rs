@@ -51,8 +51,11 @@ pub use forward::{
     TcpipForwardReply, TcpipForwardRequest,
 };
 pub use forward_runtime::{
+    direct::{self, handle_direct_streamlocal, handle_direct_tcpip, DirectForwardError},
     finish_forwarded_channel, finish_forwarded_streamlocal_channel,
     finish_forwarded_tcpip_channel, forwarded_streamlocal_header, forwarded_tcpip_header, relay,
+    reverse::{self, ReverseForwardError, ReverseForwarder},
+    socks5::{self, handle_socks5, Socks5Error},
 };
 pub use message::SshMessage;
 pub use protocol::{
