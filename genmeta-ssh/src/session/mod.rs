@@ -103,16 +103,28 @@ pub enum AuthResult {
 }
 
 /// Bootstrap payload sent from parent to child process.
-/// Contains the transport client for pulling channels and the credential for PAM auth.
+///
+/// Contains everything the child needs to construct a
+/// [`Conversation`](crate::conversation::Conversation) and begin handling the
+/// session:
+///
+/// - `manage_stream`: remoc proxy for opening/accepting QUIC streams
+/// - `control_reader` / `control_writer`: remoc proxied control stream
+/// - `credential`: for PAM authentication
+/// - `conversation_id`: unique session identifier
+/// - `peer_version`: negotiated SSH version string
 #[derive(Serialize, Deserialize)]
 pub struct ChildBootstrap {
-    pub transport: Ssh3TransportClient,
+    pub manage_stream: crate::conversation::remoc::RemoteManageStreamClient,
+    pub control_reader: h3x::remoc::quic::ReadStreamClient,
+    pub control_writer: h3x::remoc::quic::WriteStreamClient,
     pub credential: crate::auth::AuthCredential,
     #[serde(
         serialize_with = "serialize_stream_id",
         deserialize_with = "deserialize_stream_id"
     )]
     pub conversation_id: StreamId,
+    pub peer_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,7 +553,6 @@ where
 pub enum SessionError {
     Message(String),
     Io(IoErrorKind),
-    Transport(TransportError),
     Remote(remoc::rtc::CallError),
 }
 
@@ -550,7 +561,6 @@ impl std::fmt::Display for SessionError {
         match self {
             Self::Message(message) => f.write_str(message),
             Self::Io(kind) => kind.fmt(f),
-            Self::Transport(error) => error.fmt(f),
             Self::Remote(error) => error.fmt(f),
         }
     }
@@ -559,7 +569,6 @@ impl std::fmt::Display for SessionError {
 impl std::error::Error for SessionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Transport(error) => Some(error),
             Self::Remote(error) => Some(error),
             Self::Message(_) | Self::Io(_) => None,
         }
@@ -575,12 +584,6 @@ impl From<remoc::rtc::CallError> for SessionError {
 impl From<std::io::Error> for SessionError {
     fn from(err: std::io::Error) -> Self {
         Self::Io(err.kind().into())
-    }
-}
-
-impl From<TransportError> for SessionError {
-    fn from(err: TransportError) -> Self {
-        Self::Transport(err)
     }
 }
 
@@ -678,79 +681,6 @@ impl From<std::io::ErrorKind> for IoErrorKind {
     }
 }
 
-/// Serializable error type for transport-level RTC method returns.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TransportError {
-    ChannelClosed(String),
-    OpenFailed(String),
-    Timeout,
-    Other(String),
-    Remote(remoc::rtc::CallError),
-}
-
-impl std::fmt::Display for TransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ChannelClosed(msg) => f.write_str(msg),
-            Self::OpenFailed(msg) => f.write_str(msg),
-            Self::Timeout => write!(f, "timeout"),
-            Self::Other(msg) => f.write_str(msg),
-            Self::Remote(error) => error.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for TransportError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Remote(error) => Some(error),
-            Self::ChannelClosed(_) | Self::OpenFailed(_) | Self::Timeout | Self::Other(_) => None,
-        }
-    }
-}
-
-impl From<remoc::rtc::CallError> for TransportError {
-    fn from(err: remoc::rtc::CallError) -> Self {
-        Self::Remote(err)
-    }
-}
-
-/// RTC trait for SSH3 transport-level channel management.
-///
-/// The `#[remoc::rtc::remote]` macro generates `Ssh3TransportClient`,
-/// `Ssh3TransportServer`, `Ssh3TransportServerShared`, and `Ssh3TransportServerSharedMut`.
-#[remoc::rtc::remote]
-pub trait Ssh3Transport: Sync {
-    /// Accept an incoming channel from the remote peer.
-    ///
-    /// Returns `Ok(None)` when no more channels will arrive (connection closed).
-    /// The raw channel stream is returned — the caller reads the channel open
-    /// header directly from the reader using conversation.rs helpers.
-    async fn accept_channel(
-        &self,
-    ) -> Result<
-        Option<(
-            remoc::rch::mpsc::Receiver<Vec<u8>>,
-            remoc::rch::mpsc::Sender<Vec<u8>>,
-        )>,
-        TransportError,
-    >;
-
-    /// Open a new channel toward the remote peer.
-    ///
-    /// Returns raw stream reader/writer — the caller writes the channel open
-    /// header directly using conversation.rs helpers.
-    async fn open_channel(
-        &self,
-    ) -> Result<
-        (
-            remoc::rch::mpsc::Receiver<Vec<u8>>,
-            remoc::rch::mpsc::Sender<Vec<u8>>,
-        ),
-        TransportError,
-    >;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,59 +758,5 @@ mod tests {
         let json = serde_json::to_string(&err).unwrap();
         let decoded: SessionError = serde_json::from_str(&json).unwrap();
         assert_eq!(err.to_string(), decoded.to_string());
-    }
-
-    #[test]
-    fn ssh3_transport_client_type_exists() {
-        fn assert_send<T: Send>() {}
-        assert_send::<Ssh3TransportClient>();
-    }
-
-    #[test]
-    fn ssh3_transport_server_types_exist() {
-        // Ssh3TransportServerShared<T> requires a concrete impl type.
-        // Create a trivial one to verify the generated type exists and is Send.
-        struct Dummy;
-        impl Ssh3Transport for Dummy {
-            async fn accept_channel(
-                &self,
-            ) -> Result<
-                Option<(
-                    remoc::rch::mpsc::Receiver<Vec<u8>>,
-                    remoc::rch::mpsc::Sender<Vec<u8>>,
-                )>,
-                TransportError,
-            > {
-                Ok(None)
-            }
-            async fn open_channel(
-                &self,
-            ) -> Result<
-                (
-                    remoc::rch::mpsc::Receiver<Vec<u8>>,
-                    remoc::rch::mpsc::Sender<Vec<u8>>,
-                ),
-                TransportError,
-            > {
-                Err(TransportError::Other("dummy".into()))
-            }
-        }
-        fn assert_send<T: Send>() {}
-        assert_send::<Ssh3TransportServerShared<Dummy>>();
-    }
-
-    #[test]
-    fn transport_error_roundtrip() {
-        let cases = vec![
-            TransportError::ChannelClosed("gone".into()),
-            TransportError::OpenFailed("refused".into()),
-            TransportError::Timeout,
-            TransportError::Other("oops".into()),
-        ];
-        for err in &cases {
-            let json = serde_json::to_string(err).unwrap();
-            let decoded: TransportError = serde_json::from_str(&json).unwrap();
-            assert_eq!(err.to_string(), decoded.to_string());
-        }
     }
 }

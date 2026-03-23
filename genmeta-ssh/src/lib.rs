@@ -70,8 +70,7 @@ pub use session::{
     AuthResult, ChildBootstrap, ExecChannelRequest, ExecRequest, ExitSignalChannelNotice,
     ExitSignalRequest, ExitStatusChannelNotice, ExitStatusRequest, PtyChannelRequest, PtyRequest,
     SessionError, SessionInit, ShellChannelRequest,
-    SignalChannelNotice, SignalChannelRequest, SignalRequest, Ssh3Transport, Ssh3TransportClient,
-    Ssh3TransportServer, Ssh3TransportServerShared, SubsystemChannelRequest, SubsystemRequest,
-    TransportError, WindowChangeChannelNotice, WindowChangeRequest,
+    SignalChannelNotice, SignalChannelRequest, SignalRequest, SubsystemChannelRequest, SubsystemRequest,
+    WindowChangeChannelNotice, WindowChangeRequest,
 };
 pub use version::{SshVersion, negotiate_version, version_response_header};
