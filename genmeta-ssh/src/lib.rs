@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod byte_channel;
 pub mod channel;
+pub mod client;
 pub mod codec;
 pub mod constants;
 mod conversation;
@@ -12,6 +13,7 @@ pub mod forward_runtime;
 pub mod message;
 pub mod protocol;
 pub mod session;
+pub mod version;
 
 pub use auth::{AuthCredential, AuthScheme, parse_authorization_header};
 pub use byte_channel::{ChannelReader, ChannelWriter};
@@ -58,6 +60,10 @@ pub use forward_runtime::{
     socks5::{self, handle_socks5, Socks5Error},
 };
 pub use message::SshMessage;
+pub use client::{
+    ConnectError, Ssh3Client, Ssh3Connection, SSH3_CONNECT_PATH,
+    encode_basic_auth,
+};
 pub use protocol::{
     ConversationHandle, HandleError, RegisterError, RoutedBiStream, Ssh3Protocol,
     Ssh3ProtocolFactory, Ssh3StreamReader, Ssh3StreamWriter,
@@ -72,3 +78,4 @@ pub use session::{
     handle_request, handle_session_loop_message, open_session_channel, run_message_loop_with_sender,
     run_session_request_loop,
 };
+pub use version::{SshVersion, negotiate_version, version_response_header};

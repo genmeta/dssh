@@ -683,6 +683,7 @@ dependencies = [
  "futures",
  "h3x",
  "http",
+ "http-body-util",
  "nix 0.29.0",
  "remoc",
  "serde",
