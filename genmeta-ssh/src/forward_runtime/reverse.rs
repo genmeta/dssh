@@ -11,11 +11,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
-    channel::ChannelHeader,
-    conversation::ManageSessionStream,
-    forward_runtime::{finish_forwarded_channel, forwarded_streamlocal_header, forwarded_tcpip_header},
+    constants::DEFAULT_MAX_MESSAGE_SIZE,
+    conversation::{write_channel_open, ManageSessionStream, ChannelOpen},
+    forward::{
+        ForwardedTcpipChannelOpen, ForwardedTcpipRequest,
+        ForwardedStreamlocalChannelOpen, ForwardedStreamlocalRequest,
+    },
+    forward_runtime::finish_forwarded_channel,
 };
-use h3x::{codec::EncodeExt, stream_id::StreamId};
+use h3x::stream_id::StreamId;
 use snafu::{ResultExt, Snafu};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::task::JoinHandle;
@@ -231,14 +235,15 @@ async fn tcp_accept_loop<M: ManageSessionStream + 'static>(
 
         tokio::spawn(
             async move {
-                let header = forwarded_tcpip_header(
-                    session_id,
-                    &connected_addr,
-                    connected_port,
-                    &originator_addr,
-                    originator_port,
-                );
-                if let Err(e) = open_and_relay_forwarded(manage, header, tcp_stream).await {
+                let channel_open = ForwardedTcpipChannelOpen {
+                    payload: ForwardedTcpipRequest {
+                        connected_address: connected_addr.into(),
+                        connected_port: (connected_port as u32).into(),
+                        originator_address: originator_addr.into(),
+                        originator_port: (originator_port as u32).into(),
+                    },
+                };
+                if let Err(e) = open_and_relay_forwarded(manage, session_id, &channel_open, tcp_stream).await {
                     tracing::warn!(
                         error = %e,
                         "forwarded-tcpip channel error"
@@ -273,8 +278,12 @@ async fn unix_accept_loop<M: ManageSessionStream + 'static>(
 
         tokio::spawn(
             async move {
-                let header = forwarded_streamlocal_header(session_id, &path);
-                if let Err(e) = open_and_relay_forwarded(manage, header, unix_stream).await {
+                let channel_open = ForwardedStreamlocalChannelOpen {
+                    payload: ForwardedStreamlocalRequest {
+                        socket_path: path.into(),
+                    },
+                };
+                if let Err(e) = open_and_relay_forwarded(manage, session_id, &channel_open, unix_stream).await {
                     tracing::warn!(
                         error = %e,
                         "forwarded-streamlocal channel error"
@@ -286,23 +295,26 @@ async fn unix_accept_loop<M: ManageSessionStream + 'static>(
     }
 }
 
-/// Open a new channel via the stream manager, write the channel header,
-/// then relay bytes bidirectionally with the provided stream.
-async fn open_and_relay_forwarded<M, S>(
+/// Open a new channel via the stream manager, write the channel open header
+/// using the generic `ChannelOpen` type, then relay bytes bidirectionally.
+async fn open_and_relay_forwarded<M, C, PE, S>(
     manage: Arc<M>,
-    header: ChannelHeader,
+    session_id: StreamId,
+    channel_open: &C,
     stream: S,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     M: ManageSessionStream + 'static,
+    C: ChannelOpen,
+    PE: std::error::Error + Send + Sync + 'static,
+    for<'w> C::Payload: h3x::codec::EncodeInto<&'w mut M::StreamWriter, Output = (), Error = PE>,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
     let (reader, mut writer) = manage
         .open_stream()
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-    writer
-        .encode_one(header)
+    write_channel_open(&mut writer, session_id, DEFAULT_MAX_MESSAGE_SIZE, channel_open)
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
     finish_forwarded_channel(reader, writer, stream)
@@ -313,17 +325,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        channel::{ChannelMessage, ChannelOpenBody},
-        constants::DEFAULT_MAX_MESSAGE_SIZE,
-        message::SshMessage,
-    };
-    use h3x::{
-        codec::{DecodeFrom, EncodeExt},
-        varint::VarInt,
-    };
+    use h3x::varint::VarInt;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
     use tokio::sync::Mutex;
 
     /// A mock ManageSessionStream that returns duplex pairs and stores

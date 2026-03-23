@@ -7,7 +7,6 @@
 //! Built entirely on the trait-based channel API — no intermediate buffers
 //! or enum dispatch.
 
-use h3x::varint::VarInt;
 use snafu::prelude::*;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -316,6 +315,7 @@ mod tests {
         write_channel_data, write_channel_eof, write_channel_close,
     };
     use h3x::codec::EncodeExt;
+    use h3x::varint::VarInt;
 
     fn channel_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
         tokio::io::duplex(64 * 1024)

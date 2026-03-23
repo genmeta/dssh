@@ -13,29 +13,20 @@ pub mod process;
 pub mod pty;
 pub mod signal;
 
-use std::{
-    future::Future,
-    path::PathBuf,
-    pin::{Pin, pin},
-};
+use std::path::PathBuf;
+use std::pin::pin;
 
 use crate::{
-    channel::{ChannelMessage, ChannelRequest},
     codec::{CodecError, SshBool, SshBytes, SshString},
-    constants::DEFAULT_MAX_MESSAGE_SIZE,
     conversation::{EmptyPayload, NotifyChannelRequest, WantReplyChannelRequest},
-    message::{MessageError, SshMessage},
+    message::MessageError,
 };
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use snafu::{ResultExt, Snafu};
-use tokio::{
-    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
-    sync::mpsc,
-};
-use tracing::Instrument;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), module)]
@@ -67,129 +58,6 @@ pub enum SessionProtocolError {
 
     #[snafu(display("session stream shutdown failed"))]
     ShutdownIo { source: std::io::Error },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RequestAction {
-    Exec(SshBytes),
-    Shell,
-    AllocatePty(PtyRequest, SshBool),
-    WindowChange(WindowChangeRequest),
-    Signal(SignalRequest),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionLoopAction {
-    Request(RequestAction),
-    Eof,
-    Close,
-    Ignore,
-}
-
-pub async fn handle_request<W>(
-    request: ChannelRequest,
-    writer: &mut W,
-) -> Result<Option<RequestAction>, SessionProtocolError>
-where
-    W: AsyncWrite + Send + Unpin,
-{
-    match request {
-        ChannelRequest::Exec {
-            want_reply,
-            request,
-        } => {
-            if want_reply.0 {
-                writer
-                    .encode_one(SshMessage::Channel(ChannelMessage::Success))
-                    .await
-                    .context(session_protocol_error::MessageSnafu)?;
-            }
-            Ok(Some(RequestAction::Exec(request.command.clone())))
-        }
-        ChannelRequest::Shell { want_reply } => {
-            if want_reply.0 {
-                writer
-                    .encode_one(SshMessage::Channel(ChannelMessage::Success))
-                    .await
-                    .context(session_protocol_error::MessageSnafu)?;
-            }
-            Ok(Some(RequestAction::Shell))
-        }
-        ChannelRequest::PtyReq {
-            want_reply,
-            request,
-        } => Ok(Some(RequestAction::AllocatePty(request.clone(), want_reply.clone()))),
-        ChannelRequest::WindowChange(request) => Ok(Some(RequestAction::WindowChange(request.clone()))),
-        ChannelRequest::Signal {
-            want_reply,
-            request,
-        } => {
-            if want_reply.0 {
-                writer
-                    .encode_one(SshMessage::Channel(ChannelMessage::Success))
-                    .await
-                    .context(session_protocol_error::MessageSnafu)?;
-            }
-            Ok(Some(RequestAction::Signal(request.clone())))
-        }
-        ChannelRequest::Subsystem { want_reply, .. } => {
-            if want_reply.0 {
-                writer
-                    .encode_one(SshMessage::Channel(ChannelMessage::Failure))
-                    .await
-                    .context(session_protocol_error::MessageSnafu)?;
-            }
-            Ok(None)
-        }
-        ChannelRequest::ExitStatus(_) | ChannelRequest::ExitSignal(_) => Ok(None),
-        ChannelRequest::Unknown { want_reply, .. } => {
-            if want_reply.0 {
-                writer
-                    .encode_one(SshMessage::Channel(ChannelMessage::Failure))
-                    .await
-                    .context(session_protocol_error::MessageSnafu)?;
-            }
-            Ok(None)
-        }
-    }
-}
-
-pub async fn handle_session_loop_message<W>(
-    message: ChannelMessage,
-    writer: &mut W,
-) -> Result<SessionLoopAction, SessionProtocolError>
-where
-    W: AsyncWrite + Send + Unpin,
-{
-    match message {
-        ChannelMessage::Request(request) => Ok(match handle_request(request, writer).await? {
-            Some(action) => SessionLoopAction::Request(action),
-            None => SessionLoopAction::Ignore,
-        }),
-        ChannelMessage::Eof => {
-            writer
-                .encode_one(SshMessage::Channel(ChannelMessage::Eof))
-                .await
-                .context(session_protocol_error::MessageSnafu)?;
-            writer
-                .shutdown()
-                .await
-                .context(session_protocol_error::ShutdownIoSnafu)?;
-            Ok(SessionLoopAction::Eof)
-        }
-        ChannelMessage::Close => {
-            writer
-                .encode_one(SshMessage::Channel(ChannelMessage::Close))
-                .await
-                .context(session_protocol_error::MessageSnafu)?;
-            Ok(SessionLoopAction::Close)
-        }
-        ChannelMessage::Data(_) | ChannelMessage::ExtendedData { .. } => Ok(SessionLoopAction::Ignore),
-        ChannelMessage::OpenConfirmation { .. }
-        | ChannelMessage::OpenFailure(_)
-        | ChannelMessage::Success
-        | ChannelMessage::Failure => Ok(SessionLoopAction::Ignore),
-    }
 }
 
 /// Information needed to initialize an SSH3 session in the child process.
@@ -651,175 +519,6 @@ impl NotifyChannelRequest for ExitSignalChannelNotice {
     }
 }
 
-pub fn encode_exit_status(exit_code: u32) -> Vec<u8> {
-    let v = exit_code as u64;
-    if v < 64 {
-        vec![v as u8]
-    } else if v < 16384 {
-        vec![0x40 | ((v >> 8) as u8), (v & 0xff) as u8]
-    } else if v < 1_073_741_824 {
-        let val = 0x80000000u32 | (v as u32);
-        val.to_be_bytes().to_vec()
-    } else {
-        let val = 0xC000_0000_0000_0000u64 | v;
-        val.to_be_bytes().to_vec()
-    }
-}
-
-pub async fn open_session_channel<R, W>(
-    reader: R,
-    mut writer: W,
-) -> Result<(mpsc::Receiver<ChannelMessage>, W), SessionProtocolError>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    W: AsyncWrite + Send + Unpin + 'static,
-{
-    let confirm = SshMessage::Channel(ChannelMessage::OpenConfirmation {
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-    });
-    writer
-        .encode_one(confirm)
-        .await
-        .context(session_protocol_error::MessageSnafu)?;
-
-    let (event_tx, event_rx) = mpsc::channel(64);
-    tokio::spawn(
-        async move {
-            let _ = run_message_loop_with_sender(reader, event_tx).await;
-        }
-        .in_current_span(),
-    );
-    Ok((event_rx, writer))
-}
-
-pub async fn run_session_request_loop<W, S, ExecFn, ShellFn, PtyFn, ResizeFn, SignalFn>(
-    mut event_rx: mpsc::Receiver<ChannelMessage>,
-    mut writer: W,
-    mut state: S,
-    mut allocate_pty: PtyFn,
-    mut set_window_size: ResizeFn,
-    mut run_exec: ExecFn,
-    mut run_shell: ShellFn,
-    mut on_signal: SignalFn,
- ) -> Result<(), SessionProtocolError>
-where
-    W: AsyncWrite + Send + Unpin + 'static,
-    ExecFn: for<'a> FnMut(
-        SshBytes,
-        &'a mut W,
-        mpsc::Receiver<ChannelMessage>,
-        &'a mut S,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>,
-    ShellFn: for<'a> FnMut(
-        &'a mut W,
-        mpsc::Receiver<ChannelMessage>,
-        &'a mut S,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>,
-    PtyFn: for<'a> FnMut(
-        PtyRequest,
-        SshBool,
-        &'a mut W,
-        &'a mut S,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>,
-    ResizeFn: for<'a> FnMut(
-        WindowChangeRequest,
-        &'a mut S,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>,
-    SignalFn: for<'a> FnMut(
-        SignalRequest,
-        &'a mut S,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>,
-{
-    while let Some(message) = event_rx.recv().await {
-        match handle_session_loop_message(message, &mut writer).await? {
-            SessionLoopAction::Request(action) => match action {
-                RequestAction::Exec(command) => {
-                    run_exec(command, &mut writer, event_rx, &mut state)
-                        .await
-                        .context(session_protocol_error::IoSnafu {
-                            operation: "running exec request",
-                        })?;
-                    return Ok(());
-                }
-                RequestAction::Shell => {
-                    run_shell(&mut writer, event_rx, &mut state)
-                        .await
-                        .context(session_protocol_error::IoSnafu {
-                            operation: "running shell request",
-                        })?;
-                    return Ok(());
-                }
-                RequestAction::AllocatePty(req, want_reply) => {
-                    allocate_pty(req, want_reply, &mut writer, &mut state)
-                        .await
-                        .context(session_protocol_error::IoSnafu {
-                            operation: "allocating pty",
-                        })?;
-                }
-                RequestAction::WindowChange(req) => {
-                    set_window_size(req, &mut state)
-                        .await
-                        .context(session_protocol_error::IoSnafu {
-                            operation: "changing window size",
-                        })?;
-                }
-                RequestAction::Signal(req) => on_signal(req, &mut state)
-                    .await
-                    .context(session_protocol_error::IoSnafu {
-                        operation: "handling signal request",
-                    })?,
-            },
-            SessionLoopAction::Eof | SessionLoopAction::Close => break,
-            SessionLoopAction::Ignore => {}
-        }
-    }
-
-    Ok(())
-}
-
-pub async fn run_message_loop_with_sender<R>(
-    mut reader: R,
-    event_tx: mpsc::Sender<ChannelMessage>,
-) -> Result<(), SessionProtocolError>
-where
-    R: AsyncRead + Send + Unpin,
-{
-    loop {
-        let msg = match reader.decode_one::<SshMessage>().await {
-            Ok(msg) => msg,
-            Err(MessageError::ReadIo {
-                source,
-            }) if source.kind() == io::ErrorKind::UnexpectedEof => {
-                return Ok(());
-            }
-            Err(e) => return Err(SessionProtocolError::Message { source: e }),
-        };
-
-        match msg {
-            SshMessage::Channel(message @ ChannelMessage::Data(_))
-            | SshMessage::Channel(message @ ChannelMessage::ExtendedData { .. })
-            | SshMessage::Channel(message @ ChannelMessage::Request(_))
-            | SshMessage::Channel(message @ ChannelMessage::Eof)
-            | SshMessage::Channel(message @ ChannelMessage::Close) => {
-                let is_close = matches!(message, ChannelMessage::Close);
-                let _ = event_tx.send(message).await;
-                if is_close {
-                    return Ok(());
-                }
-            }
-            SshMessage::Channel(ChannelMessage::Success) => {
-                tracing::debug!("received ChannelSuccess(99)");
-            }
-            SshMessage::Channel(ChannelMessage::Failure) => {
-                tracing::debug!("received ChannelFailure(100)");
-            }
-            other => {
-                tracing::warn!("unexpected message in channel loop: {other:?}");
-            }
-        }
-    }
-}
-
 fn serialize_stream_id<S>(stream_id: &StreamId, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -1025,11 +724,12 @@ pub trait Ssh3Transport: Sync {
     /// Accept an incoming channel from the remote peer.
     ///
     /// Returns `Ok(None)` when no more channels will arrive (connection closed).
+    /// The raw channel stream is returned — the caller reads the channel open
+    /// header directly from the reader using conversation.rs helpers.
     async fn accept_channel(
         &self,
     ) -> Result<
         Option<(
-            crate::channel::ChannelHeader,
             remoc::rch::mpsc::Receiver<Vec<u8>>,
             remoc::rch::mpsc::Sender<Vec<u8>>,
         )>,
@@ -1038,10 +738,10 @@ pub trait Ssh3Transport: Sync {
 
     /// Open a new channel toward the remote peer.
     ///
-    /// If `header` is `None`, no header is written to the underlying stream.
+    /// Returns raw stream reader/writer — the caller writes the channel open
+    /// header directly using conversation.rs helpers.
     async fn open_channel(
         &self,
-        header: Option<crate::channel::ChannelHeader>,
     ) -> Result<
         (
             remoc::rch::mpsc::Receiver<Vec<u8>>,
@@ -1146,7 +846,6 @@ mod tests {
                 &self,
             ) -> Result<
                 Option<(
-                    crate::channel::ChannelHeader,
                     remoc::rch::mpsc::Receiver<Vec<u8>>,
                     remoc::rch::mpsc::Sender<Vec<u8>>,
                 )>,
@@ -1156,7 +855,6 @@ mod tests {
             }
             async fn open_channel(
                 &self,
-                _: Option<crate::channel::ChannelHeader>,
             ) -> Result<
                 (
                     remoc::rch::mpsc::Receiver<Vec<u8>>,

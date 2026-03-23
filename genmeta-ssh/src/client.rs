@@ -14,7 +14,7 @@ use http::{HeaderValue, Method, StatusCode};
 use http_body_util::Empty;
 use snafu::{ResultExt, Snafu};
 
-use crate::constants::{SSH_VERSION, DEFAULT_MAX_MESSAGE_SIZE, CHANNEL_SIGNAL_VALUE};
+use crate::constants::{SSH_VERSION, DEFAULT_MAX_MESSAGE_SIZE};
 
 /// Well-known path for SSH3 Extended CONNECT requests.
 pub const SSH3_CONNECT_PATH: &str = "/.well-known/ssh3/connect";

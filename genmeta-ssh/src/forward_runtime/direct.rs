@@ -12,22 +12,20 @@
 //! `SSH_MSG_CHANNEL_DATA`.**
 
 use crate::{
-    channel::{ChannelMessage, ChannelOpenFailure},
+    channel::reason_code,
     codec::SshString,
-    constants::DEFAULT_MAX_MESSAGE_SIZE,
+    conversation::{
+        write_channel_open_confirmation, write_channel_open_failure,
+    },
     forward_runtime::relay,
-    message::SshMessage,
 };
 use h3x::{
-    codec::{DecodeExt, EncodeExt},
+    codec::DecodeExt,
     varint::VarInt,
 };
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
-
-/// SSH_OPEN_CONNECT_FAILED reason code (RFC 4254 §5.1).
-const SSH_OPEN_CONNECT_FAILED: u64 = 2;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module)]
@@ -62,27 +60,30 @@ async fn send_open_failure<W: AsyncWrite + Unpin + Send>(
     writer: &mut W,
     description: &str,
 ) -> Result<(), DirectForwardError> {
-    let failure = SshMessage::Channel(ChannelMessage::OpenFailure(ChannelOpenFailure {
-        reason_code: VarInt::from(SSH_OPEN_CONNECT_FAILED as u8),
-        description: description.to_owned().into(),
-    }));
-    writer
-        .encode_one(failure)
-        .await
-        .context(direct_forward_error::EncodeSnafu)
+    write_channel_open_failure(
+        writer,
+        reason_code::CONNECT_FAILED,
+        description.to_owned().into(),
+    )
+    .await
+    .map_err(|e| DirectForwardError::Encode {
+        source: crate::message::MessageError::WriteIo {
+            source: std::io::Error::other(e),
+        },
+    })
 }
 
 /// Send `ChannelOpenConfirmation`.
 async fn send_open_confirmation<W: AsyncWrite + Unpin + Send>(
     writer: &mut W,
 ) -> Result<(), DirectForwardError> {
-    let confirm = SshMessage::Channel(ChannelMessage::OpenConfirmation {
-        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-    });
-    writer
-        .encode_one(confirm)
+    write_channel_open_confirmation(writer, crate::constants::DEFAULT_MAX_MESSAGE_SIZE)
         .await
-        .context(direct_forward_error::EncodeSnafu)
+        .map_err(|e| DirectForwardError::Encode {
+            source: crate::message::MessageError::WriteIo {
+                source: std::io::Error::other(e),
+            },
+        })
 }
 
 /// Spawn bidirectional relay between a channel stream pair and a split I/O stream.
@@ -204,8 +205,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channel::ChannelMessage;
-    use h3x::codec::{DecodeFrom, EncodeInto};
+    use crate::conversation::{read_channel_open_response, ChannelOpenResponse};
+    use h3x::codec::{EncodeExt, EncodeInto};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -256,10 +257,10 @@ mod tests {
         let handler = tokio::spawn(handle_direct_tcpip(server_rd, server_wr));
 
         // Read confirmation
-        let confirm = SshMessage::decode_from(&mut client_rd).await.unwrap();
+        let confirm = read_channel_open_response(&mut client_rd).await.unwrap();
         assert!(matches!(
             confirm,
-            SshMessage::Channel(ChannelMessage::OpenConfirmation { .. })
+            ChannelOpenResponse::Confirmation { .. }
         ));
 
         // Read echoed data (raw, NOT wrapped in ChannelData)
@@ -285,10 +286,10 @@ mod tests {
 
         handle_direct_tcpip(server_rd, server_wr).await.unwrap();
 
-        let msg = SshMessage::decode_from(&mut client_rd).await.unwrap();
+        let msg = read_channel_open_response(&mut client_rd).await.unwrap();
         assert!(matches!(
             msg,
-            SshMessage::Channel(ChannelMessage::OpenFailure(..))
+            ChannelOpenResponse::Failure(..)
         ));
     }
 
@@ -297,7 +298,7 @@ mod tests {
         let req = encode_tcpip_request("127.0.0.1", 70000, "127.0.0.1", 11111).await;
 
         let (mut client_wr, server_rd) = duplex(8192);
-        let (server_wr, mut client_rd) = duplex(8192);
+        let (server_wr, _client_rd) = duplex(8192);
 
         client_wr.write_all(&req).await.unwrap();
         drop(client_wr);

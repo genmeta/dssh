@@ -17,10 +17,7 @@ pub mod version;
 
 pub use auth::{AuthCredential, AuthScheme, parse_authorization_header};
 pub use byte_channel::{ChannelReader, ChannelWriter};
-pub use channel::{
-    ChannelHeader, ChannelMessage, ChannelOpenBody, ChannelOpenFailure, ChannelRequest,
-    ChannelType,
-};
+pub use channel::{ChannelOpenFailure, reason_code};
 pub use codec::{SshBool, SshString};
 pub use constants::{
     CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION, SUPPORTED_SSH_VERSIONS,
@@ -54,12 +51,14 @@ pub use forward::{
 };
 pub use forward_runtime::{
     direct::{self, handle_direct_streamlocal, handle_direct_tcpip, DirectForwardError},
-    finish_forwarded_channel, finish_forwarded_streamlocal_channel,
-    finish_forwarded_tcpip_channel, forwarded_streamlocal_header, forwarded_tcpip_header, relay,
+    finish_forwarded_channel, relay,
     reverse::{self, ReverseForwardError, ReverseForwarder},
     socks5::{self, handle_socks5, Socks5Error},
 };
-pub use message::SshMessage;
+pub use message::{MessageError, SSH_MSG_CHANNEL_DATA, SSH_MSG_CHANNEL_EXTENDED_DATA,
+    SSH_MSG_CHANNEL_EOF, SSH_MSG_CHANNEL_CLOSE, SSH_MSG_CHANNEL_REQUEST,
+    SSH_MSG_CHANNEL_SUCCESS, SSH_MSG_CHANNEL_FAILURE, SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
+    SSH_MSG_CHANNEL_OPEN_FAILURE};
 pub use client::{
     ConnectError, Ssh3Client, Ssh3Connection, SSH3_CONNECT_PATH,
     encode_basic_auth,
@@ -71,11 +70,9 @@ pub use protocol::{
 pub use session::{
     AuthResult, ChildBootstrap, ExecChannelRequest, ExecRequest, ExitSignalChannelNotice,
     ExitSignalRequest, ExitStatusChannelNotice, ExitStatusRequest, PtyChannelRequest, PtyRequest,
-    RequestAction, SessionError, SessionInit, SessionLoopAction, ShellChannelRequest,
+    SessionError, SessionInit, ShellChannelRequest,
     SignalChannelNotice, SignalChannelRequest, SignalRequest, Ssh3Transport, Ssh3TransportClient,
     Ssh3TransportServer, Ssh3TransportServerShared, SubsystemChannelRequest, SubsystemRequest,
-    TransportError, WindowChangeChannelNotice, WindowChangeRequest, encode_exit_status,
-    handle_request, handle_session_loop_message, open_session_channel, run_message_loop_with_sender,
-    run_session_request_loop,
+    TransportError, WindowChangeChannelNotice, WindowChangeRequest,
 };
 pub use version::{SshVersion, negotiate_version, version_response_header};
