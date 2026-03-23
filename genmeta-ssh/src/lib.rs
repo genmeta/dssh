@@ -36,7 +36,7 @@ pub use conversation::{
     WantReplyChannelRequest, WantReplyGlobalRequest, WriteChannelCloseError,
     WriteChannelDataError, WriteChannelEofError, WriteChannelExtendedDataError,
     WriteChannelOpenConfirmationError,
-    WriteChannelOpenError, WriteChannelOpenFailureError,
+    WriteChannelOpenFailureError,
 };
 pub use error::{Ssh3Error, ssh3_error};
 pub use forward::{

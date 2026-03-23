@@ -339,27 +339,6 @@ pub enum WriteChannelCloseError {
     Flush { source: std::io::Error },
 }
 
-/// Error from [`SshChannelWriter::open`].
-///
-/// Only used by `Ssh3Connection` which writes the full channel header
-/// (signal value + session ID) at the QUIC level.
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum WriteChannelOpenError<PE: std::error::Error + Send + Sync + 'static> {
-    #[snafu(display("failed to encode channel signal value"))]
-    EncodeSignalValue { source: std::io::Error },
-    #[snafu(display("failed to encode session id"))]
-    EncodeSessionId { source: std::io::Error },
-    #[snafu(display("failed to encode max message size"))]
-    EncodeMaxMessageSize { source: std::io::Error },
-    #[snafu(display("failed to encode channel type string"))]
-    EncodeChannelType { source: CodecError },
-    #[snafu(display("failed to encode channel open payload"))]
-    EncodePayload { source: PE },
-    #[snafu(display("failed to flush channel stream after open"))]
-    Flush { source: std::io::Error },
-}
-
 /// Error reading a channel open response (confirmation or failure).
 ///
 /// Used by [`read_channel_open_response`] and [`Conversation::open_channel`].
