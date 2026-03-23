@@ -3,18 +3,23 @@
 //! Provides [`Ssh3Client`] for establishing an SSH3 connection over HTTP/3,
 //! and [`Ssh3Connection`] for opening channels on the established connection.
 
-use std::sync::Arc;
-
 use base64::engine::{Engine, general_purpose::STANDARD};
-use h3x::codec::{EncodeInto, SinkWriter, StreamReader};
-use h3x::message::stream::{ReadStream, WriteStream};
 use h3x::qpack::field::Protocol;
 use h3x::quic::GetStreamIdExt;
+use h3x::stream_id::StreamId;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::Empty;
 use snafu::{ResultExt, Snafu};
 
-use crate::constants::SSH_VERSION;
+use crate::constants::{DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION};
+use crate::conversation::{
+    Conversation, OpenChannelError, SshChannelReader, SshChannelWriter,
+};
+use crate::forward::SessionChannelOpen;
+use crate::protocol::{
+    ConversationHandle, HandleError, RegisterError, Ssh3Protocol,
+    Ssh3StreamReader, Ssh3StreamWriter,
+};
 
 /// Well-known path for SSH3 Extended CONNECT requests.
 pub const SSH3_CONNECT_PATH: &str = "/.well-known/ssh3/connect";
@@ -55,6 +60,9 @@ pub enum ConnectError {
 
     #[snafu(display("server offered unsupported version: {server_version}"))]
     VersionMismatch { server_version: String },
+
+    #[snafu(display("failed to register conversation"))]
+    Register { source: RegisterError },
 }
 
 /// Encode Basic auth header value: `Basic base64(username:password)`.
@@ -94,10 +102,7 @@ impl Ssh3Client {
     pub async fn connect<C>(
         &self,
         client: &h3x::client::Client<C>,
-    ) -> Result<
-        Ssh3Connection<Arc<h3x::connection::Connection<C::Connection>>>,
-        ConnectError,
-    >
+    ) -> Result<Ssh3Connection, ConnectError>
     where
         C: h3x::quic::Connect + Sync,
         C::Error: Send + Sync,
@@ -194,166 +199,86 @@ impl Ssh3Client {
             "SSH3 connection established"
         );
 
+        // Create the SSH3 protocol layer and register this conversation.
+        let conn = connection.clone();
+        let protocol = Ssh3Protocol::new(move || {
+            let conn = conn.clone();
+            Box::pin(async move {
+                use h3x::codec::BoxReadStream;
+                use h3x::codec::BoxWriteStream;
+                let (reader, writer) = conn.open_bi().await?;
+                Ok((
+                    Box::pin(reader) as BoxReadStream,
+                    Box::pin(writer) as BoxWriteStream,
+                ))
+            })
+        });
+        let session_id = StreamId::try_from(conversation_id).unwrap();
+        let handle = protocol
+            .register(session_id)
+            .context(connect_error::RegisterSnafu)?;
+
+        // Convert HTTP/3 message streams to AsyncRead/AsyncWrite for the
+        // control stream (DATA-framed per RFC 9114 §4.4).
+        let control_reader = read_stream.into_box_reader();
+        let control_writer = write_stream.into_box_writer();
+
+        let conversation = Conversation::new(session_id, control_reader, control_writer, handle);
+
         Ok(Ssh3Connection {
             server_version,
-            conversation_id,
-            _control_reader: read_stream,
-            _control_writer: write_stream,
-            connection,
+            conversation,
         })
     }
 }
 
 /// An established SSH3 connection.
 ///
-/// Holds the control stream and the underlying h3x connection handle.
+/// Wraps a [`Conversation<ConversationHandle>`] that manages the control
+/// stream (global requests/notifications) and channel lifecycle.
+///
 /// Use [`open_session`](Ssh3Connection::open_session) to create session
-/// channels.
-pub struct Ssh3Connection<C> {
+/// channels, or [`conversation`](Ssh3Connection::conversation) for direct
+/// access to the underlying conversation.
+pub struct Ssh3Connection {
     server_version: String,
-    conversation_id: u64,
-    _control_reader: ReadStream,
-    _control_writer: WriteStream,
-    connection: C,
+    conversation: Conversation<ConversationHandle>,
 }
 
-impl<C> Ssh3Connection<C> {
+impl Ssh3Connection {
     pub fn server_version(&self) -> &str {
         &self.server_version
     }
 
     pub fn conversation_id(&self) -> u64 {
-        self.conversation_id
+        self.conversation.id().into_inner()
     }
 
-    pub fn connection(&self) -> &C {
-        &self.connection
+    /// Returns a reference to the underlying [`Conversation`].
+    ///
+    /// Use this for reverse forwarding, global requests, or any other
+    /// operation that requires direct conversation access.
+    pub fn conversation(&self) -> &Conversation<ConversationHandle> {
+        &self.conversation
     }
-}
 
-/// Methods available when `C` is a full h3x connection that can open streams.
-impl<C> Ssh3Connection<Arc<h3x::connection::Connection<C>>>
-where
-    C: h3x::quic::Connection + Sync + 'static,
-    C::StreamReader: Send,
-    C::StreamWriter: Send,
-{
     /// Open a session channel and return a [`ClientSession`](crate::session::client::ClientSession).
     pub async fn open_session(
         &self,
     ) -> Result<
-        crate::session::client::ClientSession<
-            StreamReader<C::StreamReader>,
-            SinkWriter<C::StreamWriter>,
-        >,
-        OpenChannelError,
+        crate::session::client::ClientSession<Ssh3StreamReader, Ssh3StreamWriter>,
+        OpenChannelError<HandleError, std::convert::Infallible>,
     > {
-        let (reader, writer) = self.open_channel(&crate::forward::SessionChannelOpen).await?;
+        let (reader, writer) = self
+            .conversation
+            .open_channel(&SessionChannelOpen, DEFAULT_MAX_MESSAGE_SIZE)
+            .await?;
 
         Ok(crate::session::client::ClientSession::new(
-            crate::conversation::SshChannelReader::new(reader),
-            crate::conversation::SshChannelWriter::new(writer),
+            SshChannelReader::new(reader),
+            SshChannelWriter::new(writer),
         ))
     }
-
-    /// Open a channel: write the full header (signal value + session ID +
-    /// max_message_size + channel_type + payload), read the confirmation
-    /// response, and return the raw stream pair.
-    async fn open_channel<CO, PE>(
-        &self,
-        channel: &CO,
-    ) -> Result<(StreamReader<C::StreamReader>, SinkWriter<C::StreamWriter>), OpenChannelError>
-    where
-        CO: crate::conversation::ChannelOpen,
-        PE: std::error::Error + Send + Sync + 'static,
-        for<'w> CO::Payload:
-            h3x::codec::EncodeInto<&'w mut SinkWriter<C::StreamWriter>, Output = (), Error = PE>,
-    {
-        use crate::constants::{CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE};
-        use h3x::codec::EncodeExt;
-
-        let (reader, writer) = self.open_bi().await?;
-        let mut reader = StreamReader::new(reader);
-        let mut writer = SinkWriter::new(writer);
-
-        // Write full channel open header (signal value + session ID + SSH fields).
-        let session_id =
-            h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(self.conversation_id).unwrap());
-        writer
-            .encode_one(CHANNEL_SIGNAL_VALUE)
-            .await
-            .map_err(|e| OpenChannelError::ChannelOpen {
-                source: Box::new(e),
-            })?;
-        writer
-            .encode_one(session_id)
-            .await
-            .map_err(|e| OpenChannelError::ChannelOpen {
-                source: Box::new(e),
-            })?;
-        writer
-            .encode_one(DEFAULT_MAX_MESSAGE_SIZE)
-            .await
-            .map_err(|e| OpenChannelError::ChannelOpen {
-                source: Box::new(e),
-            })?;
-        writer
-            .encode_one(channel.channel_type())
-            .await
-            .map_err(|e| OpenChannelError::ChannelOpen {
-                source: Box::new(std::io::Error::other(e)),
-            })?;
-        channel
-            .payload()
-            .clone()
-            .encode_into(&mut writer)
-            .await
-            .map_err(|e| OpenChannelError::ChannelOpen {
-                source: Box::new(e),
-            })?;
-        tokio::io::AsyncWriteExt::flush(&mut writer)
-            .await
-            .map_err(|e| OpenChannelError::ChannelOpen {
-                source: Box::new(e),
-            })?;
-
-        // Read confirmation.
-        crate::conversation::read_channel_open_response(&mut reader)
-            .await
-            .map_err(|e| OpenChannelError::ChannelOpenResponse {
-                source: Box::new(e),
-            })?;
-
-        Ok((reader, writer))
-    }
-
-    async fn open_bi(&self) -> Result<(C::StreamReader, C::StreamWriter), OpenChannelError> {
-        self.connection
-            .open_bi()
-            .await
-            .map_err(|e| OpenChannelError::OpenStream {
-                source: Box::new(e),
-            })
-    }
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)), module)]
-pub enum OpenChannelError {
-    #[snafu(display("failed to open QUIC stream"))]
-    OpenStream {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("failed to send channel open"))]
-    ChannelOpen {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("failed to read channel open response"))]
-    ChannelOpenResponse {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 #[cfg(test)]

@@ -131,6 +131,24 @@ impl fmt::Debug for Ssh3Protocol {
 }
 
 impl Ssh3Protocol {
+    /// Create an `Ssh3Protocol` from a stream-opening closure.
+    ///
+    /// The closure should open new QUIC bidirectional streams and return
+    /// them as boxed trait objects. This is the most flexible constructor —
+    /// use it when you have a connection handle that doesn't directly
+    /// implement the QUIC traits (e.g., `h3x::connection::Connection<C>`).
+    pub fn new(
+        open_bi: impl Fn() -> BoxFuture<'static, Result<(BoxReadStream, BoxWriteStream), ConnectionError>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            open_bi: Arc::new(open_bi),
+        }
+    }
+
     /// Register a new conversation for the given session ID.
     ///
     /// Returns a [`ConversationHandle`] that receives routed streams and can
