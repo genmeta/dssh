@@ -13,9 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::codec::{SshBytes, SshString};
 use crate::conversation::{
     ChannelEvent, ReadChannelEventError,
-    SendChannelNoticeError, SendChannelRequestError, WriteChannelCloseError,
-    WriteChannelDataError, WriteChannelEofError, read_channel_event, send_channel_notice,
-    send_channel_request, write_channel_close, write_channel_data, write_channel_eof,
+    SendChannelNoticeError, SendChannelRequestError, SshChannelReader, SshChannelWriter,
+    WriteChannelCloseError, WriteChannelDataError, WriteChannelEofError,
 };
 use crate::session::{
     ExecChannelRequest, ExecRequest, ExitSignalRequest, ExitStatusRequest,
@@ -121,8 +120,8 @@ pub enum SessionEvent {
 /// }
 /// ```
 pub struct ClientSession<R, W> {
-    reader: R,
-    writer: W,
+    reader: SshChannelReader<R>,
+    writer: SshChannelWriter<W>,
 }
 
 impl<R, W> ClientSession<R, W>
@@ -130,8 +129,8 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    /// Create a new client session from a channel stream pair.
-    pub fn new(reader: R, writer: W) -> Self {
+    /// Create a new client session from wrapped channel stream pair.
+    pub fn new(reader: SshChannelReader<R>, writer: SshChannelWriter<W>) -> Self {
         Self { reader, writer }
     }
 
@@ -139,15 +138,15 @@ where
     pub async fn request_pty(&mut self, request: &PtyRequest) -> Result<(), ClientSessionError> {
         use client_session_error::*;
 
-        send_channel_request(
-            &mut self.reader,
-            &mut self.writer,
-            &PtyChannelRequest {
-                payload: request.clone(),
-            },
-        )
-        .await
-        .context(SendPtySnafu)?;
+        self.writer
+            .request(
+                &mut self.reader,
+                &PtyChannelRequest {
+                    payload: request.clone(),
+                },
+            )
+            .await
+            .context(SendPtySnafu)?;
 
         Ok(())
     }
@@ -156,17 +155,17 @@ where
     pub async fn exec(&mut self, command: &[u8]) -> Result<(), ClientSessionError> {
         use client_session_error::*;
 
-        send_channel_request(
-            &mut self.reader,
-            &mut self.writer,
-            &ExecChannelRequest {
-                payload: ExecRequest {
-                    command: SshBytes::from(command.to_vec()),
+        self.writer
+            .request(
+                &mut self.reader,
+                &ExecChannelRequest {
+                    payload: ExecRequest {
+                        command: SshBytes::from(command.to_vec()),
+                    },
                 },
-            },
-        )
-        .await
-        .context(SendExecSnafu)?;
+            )
+            .await
+            .context(SendExecSnafu)?;
 
         Ok(())
     }
@@ -175,13 +174,10 @@ where
     pub async fn shell(&mut self) -> Result<(), ClientSessionError> {
         use client_session_error::*;
 
-        send_channel_request(
-            &mut self.reader,
-            &mut self.writer,
-            &ShellChannelRequest,
-        )
-        .await
-        .context(SendShellSnafu)?;
+        self.writer
+            .request(&mut self.reader, &ShellChannelRequest)
+            .await
+            .context(SendShellSnafu)?;
 
         Ok(())
     }
@@ -193,14 +189,12 @@ where
     ) -> Result<(), ClientSessionError> {
         use client_session_error::*;
 
-        send_channel_notice(
-            &mut self.writer,
-            &WindowChangeChannelNotice {
+        self.writer
+            .notice(&WindowChangeChannelNotice {
                 payload: request.clone(),
-            },
-        )
-        .await
-        .context(SendWindowChangeSnafu)?;
+            })
+            .await
+            .context(SendWindowChangeSnafu)?;
 
         Ok(())
     }
@@ -209,16 +203,14 @@ where
     pub async fn signal(&mut self, signal_name: &str) -> Result<(), ClientSessionError> {
         use client_session_error::*;
 
-        send_channel_notice(
-            &mut self.writer,
-            &SignalChannelNotice {
+        self.writer
+            .notice(&SignalChannelNotice {
                 payload: SignalRequest {
                     signal_name: SshString::from(signal_name.to_owned()),
                 },
-            },
-        )
-        .await
-        .context(SendSignalSnafu)?;
+            })
+            .await
+            .context(SendSignalSnafu)?;
 
         Ok(())
     }
@@ -226,7 +218,8 @@ where
     /// Send stdin data to the remote process.
     pub async fn send_stdin(&mut self, data: &[u8]) -> Result<(), ClientSessionError> {
         use client_session_error::*;
-        write_channel_data(&mut self.writer, SshBytes::from(data.to_vec()))
+        self.writer
+            .data(SshBytes::from(data.to_vec()))
             .await
             .context(WriteStdinSnafu)
     }
@@ -234,14 +227,14 @@ where
     /// Send EOF to the remote process.
     pub async fn send_eof(&mut self) -> Result<(), ClientSessionError> {
         use client_session_error::*;
-        write_channel_eof(&mut self.writer).await.context(WriteEofSnafu)
+        self.writer.eof().await.context(WriteEofSnafu)
     }
 
     /// Send close and shutdown the writer.
     pub async fn close(&mut self) -> Result<(), ClientSessionError> {
         use client_session_error::*;
-        write_channel_close(&mut self.writer).await.context(WriteCloseSnafu)?;
-        self.writer.shutdown().await.context(ShutdownSnafu)?;
+        self.writer.close().await.context(WriteCloseSnafu)?;
+        self.writer.inner_mut().shutdown().await.context(ShutdownSnafu)?;
         Ok(())
     }
 
@@ -251,7 +244,7 @@ where
     pub async fn recv_event(&mut self) -> Result<Option<SessionEvent>, ClientSessionError> {
         use client_session_error::*;
 
-        let event = match read_channel_event(&mut self.reader).await {
+        let event = match self.reader.next_event().await {
             Ok(e) => e,
             Err(ReadChannelEventError::DecodeMessageType { source })
                 if source.kind() == std::io::ErrorKind::UnexpectedEof =>
@@ -298,8 +291,8 @@ where
         }
     }
 
-    /// Consume the session and return the underlying streams.
-    pub fn into_streams(self) -> (R, W) {
+    /// Consume the session and return the underlying wrapper types.
+    pub fn into_parts(self) -> (SshChannelReader<R>, SshChannelWriter<W>) {
         (self.reader, self.writer)
     }
 }
@@ -311,9 +304,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::{
-        write_channel_data, write_channel_eof, write_channel_close,
-    };
+    use crate::conversation::SshChannelWriter;
     use h3x::codec::EncodeExt;
     use h3x::varint::VarInt;
 
@@ -325,16 +316,19 @@ mod tests {
     async fn recv_stdout_data() {
         let (client, server) = channel_pair();
         let (client_reader, client_writer) = tokio::io::split(client);
-        let (_server_reader, mut server_writer) = tokio::io::split(server);
+        let (_server_reader, server_writer) = tokio::io::split(server);
 
-        // Server sends data then close.
-        write_channel_data(&mut server_writer, SshBytes::from(b"hello".to_vec()))
-            .await
-            .unwrap();
-        write_channel_eof(&mut server_writer).await.unwrap();
-        write_channel_close(&mut server_writer).await.unwrap();
+        // Server sends data then close via SshChannelWriter.
+        // (Server side doesn't go through open/accept — just wrap directly for test)
+        let mut sw = SshChannelWriter::new(server_writer);
+        sw.data(SshBytes::from(b"hello".to_vec())).await.unwrap();
+        sw.eof().await.unwrap();
+        sw.close().await.unwrap();
 
-        let mut session = ClientSession::new(client_reader, client_writer);
+        let mut session = ClientSession::new(
+            SshChannelReader::new(client_reader),
+            SshChannelWriter::new(client_writer),
+        );
 
         match session.recv_event().await.unwrap().unwrap() {
             SessionEvent::Stdout(data) => assert_eq!(data.as_ref().as_ref(), b"hello"),
@@ -354,22 +348,23 @@ mod tests {
     async fn recv_exit_status() {
         let (client, server) = channel_pair();
         let (client_reader, client_writer) = tokio::io::split(client);
-        let (_server_reader, mut server_writer) = tokio::io::split(server);
+        let (_server_reader, server_writer) = tokio::io::split(server);
 
         // Server sends exit-status notification.
-        send_channel_notice(
-            &mut server_writer,
-            &crate::session::ExitStatusChannelNotice {
-                payload: ExitStatusRequest {
-                    exit_status: VarInt::from(42u32),
-                },
+        let mut sw = SshChannelWriter::new(server_writer);
+        sw.notice(&crate::session::ExitStatusChannelNotice {
+            payload: ExitStatusRequest {
+                exit_status: VarInt::from(42u32),
             },
-        )
+        })
         .await
         .unwrap();
-        write_channel_close(&mut server_writer).await.unwrap();
+        sw.close().await.unwrap();
 
-        let mut session = ClientSession::new(client_reader, client_writer);
+        let mut session = ClientSession::new(
+            SshChannelReader::new(client_reader),
+            SshChannelWriter::new(client_writer),
+        );
 
         match session.recv_event().await.unwrap().unwrap() {
             SessionEvent::ExitStatus(code) => assert_eq!(code, 42),
@@ -385,7 +380,10 @@ mod tests {
         // Drop server side to cause EOF.
         drop(server);
 
-        let mut session = ClientSession::new(client_reader, client_writer);
+        let mut session = ClientSession::new(
+            SshChannelReader::new(client_reader),
+            SshChannelWriter::new(client_writer),
+        );
         assert!(session.recv_event().await.unwrap().is_none());
     }
 }

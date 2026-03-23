@@ -61,7 +61,6 @@ use tokio::sync::Notify;
 
 use crate::channel::ChannelOpenFailure;
 use crate::codec::{CodecError, SshBool, SshBytes, SshString};
-use crate::constants::CHANNEL_SIGNAL_VALUE;
 
 const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
 const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
@@ -193,6 +192,8 @@ where
     EncodePayload { source: PE },
     #[snafu(display("failed to flush channel stream after open"))]
     Flush { source: std::io::Error },
+    #[snafu(display("failed to read channel open confirmation"))]
+    AwaitConfirmation { source: AwaitOpenError },
 }
 
 /// Error from [`Conversation::accept_channel`].
@@ -210,7 +211,7 @@ where
     DecodeChannelType { source: CodecError },
 }
 
-/// Error from [`send_channel_request`].
+/// Error from [`SshChannelWriter::request`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum SendChannelRequestError<PE: std::error::Error + Send + Sync + 'static, SE: std::error::Error + Send + Sync + 'static> {
@@ -234,7 +235,7 @@ pub enum SendChannelRequestError<PE: std::error::Error + Send + Sync + 'static, 
     UnexpectedResponseType { message_type: VarInt },
 }
 
-/// Error from [`send_channel_notice`].
+/// Error from [`SshChannelWriter::notice`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum SendChannelNoticeError<PE: std::error::Error + Send + Sync + 'static> {
@@ -250,7 +251,7 @@ pub enum SendChannelNoticeError<PE: std::error::Error + Send + Sync + 'static> {
     Flush { source: std::io::Error },
 }
 
-/// Error from [`read_channel_event`].
+/// Error from [`SshChannelReader::next_event`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ReadChannelEventError {
@@ -292,7 +293,7 @@ pub enum RespondChannelFailureError {
     Flush { source: std::io::Error },
 }
 
-/// Error from [`write_channel_data`].
+/// Error from [`SshChannelWriter::data`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum WriteChannelDataError {
@@ -304,7 +305,7 @@ pub enum WriteChannelDataError {
     Flush { source: std::io::Error },
 }
 
-/// Error from [`write_channel_extended_data`].
+/// Error from [`SshChannelWriter::extended_data`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum WriteChannelExtendedDataError {
@@ -318,7 +319,7 @@ pub enum WriteChannelExtendedDataError {
     Flush { source: std::io::Error },
 }
 
-/// Error from [`write_channel_eof`].
+/// Error from [`SshChannelWriter::eof`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum WriteChannelEofError {
@@ -328,7 +329,7 @@ pub enum WriteChannelEofError {
     Flush { source: std::io::Error },
 }
 
-/// Error from [`write_channel_close`].
+/// Error from [`SshChannelWriter::close`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum WriteChannelCloseError {
@@ -338,7 +339,10 @@ pub enum WriteChannelCloseError {
     Flush { source: std::io::Error },
 }
 
-/// Error from [`write_channel_open`].
+/// Error from [`SshChannelWriter::open`].
+///
+/// Only used by `Ssh3Connection` which writes the full channel header
+/// (signal value + session ID) at the QUIC level.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum WriteChannelOpenError<PE: std::error::Error + Send + Sync + 'static> {
@@ -356,10 +360,12 @@ pub enum WriteChannelOpenError<PE: std::error::Error + Send + Sync + 'static> {
     Flush { source: std::io::Error },
 }
 
-/// Error from [`read_channel_open_response`].
+/// Error reading a channel open response (confirmation or failure).
+///
+/// Used by [`read_channel_open_response`] and [`Conversation::open_channel`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum ReadChannelOpenResponseError {
+pub enum AwaitOpenError {
     #[snafu(display("failed to decode channel open response message type"))]
     DecodeMessageType { source: std::io::Error },
     #[snafu(display("failed to decode max message size from confirmation"))]
@@ -368,11 +374,13 @@ pub enum ReadChannelOpenResponseError {
     DecodeReasonCode { source: std::io::Error },
     #[snafu(display("failed to decode open failure description"))]
     DecodeDescription { source: CodecError },
+    #[snafu(display("channel open was rejected"))]
+    Rejected { failure: ChannelOpenFailure },
     #[snafu(display("unexpected channel open response message type {message_type}"))]
     UnexpectedMessageType { message_type: VarInt },
 }
 
-/// Error from [`write_channel_open_confirmation`].
+/// Error from [`PendingChannel::accept`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum WriteChannelOpenConfirmationError {
@@ -384,7 +392,7 @@ pub enum WriteChannelOpenConfirmationError {
     Flush { source: std::io::Error },
 }
 
-/// Error from [`write_channel_open_failure`].
+/// Error from [`PendingChannel::reject`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum WriteChannelOpenFailureError {
@@ -396,6 +404,51 @@ pub enum WriteChannelOpenFailureError {
     EncodeDescription { source: CodecError },
     #[snafu(display("failed to flush channel stream after failure"))]
     Flush { source: std::io::Error },
+}
+
+// ===========================================================================
+// Channel open response reader (shared helper)
+// ===========================================================================
+
+/// Read and validate a channel open response (confirmation or failure).
+///
+/// This is the initiator-side counterpart of [`PendingChannel::accept`] /
+/// [`PendingChannel::reject`]. Used by [`Conversation::open_channel`] and
+/// by direct callers that bypass the `Conversation` layer (e.g. the client).
+pub(crate) async fn read_channel_open_response<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+) -> Result<(), AwaitOpenError> {
+    use await_open_error::*;
+
+    let msg_type: VarInt = reader.decode_one().await.context(DecodeMessageTypeSnafu)?;
+    match msg_type {
+        SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
+            let _max_message_size: VarInt = reader
+                .decode_one()
+                .await
+                .context(DecodeMaxMessageSizeSnafu)?;
+            Ok(())
+        }
+        SSH_MSG_CHANNEL_OPEN_FAILURE => {
+            let reason_code: VarInt = reader
+                .decode_one()
+                .await
+                .context(DecodeReasonCodeSnafu)?;
+            let description: SshString = reader
+                .decode_one()
+                .await
+                .context(DecodeDescriptionSnafu)?;
+            Err(AwaitOpenError::Rejected {
+                failure: ChannelOpenFailure {
+                    reason_code,
+                    description,
+                },
+            })
+        }
+        other => Err(AwaitOpenError::UnexpectedMessageType {
+            message_type: other,
+        }),
+    }
 }
 
 // ===========================================================================
@@ -1042,7 +1095,7 @@ impl<M: ManageSessionStream> Conversation<M> {
     {
         use open_channel_error::*;
 
-        let (reader, mut writer) = self
+        let (mut reader, mut writer) = self
             ._manage_stream
             .open_stream()
             .await
@@ -1065,6 +1118,11 @@ impl<M: ManageSessionStream> Conversation<M> {
         AsyncWriteExt::flush(&mut writer)
             .await
             .context(FlushSnafu)?;
+
+        // Read channel open response (confirmation or failure).
+        read_channel_open_response(&mut reader)
+            .await
+            .context(AwaitConfirmationSnafu)?;
 
         Ok((reader, writer))
     }
@@ -1117,7 +1175,8 @@ impl<M: ManageSessionStream> Conversation<M> {
 ///
 /// The caller inspects [`channel_type`](Self::channel_type) to determine what
 /// kind of channel was opened, then calls [`decode_payload`](Self::decode_payload)
-/// to decode the channel-type-specific payload and obtain the stream pair.
+/// to decode the channel-type-specific payload and obtain a [`PendingChannel`]
+/// that can be accepted or rejected.
 ///
 /// Unlike global requests, channels have independent streams. Dropping this
 /// struct simply closes the streams — it does **not** poison the session.
@@ -1142,131 +1201,426 @@ impl<M: ManageSessionStream> IncomingChannel<M> {
     /// Decode the channel-type-specific payload from the stream, consuming
     /// `self`.
     ///
-    /// Returns the decoded payload together with the (reader, writer) pair
-    /// for subsequent channel communication.
+    /// Returns the decoded payload together with a [`PendingChannel`] that
+    /// must be accepted or rejected to complete the channel handshake.
     pub async fn decode_payload<T, DE>(
         mut self,
-    ) -> Result<(T, M::StreamReader, M::StreamWriter), DE>
+    ) -> Result<(T, PendingChannel<M::StreamReader, M::StreamWriter>), DE>
     where
         T: for<'r> DecodeFrom<&'r mut M::StreamReader, Error = DE>,
     {
         let value = T::decode_from(&mut self.reader).await?;
-        Ok((value, self.reader, self.writer))
+        Ok((value, PendingChannel { reader: self.reader, writer: self.writer }))
     }
 
-    /// Skip payload decoding and directly return the stream pair.
+    /// Skip payload decoding and return a [`PendingChannel`] directly.
     ///
     /// Useful for channel types that carry no additional payload (e.g.
     /// `"session"` channels).
-    pub fn into_streams(self) -> (M::StreamReader, M::StreamWriter) {
-        (self.reader, self.writer)
+    pub fn skip_payload(self) -> PendingChannel<M::StreamReader, M::StreamWriter> {
+        PendingChannel { reader: self.reader, writer: self.writer }
     }
 }
 
 // ===========================================================================
-// Channel request / event functions (standalone, not on Conversation)
+// PendingChannel — awaiting accept/reject decision
 // ===========================================================================
 
-/// Send a channel request that expects a reply and wait for the response.
+/// A channel that has been opened by the remote but not yet confirmed or
+/// rejected locally.
 ///
-/// This is a standalone function operating on an already-opened channel's
-/// streams. No `OrderedAccess` is needed because each channel has its own
-/// independent QUIC stream pair.
-pub async fn send_channel_request<R, W, Req, PE, SE>(
-    reader: &mut R,
-    writer: &mut W,
-    request: &Req,
-) -> Result<Req::Success, SendChannelRequestError<PE, SE>>
-where
-    R: AsyncRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
-    Req: WantReplyChannelRequest,
-    PE: std::error::Error + Send + Sync + 'static,
-    SE: std::error::Error + Send + Sync + 'static,
-    for<'a> Req::Payload: EncodeInto<&'a mut W, Output = (), Error = PE>,
-    for<'a> Req::Success: DecodeFrom<&'a mut R, Error = SE>,
-{
-    use send_channel_request_error::*;
+/// Obtained from [`IncomingChannel::decode_payload`] or
+/// [`IncomingChannel::skip_payload`]. Call [`accept`](Self::accept) to send
+/// a confirmation and obtain the raw stream pair, or [`reject`](Self::reject)
+/// to send a failure.
+///
+/// After [`accept`](Self::accept), the returned streams carry:
+/// - **Raw bytes** for forwarding channels (direct-tcp, forwarded-tcp, etc.)
+/// - **SSH messages** for session channels (wrap in [`SshChannelWriter`] /
+///   [`SshChannelReader`])
+pub struct PendingChannel<R, W> {
+    reader: R,
+    writer: W,
+}
 
-    writer
-        .encode_one(SSH_MSG_CHANNEL_REQUEST)
-        .await
-        .context(EncodeMessageTypeSnafu)?;
-    writer
-        .encode_one(request.request_type())
-        .await
-        .context(EncodeRequestTypeSnafu)?;
-    writer
-        .encode_one(SshBool(true))
-        .await
-        .context(EncodeWantReplySnafu)?;
-    request
-        .payload()
-        .clone()
-        .encode_into(writer)
-        .await
-        .context(EncodePayloadSnafu)?;
-    AsyncWriteExt::flush(writer).await.context(FlushSnafu)?;
-
-    let msg_type: VarInt = reader
-        .decode_one()
-        .await
-        .context(DecodeResponseTypeSnafu)?;
-
-    match msg_type {
-        SSH_MSG_CHANNEL_SUCCESS => {
-            let success = Req::Success::decode_from(reader)
-                .await
-                .context(DecodeSuccessSnafu)?;
-            Ok(success)
-        }
-        SSH_MSG_CHANNEL_FAILURE => Err(SendChannelRequestError::Rejected),
-        other => Err(SendChannelRequestError::UnexpectedResponseType {
-            message_type: other,
-        }),
+impl<R, W> PendingChannel<R, W> {
+    /// Create a `PendingChannel` from pre-decoded reader and writer.
+    ///
+    /// Use this when the channel-type-specific payload has already been
+    /// decoded from the reader at a different layer (e.g. the direct
+    /// forwarding handler).
+    pub fn from_raw_parts(reader: R, writer: W) -> Self {
+        Self { reader, writer }
     }
 }
 
-/// Send a channel notification (no reply expected).
-pub async fn send_channel_notice<W, N, PE>(
-    writer: &mut W,
-    notice: &N,
-) -> Result<(), SendChannelNoticeError<PE>>
-where
-    W: AsyncWrite + Unpin + Send,
-    N: NotifyChannelRequest,
-    PE: std::error::Error + Send + Sync + 'static,
-    for<'a> N::Payload: EncodeInto<&'a mut W, Output = (), Error = PE>,
-{
-    use send_channel_notice_error::*;
+impl<R, W: AsyncWrite + Unpin + Send> PendingChannel<R, W> {
+    /// Send a channel open confirmation and return the raw stream pair.
+    pub async fn accept(
+        mut self,
+        max_message_size: VarInt,
+    ) -> Result<(R, W), WriteChannelOpenConfirmationError> {
+        use write_channel_open_confirmation_error::*;
 
-    writer
-        .encode_one(SSH_MSG_CHANNEL_REQUEST)
-        .await
-        .context(EncodeMessageTypeSnafu)?;
-    writer
-        .encode_one(notice.request_type())
-        .await
-        .context(EncodeRequestTypeSnafu)?;
-    writer
-        .encode_one(SshBool(false))
-        .await
-        .context(EncodeWantReplySnafu)?;
-    notice
-        .payload()
-        .clone()
-        .encode_into(writer)
-        .await
-        .context(EncodePayloadSnafu)?;
-    AsyncWriteExt::flush(writer).await.context(FlushSnafu)?;
+        self.writer
+            .encode_one(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+            .await
+            .context(EncodeMessageTypeSnafu)?;
+        self.writer
+            .encode_one(max_message_size)
+            .await
+            .context(EncodeMaxMessageSizeSnafu)?;
+        AsyncWriteExt::flush(&mut self.writer)
+            .await
+            .context(FlushSnafu)?;
+        Ok((self.reader, self.writer))
+    }
 
-    Ok(())
+    /// Send a channel open failure. The channel is dead after this.
+    pub async fn reject(
+        mut self,
+        reason_code: VarInt,
+        description: SshString,
+    ) -> Result<(), WriteChannelOpenFailureError> {
+        use write_channel_open_failure_error::*;
+
+        self.writer
+            .encode_one(SSH_MSG_CHANNEL_OPEN_FAILURE)
+            .await
+            .context(EncodeMessageTypeSnafu)?;
+        self.writer
+            .encode_one(reason_code)
+            .await
+            .context(EncodeReasonCodeSnafu)?;
+        self.writer
+            .encode_one(description)
+            .await
+            .context(EncodeDescriptionSnafu)?;
+        AsyncWriteExt::flush(&mut self.writer)
+            .await
+            .context(FlushSnafu)?;
+        Ok(())
+    }
 }
+
+// ===========================================================================
+// SshChannelWriter — typed wrapper for channel write operations
+// ===========================================================================
+
+/// Typed wrapper around a channel's write half for SSH message IO.
+///
+/// Constructed via [`new`](Self::new) after channel establishment is complete.
+/// Provides methods for sending SSH channel messages (data, extended data,
+/// EOF, close, request, notice). Only meaningful for channel types that use
+/// SSH message framing (e.g. `"session"`). Forwarding channels should use
+/// raw streams directly.
+pub struct SshChannelWriter<W> {
+    writer: W,
+}
+
+impl<W: AsyncWrite + Unpin + Send> SshChannelWriter<W> {
+    /// Wrap a writer for SSH channel message IO.
+    ///
+    /// The channel must already be established (open/accept handshake done).
+    pub fn new(writer: W) -> Self {
+        Self { writer }
+    }
+
+    // --- Data operations ---
+
+    /// Write channel data (`SSH_MSG_CHANNEL_DATA`).
+    pub async fn data(&mut self, data: SshBytes) -> Result<(), WriteChannelDataError> {
+        use write_channel_data_error::*;
+
+        self.writer
+            .encode_one(SSH_MSG_CHANNEL_DATA)
+            .await
+            .context(EncodeMessageTypeSnafu)?;
+        self.writer
+            .encode_one(data)
+            .await
+            .context(EncodeDataSnafu)?;
+        AsyncWriteExt::flush(&mut self.writer)
+            .await
+            .context(FlushSnafu)?;
+        Ok(())
+    }
+
+    /// Write channel extended data (`SSH_MSG_CHANNEL_EXTENDED_DATA`).
+    ///
+    /// `data_type` distinguishes the data substream (e.g. `1` for stderr
+    /// per RFC 4254 Section 5.2).
+    pub async fn extended_data(
+        &mut self,
+        data_type: VarInt,
+        data: SshBytes,
+    ) -> Result<(), WriteChannelExtendedDataError> {
+        use write_channel_extended_data_error::*;
+
+        self.writer
+            .encode_one(SSH_MSG_CHANNEL_EXTENDED_DATA)
+            .await
+            .context(EncodeMessageTypeSnafu)?;
+        self.writer
+            .encode_one(data_type)
+            .await
+            .context(EncodeDataTypeSnafu)?;
+        self.writer
+            .encode_one(data)
+            .await
+            .context(EncodeDataSnafu)?;
+        AsyncWriteExt::flush(&mut self.writer)
+            .await
+            .context(FlushSnafu)?;
+        Ok(())
+    }
+
+    /// Write channel EOF (`SSH_MSG_CHANNEL_EOF`).
+    pub async fn eof(&mut self) -> Result<(), WriteChannelEofError> {
+        use write_channel_eof_error::*;
+
+        self.writer
+            .encode_one(SSH_MSG_CHANNEL_EOF)
+            .await
+            .context(EncodeMessageTypeSnafu)?;
+        AsyncWriteExt::flush(&mut self.writer)
+            .await
+            .context(FlushSnafu)?;
+        Ok(())
+    }
+
+    /// Write channel close (`SSH_MSG_CHANNEL_CLOSE`).
+    pub async fn close(&mut self) -> Result<(), WriteChannelCloseError> {
+        use write_channel_close_error::*;
+
+        self.writer
+            .encode_one(SSH_MSG_CHANNEL_CLOSE)
+            .await
+            .context(EncodeMessageTypeSnafu)?;
+        AsyncWriteExt::flush(&mut self.writer)
+            .await
+            .context(FlushSnafu)?;
+        Ok(())
+    }
+
+    // --- Request operations ---
+
+    /// Send a channel request that expects a reply, reading the response
+    /// from the given [`SshChannelReader`].
+    pub async fn request<R, Req, PE, SE>(
+        &mut self,
+        reader: &mut SshChannelReader<R>,
+        request: &Req,
+    ) -> Result<Req::Success, SendChannelRequestError<PE, SE>>
+    where
+        R: AsyncRead + Unpin + Send,
+        Req: WantReplyChannelRequest,
+        PE: std::error::Error + Send + Sync + 'static,
+        SE: std::error::Error + Send + Sync + 'static,
+        for<'a> Req::Payload: EncodeInto<&'a mut W, Output = (), Error = PE>,
+        for<'a> Req::Success: DecodeFrom<&'a mut R, Error = SE>,
+    {
+        use send_channel_request_error::*;
+
+        self.writer
+            .encode_one(SSH_MSG_CHANNEL_REQUEST)
+            .await
+            .context(EncodeMessageTypeSnafu)?;
+        self.writer
+            .encode_one(request.request_type())
+            .await
+            .context(EncodeRequestTypeSnafu)?;
+        self.writer
+            .encode_one(SshBool(true))
+            .await
+            .context(EncodeWantReplySnafu)?;
+        request
+            .payload()
+            .clone()
+            .encode_into(&mut self.writer)
+            .await
+            .context(EncodePayloadSnafu)?;
+        AsyncWriteExt::flush(&mut self.writer)
+            .await
+            .context(FlushSnafu)?;
+
+        let msg_type: VarInt = reader
+            .reader
+            .decode_one()
+            .await
+            .context(DecodeResponseTypeSnafu)?;
+
+        match msg_type {
+            SSH_MSG_CHANNEL_SUCCESS => {
+                let success = Req::Success::decode_from(&mut reader.reader)
+                    .await
+                    .context(DecodeSuccessSnafu)?;
+                Ok(success)
+            }
+            SSH_MSG_CHANNEL_FAILURE => Err(SendChannelRequestError::Rejected),
+            other => Err(SendChannelRequestError::UnexpectedResponseType {
+                message_type: other,
+            }),
+        }
+    }
+
+    /// Send a channel notification (no reply expected).
+    pub async fn notice<N, PE>(
+        &mut self,
+        notice: &N,
+    ) -> Result<(), SendChannelNoticeError<PE>>
+    where
+        N: NotifyChannelRequest,
+        PE: std::error::Error + Send + Sync + 'static,
+        for<'a> N::Payload: EncodeInto<&'a mut W, Output = (), Error = PE>,
+    {
+        use send_channel_notice_error::*;
+
+        self.writer
+            .encode_one(SSH_MSG_CHANNEL_REQUEST)
+            .await
+            .context(EncodeMessageTypeSnafu)?;
+        self.writer
+            .encode_one(notice.request_type())
+            .await
+            .context(EncodeRequestTypeSnafu)?;
+        self.writer
+            .encode_one(SshBool(false))
+            .await
+            .context(EncodeWantReplySnafu)?;
+        notice
+            .payload()
+            .clone()
+            .encode_into(&mut self.writer)
+            .await
+            .context(EncodePayloadSnafu)?;
+        AsyncWriteExt::flush(&mut self.writer)
+            .await
+            .context(FlushSnafu)?;
+        Ok(())
+    }
+
+    /// Borrow the underlying writer.
+    pub fn inner(&self) -> &W {
+        &self.writer
+    }
+
+    /// Mutably borrow the underlying writer.
+    pub fn inner_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
+    /// Consume the wrapper and return the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+}
+
+// ===========================================================================
+// SshChannelReader — typed wrapper for channel read operations
+// ===========================================================================
+
+/// Typed wrapper around a channel's read half for SSH message IO.
+///
+/// Constructed via [`new`](Self::new) after channel establishment is complete.
+/// Provides [`next_event`](Self::next_event) for reading SSH channel events.
+/// Only meaningful for channel types that use SSH message framing (e.g.
+/// `"session"`). Forwarding channels should use raw streams directly.
+pub struct SshChannelReader<R> {
+    reader: R,
+}
+
+impl<R: AsyncRead + Unpin + Send> SshChannelReader<R> {
+    /// Wrap a reader for SSH channel message IO.
+    ///
+    /// The channel must already be established (open/accept handshake done).
+    pub fn new(reader: R) -> Self {
+        Self { reader }
+    }
+
+    /// Read the next event from the channel stream.
+    pub async fn next_event(&mut self) -> Result<ChannelEvent<'_, R>, ReadChannelEventError> {
+        use read_channel_event_error::*;
+
+        let msg_type: VarInt = self
+            .reader
+            .decode_one()
+            .await
+            .context(DecodeMessageTypeSnafu)?;
+
+        match msg_type {
+            SSH_MSG_CHANNEL_DATA => {
+                let data: SshBytes = self
+                    .reader
+                    .decode_one()
+                    .await
+                    .context(DecodeDataSnafu)?;
+                Ok(ChannelEvent::Data(data))
+            }
+            SSH_MSG_CHANNEL_EXTENDED_DATA => {
+                let data_type: VarInt = self
+                    .reader
+                    .decode_one()
+                    .await
+                    .context(DecodeExtendedDataTypeSnafu)?;
+                let data: SshBytes = self
+                    .reader
+                    .decode_one()
+                    .await
+                    .context(DecodeExtendedDataSnafu)?;
+                Ok(ChannelEvent::ExtendedData { data_type, data })
+            }
+            SSH_MSG_CHANNEL_REQUEST => {
+                let request_type: SshString = self
+                    .reader
+                    .decode_one()
+                    .await
+                    .context(DecodeRequestTypeSnafu)?;
+                let want_reply: SshBool = self
+                    .reader
+                    .decode_one()
+                    .await
+                    .context(DecodeWantReplySnafu)?;
+                Ok(ChannelEvent::Request(IncomingChannelRequest {
+                    request_type,
+                    want_reply: want_reply.0,
+                    reader: &mut self.reader,
+                }))
+            }
+            SSH_MSG_CHANNEL_SUCCESS => Ok(ChannelEvent::Success),
+            SSH_MSG_CHANNEL_FAILURE => Ok(ChannelEvent::Failure),
+            SSH_MSG_CHANNEL_EOF => Ok(ChannelEvent::Eof),
+            SSH_MSG_CHANNEL_CLOSE => Ok(ChannelEvent::Close),
+            other => Err(ReadChannelEventError::UnexpectedMessageType {
+                message_type: other,
+            }),
+        }
+    }
+
+    /// Borrow the underlying reader.
+    pub fn inner(&self) -> &R {
+        &self.reader
+    }
+
+    /// Mutably borrow the underlying reader.
+    pub fn inner_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Consume the wrapper and return the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+}
+
+// ===========================================================================
+// Channel event types
+// ===========================================================================
 
 /// An event read from a channel stream.
 ///
-/// Returned by [`read_channel_event`]. For `Request` events, the caller
-/// inspects the request type and then decodes the payload via
+/// Returned by [`SshChannelReader::next_event`]. For `Request` events, the
+/// caller inspects the request type and then decodes the payload via
 /// [`IncomingChannelRequest`].
 pub enum ChannelEvent<'r, R> {
     /// Channel data (`SSH_MSG_CHANNEL_DATA`).
@@ -1283,65 +1637,6 @@ pub enum ChannelEvent<'r, R> {
     Eof,
     /// Channel close (`SSH_MSG_CHANNEL_CLOSE`).
     Close,
-}
-
-/// Read the next event from a channel stream.
-///
-/// For `ChannelEvent::Request`, the returned [`IncomingChannelRequest`]
-/// holds a mutable reference to the reader only. The caller inspects
-/// [`request_type()`](IncomingChannelRequest::request_type) and then calls
-/// [`decode_payload`](IncomingChannelRequest::decode_payload) to decode the
-/// request body. The writer is passed separately when responding via
-/// [`ChannelResponder`].
-pub async fn read_channel_event<'r, R>(
-    reader: &'r mut R,
-) -> Result<ChannelEvent<'r, R>, ReadChannelEventError>
-where
-    R: AsyncRead + Unpin + Send,
-{
-    use read_channel_event_error::*;
-
-    let msg_type: VarInt = reader.decode_one().await.context(DecodeMessageTypeSnafu)?;
-
-    match msg_type {
-        SSH_MSG_CHANNEL_DATA => {
-            let data: SshBytes = reader.decode_one().await.context(DecodeDataSnafu)?;
-            Ok(ChannelEvent::Data(data))
-        }
-        SSH_MSG_CHANNEL_EXTENDED_DATA => {
-            let data_type: VarInt = reader
-                .decode_one()
-                .await
-                .context(DecodeExtendedDataTypeSnafu)?;
-            let data: SshBytes = reader
-                .decode_one()
-                .await
-                .context(DecodeExtendedDataSnafu)?;
-            Ok(ChannelEvent::ExtendedData { data_type, data })
-        }
-        SSH_MSG_CHANNEL_REQUEST => {
-            let request_type: SshString = reader
-                .decode_one()
-                .await
-                .context(DecodeRequestTypeSnafu)?;
-            let want_reply: SshBool = reader
-                .decode_one()
-                .await
-                .context(DecodeWantReplySnafu)?;
-            Ok(ChannelEvent::Request(IncomingChannelRequest {
-                request_type,
-                want_reply: want_reply.0,
-                reader,
-            }))
-        }
-        SSH_MSG_CHANNEL_SUCCESS => Ok(ChannelEvent::Success),
-        SSH_MSG_CHANNEL_FAILURE => Ok(ChannelEvent::Failure),
-        SSH_MSG_CHANNEL_EOF => Ok(ChannelEvent::Eof),
-        SSH_MSG_CHANNEL_CLOSE => Ok(ChannelEvent::Close),
-        other => Err(ReadChannelEventError::UnexpectedMessageType {
-            message_type: other,
-        }),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1423,7 +1718,7 @@ impl ChannelResponder {
     /// Send a success response, optionally with a payload.
     pub async fn respond_success<W, P, RE>(
         self,
-        writer: &mut W,
+        writer: &mut SshChannelWriter<W>,
         response: P,
     ) -> Result<(), RespondChannelSuccessError<RE>>
     where
@@ -1434,273 +1729,40 @@ impl ChannelResponder {
         use respond_channel_success_error::*;
 
         writer
+            .writer
             .encode_one(SSH_MSG_CHANNEL_SUCCESS)
             .await
             .context(EncodeMessageTypeSnafu)?;
         response
-            .encode_into(writer)
+            .encode_into(&mut writer.writer)
             .await
             .context(EncodePayloadSnafu)?;
-        AsyncWriteExt::flush(writer)
+        AsyncWriteExt::flush(&mut writer.writer)
             .await
             .context(FlushSnafu)?;
         Ok(())
     }
 
     /// Send a failure response.
-    pub async fn respond_failure<W>(self, writer: &mut W) -> Result<(), RespondChannelFailureError>
+    pub async fn respond_failure<W>(
+        self,
+        writer: &mut SshChannelWriter<W>,
+    ) -> Result<(), RespondChannelFailureError>
     where
         W: AsyncWrite + Unpin + Send,
     {
         use respond_channel_failure_error::*;
 
         writer
+            .writer
             .encode_one(SSH_MSG_CHANNEL_FAILURE)
             .await
             .context(EncodeMessageTypeSnafu)?;
-        AsyncWriteExt::flush(writer)
+        AsyncWriteExt::flush(&mut writer.writer)
             .await
             .context(FlushSnafu)?;
         Ok(())
     }
-}
-
-// ===========================================================================
-// Channel IO helper functions
-// ===========================================================================
-
-/// The result of reading a channel open response.
-pub enum ChannelOpenResponse {
-    /// The channel was accepted. Contains the remote's max message size.
-    Confirmation { max_message_size: VarInt },
-    /// The channel was rejected.
-    Failure(ChannelOpenFailure),
-}
-
-/// Write a channel open header to a stream.
-///
-/// Encodes: `CHANNEL_SIGNAL_VALUE + session_id + max_message_size + channel_type + payload`.
-/// This is the same encoding used by [`Conversation::open_channel`] but works
-/// with any writer, without requiring a [`Conversation`] instance.
-pub async fn write_channel_open<W, C, PE>(
-    writer: &mut W,
-    session_id: StreamId,
-    max_message_size: VarInt,
-    channel: &C,
-) -> Result<(), WriteChannelOpenError<PE>>
-where
-    W: AsyncWrite + Unpin + Send,
-    C: ChannelOpen,
-    PE: std::error::Error + Send + Sync + 'static,
-    for<'w> C::Payload: EncodeInto<&'w mut W, Output = (), Error = PE>,
-{
-    use write_channel_open_error::*;
-
-    writer
-        .encode_one(CHANNEL_SIGNAL_VALUE)
-        .await
-        .context(EncodeSignalValueSnafu)?;
-    writer
-        .encode_one(session_id)
-        .await
-        .context(EncodeSessionIdSnafu)?;
-    writer
-        .encode_one(max_message_size)
-        .await
-        .context(EncodeMaxMessageSizeSnafu)?;
-    writer
-        .encode_one(channel.channel_type())
-        .await
-        .context(EncodeChannelTypeSnafu)?;
-    channel
-        .payload()
-        .clone()
-        .encode_into(writer)
-        .await
-        .context(EncodePayloadSnafu)?;
-    AsyncWriteExt::flush(writer)
-        .await
-        .context(FlushSnafu)?;
-    Ok(())
-}
-
-/// Read a channel open response (confirmation or failure) from a stream.
-pub async fn read_channel_open_response<R>(
-    reader: &mut R,
-) -> Result<ChannelOpenResponse, ReadChannelOpenResponseError>
-where
-    R: AsyncRead + Unpin + Send,
-{
-    use read_channel_open_response_error::*;
-
-    let msg_type: VarInt = reader.decode_one().await.context(DecodeMessageTypeSnafu)?;
-    match msg_type {
-        SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
-            let max_message_size: VarInt = reader
-                .decode_one()
-                .await
-                .context(DecodeMaxMessageSizeSnafu)?;
-            Ok(ChannelOpenResponse::Confirmation { max_message_size })
-        }
-        SSH_MSG_CHANNEL_OPEN_FAILURE => {
-            let reason_code: VarInt = reader
-                .decode_one()
-                .await
-                .context(DecodeReasonCodeSnafu)?;
-            let description: SshString = reader
-                .decode_one()
-                .await
-                .context(DecodeDescriptionSnafu)?;
-            Ok(ChannelOpenResponse::Failure(ChannelOpenFailure {
-                reason_code,
-                description,
-            }))
-        }
-        other => Err(ReadChannelOpenResponseError::UnexpectedMessageType {
-            message_type: other,
-        }),
-    }
-}
-
-/// Write a channel open confirmation response.
-pub async fn write_channel_open_confirmation<W>(
-    writer: &mut W,
-    max_message_size: VarInt,
-) -> Result<(), WriteChannelOpenConfirmationError>
-where
-    W: AsyncWrite + Unpin + Send,
-{
-    use write_channel_open_confirmation_error::*;
-
-    writer
-        .encode_one(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
-        .await
-        .context(EncodeMessageTypeSnafu)?;
-    writer
-        .encode_one(max_message_size)
-        .await
-        .context(EncodeMaxMessageSizeSnafu)?;
-    AsyncWriteExt::flush(writer)
-        .await
-        .context(FlushSnafu)?;
-    Ok(())
-}
-
-/// Write a channel open failure response.
-pub async fn write_channel_open_failure<W>(
-    writer: &mut W,
-    reason_code: VarInt,
-    description: SshString,
-) -> Result<(), WriteChannelOpenFailureError>
-where
-    W: AsyncWrite + Unpin + Send,
-{
-    use write_channel_open_failure_error::*;
-
-    writer
-        .encode_one(SSH_MSG_CHANNEL_OPEN_FAILURE)
-        .await
-        .context(EncodeMessageTypeSnafu)?;
-    writer
-        .encode_one(reason_code)
-        .await
-        .context(EncodeReasonCodeSnafu)?;
-    writer
-        .encode_one(description)
-        .await
-        .context(EncodeDescriptionSnafu)?;
-    AsyncWriteExt::flush(writer)
-        .await
-        .context(FlushSnafu)?;
-    Ok(())
-}
-
-/// Write channel data (`SSH_MSG_CHANNEL_DATA`) to a stream.
-pub async fn write_channel_data<W>(
-    writer: &mut W,
-    data: SshBytes,
-) -> Result<(), WriteChannelDataError>
-where
-    W: AsyncWrite + Unpin + Send,
-{
-    use write_channel_data_error::*;
-
-    writer
-        .encode_one(SSH_MSG_CHANNEL_DATA)
-        .await
-        .context(EncodeMessageTypeSnafu)?;
-    writer.encode_one(data).await.context(EncodeDataSnafu)?;
-    AsyncWriteExt::flush(writer)
-        .await
-        .context(FlushSnafu)?;
-    Ok(())
-}
-
-/// Write channel extended data (`SSH_MSG_CHANNEL_EXTENDED_DATA`) to a stream.
-///
-/// `data_type` distinguishes the data substream (e.g. `1` for stderr per
-/// RFC 4254 Section 5.2).
-pub async fn write_channel_extended_data<W>(
-    writer: &mut W,
-    data_type: VarInt,
-    data: SshBytes,
-) -> Result<(), WriteChannelExtendedDataError>
-where
-    W: AsyncWrite + Unpin + Send,
-{
-    use write_channel_extended_data_error::*;
-
-    writer
-        .encode_one(SSH_MSG_CHANNEL_EXTENDED_DATA)
-        .await
-        .context(EncodeMessageTypeSnafu)?;
-    writer
-        .encode_one(data_type)
-        .await
-        .context(EncodeDataTypeSnafu)?;
-    writer.encode_one(data).await.context(EncodeDataSnafu)?;
-    AsyncWriteExt::flush(writer)
-        .await
-        .context(FlushSnafu)?;
-    Ok(())
-}
-
-/// Write channel EOF (`SSH_MSG_CHANNEL_EOF`) to a stream.
-pub async fn write_channel_eof<W>(
-    writer: &mut W,
-) -> Result<(), WriteChannelEofError>
-where
-    W: AsyncWrite + Unpin + Send,
-{
-    use write_channel_eof_error::*;
-
-    writer
-        .encode_one(SSH_MSG_CHANNEL_EOF)
-        .await
-        .context(EncodeMessageTypeSnafu)?;
-    AsyncWriteExt::flush(writer)
-        .await
-        .context(FlushSnafu)?;
-    Ok(())
-}
-
-/// Write channel close (`SSH_MSG_CHANNEL_CLOSE`) to a stream.
-pub async fn write_channel_close<W>(
-    writer: &mut W,
-) -> Result<(), WriteChannelCloseError>
-where
-    W: AsyncWrite + Unpin + Send,
-{
-    use write_channel_close_error::*;
-
-    writer
-        .encode_one(SSH_MSG_CHANNEL_CLOSE)
-        .await
-        .context(EncodeMessageTypeSnafu)?;
-    AsyncWriteExt::flush(writer)
-        .await
-        .context(FlushSnafu)?;
-    Ok(())
 }
 
 pub enum IncomingGlobal<M: ManageSessionStream> {
@@ -3390,7 +3452,7 @@ mod tests {
         // remote side will use.
         let ch_stream_id = VarInt::from_u32(100);
         let (ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
-        let (ch_local_reader, _ch_remote_writer) = make_half(ch_stream_id);
+        let (ch_local_reader, mut ch_remote_writer) = make_half(ch_stream_id);
         manage.provide_open_stream(ch_local_reader, ch_local_writer);
 
         let max_msg_size = VarInt::from_u32(1 << 20);
@@ -3398,24 +3460,37 @@ mod tests {
             payload: TestPayload(SshString::from_static("hello")),
         };
 
+        // Spawn a "remote side" that reads the channel header then sends confirmation.
+        let remote_task = tokio::spawn(async move {
+            let mut rr = ch_remote_reader;
+
+            let mms: VarInt = rr.decode_one().await.unwrap();
+            assert_eq!(mms, max_msg_size);
+
+            let ct: SshString = rr.decode_one().await.unwrap();
+            assert_eq!(ct.as_ref() as &[u8], b"test-channel");
+
+            let payload: SshString = rr.decode_one().await.unwrap();
+            assert_eq!(payload.as_ref() as &[u8], b"hello");
+
+            // Send confirmation: SSH_MSG_CHANNEL_OPEN_CONFIRMATION + max_message_size
+            ch_remote_writer
+                .encode_one(VarInt::from_u32(91))
+                .await
+                .unwrap();
+            ch_remote_writer
+                .encode_one(VarInt::from_u32(1 << 20))
+                .await
+                .unwrap();
+            AsyncWriteExt::flush(&mut ch_remote_writer).await.unwrap();
+        });
+
         let (_reader, _writer) = conv
             .open_channel(&channel, max_msg_size)
             .await
             .expect("open_channel should succeed");
 
-        // The remote side should see: max_msg_size, channel_type string,
-        // then the payload (SshString). Signal value and session ID are
-        // handled by ManageSessionStream, not written by Conversation.
-        let mut rr = ch_remote_reader;
-
-        let mms: VarInt = rr.decode_one().await.unwrap();
-        assert_eq!(mms, max_msg_size);
-
-        let ct: SshString = rr.decode_one().await.unwrap();
-        assert_eq!(ct.as_ref() as &[u8], b"test-channel");
-
-        let payload: SshString = rr.decode_one().await.unwrap();
-        assert_eq!(payload.as_ref() as &[u8], b"hello");
+        remote_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -3451,7 +3526,7 @@ mod tests {
         assert_eq!(incoming.max_message_size(), max_msg_size);
 
         // Decode the channel-type-specific payload.
-        let (payload, _reader, _writer): (SshString, _, _) = incoming
+        let (payload, _pending): (SshString, _) = incoming
             .decode_payload()
             .await
             .expect("decode_payload should succeed");
@@ -3483,8 +3558,8 @@ mod tests {
         let incoming = conv.accept_channel().await.unwrap();
         assert_eq!(incoming.channel_type().as_ref() as &[u8], b"session");
 
-        // Use into_streams since session has no payload.
-        let (_reader, _writer) = incoming.into_streams();
+        // Use skip_payload since session has no payload.
+        let _pending = incoming.skip_payload();
     }
 
     #[tokio::test]
@@ -3494,25 +3569,33 @@ mod tests {
 
         let ch_stream_id = VarInt::from_u32(600);
         let (ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
-        let (ch_local_reader, _ch_remote_writer) = make_half(ch_stream_id);
+        let (ch_local_reader, mut ch_remote_writer) = make_half(ch_stream_id);
 
         manage.provide_open_stream(ch_local_reader, ch_local_writer);
+
+        // Remote reads header and sends confirmation.
+        let remote_task = tokio::spawn(async move {
+            let mut rr = ch_remote_reader;
+
+            let mms: VarInt = rr.decode_one().await.unwrap();
+            assert_eq!(mms, VarInt::from_u32(1 << 20));
+
+            let ct: SshString = rr.decode_one().await.unwrap();
+            assert_eq!(ct.as_ref() as &[u8], b"session");
+            // No payload bytes follow.
+
+            // Send confirmation
+            ch_remote_writer.encode_one(VarInt::from_u32(91)).await.unwrap();
+            ch_remote_writer.encode_one(VarInt::from_u32(1 << 20)).await.unwrap();
+            AsyncWriteExt::flush(&mut ch_remote_writer).await.unwrap();
+        });
 
         let (_reader, _writer) = conv
             .open_channel(&SessionChannel, VarInt::from_u32(1 << 20))
             .await
             .expect("open session channel should succeed");
 
-        // Verify remote sees the channel header (signal value and session ID
-        // are written by ManageSessionStream, not by Conversation).
-        let mut rr = ch_remote_reader;
-
-        let mms: VarInt = rr.decode_one().await.unwrap();
-        assert_eq!(mms, VarInt::from_u32(1 << 20));
-
-        let ct: SshString = rr.decode_one().await.unwrap();
-        assert_eq!(ct.as_ref() as &[u8], b"session");
-        // No payload bytes follow.
+        remote_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -3573,11 +3656,13 @@ mod tests {
             payload: TestPayload(SshString::from_static("roundtrip")),
         };
 
-        // A opens the channel.
-        let (_a_reader, _a_writer) = conv_a
-            .open_channel(&channel, max_msg)
-            .await
-            .expect("A should open channel");
+        // A opens and B accepts concurrently (A blocks until B sends confirmation).
+        let open_task = tokio::spawn(async move {
+            conv_a
+                .open_channel::<_, crate::codec::CodecError>(&channel, max_msg)
+                .await
+                .expect("A should open channel")
+        });
 
         // B accepts the channel.
         let incoming = conv_b
@@ -3588,12 +3673,18 @@ mod tests {
         assert_eq!(incoming.channel_type().as_ref() as &[u8], b"test-channel");
         assert_eq!(incoming.max_message_size(), max_msg);
 
-        let (payload, _b_reader, _b_writer): (SshString, _, _) = incoming
+        let (payload, pending): (SshString, _) = incoming
             .decode_payload()
             .await
             .expect("B should decode payload");
 
         assert_eq!(payload.as_ref() as &[u8], b"roundtrip");
+
+        // B accepts, sending confirmation back to A.
+        let (_b_reader, _b_writer) = pending.accept(max_msg).await.unwrap();
+
+        // A's open_channel should now complete.
+        let (_a_reader, _a_writer) = open_task.await.unwrap();
     }
 
     // =======================================================================
@@ -3645,7 +3736,7 @@ mod tests {
         (a_reader, a_writer, b_reader, b_writer)
     }
 
-    // -- send_channel_request tests -----------------------------------------
+    // -- SshChannelWriter/SshChannelReader tests ------------------------------
 
     #[tokio::test]
     async fn channel_request_success_roundtrip() {
@@ -3671,7 +3762,9 @@ mod tests {
         let req = TestChannelReq {
             payload: TestPayload(SshString::from("hello-channel".to_string())),
         };
-        let result: VarInt = send_channel_request(&mut a_reader, &mut a_writer, &req)
+        let mut ch_writer = SshChannelWriter::new(a_writer);
+        let mut ch_reader = SshChannelReader::new(a_reader);
+        let result: VarInt = ch_writer.request(&mut ch_reader, &req)
             .await
             .unwrap();
         assert_eq!(result, VarInt::from_u32(42));
@@ -3698,14 +3791,16 @@ mod tests {
         let req = TestChannelReq {
             payload: TestPayload(SshString::from_static("data")),
         };
+        let mut ch_writer = SshChannelWriter::new(a_writer);
+        let mut ch_reader = SshChannelReader::new(a_reader);
         let result: Result<VarInt, _> =
-            send_channel_request(&mut a_reader, &mut a_writer, &req).await;
+            ch_writer.request(&mut ch_reader, &req).await;
         assert!(matches!(result, Err(SendChannelRequestError::Rejected)));
 
         handle.await.unwrap();
     }
 
-    // -- send_channel_notice tests ------------------------------------------
+    // -- SshChannelWriter::notice tests -------------------------------------
 
     #[tokio::test]
     async fn channel_notice_sends_correctly() {
@@ -3714,7 +3809,8 @@ mod tests {
         let notice = TestChannelNotice {
             payload: TestPayload(SshString::from("notice-data".to_string())),
         };
-        send_channel_notice(&mut a_writer, &notice).await.unwrap();
+        let mut ch_writer = SshChannelWriter::new(a_writer);
+        ch_writer.notice(&notice).await.unwrap();
 
         // B 端验证
         let msg_type: VarInt = b_reader.decode_one().await.unwrap();
@@ -3727,7 +3823,7 @@ mod tests {
         assert_eq!(payload.as_ref() as &[u8], b"notice-data");
     }
 
-    // -- read_channel_event tests -------------------------------------------
+    // -- SshChannelReader::next_event tests ---------------------------------
 
     #[tokio::test]
     async fn read_channel_event_data() {
@@ -3741,7 +3837,8 @@ mod tests {
             .unwrap();
         AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-        let event = read_channel_event(&mut a_reader).await.unwrap();
+        let mut ch_reader = SshChannelReader::new(a_reader);
+        let event = ch_reader.next_event().await.unwrap();
         match event {
             ChannelEvent::Data(data) => {
                 assert_eq!(data.as_ref() as &[u8], b"hello");
@@ -3763,7 +3860,8 @@ mod tests {
             .unwrap();
         AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-        let event = read_channel_event(&mut a_reader).await.unwrap();
+        let mut ch_reader = SshChannelReader::new(a_reader);
+        let event = ch_reader.next_event().await.unwrap();
         match event {
             ChannelEvent::ExtendedData { data_type, data } => {
                 assert_eq!(data_type, VarInt::from_u32(1));
@@ -3783,22 +3881,11 @@ mod tests {
         }
         AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-        assert!(matches!(
-            read_channel_event(&mut a_reader).await.unwrap(),
-            ChannelEvent::Eof
-        ));
-        assert!(matches!(
-            read_channel_event(&mut a_reader).await.unwrap(),
-            ChannelEvent::Close
-        ));
-        assert!(matches!(
-            read_channel_event(&mut a_reader).await.unwrap(),
-            ChannelEvent::Success
-        ));
-        assert!(matches!(
-            read_channel_event(&mut a_reader).await.unwrap(),
-            ChannelEvent::Failure
-        ));
+        let mut ch_reader = SshChannelReader::new(a_reader);
+        assert!(matches!(ch_reader.next_event().await.unwrap(), ChannelEvent::Eof));
+        assert!(matches!(ch_reader.next_event().await.unwrap(), ChannelEvent::Close));
+        assert!(matches!(ch_reader.next_event().await.unwrap(), ChannelEvent::Success));
+        assert!(matches!(ch_reader.next_event().await.unwrap(), ChannelEvent::Failure));
     }
 
     #[tokio::test]
@@ -3818,7 +3905,9 @@ mod tests {
             .unwrap();
         AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-        let event = read_channel_event(&mut a_reader).await.unwrap();
+        let mut ch_reader = SshChannelReader::new(a_reader);
+        let mut ch_writer = SshChannelWriter::new(a_writer);
+        let event = ch_reader.next_event().await.unwrap();
         let req = match event {
             ChannelEvent::Request(r) => r,
             _ => panic!("expected Request event"),
@@ -3835,7 +3924,7 @@ mod tests {
         let responder = responder.expect("want_reply was true, should have responder");
 
         // 发送 success 响应（空 payload）
-        responder.respond_success(&mut a_writer, EmptyChannelPayload).await.unwrap();
+        responder.respond_success(&mut ch_writer, EmptyChannelPayload).await.unwrap();
 
         // B 端验证
         let msg_type: VarInt = b_reader.decode_one().await.unwrap();
@@ -3859,7 +3948,9 @@ mod tests {
             .unwrap();
         AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-        let event = read_channel_event(&mut a_reader).await.unwrap();
+        let mut ch_reader = SshChannelReader::new(a_reader);
+        let mut ch_writer = SshChannelWriter::new(a_writer);
+        let event = ch_reader.next_event().await.unwrap();
         let req = match event {
             ChannelEvent::Request(r) => r,
             _ => panic!("expected Request event"),
@@ -3867,7 +3958,7 @@ mod tests {
 
         let (_payload, responder): (SshString, _) = req.decode_payload().await.unwrap();
         let responder = responder.unwrap();
-        responder.respond_failure(&mut a_writer).await.unwrap();
+        responder.respond_failure(&mut ch_writer).await.unwrap();
 
         // B 端验证
         let msg_type: VarInt = b_reader.decode_one().await.unwrap();
@@ -3891,7 +3982,8 @@ mod tests {
             .unwrap();
         AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-        let event = read_channel_event(&mut a_reader).await.unwrap();
+        let mut ch_reader = SshChannelReader::new(a_reader);
+        let event = ch_reader.next_event().await.unwrap();
         let req = match event {
             ChannelEvent::Request(r) => r,
             _ => panic!("expected Request event"),
@@ -3913,7 +4005,8 @@ mod tests {
         b_writer.encode_one(VarInt::from_u32(200)).await.unwrap();
         AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-        let result = read_channel_event(&mut a_reader).await;
+        let mut ch_reader = SshChannelReader::new(a_reader);
+        let result = ch_reader.next_event().await;
         assert!(matches!(
             result,
             Err(ReadChannelEventError::UnexpectedMessageType { .. })
@@ -3922,11 +4015,13 @@ mod tests {
 
     #[tokio::test]
     async fn channel_request_full_roundtrip_via_traits() {
-        // 完整的双向 roundtrip：A 发送 channel request，B 用 read_channel_event 接收并响应
+        // 完整的双向 roundtrip：A 发送 channel request，B 用 next_event 接收并响应
         let (mut a_reader, mut a_writer, mut b_reader, mut b_writer) = make_channel_pair();
 
         let handle = tokio::spawn(async move {
-            let event = read_channel_event(&mut b_reader)
+            let mut ch_reader = SshChannelReader::new(b_reader);
+            let mut ch_writer = SshChannelWriter::new(b_writer);
+            let event = ch_reader.next_event()
                 .await
                 .unwrap();
             let req = match event {
@@ -3941,13 +4036,15 @@ mod tests {
             assert_eq!(payload.as_ref() as &[u8], b"roundtrip");
 
             let responder = responder.unwrap();
-            responder.respond_success(&mut b_writer, VarInt::from_u32(999)).await.unwrap();
+            responder.respond_success(&mut ch_writer, VarInt::from_u32(999)).await.unwrap();
         });
 
         let req = TestChannelReq {
             payload: TestPayload(SshString::from_static("roundtrip")),
         };
-        let result: VarInt = send_channel_request(&mut a_reader, &mut a_writer, &req)
+        let mut ch_writer = SshChannelWriter::new(a_writer);
+        let mut ch_reader = SshChannelReader::new(a_reader);
+        let result: VarInt = ch_writer.request(&mut ch_reader, &req)
             .await
             .unwrap();
         assert_eq!(result, VarInt::from_u32(999));

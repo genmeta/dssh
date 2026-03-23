@@ -14,9 +14,7 @@
 use crate::{
     channel::reason_code,
     codec::SshString,
-    conversation::{
-        write_channel_open_confirmation, write_channel_open_failure,
-    },
+    conversation::{PendingChannel, WriteChannelOpenConfirmationError, WriteChannelOpenFailureError},
     forward_runtime::relay,
 };
 use h3x::{
@@ -39,8 +37,11 @@ pub enum DirectForwardError {
     #[snafu(display("destination port {raw_port} exceeds u16 range"))]
     PortOverflow { raw_port: u64 },
 
-    #[snafu(display("failed to encode channel response"))]
-    Encode { source: crate::message::MessageError },
+    #[snafu(display("failed to send channel open confirmation"))]
+    Accept { source: WriteChannelOpenConfirmationError },
+
+    #[snafu(display("failed to send channel open failure"))]
+    Reject { source: WriteChannelOpenFailureError },
 
     #[snafu(display("TCP connect to {addr} failed"))]
     TcpConnect { addr: String, source: std::io::Error },
@@ -56,34 +57,24 @@ pub enum DirectForwardError {
 }
 
 /// Send `ChannelOpenFailure` with `SSH_OPEN_CONNECT_FAILED`.
-async fn send_open_failure<W: AsyncWrite + Unpin + Send>(
-    writer: &mut W,
+async fn send_open_failure<R, W: AsyncWrite + Unpin + Send>(
+    pending: PendingChannel<R, W>,
     description: &str,
 ) -> Result<(), DirectForwardError> {
-    write_channel_open_failure(
-        writer,
-        reason_code::CONNECT_FAILED,
-        description.to_owned().into(),
-    )
-    .await
-    .map_err(|e| DirectForwardError::Encode {
-        source: crate::message::MessageError::WriteIo {
-            source: std::io::Error::other(e),
-        },
-    })
+    pending
+        .reject(reason_code::CONNECT_FAILED, description.to_owned().into())
+        .await
+        .context(direct_forward_error::RejectSnafu)
 }
 
-/// Send `ChannelOpenConfirmation`.
-async fn send_open_confirmation<W: AsyncWrite + Unpin + Send>(
-    writer: &mut W,
-) -> Result<(), DirectForwardError> {
-    write_channel_open_confirmation(writer, crate::constants::DEFAULT_MAX_MESSAGE_SIZE)
+/// Send `ChannelOpenConfirmation` and return the raw stream pair.
+async fn send_open_confirmation<R, W: AsyncWrite + Unpin + Send>(
+    pending: PendingChannel<R, W>,
+) -> Result<(R, W), DirectForwardError> {
+    pending
+        .accept(crate::constants::DEFAULT_MAX_MESSAGE_SIZE)
         .await
-        .map_err(|e| DirectForwardError::Encode {
-            source: crate::message::MessageError::WriteIo {
-                source: std::io::Error::other(e),
-            },
-        })
+        .context(direct_forward_error::AcceptSnafu)
 }
 
 /// Spawn bidirectional relay between a channel stream pair and a split I/O stream.
@@ -117,7 +108,7 @@ where
 /// On connect failure, sends `ChannelOpenFailure` and returns `Ok(())`.
 pub async fn handle_direct_tcpip<R, W>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
 ) -> Result<(), DirectForwardError>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -143,22 +134,21 @@ where
     let raw_port = dest_port.into_inner();
     let port = u16::try_from(raw_port).map_err(|_| DirectForwardError::PortOverflow { raw_port })?;
 
-    // On port overflow or connect failure, send failure and return Ok.
-    // The caller doesn't need to treat connect-refused as an error.
+    let pending = PendingChannel::from_raw_parts(reader, writer);
     let addr = format!("{}:{}", &*dest_host, port);
     let tcp_stream = match TcpStream::connect(&addr).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(%addr, error = %snafu::Report::from_error(&e), "direct-tcpip connect failed");
-            send_open_failure(&mut writer, "connect failed").await?;
+            send_open_failure(pending, "connect failed").await?;
             return Ok(());
         }
     };
 
-    send_open_confirmation(&mut writer).await?;
+    let (channel_reader, channel_writer) = send_open_confirmation(pending).await?;
 
     let (tcp_reader, tcp_writer) = tcp_stream.into_split();
-    relay_bidirectional(reader, writer, tcp_reader, tcp_writer).await
+    relay_bidirectional(channel_reader, channel_writer, tcp_reader, tcp_writer).await
 }
 
 /// Handle a `direct-streamlocal@openssh.com` channel.
@@ -167,7 +157,7 @@ where
 /// sends confirmation, then relays raw bytes.
 pub async fn handle_direct_streamlocal<R, W>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
 ) -> Result<(), DirectForwardError>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -186,26 +176,27 @@ where
         .await
         .context(direct_forward_error::DecodeVarintSnafu)?;
 
+    let pending = PendingChannel::from_raw_parts(reader, writer);
     let path = socket_path.to_string();
     let unix_stream = match UnixStream::connect(&path).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(%path, error = %snafu::Report::from_error(&e), "direct-streamlocal connect failed");
-            send_open_failure(&mut writer, "connect failed").await?;
+            send_open_failure(pending, "connect failed").await?;
             return Ok(());
         }
     };
 
-    send_open_confirmation(&mut writer).await?;
+    let (channel_reader, channel_writer) = send_open_confirmation(pending).await?;
 
     let (unix_reader, unix_writer) = unix_stream.into_split();
-    relay_bidirectional(reader, writer, unix_reader, unix_writer).await
+    relay_bidirectional(channel_reader, channel_writer, unix_reader, unix_writer).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::{read_channel_open_response, ChannelOpenResponse};
+    use crate::conversation::read_channel_open_response;
     use h3x::codec::{EncodeExt, EncodeInto};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -256,12 +247,8 @@ mod tests {
 
         let handler = tokio::spawn(handle_direct_tcpip(server_rd, server_wr));
 
-        // Read confirmation
-        let confirm = read_channel_open_response(&mut client_rd).await.unwrap();
-        assert!(matches!(
-            confirm,
-            ChannelOpenResponse::Confirmation { .. }
-        ));
+        // Read confirmation via read_channel_open_response
+        read_channel_open_response(&mut client_rd).await.unwrap();
 
         // Read echoed data (raw, NOT wrapped in ChannelData)
         let mut echoed = Vec::new();
@@ -286,10 +273,11 @@ mod tests {
 
         handle_direct_tcpip(server_rd, server_wr).await.unwrap();
 
-        let msg = read_channel_open_response(&mut client_rd).await.unwrap();
+        // read_channel_open_response should return a Rejected error
+        let result = read_channel_open_response(&mut client_rd).await;
         assert!(matches!(
-            msg,
-            ChannelOpenResponse::Failure(..)
+            result,
+            Err(crate::conversation::AwaitOpenError::Rejected { .. })
         ));
     }
 

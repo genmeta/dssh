@@ -23,21 +23,20 @@ pub use constants::{
     CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION, SUPPORTED_SSH_VERSIONS,
 };
 pub use conversation::{
-    AcceptChannelError, AcceptError, ChannelEvent, ChannelOpen, ChannelOpenResponse,
+    AcceptChannelError, AcceptError, AwaitOpenError, ChannelEvent, ChannelOpen,
     ChannelResponder, Conversation, DecodedGlobalRequest, EmptyPayload, IncomingChannel,
     IncomingChannelRequest, IncomingGlobal, IncomingGlobalNotice, IncomingGlobalRequest,
     ManageSessionStream, NotifyChannelRequest, NotifyGlobalRequest, OpenChannelError,
-    ReadChannelEventError, ReadChannelOpenResponseError, RespondChannelFailureError,
+    PendingChannel,
+    ReadChannelEventError,
+    RespondChannelFailureError,
     RespondChannelSuccessError, RespondFailureError, RespondSuccessError, SendChannelNoticeError,
     SendChannelRequestError, SendNotifyError, SendRequestError, SessionPoisonedError,
+    SshChannelReader, SshChannelWriter,
     WantReplyChannelRequest, WantReplyGlobalRequest, WriteChannelCloseError,
     WriteChannelDataError, WriteChannelEofError, WriteChannelExtendedDataError,
     WriteChannelOpenConfirmationError,
-    WriteChannelOpenError, WriteChannelOpenFailureError, read_channel_event,
-    read_channel_open_response, send_channel_notice, send_channel_request, write_channel_close,
-    write_channel_data, write_channel_eof, write_channel_extended_data,
-    write_channel_open, write_channel_open_confirmation,
-    write_channel_open_failure,
+    WriteChannelOpenError, WriteChannelOpenFailureError,
 };
 pub use error::{Ssh3Error, ssh3_error};
 pub use forward::{
@@ -51,7 +50,7 @@ pub use forward::{
 };
 pub use forward_runtime::{
     direct::{self, handle_direct_streamlocal, handle_direct_tcpip, DirectForwardError},
-    finish_forwarded_channel, relay,
+    relay,
     reverse::{self, ReverseForwardError, ReverseForwarder},
     socks5::{self, handle_socks5, Socks5Error},
 };

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use base64::engine::{Engine, general_purpose::STANDARD};
-use h3x::codec::{SinkWriter, StreamReader};
+use h3x::codec::{EncodeInto, SinkWriter, StreamReader};
 use h3x::message::stream::{ReadStream, WriteStream};
 use h3x::qpack::field::Protocol;
 use h3x::quic::GetStreamIdExt;
@@ -14,7 +14,7 @@ use http::{HeaderValue, Method, StatusCode};
 use http_body_util::Empty;
 use snafu::{ResultExt, Snafu};
 
-use crate::constants::{SSH_VERSION, DEFAULT_MAX_MESSAGE_SIZE};
+use crate::constants::SSH_VERSION;
 
 /// Well-known path for SSH3 Extended CONNECT requests.
 pub const SSH3_CONNECT_PATH: &str = "/.well-known/ssh3/connect";
@@ -248,28 +248,83 @@ where
         >,
         OpenChannelError,
     > {
+        let (reader, writer) = self.open_channel(&crate::forward::SessionChannelOpen).await?;
+
+        Ok(crate::session::client::ClientSession::new(
+            crate::conversation::SshChannelReader::new(reader),
+            crate::conversation::SshChannelWriter::new(writer),
+        ))
+    }
+
+    /// Open a channel: write the full header (signal value + session ID +
+    /// max_message_size + channel_type + payload), read the confirmation
+    /// response, and return the raw stream pair.
+    async fn open_channel<CO, PE>(
+        &self,
+        channel: &CO,
+    ) -> Result<(StreamReader<C::StreamReader>, SinkWriter<C::StreamWriter>), OpenChannelError>
+    where
+        CO: crate::conversation::ChannelOpen,
+        PE: std::error::Error + Send + Sync + 'static,
+        for<'w> CO::Payload:
+            h3x::codec::EncodeInto<&'w mut SinkWriter<C::StreamWriter>, Output = (), Error = PE>,
+    {
+        use crate::constants::{CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE};
+        use h3x::codec::EncodeExt;
+
         let (reader, writer) = self.open_bi().await?;
         let mut reader = StreamReader::new(reader);
         let mut writer = SinkWriter::new(writer);
 
-        crate::conversation::write_channel_open(
-            &mut writer,
-            h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(self.conversation_id).unwrap()),
-            DEFAULT_MAX_MESSAGE_SIZE,
-            &crate::forward::SessionChannelOpen,
-        )
-        .await
-        .map_err(|e| OpenChannelError::ChannelOpen {
-            source: Box::new(e),
-        })?;
+        // Write full channel open header (signal value + session ID + SSH fields).
+        let session_id =
+            h3x::stream_id::StreamId(h3x::varint::VarInt::try_from(self.conversation_id).unwrap());
+        writer
+            .encode_one(CHANNEL_SIGNAL_VALUE)
+            .await
+            .map_err(|e| OpenChannelError::ChannelOpen {
+                source: Box::new(e),
+            })?;
+        writer
+            .encode_one(session_id)
+            .await
+            .map_err(|e| OpenChannelError::ChannelOpen {
+                source: Box::new(e),
+            })?;
+        writer
+            .encode_one(DEFAULT_MAX_MESSAGE_SIZE)
+            .await
+            .map_err(|e| OpenChannelError::ChannelOpen {
+                source: Box::new(e),
+            })?;
+        writer
+            .encode_one(channel.channel_type())
+            .await
+            .map_err(|e| OpenChannelError::ChannelOpen {
+                source: Box::new(std::io::Error::other(e)),
+            })?;
+        channel
+            .payload()
+            .clone()
+            .encode_into(&mut writer)
+            .await
+            .map_err(|e| OpenChannelError::ChannelOpen {
+                source: Box::new(e),
+            })?;
+        tokio::io::AsyncWriteExt::flush(&mut writer)
+            .await
+            .map_err(|e| OpenChannelError::ChannelOpen {
+                source: Box::new(e),
+            })?;
 
+        // Read confirmation.
         crate::conversation::read_channel_open_response(&mut reader)
             .await
             .map_err(|e| OpenChannelError::ChannelOpenResponse {
                 source: Box::new(e),
             })?;
 
-        Ok(crate::session::client::ClientSession::new(reader, writer))
+        Ok((reader, writer))
     }
 
     async fn open_bi(&self) -> Result<(C::StreamReader, C::StreamWriter), OpenChannelError> {
