@@ -370,55 +370,7 @@ pub trait ManageSessionStream: Send + Sync {
     ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Self::Error>> + Send;
 }
 
-mod chmoc {
-    use h3x::{
-        codec::{SinkWriter, StreamReader},
-        dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
-        quic,
-        remoc::quic::{ReadStreamClient, WriteStreamClient},
-    };
-
-    #[remoc::rtc::remote]
-    trait ManageSessionStream {
-        async fn open_stream(
-            &self,
-        ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError>;
-
-        async fn accept_stream(
-            &self,
-        ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError>;
-    }
-
-    impl super::ManageSessionStream for ManageSessionStreamClient {
-        type StreamReader = StreamReader<BoxDynQuicStreamReader>;
-
-        type StreamWriter = SinkWriter<BoxDynQuicStreamWriter>;
-
-        type Error = quic::ConnectionError;
-
-        async fn open_stream(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-            ManageSessionStream::open_stream(self).await.map(|(r, w)| {
-                let r = StreamReader::new(r.into_boxed_quic());
-                let w = SinkWriter::new(w.into_boxed_quic());
-                (r, w)
-            })
-        }
-
-        async fn accept_stream(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-            ManageSessionStream::accept_stream(self)
-                .await
-                .map(|(r, w)| {
-                    let r = StreamReader::new(r.into_boxed_quic());
-                    let w = SinkWriter::new(w.into_boxed_quic());
-                    (r, w)
-                })
-        }
-    }
-}
+pub mod remoc;
 
 // ===========================================================================
 // Conversation shared state

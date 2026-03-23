@@ -50,8 +50,9 @@ pub type Ssh3StreamReader = StreamReader<BoxReadStream>;
 pub type Ssh3StreamWriter = SinkWriter<BoxWriteStream>;
 
 /// A routed bidirectional stream after the protocol layer has consumed
-/// the signal value and session ID.
-pub type RoutedBiStream = (Ssh3StreamReader, Ssh3StreamWriter);
+/// the signal value and session ID. Raw QUIC streams — consumers wrap
+/// in [`StreamReader`]/[`SinkWriter`] as needed.
+type RoutedBiStream = (BoxReadStream, BoxWriteStream);
 
 type Registry = Arc<std::sync::Mutex<HashMap<u64, mpsc::Sender<RoutedBiStream>>>>;
 
@@ -60,7 +61,7 @@ type Registry = Arc<std::sync::Mutex<HashMap<u64, mpsc::Sender<RoutedBiStream>>>
 /// Captured during [`ProductProtocol::init`] to erase the concrete connection
 /// type. Returns raw boxed streams — callers wrap them in
 /// [`StreamReader`]/[`SinkWriter`] as needed.
-type OpenBiFn = Arc<
+pub(crate) type OpenBiFn = Arc<
     dyn Fn() -> BoxFuture<'static, Result<(BoxReadStream, BoxWriteStream), ConnectionError>>
         + Send
         + Sync,
@@ -204,8 +205,8 @@ impl Ssh3Protocol {
             }
         };
 
-        // Convert to plain StreamReader, consuming the peeked bytes.
-        let stream_reader = reader.into_stream_reader();
+        // Convert to raw QUIC stream, consuming the peeked bytes.
+        let raw_reader = reader.into_stream_reader().into_inner();
 
         // Lookup and route.
         let sender = {
@@ -218,7 +219,8 @@ impl Ssh3Protocol {
 
         match sender {
             Some(sender) => {
-                if sender.send((stream_reader, writer)).await.is_err() {
+                let raw_writer = writer.into_inner();
+                if sender.send((raw_reader, raw_writer)).await.is_err() {
                     tracing::debug!(
                         %session_id,
                         "conversation channel closed, dropping SSH3 stream"
@@ -311,9 +313,9 @@ impl<C: quic::Connection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
 /// Dropping the handle automatically unregisters the conversation from the
 /// protocol registry.
 pub struct ConversationHandle {
-    session_id: StreamId,
-    receiver: tokio::sync::Mutex<mpsc::Receiver<RoutedBiStream>>,
-    open_bi: OpenBiFn,
+    pub(crate) session_id: StreamId,
+    pub(crate) receiver: tokio::sync::Mutex<mpsc::Receiver<RoutedBiStream>>,
+    pub(crate) open_bi: OpenBiFn,
     registry: Registry,
 }
 
@@ -373,12 +375,14 @@ impl ManageSessionStream for ConversationHandle {
     async fn accept_stream(
         &self,
     ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-        self.receiver
+        let (reader, writer) = self
+            .receiver
             .lock()
             .await
             .recv()
             .await
-            .ok_or(HandleError::ChannelClosed)
+            .ok_or(HandleError::ChannelClosed)?;
+        Ok((StreamReader::new(reader), SinkWriter::new(writer)))
     }
 }
 

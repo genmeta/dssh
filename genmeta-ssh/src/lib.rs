@@ -63,7 +63,7 @@ pub use client::{
     encode_basic_auth,
 };
 pub use protocol::{
-    ConversationHandle, HandleError, RegisterError, RoutedBiStream, Ssh3Protocol,
+    ConversationHandle, HandleError, RegisterError, Ssh3Protocol,
     Ssh3ProtocolFactory, Ssh3StreamReader, Ssh3StreamWriter,
 };
 pub use session::{
