@@ -57,10 +57,16 @@ use h3x::{
 };
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use std::pin::Pin;
 use tokio::sync::Notify;
 
 use crate::channel::ChannelOpenFailure;
 use crate::codec::{CodecError, SshBool, SshBytes, SshString};
+
+/// Type-erased control stream reader.
+type ControlReader = Pin<Box<dyn AsyncRead + Send>>;
+/// Type-erased control stream writer.
+type ControlWriter = Pin<Box<dyn AsyncWrite + Send>>;
 
 const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
 const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
@@ -723,9 +729,9 @@ mod chmoc {
 // Conversation shared state
 // ===========================================================================
 
-struct ConversationShared<M: ManageSessionStream> {
-    reader: OrderedAccess<M::StreamReader>,
-    writer: OrderedAccess<M::StreamWriter>,
+struct ConversationShared {
+    reader: OrderedAccess<Pin<Box<dyn AsyncRead + Send>>>,
+    writer: OrderedAccess<Pin<Box<dyn AsyncWrite + Send>>>,
     poisoned: AtomicBool,
     /// Lock to atomically allocate paired (writer, reader) tickets for
     /// outgoing requests, ensuring send order matches receive order.
@@ -736,7 +742,7 @@ struct ConversationShared<M: ManageSessionStream> {
     auto_failures: std::sync::Mutex<BTreeSet<u64>>,
 }
 
-impl<M: ManageSessionStream> ConversationShared<M> {
+impl ConversationShared {
     fn poison(&self) {
         self.poisoned.store(true, Ordering::SeqCst);
         self.reader.notify_waiters();
@@ -787,7 +793,7 @@ impl<M: ManageSessionStream> ConversationShared<M> {
     async fn acquire_writer(
         &self,
         ticket: u64,
-    ) -> Result<OrderedGuard<M::StreamWriter>, SessionPoisonedError> {
+    ) -> Result<OrderedGuard<Pin<Box<dyn AsyncWrite + Send>>>, SessionPoisonedError> {
         loop {
             self.drain_auto_failures().await?;
 
@@ -815,22 +821,22 @@ impl<M: ManageSessionStream> ConversationShared<M> {
 
 pub struct Conversation<M: ManageSessionStream> {
     id: StreamId,
-    shared: Arc<ConversationShared<M>>,
+    shared: Arc<ConversationShared>,
     _manage_stream: M,
 }
 
 impl<M: ManageSessionStream> Conversation<M> {
     pub fn new(
         id: StreamId,
-        control_stream_reader: M::StreamReader,
-        control_stream_writer: M::StreamWriter,
+        control_stream_reader: impl AsyncRead + Unpin + Send + 'static,
+        control_stream_writer: impl AsyncWrite + Unpin + Send + 'static,
         manage_stream: M,
     ) -> Self {
         Self {
             id,
             shared: Arc::new(ConversationShared {
-                reader: OrderedAccess::new(control_stream_reader),
-                writer: OrderedAccess::new(control_stream_writer),
+                reader: OrderedAccess::new(Box::pin(control_stream_reader)),
+                writer: OrderedAccess::new(Box::pin(control_stream_writer)),
                 poisoned: AtomicBool::new(false),
                 ticket_pair_lock: std::sync::Mutex::new(()),
                 auto_failures: std::sync::Mutex::new(BTreeSet::new()),
@@ -858,8 +864,8 @@ impl<M: ManageSessionStream> Conversation<M> {
         R: WantReplyGlobalRequest,
         PE: std::error::Error + Send + Sync + 'static,
         SE: std::error::Error + Send + Sync + 'static,
-        for<'w> R::Payload: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = PE>,
-        for<'r> R::Success: DecodeFrom<&'r mut M::StreamReader, Error = SE>,
+        for<'w> R::Payload: EncodeInto<&'w mut ControlWriter, Output = (), Error = PE>,
+        for<'r> R::Success: DecodeFrom<&'r mut ControlReader, Error = SE>,
     {
         use send_request_error::*;
 
@@ -940,7 +946,7 @@ impl<M: ManageSessionStream> Conversation<M> {
     where
         N: NotifyGlobalRequest,
         PE: std::error::Error + Send + Sync + 'static,
-        for<'w> N::Payload: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = PE>,
+        for<'w> N::Payload: EncodeInto<&'w mut ControlWriter, Output = (), Error = PE>,
     {
         use send_notify_error::*;
 
@@ -989,7 +995,7 @@ impl<M: ManageSessionStream> Conversation<M> {
     /// [`IncomingGlobalRequest::decode_payload`] or
     /// [`IncomingGlobalNotice::decode_payload`]) before the next `accept()`
     /// can proceed.
-    pub async fn accept(&self) -> Result<IncomingGlobal<M>, AcceptError> {
+    pub async fn accept(&self) -> Result<IncomingGlobal, AcceptError> {
         use accept_error::*;
 
         let read_ticket = self.shared.reader.take_ticket();
@@ -1744,9 +1750,9 @@ impl ChannelResponder {
     }
 }
 
-pub enum IncomingGlobal<M: ManageSessionStream> {
-    Notify(IncomingGlobalNotice<M>),
-    Request(IncomingGlobalRequest<M>),
+pub enum IncomingGlobal {
+    Notify(IncomingGlobalNotice),
+    Request(IncomingGlobalRequest),
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,14 +1767,14 @@ pub enum IncomingGlobal<M: ManageSessionStream> {
 /// Dropping without decoding poisons the session (the stream contains
 /// residual unknown bytes that cannot be skipped).
 #[must_use = "incoming global requests must be decoded and answered"]
-pub struct IncomingGlobalRequest<M: ManageSessionStream> {
+pub struct IncomingGlobalRequest {
     request_type: SshString,
-    reader_guard: Option<OrderedGuard<M::StreamReader>>,
+    reader_guard: Option<OrderedGuard<ControlReader>>,
     writer_ticket: Option<u64>,
-    shared: Arc<ConversationShared<M>>,
+    shared: Arc<ConversationShared>,
 }
 
-impl<M: ManageSessionStream> IncomingGlobalRequest<M> {
+impl IncomingGlobalRequest {
     /// The SSH request type string sent by the remote.
     pub fn request_type(&self) -> &SshString {
         &self.request_type
@@ -1783,9 +1789,9 @@ impl<M: ManageSessionStream> IncomingGlobalRequest<M> {
     /// bytes consumed), so the session is poisoned when `self` drops.
     pub async fn decode_payload<T, DE>(
         mut self,
-    ) -> Result<(T, DecodedGlobalRequest<M>), DE>
+    ) -> Result<(T, DecodedGlobalRequest), DE>
     where
-        T: for<'r> DecodeFrom<&'r mut M::StreamReader, Error = DE>,
+        T: for<'r> DecodeFrom<&'r mut ControlReader, Error = DE>,
     {
         let guard = self
             .reader_guard
@@ -1816,7 +1822,7 @@ impl<M: ManageSessionStream> IncomingGlobalRequest<M> {
     }
 }
 
-impl<M: ManageSessionStream> Drop for IncomingGlobalRequest<M> {
+impl Drop for IncomingGlobalRequest {
     fn drop(&mut self) {
         if self.reader_guard.is_some() {
             // Stream has residual unknown bytes — unrecoverable.
@@ -1840,12 +1846,12 @@ impl<M: ManageSessionStream> Drop for IncomingGlobalRequest<M> {
 ///
 /// Dropping without responding queues an automatic failure response.
 #[must_use = "decoded global requests should be answered"]
-pub struct DecodedGlobalRequest<M: ManageSessionStream> {
+pub struct DecodedGlobalRequest {
     writer_ticket: Option<u64>,
-    shared: Arc<ConversationShared<M>>,
+    shared: Arc<ConversationShared>,
 }
 
-impl<M: ManageSessionStream> DecodedGlobalRequest<M> {
+impl DecodedGlobalRequest {
     /// Send a success response with the given payload.
     ///
     /// Waits for the writer ticket to be served (ensuring response ordering).
@@ -1856,7 +1862,7 @@ impl<M: ManageSessionStream> DecodedGlobalRequest<M> {
     ) -> Result<(), RespondSuccessError<RE>>
     where
         RE: std::error::Error + Send + Sync + 'static,
-        for<'w> R: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = RE>,
+        for<'w> R: EncodeInto<&'w mut ControlWriter, Output = (), Error = RE>,
     {
         use respond_success_error::*;
 
@@ -1920,7 +1926,7 @@ impl<M: ManageSessionStream> DecodedGlobalRequest<M> {
     }
 }
 
-impl<M: ManageSessionStream> Drop for DecodedGlobalRequest<M> {
+impl Drop for DecodedGlobalRequest {
     fn drop(&mut self) {
         if let Some(ticket) = self.writer_ticket.take() {
             self.shared
@@ -1942,13 +1948,13 @@ impl<M: ManageSessionStream> Drop for DecodedGlobalRequest<M> {
 /// Call [`decode_payload`](Self::decode_payload) to decode the notification
 /// body. Dropping without decoding poisons the session.
 #[must_use = "incoming global notices must be decoded"]
-pub struct IncomingGlobalNotice<M: ManageSessionStream> {
+pub struct IncomingGlobalNotice {
     request_type: SshString,
-    reader_guard: Option<OrderedGuard<M::StreamReader>>,
-    shared: Arc<ConversationShared<M>>,
+    reader_guard: Option<OrderedGuard<ControlReader>>,
+    shared: Arc<ConversationShared>,
 }
 
-impl<M: ManageSessionStream> IncomingGlobalNotice<M> {
+impl IncomingGlobalNotice {
     /// The SSH request type string sent by the remote.
     pub fn request_type(&self) -> &SshString {
         &self.request_type
@@ -1960,7 +1966,7 @@ impl<M: ManageSessionStream> IncomingGlobalNotice<M> {
     /// bytes consumed make the stream irrecoverable).
     pub async fn decode_payload<T, DE>(mut self) -> Result<T, DE>
     where
-        T: for<'r> DecodeFrom<&'r mut M::StreamReader, Error = DE>,
+        T: for<'r> DecodeFrom<&'r mut ControlReader, Error = DE>,
     {
         let guard = self
             .reader_guard
@@ -1978,7 +1984,7 @@ impl<M: ManageSessionStream> IncomingGlobalNotice<M> {
     }
 }
 
-impl<M: ManageSessionStream> Drop for IncomingGlobalNotice<M> {
+impl Drop for IncomingGlobalNotice {
     fn drop(&mut self) {
         if self.reader_guard.is_some() {
             self.shared.poison();
@@ -1990,9 +1996,9 @@ impl<M: ManageSessionStream> Drop for IncomingGlobalNotice<M> {
 // PoisonOnDrop — marks session poisoned if dropped before disarming
 // ---------------------------------------------------------------------------
 
-struct PoisonOnDrop<'a, M: ManageSessionStream>(&'a ConversationShared<M>);
+struct PoisonOnDrop<'a>(&'a ConversationShared);
 
-impl<M: ManageSessionStream> Drop for PoisonOnDrop<'_, M> {
+impl Drop for PoisonOnDrop<'_> {
     fn drop(&mut self) {
         self.0.poison();
     }
@@ -2943,7 +2949,7 @@ mod tests {
         }
 
         // Accept all 4
-        let mut decoded_reqs: Vec<DecodedGlobalRequest<TestManageStream>> = Vec::new();
+        let mut decoded_reqs: Vec<DecodedGlobalRequest> = Vec::new();
         for _ in 0..4 {
             match conv.accept().await.unwrap() {
                 IncomingGlobal::Request(r) => {
