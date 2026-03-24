@@ -151,6 +151,8 @@ pub enum WriteDataError {
     EncodeLength { source: std::io::Error },
     #[snafu(display("failed to write channel data payload"))]
     WritePayload { source: std::io::Error },
+    #[snafu(display("source yielded {actual} bytes but {expected} were declared"))]
+    ShortSource { expected: u64, actual: u64 },
     #[snafu(display("failed to flush channel stream after data"))]
     Flush { source: std::io::Error },
 }
@@ -167,6 +169,8 @@ pub enum WriteExtendedDataError {
     EncodeLength { source: std::io::Error },
     #[snafu(display("failed to write extended data payload"))]
     WritePayload { source: std::io::Error },
+    #[snafu(display("source yielded {actual} bytes but {expected} were declared"))]
+    ShortSource { expected: u64, actual: u64 },
     #[snafu(display("failed to flush channel stream after extended data"))]
     Flush { source: std::io::Error },
 }
@@ -584,7 +588,10 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> SshChannel<R, W>
         let copied = tokio::io::copy(&mut source.take(length), &mut self.writer)
             .await
             .context(WritePayloadSnafu)?;
-        debug_assert_eq!(copied, length, "source yielded fewer bytes than declared");
+        snafu::ensure!(
+            copied == length,
+            ShortSourceSnafu { expected: length, actual: copied }
+        );
 
         AsyncWriteExt::flush(&mut self.writer)
             .await
@@ -651,7 +658,10 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> SshChannel<R, W>
         let copied = tokio::io::copy(&mut source.take(length), &mut self.writer)
             .await
             .context(WritePayloadSnafu)?;
-        debug_assert_eq!(copied, length, "source yielded fewer bytes than declared");
+        snafu::ensure!(
+            copied == length,
+            ShortSourceSnafu { expected: length, actual: copied }
+        );
 
         AsyncWriteExt::flush(&mut self.writer)
             .await
