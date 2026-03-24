@@ -36,8 +36,23 @@ pub enum ConnectError {
     #[snafu(display("failed to build HTTP request"))]
     RequestBuild { source: http::Error },
 
-    #[snafu(display("Extended CONNECT request failed"))]
-    ConnectRequest {
+    #[snafu(display("failed to open initial message stream"))]
+    InitialStream {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("failed to get stream ID"))]
+    GetStreamId {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("failed to send Extended CONNECT request"))]
+    SendRequest {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("failed to read HTTP response"))]
+    ReadResponse {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -134,14 +149,14 @@ impl Ssh3Client {
         let (mut read_stream, mut write_stream) = connection
             .initial_message_stream()
             .await
-            .map_err(|e| ConnectError::ConnectRequest {
+            .map_err(|e| ConnectError::InitialStream {
                 source: Box::new(e),
             })?;
 
         let conversation_id = write_stream
             .stream_id()
             .await
-            .map_err(|e| ConnectError::ConnectRequest {
+            .map_err(|e| ConnectError::GetStreamId {
                 source: Box::new(e),
             })?
             .into_inner();
@@ -149,23 +164,25 @@ impl Ssh3Client {
         write_stream
             .send_hyper_request(request)
             .await
-            .map_err(|e| ConnectError::ConnectRequest {
+            .map_err(|e| ConnectError::SendRequest {
                 source: Box::new(e),
             })?;
 
-        let mut response = read_stream.read_hyper_response_parts().await.map_err(|e| {
-            ConnectError::ConnectRequest {
+        let mut response = read_stream
+            .read_hyper_response_parts()
+            .await
+            .map_err(|e| ConnectError::ReadResponse {
                 source: Box::new(e),
-            }
-        })?;
+            })?;
 
         // Skip informational (1xx) responses.
         while response.status.is_informational() {
-            response = read_stream.read_hyper_response_parts().await.map_err(|e| {
-                ConnectError::ConnectRequest {
+            response = read_stream
+                .read_hyper_response_parts()
+                .await
+                .map_err(|e| ConnectError::ReadResponse {
                     source: Box::new(e),
-                }
-            })?;
+                })?;
         }
 
         if response.status == StatusCode::UNAUTHORIZED {
