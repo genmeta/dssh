@@ -3,18 +3,18 @@
 //! Listens for QUIC connections, handles SSH3 Extended CONNECT requests,
 //! and runs session handlers directly.
 //!
-//! A production server would spawn a privilege-separated child process
-//! (ssh3-session) and relay streams via remoc — see the `ssh3-session`
-//! example for the child-side flow.
+//! In a production deployment the server would spawn a privilege-separated
+//! child process (ssh3-session) per session, bridging QUIC streams via remoc.
+//! This example runs sessions in-process for simplicity.
 
 use std::sync::Arc;
 
 use clap::Parser;
 use genmeta_ssh::{
+    auth::parse_authorization_header,
     client::SSH3_CONNECT_PATH,
     constants::SSH_VERSION,
     conversation::Conversation,
-    auth::parse_authorization_header,
     protocol::Ssh3ProtocolFactory,
     session::dispatcher::{SessionConfig, run_session},
 };
@@ -48,8 +48,6 @@ async fn main() {
 
     let router = Router::new().connect(SSH3_CONNECT_PATH, handle_ssh3_connect);
 
-    // Register Ssh3ProtocolFactory so each QUIC connection gets an Ssh3Protocol
-    // instance that routes bidirectional streams by session ID.
     let builder = ConnectionBuilder::new(Arc::default()).protocol(Ssh3ProtocolFactory);
 
     let mut servers: H3Servers<_> = H3Servers::builder()
@@ -83,7 +81,7 @@ async fn handle_ssh3_connect(req: &mut Request, res: &mut Response) {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let _credential = match parse_authorization_header(auth_header) {
+    let credential = match parse_authorization_header(auth_header) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %snafu::Report::from_error(&e), "auth parse failed");
@@ -133,12 +131,13 @@ async fn handle_ssh3_connect(req: &mut Request, res: &mut Response) {
         handle,
     ));
 
+    tracing::info!(%conversation_id, user = %credential.username(), "session starting");
+
     let config = SessionConfig {
         shell: "/bin/sh".into(),
         ..Default::default()
     };
 
-    tracing::info!(%conversation_id, "session starting");
     run_session(conversation, config).await;
     tracing::info!(%conversation_id, "session ended");
 }

@@ -1,27 +1,28 @@
-//! SSH3 session child process example.
+//! SSH3 session child process.
 //!
 //! Launched by the gateway (ssh3-server) as a privilege-separated subprocess.
-//! Communicates with the parent via a remoc channel over stdin/stdout.
+//! Communicates with the parent via a remoc channel over stdin/stdout using
+//! nested [`RFnOnce`](remoc::rfn::RFnOnce) remote functions.
 //!
 //! Flow:
-//! 1. Establish remoc channel over stdin/stdout
-//! 2. Receive [`ChildBootstrap`] containing auth credential, conversation
-//!    streams, and ManageSessionStream RPC handle
-//! 3. Authenticate (verify credential)
-//! 4. Drop privileges to the target user
-//! 5. Construct [`Conversation`] from the remoc-proxied streams
-//! 6. Run the session dispatcher until the session ends
+//! 1. Create a nested `AuthenticateFn` closure and send it to the parent
+//! 2. Parent calls the outer fn with [`AuthRequest`] → child runs PAM
+//! 3. On success, return inner `StartSessionFn` to parent
+//! 4. Parent calls inner fn with [`SessionBootstrap`] → child drops
+//!    privileges and runs the session dispatcher
 
 use std::sync::Arc;
 
 use genmeta_ssh::{
     conversation::Conversation,
     session::{
-        ChildBootstrap, SessionInit,
+        AuthError, AuthRequest, SessionBootstrap, SessionRunError, StartSessionFn,
         dispatcher::{SessionConfig, run_session},
         privilege::drop_privileges,
     },
 };
+use snafu::Report;
+use tracing::Instrument;
 
 #[tokio::main]
 async fn main() {
@@ -31,69 +32,108 @@ async fn main() {
     let stdout = tokio::io::stdout();
 
     // Establish remoc channel over stdin/stdout.
-    let (conn, _tx, mut rx) =
-        remoc::Connect::io::<_, _, (), ChildBootstrap, remoc::codec::Default>(
+    // Parent receives AuthenticateFn; child sends it.
+    let (conn, mut tx, _rx) =
+        remoc::Connect::io::<_, _, genmeta_ssh::session::AuthenticateFn, (), remoc::codec::Default>(
             remoc::Cfg::default(),
             stdin,
             stdout,
         )
         .await
         .expect("failed to establish remoc channel");
-    tokio::spawn(conn);
+    let conn_handle = tokio::spawn(conn.instrument(tracing::info_span!("remoc_conn")));
 
-    // Receive bootstrap payload from parent.
-    let bootstrap: ChildBootstrap = rx
-        .recv()
-        .await
-        .expect("remoc receive error")
-        .expect("parent closed channel without sending bootstrap");
+    // Create the outer RFnOnce: PAM authentication.
+    let auth_fn = remoc::rfn::RFnOnce::new_1(
+        |auth_request: AuthRequest| async move {
+            tracing::info!(username = %auth_request.username, "PAM authentication starting");
 
-    tracing::info!(
-        conversation_id = ?bootstrap.conversation_id,
-        peer_version = %bootstrap.peer_version,
-        "received bootstrap"
+            // PAM authenticate + acct_mgmt + user lookup.
+            #[cfg(feature = "pam")]
+            let user_info = genmeta_ssh::session::pam::authenticate(
+                "sshd",
+                &auth_request.username,
+                auth_request.credential.password(),
+            )
+            .await
+            .map_err(|e| AuthError::PamFailed {
+                reason: Report::from_error(e).to_string(),
+            })?;
+
+            // Fallback for non-PAM builds: look up the user without authenticating.
+            #[cfg(not(feature = "pam"))]
+            let (uid, gid, shell) = {
+                let user = nix::unistd::User::from_name(&auth_request.username)
+                    .map_err(|e| AuthError::PamFailed {
+                        reason: format!("user lookup failed: {e}"),
+                    })?
+                    .ok_or_else(|| AuthError::UserNotFound {
+                        username: auth_request.username.clone(),
+                    })?;
+                (user.uid.as_raw(), user.gid.as_raw(), user.shell)
+            };
+
+            #[cfg(feature = "pam")]
+            let (uid, gid, shell) = (user_info.uid, user_info.gid, user_info.shell);
+
+            tracing::info!(uid, gid, "PAM authentication succeeded");
+
+            // Capture user info into the inner closure.
+            let username = auth_request.username;
+
+            // Create the inner RFnOnce: drop privileges + run session.
+            let start_session_fn: StartSessionFn = remoc::rfn::RFnOnce::new_1(
+                move |bootstrap: SessionBootstrap| async move {
+                    tracing::info!(%username, "starting session");
+
+                    // PAM open_session (leak — close_session requires root).
+                    // TODO: open_session before drop_privileges
+
+                    // Drop privileges from root to target user.
+                    if nix::unistd::getuid().is_root() {
+                        drop_privileges(uid, gid, &username).map_err(|e| {
+                            SessionRunError::DropPrivileges {
+                                reason: Report::from_error(e).to_string(),
+                            }
+                        })?;
+                        tracing::info!(uid, gid, "privileges dropped");
+                    }
+
+                    // Build Conversation from remoc-proxied streams.
+                    let control_reader =
+                        h3x::codec::StreamReader::new(bootstrap.control_reader.into_boxed_quic());
+                    let control_writer =
+                        h3x::codec::SinkWriter::new(bootstrap.control_writer.into_boxed_quic());
+
+                    let conversation = Arc::new(Conversation::new(
+                        bootstrap.conversation_id,
+                        bootstrap.peer_version,
+                        control_reader,
+                        control_writer,
+                        bootstrap.manage_stream,
+                    ));
+
+                    let config = SessionConfig {
+                        shell,
+                        ..Default::default()
+                    };
+
+                    tracing::info!("session dispatcher starting");
+                    run_session(conversation, config).await;
+                    tracing::info!("session ended");
+                    Ok(())
+                },
+            );
+
+            Ok(start_session_fn)
+        },
     );
 
-    // TODO: PAM authentication using bootstrap.credential.
-    // For now, assume auth succeeds with a fixed user.
-    let session_init = SessionInit {
-        conversation_id: bootstrap.conversation_id,
-        username: "nobody".into(),
-        uid: 65534,
-        gid: 65534,
-        home: "/nonexistent".into(),
-        shell: "/bin/sh".into(),
-    };
+    tx.send(auth_fn)
+        .await
+        .expect("failed to send AuthenticateFn to parent");
 
-    // Drop privileges from root to target user.
-    if nix::unistd::getuid().is_root() {
-        drop_privileges(session_init.uid, session_init.gid, &session_init.username)
-            .expect("failed to drop privileges");
-        tracing::info!(
-            uid = session_init.uid,
-            gid = session_init.gid,
-            "privileges dropped"
-        );
-    }
-
-    // Convert control stream clients to AsyncRead/AsyncWrite via h3x codec wrappers.
-    let control_reader = h3x::codec::StreamReader::new(bootstrap.control_reader.into_boxed_quic());
-    let control_writer = h3x::codec::SinkWriter::new(bootstrap.control_writer.into_boxed_quic());
-
-    let conversation = Arc::new(Conversation::new(
-        bootstrap.conversation_id,
-        bootstrap.peer_version,
-        control_reader,
-        control_writer,
-        bootstrap.manage_stream,
-    ));
-
-    let config = SessionConfig {
-        shell: session_init.shell,
-        ..Default::default()
-    };
-
-    tracing::info!("session dispatcher starting");
-    run_session(conversation, config).await;
-    tracing::info!("session ended");
+    // Wait for remoc connection to close (rfn tasks run in background).
+    let _ = conn_handle.await;
+    tracing::info!("child process exiting");
 }

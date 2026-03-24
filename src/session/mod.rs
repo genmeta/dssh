@@ -11,12 +11,13 @@
 
 pub mod client;
 pub mod dispatcher;
+#[cfg(feature = "pam")]
+pub mod pam;
 pub mod privilege;
 pub mod process;
 pub mod pty;
 pub mod signal;
 
-use std::path::PathBuf;
 use std::pin::pin;
 
 use crate::{
@@ -63,72 +64,115 @@ pub enum SessionProtocolError {
     ShutdownIo { source: std::io::Error },
 }
 
-/// Information needed to initialize an SSH3 session in the child process.
+/// Argument to the outer [`AuthenticateFn`]: carries the credential to the child
+/// process for PAM authentication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionInit {
-    /// Unique conversation identifier for this session.
+pub struct AuthRequest {
+    /// Username extracted from the HTTP Authorization header.
+    pub username: String,
+    /// Authentication credential for PAM.
+    pub credential: crate::auth::AuthCredential,
+}
+
+/// Argument to the inner [`StartSessionFn`]: everything the child needs to
+/// construct a [`Conversation`](crate::conversation::Conversation) after
+/// authentication succeeds and the parent completes the HTTP upgrade.
+#[derive(Serialize, Deserialize)]
+pub struct SessionBootstrap {
+    /// Remoc proxy for opening/accepting QUIC streams.
+    pub manage_stream: crate::conversation::remoc::RemoteManageStreamClient,
+    /// Remoc-proxied control stream reader.
+    pub control_reader: h3x::remoc::quic::ReadStreamClient,
+    /// Remoc-proxied control stream writer.
+    pub control_writer: h3x::remoc::quic::WriteStreamClient,
+    /// Unique session identifier.
     #[serde(
         serialize_with = "serialize_stream_id",
         deserialize_with = "deserialize_stream_id"
     )]
     pub conversation_id: StreamId,
-    /// Authenticated username.
-    pub username: String,
-    /// POSIX user ID.
-    pub uid: u32,
-    /// POSIX group ID.
-    pub gid: u32,
-    /// User's home directory.
-    pub home: PathBuf,
-    /// User's login shell.
-    pub shell: PathBuf,
+    /// Negotiated SSH version string.
+    pub peer_version: String,
 }
 
-/// Result of PAM authentication performed by the main process.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AuthResult {
-    /// Authentication succeeded.
-    Success {
-        /// POSIX user ID.
-        uid: u32,
-        /// POSIX group ID.
-        gid: u32,
-        /// User's home directory.
-        home: PathBuf,
-        /// User's login shell.
-        shell: PathBuf,
+/// Error returned by the outer [`AuthenticateFn`] when PAM authentication or
+/// user lookup fails.
+#[derive(Debug, Snafu, Serialize, Deserialize)]
+#[snafu(module)]
+pub enum AuthError {
+    /// PAM authentication or account management failed.
+    #[snafu(display("PAM authentication failed: {reason}"))]
+    PamFailed {
+        /// Human-readable reason from PAM.
+        reason: String,
     },
-    /// Authentication failed.
-    Failure {
+
+    /// The authenticated user does not exist in `/etc/passwd`.
+    #[snafu(display("user not found: {username}"))]
+    UserNotFound {
+        /// The username that was looked up.
+        username: String,
+    },
+
+    /// The remote function call itself failed (transport error).
+    #[snafu(display("remote call failed"))]
+    RemoteCall {
+        /// The underlying call error.
+        source: remoc::rfn::CallError,
+    },
+}
+
+impl From<remoc::rfn::CallError> for AuthError {
+    fn from(source: remoc::rfn::CallError) -> Self {
+        Self::RemoteCall { source }
+    }
+}
+
+/// Error returned by the inner [`StartSessionFn`] when the session fails to
+/// start (privilege drop failure, etc.).
+#[derive(Debug, Snafu, Serialize, Deserialize)]
+#[snafu(module)]
+pub enum SessionRunError {
+    /// Dropping privileges to the target user failed.
+    #[snafu(display("failed to drop privileges: {reason}"))]
+    DropPrivileges {
         /// Human-readable reason for the failure.
         reason: String,
     },
+
+    /// Building the [`Conversation`](crate::conversation::Conversation) failed.
+    #[snafu(display("failed to build conversation: {reason}"))]
+    ConversationBuild {
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+
+    /// The remote function call itself failed (transport error).
+    #[snafu(display("remote call failed"))]
+    RemoteCall {
+        /// The underlying call error.
+        source: remoc::rfn::CallError,
+    },
 }
 
-/// Bootstrap payload sent from parent to child process.
-///
-/// Contains everything the child needs to construct a
-/// [`Conversation`](crate::conversation::Conversation) and begin handling the
-/// session:
-///
-/// - `manage_stream`: remoc proxy for opening/accepting QUIC streams
-/// - `control_reader` / `control_writer`: remoc proxied control stream
-/// - `credential`: for PAM authentication
-/// - `conversation_id`: unique session identifier
-/// - `peer_version`: negotiated SSH version string
-#[derive(Serialize, Deserialize)]
-pub struct ChildBootstrap {
-    pub manage_stream: crate::conversation::remoc::RemoteManageStreamClient,
-    pub control_reader: h3x::remoc::quic::ReadStreamClient,
-    pub control_writer: h3x::remoc::quic::WriteStreamClient,
-    pub credential: crate::auth::AuthCredential,
-    #[serde(
-        serialize_with = "serialize_stream_id",
-        deserialize_with = "deserialize_stream_id"
-    )]
-    pub conversation_id: StreamId,
-    pub peer_version: String,
+impl From<remoc::rfn::CallError> for SessionRunError {
+    fn from(source: remoc::rfn::CallError) -> Self {
+        Self::RemoteCall { source }
+    }
 }
+
+/// Outer remote function: the child creates this and sends it to the parent.
+///
+/// When the parent calls it with [`AuthRequest`], the child performs PAM
+/// authentication. On success it returns a [`StartSessionFn`] continuation;
+/// on failure it returns [`AuthError`].
+pub type AuthenticateFn = remoc::rfn::RFnOnce<(AuthRequest,), Result<StartSessionFn, AuthError>>;
+
+/// Inner remote function: returned by [`AuthenticateFn`] on success.
+///
+/// When the parent calls it with [`SessionBootstrap`] (after HTTP upgrade),
+/// the child drops privileges and runs the session dispatcher.
+pub type StartSessionFn = remoc::rfn::RFnOnce<(SessionBootstrap,), Result<(), SessionRunError>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecRequest {
@@ -791,62 +835,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_init_roundtrip() {
-        let init = SessionInit {
-            conversation_id: StreamId::try_from(42u64).unwrap(),
+    fn auth_request_roundtrip() {
+        let req = AuthRequest {
             username: "alice".into(),
-            uid: 1000,
-            gid: 1000,
-            home: PathBuf::from("/home/alice"),
-            shell: PathBuf::from("/bin/bash"),
+            credential: crate::auth::AuthCredential::Basic {
+                username: "alice".into(),
+                password: "secret".into(),
+            },
         };
-        let json = serde_json::to_string(&init).unwrap();
-        let decoded: SessionInit = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.conversation_id, StreamId::try_from(42u64).unwrap());
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: AuthRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.username, "alice");
-        assert_eq!(decoded.uid, 1000);
-        assert_eq!(decoded.gid, 1000);
-        assert_eq!(decoded.home, PathBuf::from("/home/alice"));
-        assert_eq!(decoded.shell, PathBuf::from("/bin/bash"));
     }
 
     #[test]
-    fn auth_result_success_roundtrip() {
-        let result = AuthResult::Success {
-            uid: 1000,
-            gid: 1000,
-            home: PathBuf::from("/home/bob"),
-            shell: PathBuf::from("/bin/zsh"),
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        let decoded: AuthResult = serde_json::from_str(&json).unwrap();
-        match decoded {
-            AuthResult::Success {
-                uid,
-                gid,
-                home,
-                shell,
-            } => {
-                assert_eq!(uid, 1000);
-                assert_eq!(gid, 1000);
-                assert_eq!(home, PathBuf::from("/home/bob"));
-                assert_eq!(shell, PathBuf::from("/bin/zsh"));
-            }
-            AuthResult::Failure { .. } => panic!("expected Success"),
-        }
-    }
-
-    #[test]
-    fn auth_result_failure_roundtrip() {
-        let result = AuthResult::Failure {
+    fn auth_error_display() {
+        let err = AuthError::PamFailed {
             reason: "invalid password".into(),
         };
-        let json = serde_json::to_string(&result).unwrap();
-        let decoded: AuthResult = serde_json::from_str(&json).unwrap();
-        match decoded {
-            AuthResult::Failure { reason } => assert_eq!(reason, "invalid password"),
-            AuthResult::Success { .. } => panic!("expected Failure"),
-        }
+        assert_eq!(err.to_string(), "PAM authentication failed: invalid password");
+
+        let err = AuthError::UserNotFound {
+            username: "nobody".into(),
+        };
+        assert_eq!(err.to_string(), "user not found: nobody");
+    }
+
+    #[test]
+    fn session_run_error_display() {
+        let err = SessionRunError::DropPrivileges {
+            reason: "setuid failed".into(),
+        };
+        assert_eq!(err.to_string(), "failed to drop privileges: setuid failed");
     }
 
     #[test]

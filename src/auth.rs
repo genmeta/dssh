@@ -22,6 +22,22 @@ impl fmt::Display for AuthCredential {
     }
 }
 
+impl AuthCredential {
+    /// Returns the username from the credential.
+    pub fn username(&self) -> &str {
+        match self {
+            Self::Basic { username, .. } => username,
+        }
+    }
+
+    /// Returns the password from the credential.
+    pub fn password(&self) -> &str {
+        match self {
+            Self::Basic { password, .. } => password,
+        }
+    }
+}
+
 /// Authentication scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthScheme {

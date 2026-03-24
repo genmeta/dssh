@@ -1,0 +1,107 @@
+//! PAM authentication for privilege-separated child processes.
+//!
+//! Performs non-interactive PAM authentication using `pam-client2` and
+//! looks up the user in `/etc/passwd` via `nix::unistd::User`.
+//!
+//! PAM is a synchronous C library, so all calls are run inside
+//! [`tokio::task::spawn_blocking`].
+
+use std::path::PathBuf;
+
+use snafu::{OptionExt, ResultExt, Snafu};
+
+/// Successful PAM authentication result with user info from `/etc/passwd`.
+#[derive(Debug, Clone)]
+pub struct UserInfo {
+    /// POSIX user ID.
+    pub uid: u32,
+    /// POSIX group ID.
+    pub gid: u32,
+    /// User's home directory.
+    pub home: PathBuf,
+    /// User's login shell.
+    pub shell: PathBuf,
+}
+
+/// Errors that can occur during PAM authentication or user lookup.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum PamAuthError {
+    /// Failed to initialize the PAM context.
+    #[snafu(display("failed to create PAM context"))]
+    CreateContext { source: pam_client2::Error },
+
+    /// `pam_authenticate` rejected the credentials.
+    #[snafu(display("PAM authentication rejected"))]
+    Authenticate { source: pam_client2::Error },
+
+    /// `pam_acct_mgmt` rejected the account (expired, locked, etc.).
+    #[snafu(display("PAM account management rejected"))]
+    AccountManagement { source: pam_client2::Error },
+
+    /// Failed to query `/etc/passwd` for the user.
+    #[snafu(display("failed to query user from /etc/passwd"))]
+    UserQuery { source: nix::Error },
+
+    /// The username does not exist in `/etc/passwd`.
+    #[snafu(display("user not found in /etc/passwd: {username}"))]
+    UserNotFound { username: String },
+
+    /// The blocking task was cancelled (should not happen in practice).
+    #[snafu(display("blocking task cancelled"))]
+    TaskCancelled,
+}
+
+/// Perform PAM authentication and look up the user's POSIX identity.
+///
+/// This function:
+/// 1. Creates a non-interactive PAM context with `conv_mock::Conversation`
+/// 2. Calls `pam_authenticate` to verify the password
+/// 3. Calls `pam_acct_mgmt` to check account status (expired, locked, etc.)
+/// 4. Looks up the user in `/etc/passwd` via `nix::unistd::User::from_name`
+///
+/// All PAM calls run inside `spawn_blocking` because PAM is synchronous.
+pub async fn authenticate(
+    service: &str,
+    username: &str,
+    password: &str,
+) -> Result<UserInfo, PamAuthError> {
+    let service = service.to_owned();
+    let username = username.to_owned();
+    let password = password.to_owned();
+
+    tokio::task::spawn_blocking(move || authenticate_blocking(&service, &username, &password))
+        .await
+        .map_err(|_| PamAuthError::TaskCancelled)?
+}
+
+fn authenticate_blocking(
+    service: &str,
+    username: &str,
+    password: &str,
+) -> Result<UserInfo, PamAuthError> {
+    use pam_client2::{Context, Flag, conv_mock};
+
+    let conversation = conv_mock::Conversation::with_credentials(username, password);
+    let mut context = Context::new(service, Some(username), conversation)
+        .context(pam_auth_error::CreateContextSnafu)?;
+
+    context
+        .authenticate(Flag::NONE)
+        .context(pam_auth_error::AuthenticateSnafu)?;
+
+    context
+        .acct_mgmt(Flag::NONE)
+        .context(pam_auth_error::AccountManagementSnafu)?;
+
+    let user = nix::unistd::User::from_name(username)
+        .context(pam_auth_error::UserQuerySnafu)?
+        .context(pam_auth_error::UserNotFoundSnafu { username })?;
+
+    Ok(UserInfo {
+        uid: user.uid.as_raw(),
+        gid: user.gid.as_raw(),
+        home: user.dir,
+        shell: user.shell,
+    })
+}

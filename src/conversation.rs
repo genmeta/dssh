@@ -80,6 +80,7 @@ const SSH_MSG_CHANNEL_EXTENDED_DATA: VarInt = VarInt::from_u32(95);
 const SSH_MSG_CHANNEL_EOF: VarInt = VarInt::from_u32(96);
 const SSH_MSG_CHANNEL_CLOSE: VarInt = VarInt::from_u32(97);
 const SSH_MSG_CHANNEL_REQUEST: VarInt = VarInt::from_u32(98);
+
 const SSH_MSG_CHANNEL_SUCCESS: VarInt = VarInt::from_u32(99);
 const SSH_MSG_CHANNEL_FAILURE: VarInt = VarInt::from_u32(100);
 
@@ -424,10 +425,7 @@ where
 
     /// Acquire the writer for the given ticket, draining any preceding
     /// auto-failure responses first.
-    async fn acquire_writer(
-        &self,
-        ticket: u64,
-    ) -> Result<OrderedGuard<W>, SessionPoisonedError> {
+    async fn acquire_writer(&self, ticket: u64) -> Result<OrderedGuard<W>, SessionPoisonedError> {
         loop {
             self.drain_auto_failures().await?;
 
@@ -453,7 +451,11 @@ where
 // Conversation
 // ===========================================================================
 
-pub struct Conversation<M: ManageSessionStream, R = Pin<Box<dyn AsyncRead + Send>>, W = Pin<Box<dyn AsyncWrite + Send>>> {
+pub struct Conversation<
+    M: ManageSessionStream,
+    R = Pin<Box<dyn AsyncRead + Send>>,
+    W = Pin<Box<dyn AsyncWrite + Send>>,
+> {
     id: StreamId,
     peer_version: String,
     shared: Arc<ConversationShared<R, W>>,
