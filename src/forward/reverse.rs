@@ -28,6 +28,9 @@ pub enum ReverseForwardError {
     #[snafu(display("failed to bind TCP listener"))]
     TcpBind { source: std::io::Error },
 
+    #[snafu(display("failed to get local address of TCP listener"))]
+    LocalAddr { source: std::io::Error },
+
     #[snafu(display("failed to bind Unix listener"))]
     UnixBind { source: std::io::Error },
 }
@@ -77,14 +80,16 @@ where
         let listener = TcpListener::bind(addr)
             .await
             .context(reverse_forward_error::TcpBindSnafu)?;
-        let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let local_addr = listener
+            .local_addr()
+            .context(reverse_forward_error::LocalAddrSnafu)?;
 
         let conversation = Arc::clone(self);
         let handle = tokio::spawn(
-            tcp_accept_loop(listener, conversation).in_current_span(),
+            tcp_accept_loop(listener, conversation, local_addr).in_current_span(),
         );
 
-        Ok((actual_port, ForwardHandle { handle, cleanup: None }))
+        Ok((local_addr.port(), ForwardHandle { handle, cleanup: None }))
     }
 
     /// Start a Unix socket reverse forwarding listener.
@@ -122,16 +127,14 @@ where
 async fn tcp_accept_loop<M>(
     listener: TcpListener,
     conversation: Arc<Conversation<M>>,
+    bound_addr: std::net::SocketAddr,
 ) where
     M: ManageSessionStream + 'static,
     M::StreamReader: AsyncRead + Send + Unpin + 'static,
     M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
 {
-    let connected_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    let connected_addr = listener
-        .local_addr()
-        .map(|a| a.ip().to_string())
-        .unwrap_or_default();
+    let connected_port = bound_addr.port();
+    let connected_addr = bound_addr.ip().to_string();
 
     loop {
         let (tcp_stream, peer_addr) = match listener.accept().await {
