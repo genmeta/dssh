@@ -6,11 +6,10 @@
 //! A production server would spawn a privilege-separated child process
 //! (ssh3-session) and relay streams via remoc — see the `ssh3-session`
 //! example for the child-side flow.
-//!
-//! Usage: cargo run --example ssh3-server -- <cert.pem> <key.pem> [bind_addr]
 
 use std::sync::Arc;
 
+use clap::Parser;
 use genmeta_ssh::{
     Conversation, SSH3_CONNECT_PATH,
     auth::parse_authorization_header,
@@ -23,22 +22,28 @@ use h3x::gm_quic::H3Servers;
 use h3x::server::{Request, Response, Router};
 use http::{HeaderValue, StatusCode};
 
+#[derive(Parser)]
+#[command(about = "SSH3 server example")]
+struct Cli {
+    /// Path to TLS certificate (PEM)
+    cert: String,
+
+    /// Path to TLS private key (PEM)
+    key: String,
+
+    /// Bind address
+    #[arg(short, long, default_value = "0.0.0.0:443")]
+    bind: String,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: {} <cert.pem> <key.pem> [bind_addr]", args[0]);
-        std::process::exit(1);
-    }
+    let cli = Cli::parse();
 
-    let cert_path = &args[1];
-    let key_path = &args[2];
-    let bind_addr = args.get(3).map(|s| s.as_str()).unwrap_or("0.0.0.0:443");
-
-    let cert_pem = std::fs::read(cert_path).expect("failed to read certificate");
-    let key_pem = std::fs::read(key_path).expect("failed to read private key");
+    let cert_pem = std::fs::read(&cli.cert).expect("failed to read certificate");
+    let key_pem = std::fs::read(&cli.key).expect("failed to read private key");
 
     let router = Router::new().connect(SSH3_CONNECT_PATH, handle_ssh3_connect);
 
@@ -59,13 +64,13 @@ async fn main() {
             cert_pem.as_slice(),
             key_pem.as_slice(),
             None::<Vec<u8>>,
-            [format!("inet://{bind_addr}")],
+            [format!("inet://{}", cli.bind)],
             router,
         )
         .await
         .expect("failed to add server");
 
-    tracing::info!(%bind_addr, "SSH3 server listening");
+    tracing::info!(bind = %cli.bind, "SSH3 server listening");
     let err = servers.run().await;
     tracing::error!(error = %err, "server stopped");
 }

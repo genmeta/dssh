@@ -2,30 +2,42 @@
 //!
 //! Connects to an SSH3 server, opens a session channel, executes a command
 //! (or starts an interactive shell), and relays stdin/stdout.
-//!
-//! Usage: cargo run --example ssh3-client -- <user:pass@host:port> [command...]
 
+use clap::Parser;
 use genmeta_ssh::{
     DEFAULT_MAX_MESSAGE_SIZE, SessionChannelOpen, SshChannel, client::Ssh3Client,
     session::client::ClientSession,
 };
 use h3x::gm_quic::H3Client;
 
+#[derive(Parser)]
+#[command(about = "SSH3 client example")]
+struct Cli {
+    /// Server authority (host:port)
+    authority: String,
+
+    /// Username for basic auth
+    #[arg(short, long, default_value = "user")]
+    user: String,
+
+    /// Password for basic auth
+    #[arg(short, long, default_value = "pass")]
+    password: String,
+
+    /// Command to execute (omit for interactive shell)
+    command: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: {} <user:pass@host:port> [command...]", args[0]);
-        std::process::exit(1);
-    }
+    let cli = Cli::parse();
 
-    let authority_str = &args[1];
-    let command: Option<String> = if args.len() > 2 {
-        Some(args[2..].join(" "))
-    } else {
+    let command: Option<String> = if cli.command.is_empty() {
         None
+    } else {
+        Some(cli.command.join(" "))
     };
 
     // Build h3x QUIC client (no server cert verification for demo).
@@ -35,8 +47,7 @@ async fn main() {
         .expect("failed to configure TLS")
         .build();
 
-    // Create SSH3 client with basic auth.
-    let ssh3_client = Ssh3Client::with_basic_auth(authority_str, "user", "pass");
+    let ssh3_client = Ssh3Client::with_basic_auth(&cli.authority, &cli.user, &cli.password);
 
     // Connect → Conversation.
     let conversation = ssh3_client
@@ -81,7 +92,6 @@ async fn main() {
 
     loop {
         tokio::select! {
-            // Read stdin and forward to remote.
             result = stdin.read(&mut stdin_buf), if !stdin_eof => {
                 match result {
                     Ok(0) | Err(_) => {
@@ -95,7 +105,6 @@ async fn main() {
                     }
                 }
             }
-            // Read events from the remote session.
             result = session.recv_event() => {
                 match result {
                     Ok(Some(SessionEvent::Stdout(data))) => {
