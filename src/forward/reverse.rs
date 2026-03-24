@@ -96,9 +96,8 @@ where
         path: impl AsRef<Path>,
     ) -> Result<ForwardHandle, ReverseForwardError> {
         let path = path.as_ref();
-        let listener = UnixListener::bind(path).map_err(|source| {
-            ReverseForwardError::UnixBind { source }
-        })?;
+        let listener = UnixListener::bind(path)
+            .context(reverse_forward_error::UnixBindSnafu)?;
 
         let path_for_task = path.to_path_buf();
         let path_for_cleanup = path.to_path_buf();

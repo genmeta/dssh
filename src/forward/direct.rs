@@ -140,8 +140,11 @@ where
         .context(direct_forward_error::DecodeVarintSnafu)?;
 
     let raw_port = dest_port.into_inner();
-    let port =
-        u16::try_from(raw_port).map_err(|_| DirectForwardError::PortOverflow { raw_port })?;
+    snafu::ensure!(
+        raw_port <= u16::MAX as u64,
+        direct_forward_error::PortOverflowSnafu { raw_port }
+    );
+    let port = raw_port as u16;
 
     let pending = PendingChannel::from_raw_parts(reader, writer);
     let addr = format!("{}:{}", &*dest_host, port);

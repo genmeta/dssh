@@ -8,7 +8,7 @@
 //! 3. TCP connect, reply, then bidirectional data relay.
 
 use crate::forward::relay;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -57,7 +57,7 @@ where
     let ver = reader
         .read_u8()
         .await
-        .map_err(|e| Socks5Error::Io { source: e })?;
+        .context(socks5_error::IoSnafu)?;
     if ver != SOCKS5_VERSION {
         return Err(Socks5Error::UnsupportedVersion { version: ver });
     }
@@ -65,35 +65,35 @@ where
     let nmethods = reader
         .read_u8()
         .await
-        .map_err(|e| Socks5Error::Io { source: e })? as usize;
+        .context(socks5_error::IoSnafu)? as usize;
     let mut methods = vec![0u8; nmethods];
     reader
         .read_exact(&mut methods)
         .await
-        .map_err(|e| Socks5Error::Io { source: e })?;
+        .context(socks5_error::IoSnafu)?;
 
     if !methods.contains(&METHOD_NO_AUTH) {
         writer
             .write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE])
             .await
-            .map_err(|e| Socks5Error::Io { source: e })?;
+            .context(socks5_error::IoSnafu)?;
         writer
             .shutdown()
             .await
-            .map_err(|e| Socks5Error::Io { source: e })?;
+            .context(socks5_error::IoSnafu)?;
         return Ok(());
     }
 
     writer
         .write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH])
         .await
-        .map_err(|e| Socks5Error::Io { source: e })?;
+        .context(socks5_error::IoSnafu)?;
 
     // Phase 2: CONNECT request
     let ver = reader
         .read_u8()
         .await
-        .map_err(|e| Socks5Error::Io { source: e })?;
+        .context(socks5_error::IoSnafu)?;
     if ver != SOCKS5_VERSION {
         return Err(Socks5Error::UnsupportedVersion { version: ver });
     }
@@ -101,15 +101,15 @@ where
     let cmd = reader
         .read_u8()
         .await
-        .map_err(|e| Socks5Error::Io { source: e })?;
+        .context(socks5_error::IoSnafu)?;
     let _rsv = reader
         .read_u8()
         .await
-        .map_err(|e| Socks5Error::Io { source: e })?;
+        .context(socks5_error::IoSnafu)?;
     let atyp = reader
         .read_u8()
         .await
-        .map_err(|e| Socks5Error::Io { source: e })?;
+        .context(socks5_error::IoSnafu)?;
 
     let (dest_addr, dest_atyp_bytes) = match atyp {
         ATYP_IPV4 => {
@@ -117,21 +117,21 @@ where
             reader
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| Socks5Error::Io { source: e })?;
+                .context(socks5_error::IoSnafu)?;
             (Ipv4Addr::from(buf).to_string(), buf.to_vec())
         }
         ATYP_DOMAIN => {
             let len = reader
                 .read_u8()
                 .await
-                .map_err(|e| Socks5Error::Io { source: e })? as usize;
+                .context(socks5_error::IoSnafu)? as usize;
             let mut buf = vec![0u8; len];
             reader
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| Socks5Error::Io { source: e })?;
+                .context(socks5_error::IoSnafu)?;
             let domain = String::from_utf8(buf.clone())
-                .map_err(|e| Socks5Error::InvalidDomain { source: e })?;
+                .context(socks5_error::InvalidDomainSnafu)?;
             let mut atyp_bytes = vec![len as u8];
             atyp_bytes.extend_from_slice(&buf);
             (domain, atyp_bytes)
@@ -141,7 +141,7 @@ where
             reader
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| Socks5Error::Io { source: e })?;
+                .context(socks5_error::IoSnafu)?;
             (Ipv6Addr::from(buf).to_string(), buf.to_vec())
         }
         _ => return Err(Socks5Error::UnsupportedAddressType { atyp }),
@@ -150,7 +150,7 @@ where
     let dest_port = reader
         .read_u16()
         .await
-        .map_err(|e| Socks5Error::Io { source: e })?;
+        .context(socks5_error::IoSnafu)?;
 
     if cmd != CMD_CONNECT {
         send_reply(
@@ -164,7 +164,7 @@ where
         writer
             .shutdown()
             .await
-            .map_err(|e| Socks5Error::Io { source: e })?;
+            .context(socks5_error::IoSnafu)?;
         return Ok(());
     }
 
@@ -185,14 +185,14 @@ where
             writer
                 .shutdown()
                 .await
-                .map_err(|e| Socks5Error::Io { source: e })?;
+                .context(socks5_error::IoSnafu)?;
             return Ok(());
         }
     };
 
     let local_addr = tcp_stream
         .local_addr()
-        .map_err(|e| Socks5Error::Io { source: e })?;
+        .context(socks5_error::IoSnafu)?;
     send_reply_with_bound_addr(&mut writer, REP_SUCCEEDED, &local_addr).await?;
 
     // Phase 4: Bidirectional relay
@@ -201,10 +201,10 @@ where
     let t2q = tokio::spawn(relay(tcp_reader, writer).in_current_span());
 
     let (r1, r2) = tokio::join!(q2t, t2q);
-    r1.map_err(|e| Socks5Error::RelayJoin { source: e })?
-        .map_err(|e| Socks5Error::Io { source: e })?;
-    r2.map_err(|e| Socks5Error::RelayJoin { source: e })?
-        .map_err(|e| Socks5Error::Io { source: e })?;
+    r1.context(socks5_error::RelayJoinSnafu)?
+        .context(socks5_error::IoSnafu)?;
+    r2.context(socks5_error::RelayJoinSnafu)?
+        .context(socks5_error::IoSnafu)?;
 
     Ok(())
 }
@@ -222,7 +222,7 @@ async fn send_reply<W: AsyncWrite + Unpin>(
     writer
         .write_all(&reply)
         .await
-        .map_err(|e| Socks5Error::Io { source: e })
+        .context(socks5_error::IoSnafu)
 }
 
 async fn send_reply_with_bound_addr<W: AsyncWrite + Unpin>(
@@ -238,7 +238,7 @@ async fn send_reply_with_bound_addr<W: AsyncWrite + Unpin>(
             writer
                 .write_all(&reply)
                 .await
-                .map_err(|e| Socks5Error::Io { source: e })
+                .context(socks5_error::IoSnafu)
         }
         SocketAddr::V6(v6) => {
             let mut reply = vec![SOCKS5_VERSION, rep, 0x00, ATYP_IPV6];
@@ -247,7 +247,7 @@ async fn send_reply_with_bound_addr<W: AsyncWrite + Unpin>(
             writer
                 .write_all(&reply)
                 .await
-                .map_err(|e| Socks5Error::Io { source: e })
+                .context(socks5_error::IoSnafu)
         }
     }
 }
