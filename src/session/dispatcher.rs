@@ -9,16 +9,16 @@
 //! | Channel type | Handler |
 //! |---|---|
 //! | `"session"` | [`run_piped`](super::process::run_piped) / [`run_pty`](super::process::run_pty) |
-//! | `"direct-tcpip"` | [`handle_direct_tcpip`](crate::forward_runtime::direct::handle_direct_tcpip) |
-//! | `"direct-streamlocal@openssh.com"` | [`handle_direct_streamlocal`](crate::forward_runtime::direct::handle_direct_streamlocal) |
-//! | `"socks5"` | [`handle_socks5`](crate::forward_runtime::socks5::handle_socks5) |
+//! | `"direct-tcpip"` | [`handle_direct_tcpip`](crate::forward::direct::handle_direct_tcpip) |
+//! | `"direct-streamlocal@openssh.com"` | [`handle_direct_streamlocal`](crate::forward::direct::handle_direct_streamlocal) |
+//! | `"socks5"` | [`handle_socks5`](crate::forward::socks5::handle_socks5) |
 //! | unknown | reject with `UNKNOWN_CHANNEL_TYPE` |
 //!
 //! # Global request dispatch
 //!
 //! | Request type | Action |
 //! |---|---|
-//! | `"tcpip-forward"` | Start TCP listener via [`ReverseForwarder`](crate::forward_runtime::reverse::ReverseForwarder) |
+//! | `"tcpip-forward"` | Start TCP listener via [`ReverseForwarder`](crate::forward::reverse::ReverseForwarder) |
 //! | `"cancel-tcpip-forward"` | Stop TCP listener |
 //! | `"streamlocal-forward@openssh.com"` | Start Unix socket listener |
 //! | `"cancel-streamlocal-forward@openssh.com"` | Stop Unix socket listener |
@@ -35,7 +35,7 @@ use crate::forward::{
     CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, ForwardError,
     StreamlocalForwardRequest, TcpipForwardReply, TcpipForwardRequest,
 };
-use crate::forward_runtime::reverse::ReverseForwarder;
+use crate::forward::reverse::ReverseForwarder;
 use crate::session::process::CommandMode;
 use h3x::varint::VarInt;
 
@@ -115,7 +115,7 @@ where
                     "direct-tcpip" => {
                         let (reader, writer) = incoming.into_raw_parts();
                         channel_tasks.spawn(async move {
-                            if let Err(e) = crate::forward_runtime::direct::handle_direct_tcpip(reader, writer).await {
+                            if let Err(e) = crate::forward::direct::handle_direct_tcpip(reader, writer).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "direct-tcpip error");
                             }
                         });
@@ -123,7 +123,7 @@ where
                     "direct-streamlocal@openssh.com" => {
                         let (reader, writer) = incoming.into_raw_parts();
                         channel_tasks.spawn(async move {
-                            if let Err(e) = crate::forward_runtime::direct::handle_direct_streamlocal(reader, writer).await {
+                            if let Err(e) = crate::forward::direct::handle_direct_streamlocal(reader, writer).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "direct-streamlocal error");
                             }
                         });
@@ -131,7 +131,7 @@ where
                     "socks5" => {
                         let (reader, writer) = incoming.into_raw_parts();
                         channel_tasks.spawn(async move {
-                            if let Err(e) = crate::forward_runtime::socks5::handle_socks5(reader, writer).await {
+                            if let Err(e) = crate::forward::socks5::handle_socks5(reader, writer).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "socks5 error");
                             }
                         });

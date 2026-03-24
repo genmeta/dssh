@@ -7,7 +7,7 @@
 //! 2. CONNECT request with IPv4 / IPv6 / domain destination.
 //! 3. TCP connect, reply, then bidirectional data relay.
 
-use crate::forward_runtime::relay;
+use crate::forward::relay;
 use snafu::Snafu;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

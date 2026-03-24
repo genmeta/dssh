@@ -18,7 +18,7 @@ use crate::{
         ForwardedStreamlocalChannelOpen, ForwardedStreamlocalRequest, ForwardedTcpipChannelOpen,
         ForwardedTcpipRequest,
     },
-    forward_runtime::relay,
+    forward::relay,
 };
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};

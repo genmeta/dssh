@@ -17,7 +17,7 @@ use crate::{
     conversation::{
         PendingChannel, WriteChannelOpenConfirmationError, WriteChannelOpenFailureError,
     },
-    forward_runtime::relay,
+    forward::relay,
 };
 use h3x::{codec::DecodeExt, varint::VarInt};
 use snafu::{ResultExt, Snafu};
