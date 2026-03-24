@@ -176,10 +176,8 @@ where
 
             // Reap completed forward listener tasks.
             Some(result) = forward_tasks.join_next() => {
-                if let Err(e) = result {
-                    if !e.is_cancelled() {
-                        tracing::warn!(error = %e, "forward task panicked");
-                    }
+                if let Err(e) = result && !e.is_cancelled() {
+                    tracing::warn!(error = %e, "forward task panicked");
                 }
             }
         }

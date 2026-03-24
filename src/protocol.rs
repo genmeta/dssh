@@ -386,7 +386,9 @@ mod tests {
 
     // ConversationHandle is Send + Sync (required for ManageSessionStream usage).
     const _: () = {
+        #[allow(dead_code)]
         fn assert_send_sync<T: Send + Sync>() {}
+        #[allow(dead_code)]
         fn check() {
             assert_send_sync::<ConversationHandle>();
             assert_send_sync::<Ssh3Protocol>();

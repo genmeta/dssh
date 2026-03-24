@@ -330,7 +330,7 @@ mod tests {
                 .lock()
                 .await
                 .pop()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no pairs enqueued"))
+                .ok_or_else(|| std::io::Error::other("no pairs enqueued"))
         }
 
         async fn accept_stream(&self) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
