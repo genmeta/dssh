@@ -10,7 +10,7 @@ use genmeta_ssh::{
     client::SSH3_CONNECT_PATH,
     client::encode_basic_auth,
     constants::{DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION},
-    conversation::{Conversation, SshChannel},
+    conversation::{Conversation, channel::SshChannel},
     forward::SessionChannelOpen,
     protocol::{ConversationHandle, Ssh3Protocol},
     session::client::ClientSession,

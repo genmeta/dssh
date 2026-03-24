@@ -32,7 +32,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::channel::reason_code;
-use crate::conversation::{Conversation, IncomingGlobal, ManageSessionStream};
+use crate::conversation::global::IncomingGlobal;
+use crate::conversation::{Conversation, ManageSessionStream};
 use crate::forward::{
     CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, ForwardError,
     StreamlocalForwardRequest, TcpipForwardRequest,

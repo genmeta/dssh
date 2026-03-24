@@ -1,5 +1,9 @@
 use super::*;
 
+use super::channel::{
+    ChannelEvent, ReadChannelEventError, SendChannelRequestError, SshChannel,
+};
+use super::global::{DecodedGlobalRequest, RespondFailureError, RespondSuccessError};
 use crate::codec::SshBytes;
 use std::pin::Pin;
 use std::task::{Context, Poll};

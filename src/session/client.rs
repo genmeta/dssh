@@ -11,7 +11,7 @@ use snafu::prelude::*;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::codec::{SshBytes, SshString};
-use crate::conversation::{
+use crate::conversation::channel::{
     ChannelEvent, ReadChannelEventError, SendChannelNoticeError, SendChannelRequestError,
     SshChannel, WriteChannelCloseError, WriteChannelEofError, WriteDataError,
 };
@@ -323,7 +323,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::SshChannel;
+    use crate::conversation::channel::SshChannel;
     use h3x::varint::VarInt;
 
     fn channel_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {

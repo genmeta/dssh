@@ -63,7 +63,11 @@ use tokio::sync::Notify;
 use crate::channel::ChannelOpenFailure;
 use crate::codec::{SshBool, SshString};
 
-use self::global::PoisonOnDrop;
+use self::channel::{AcceptChannelError, AwaitOpenError, IncomingChannel, OpenChannelError};
+use self::global::{
+    AcceptError, IncomingGlobal, IncomingGlobalNotice, IncomingGlobalRequest, PoisonOnDrop,
+    SendNotifyError, SendRequestError, SessionPoisonedError,
+};
 
 const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
 const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
@@ -784,24 +788,8 @@ where
 // Submodules
 // ===========================================================================
 
-mod channel;
-mod global;
+pub mod channel;
+pub mod global;
 
 #[cfg(test)]
 mod tests;
-
-pub use channel::{
-    AcceptChannelError, AwaitOpenError, ChannelDataRead, ChannelEvent, ChannelResponder,
-    IncomingChannel, IncomingChannelNotice, IncomingChannelRequest, OpenChannelError,
-    PendingChannel, ReadChannelEventError, ReaderEvent, RespondChannelFailureError,
-    RespondChannelSuccessError, SendChannelNoticeError, SendChannelRequestError, SshChannel,
-    SshChannelReader, SshChannelWriter, WriteChannelCloseError, WriteChannelEofError,
-    WriteChannelOpenConfirmationError, WriteChannelOpenFailureError, WriteDataError,
-    WriteExtendedDataError,
-};
-
-pub use global::{
-    AcceptError, DecodedGlobalRequest, IncomingGlobal, IncomingGlobalNotice, IncomingGlobalRequest,
-    RespondFailureError, RespondSuccessError, SendNotifyError, SendRequestError,
-    SessionPoisonedError,
-};

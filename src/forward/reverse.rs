@@ -14,9 +14,9 @@ use std::sync::Arc;
 use crate::{
     constants::DEFAULT_MAX_MESSAGE_SIZE,
     conversation::{
-        ChannelOpen, Conversation, DecodedGlobalRequest, ManageSessionStream,
-        RespondSuccessError,
+        ChannelOpen, Conversation, ManageSessionStream,
     },
+    conversation::global::{DecodedGlobalRequest, RespondSuccessError},
     forward::{
         ForwardError, ForwardedStreamlocal, ForwardedTcpip, TcpipForwardReply,
         TcpipForwardRequest, StreamlocalForwardRequest, relay,

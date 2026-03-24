@@ -14,7 +14,7 @@
 use crate::{
     channel::reason_code,
     codec::SshString,
-    conversation::{
+    conversation::channel::{
         PendingChannel, WriteChannelOpenConfirmationError, WriteChannelOpenFailureError,
     },
     forward::relay,
@@ -85,7 +85,7 @@ async fn send_open_confirmation<R, W: AsyncWrite + Unpin + Send>(
         .accept(crate::constants::DEFAULT_MAX_MESSAGE_SIZE)
         .await
         .context(direct_forward_error::AcceptSnafu)
-        .map(|ch| ch.into_parts())
+        .map(|ch| ch.into_inner())
 }
 
 /// Spawn bidirectional relay between a channel stream pair and a split I/O stream.
@@ -287,7 +287,7 @@ mod tests {
         let result = read_channel_open_response(&mut client_rd).await;
         assert!(matches!(
             result,
-            Err(crate::conversation::AwaitOpenError::Rejected { .. })
+            Err(crate::conversation::channel::AwaitOpenError::Rejected { .. })
         ));
     }
 

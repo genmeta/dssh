@@ -5,8 +5,9 @@
 //!   stderr → channel extended data (type 1).
 //! - **PTY**: all I/O through a PTY master; everything → channel data.
 //!
-//! Both modes use `tokio::select!` for output multiplexing (no intermediate
-//! mpsc channels) and a spawned task for input relay (channel → process).
+//! Both modes use `tokio::join!` for concurrent I/O relay (no spawned tasks,
+//! no cancellation issues). The reader half uses `SshChannelReader::next_event`
+//! which is safe since it never needs to be cancelled.
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
@@ -18,13 +19,13 @@ use std::process::Stdio;
 use h3x::varint::VarInt;
 use nix::unistd::{Pid, setpgid};
 use snafu::prelude::*;
-use tracing::Instrument;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::codec::{SshBool, SshString};
-use crate::conversation::{
-    ChannelEvent, SendChannelNoticeError, SshChannel, WriteChannelCloseError, WriteChannelEofError,
-    WriteDataError, WriteExtendedDataError,
+use crate::conversation::channel::{
+    IncomingChannelNotice, ReaderEvent, SendChannelNoticeError, SshChannel, SshChannelReader,
+    SshChannelWriter, WriteChannelCloseError, WriteChannelEofError, WriteDataError,
+    WriteExtendedDataError,
 };
 use crate::session::pty::PtyPair;
 use crate::session::signal;
@@ -43,6 +44,9 @@ use crate::session::{
 pub enum ProcessError {
     #[snafu(display("failed to spawn command"))]
     Spawn { source: std::io::Error },
+
+    #[snafu(display("failed to duplicate PTY file descriptor"))]
+    DupFd { source: nix::Error },
 
     #[snafu(display("failed to read from process stdout"))]
     ReadStdout { source: std::io::Error },
@@ -123,7 +127,7 @@ pub async fn run_piped<R, W>(
     mode: CommandMode<'_>,
 ) -> Result<(), ProcessError>
 where
-    R: AsyncRead + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
     use process_error::*;
@@ -133,7 +137,6 @@ where
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // New process group for clean signal delivery.
     unsafe {
         cmd.pre_exec(|| setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(std::io::Error::other));
     }
@@ -144,41 +147,21 @@ where
     let mut stderr = child.stderr.take().unwrap();
     let pid = child.id().map(|id| Pid::from_raw(id as i32));
 
-    // Split channel: reader half for input relay, writer half for output relay.
-    let (reader, writer) = channel.into_parts();
+    let (reader, mut writer) = channel.into_split();
 
-    // Input relay: channel → process stdin + signal handling.
-    // Runs in a spawned task because next_event is not cancellation-safe.
-    let input_handle = tokio::spawn(relay_input_piped(
-        SshChannel::new(reader, tokio::io::sink()),
-        stdin,
-        pid,
-    ).in_current_span());
-
-    // Output relay: stdout/stderr → channel (in main task, using select!).
-    let mut channel_writer = SshChannel::new(tokio::io::empty(), writer);
-    relay_output_piped(&mut stdout, &mut stderr, &mut channel_writer).await?;
-
-    // Wait for child exit.
-    let status = child.wait().await.context(WaitSnafu)?;
-
-    // Send exit notification.
-    send_exit_notification(&mut channel_writer, &status).await?;
-
-    // Send EOF + Close + shutdown.
-    channel_writer.eof().await.context(WriteEofSnafu)?;
-    channel_writer.close().await.context(WriteCloseSnafu)?;
-    channel_writer
-        .writer_mut()
-        .shutdown()
-        .await
-        .context(ShutdownSnafu)?;
-
-    // Clean up input relay.
-    input_handle.abort();
-    let _ = input_handle.await;
-
-    Ok(())
+    let (_, output_result) = tokio::join!(
+        relay_input_piped(reader, stdin, pid),
+        async {
+            relay_output_piped(&mut stdout, &mut stderr, &mut writer).await?;
+            let status = child.wait().await.context(WaitSnafu)?;
+            send_exit_notification(&mut writer, &status).await?;
+            writer.eof().await.context(WriteEofSnafu)?;
+            writer.close().await.context(WriteCloseSnafu)?;
+            writer.writer_mut().shutdown().await.context(ShutdownSnafu)?;
+            Ok::<_, ProcessError>(())
+        },
+    );
+    output_result
 }
 
 /// Run a command with a PTY.
@@ -195,78 +178,55 @@ pub async fn run_pty<R, W>(
     pty: PtyPair,
 ) -> Result<(), ProcessError>
 where
-    R: AsyncRead + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
     use process_error::*;
 
-    // Set up child process with PTY slave as stdio.
     let slave_fd = pty.slave.into_raw_fd();
-    let stdout_fd = nix::unistd::dup(slave_fd)
-        .map_err(std::io::Error::other)
-        .context(SpawnSnafu)?;
-    let stderr_fd = nix::unistd::dup(slave_fd)
-        .map_err(std::io::Error::other)
-        .context(SpawnSnafu)?;
+    let stdout_fd = nix::unistd::dup(slave_fd).context(DupFdSnafu)?;
+    let stderr_fd = nix::unistd::dup(slave_fd).context(DupFdSnafu)?;
 
-    let mut child = tokio::process::Command::new(mode.program())
-        .args(mode.args())
+    let mut cmd = tokio::process::Command::new(mode.program());
+    cmd.args(mode.args())
         .stdin(unsafe { Stdio::from_raw_fd(slave_fd) })
         .stdout(unsafe { Stdio::from_raw_fd(stdout_fd) })
-        .stderr(unsafe { Stdio::from_raw_fd(stderr_fd) })
-        .spawn()
-        .context(SpawnSnafu)?;
+        .stderr(unsafe { Stdio::from_raw_fd(stderr_fd) });
+    unsafe {
+        cmd.pre_exec(|| {
+            nix::unistd::setsid().map_err(std::io::Error::other)?;
+            Ok(())
+        });
+    }
 
+    let mut child = cmd.spawn().context(SpawnSnafu)?;
     let pid = child.id().map(|id| Pid::from_raw(id as i32));
 
-    // Wrap PTY master in async file, then split for concurrent read/write.
-    // Keep the raw fd for window-change ioctl (safe: file lives until end of function).
     let master_raw_fd = pty.master.as_raw_fd();
     let master_file = std::fs::File::from(pty.master);
     let master_tokio = tokio::fs::File::from(master_file);
     let (mut master_reader, master_writer) = tokio::io::split(master_tokio);
 
-    // Split channel: reader half for input relay, writer half for output relay.
-    let (reader, writer) = channel.into_parts();
+    let (reader, mut writer) = channel.into_split();
 
-    // Input relay: channel → PTY master + signal/window-change handling.
-    let input_handle = tokio::spawn(relay_input_pty(
-        SshChannel::new(reader, tokio::io::sink()),
-        master_writer,
-        pid,
-        master_raw_fd,
-    ).in_current_span());
-
-    // Output relay: PTY master → channel data.
-    // EIO is expected when the child exits (slave side closes).
-    let mut channel_writer = SshChannel::new(tokio::io::empty(), writer);
-    let output_result = relay_output_pty(&mut master_reader, &mut channel_writer).await;
-    if let Err(ProcessError::ReadPty { ref source }) = output_result
-        && source.raw_os_error() != Some(nix::libc::EIO)
-    {
-        output_result?;
-    }
-
-    // Wait for child exit.
-    let status = child.wait().await.context(WaitSnafu)?;
-
-    // Send exit notification.
-    send_exit_notification(&mut channel_writer, &status).await?;
-
-    // Send EOF + Close + shutdown.
-    channel_writer.eof().await.context(WriteEofSnafu)?;
-    channel_writer.close().await.context(WriteCloseSnafu)?;
-    channel_writer
-        .writer_mut()
-        .shutdown()
-        .await
-        .context(ShutdownSnafu)?;
-
-    // Clean up input relay.
-    input_handle.abort();
-    let _ = input_handle.await;
-
-    Ok(())
+    let (_, output_result) = tokio::join!(
+        relay_input_pty(reader, master_writer, pid, master_raw_fd),
+        async {
+            let output_result = relay_output_pty(&mut master_reader, &mut writer).await;
+            if let Err(ProcessError::ReadPty { ref source }) = output_result
+                && source.raw_os_error() != Some(nix::libc::EIO)
+            {
+                output_result?;
+            }
+            let status = child.wait().await.context(WaitSnafu)?;
+            send_exit_notification(&mut writer, &status).await?;
+            writer.eof().await.context(WriteEofSnafu)?;
+            writer.close().await.context(WriteCloseSnafu)?;
+            writer.writer_mut().shutdown().await.context(ShutdownSnafu)?;
+            Ok::<_, ProcessError>(())
+        },
+    );
+    output_result
 }
 
 // ============================================================================
@@ -274,13 +234,12 @@ where
 // ============================================================================
 
 /// Multiplex stdout and stderr to the channel writer using `tokio::select!`.
-async fn relay_output_piped<R, W>(
+async fn relay_output_piped<W>(
     stdout: &mut (impl AsyncRead + Unpin),
     stderr: &mut (impl AsyncRead + Unpin),
-    channel: &mut SshChannel<R, W>,
+    writer: &mut SshChannelWriter<W>,
 ) -> Result<(), ProcessError>
 where
-    R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
     use process_error::*;
@@ -298,7 +257,7 @@ where
                     stdout_done = true;
                     continue;
                 }
-                channel
+                writer
                     .data(&stdout_buf[..n])
                     .await
                     .context(WriteDataSnafu)?;
@@ -309,7 +268,7 @@ where
                     stderr_done = true;
                     continue;
                 }
-                channel
+                writer
                     .extended_data(
                         VarInt::from(1u8), // SSH_EXTENDED_DATA_STDERR
                         &stderr_buf[..n],
@@ -324,12 +283,11 @@ where
 }
 
 /// Relay PTY master output to the channel writer.
-async fn relay_output_pty<R, W>(
+async fn relay_output_pty<W>(
     master: &mut (impl AsyncRead + Unpin),
-    channel: &mut SshChannel<R, W>,
+    writer: &mut SshChannelWriter<W>,
 ) -> Result<(), ProcessError>
 where
-    R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
     use process_error::*;
@@ -340,7 +298,7 @@ where
         if n == 0 {
             break;
         }
-        channel.data(&buf[..n]).await.context(WriteDataSnafu)?;
+        writer.data(&buf[..n]).await.context(WriteDataSnafu)?;
     }
     Ok(())
 }
@@ -350,65 +308,62 @@ where
 // ============================================================================
 
 /// Read from channel, write data to process stdin, deliver signals.
-async fn relay_input_piped<R, W>(
-    mut channel: SshChannel<R, W>,
+async fn relay_input_piped<R>(
+    mut reader: SshChannelReader<R>,
     mut stdin: impl AsyncWrite + Unpin + Send,
     pid: Option<Pid>,
 ) where
     R: AsyncRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
 {
     loop {
-        let event = match channel.next_event().await {
+        let event = match reader.next_event().await {
             Ok(e) => e,
             Err(_) => break,
         };
         match event {
-            ChannelEvent::Data(mut data) => {
+            ReaderEvent::Data(mut data) => {
                 if io::copy(&mut data, &mut stdin).await.is_err() {
                     break;
                 }
             }
-            ChannelEvent::Request(incoming) => {
-                if !handle_piped_request(incoming, pid).await {
+            ReaderEvent::Notice(incoming) => {
+                if !handle_piped_notice(incoming, pid).await {
                     break;
                 }
             }
-            ChannelEvent::Eof | ChannelEvent::Close => break,
+            ReaderEvent::Eof | ReaderEvent::Close => break,
             _ => {}
         }
     }
-    // Drop stdin to signal EOF to child process.
 }
 
 /// Read from channel, write data to PTY master, deliver signals, handle
 /// window-change requests.
-async fn relay_input_pty<R, W>(
-    mut channel: SshChannel<R, W>,
+async fn relay_input_pty<R>(
+    mut reader: SshChannelReader<R>,
     mut pty_writer: impl AsyncWrite + Unpin + Send,
     pid: Option<Pid>,
     master_raw_fd: RawFd,
 ) where
     R: AsyncRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
 {
     loop {
-        let event = match channel.next_event().await {
+        let event = match reader.next_event().await {
             Ok(e) => e,
             Err(_) => break,
         };
         match event {
-            ChannelEvent::Data(mut data) => {
+            ReaderEvent::Data(mut data) => {
                 if io::copy(&mut data, &mut pty_writer).await.is_err() {
                     break;
                 }
             }
-            ChannelEvent::Request(incoming) => {
-                if !handle_pty_request(incoming, pid, master_raw_fd).await {
+            ReaderEvent::Notice(incoming) => {
+                if !handle_pty_notice(incoming, pid, master_raw_fd).await {
                     break;
                 }
             }
-            ChannelEvent::Eof | ChannelEvent::Close => break,
+            ReaderEvent::Eof | ReaderEvent::Close => break,
             _ => {}
         }
     }
@@ -416,17 +371,17 @@ async fn relay_input_pty<R, W>(
 }
 
 // ============================================================================
-// Request handlers for input relay
+// Notice handlers for input relay
 // ============================================================================
 
-/// Handle a channel request in piped mode. Returns `true` to continue, `false` to stop.
-async fn handle_piped_request<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send>(
-    incoming: crate::conversation::IncomingChannelRequest<'_, R, W>,
+/// Handle a channel notice in piped mode. Returns `true` to continue, `false` to stop.
+async fn handle_piped_notice<R: AsyncRead + Unpin + Send>(
+    incoming: IncomingChannelNotice<'_, R>,
     pid: Option<Pid>,
 ) -> bool {
     match &**incoming.request_type() {
         "signal" => {
-            let Ok((req, _responder)) = incoming
+            let Ok(req) = incoming
                 .decode_payload::<SignalRequest, SessionCodecError>()
                 .await
             else {
@@ -436,21 +391,21 @@ async fn handle_piped_request<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin
             true
         }
         _ => {
-            // Unknown request in piped mode — can't decode payload, abandon input.
+            // Unknown notice in piped mode — can't decode payload, abandon input.
             false
         }
     }
 }
 
-/// Handle a channel request in PTY mode. Returns `true` to continue, `false` to stop.
-async fn handle_pty_request<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send>(
-    incoming: crate::conversation::IncomingChannelRequest<'_, R, W>,
+/// Handle a channel notice in PTY mode. Returns `true` to continue, `false` to stop.
+async fn handle_pty_notice<R: AsyncRead + Unpin + Send>(
+    incoming: IncomingChannelNotice<'_, R>,
     pid: Option<Pid>,
     master_raw_fd: RawFd,
 ) -> bool {
     match &**incoming.request_type() {
         "signal" => {
-            let Ok((req, _responder)) = incoming
+            let Ok(req) = incoming
                 .decode_payload::<SignalRequest, SessionCodecError>()
                 .await
             else {
@@ -460,7 +415,7 @@ async fn handle_pty_request<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin +
             true
         }
         "window-change" => {
-            let Ok((req, _responder)) = incoming
+            let Ok(req) = incoming
                 .decode_payload::<WindowChangeRequest, SessionCodecError>()
                 .await
             else {
@@ -477,7 +432,7 @@ async fn handle_pty_request<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin +
             true
         }
         _ => {
-            // Unknown request — can't decode payload, abandon input.
+            // Unknown notice — can't decode payload, abandon input.
             false
         }
     }
@@ -502,12 +457,11 @@ fn deliver_to_pid(pid: Option<Pid>, signal_name: &SshString) {
 // Exit status notification
 // ============================================================================
 
-async fn send_exit_notification<R, W>(
-    channel: &mut SshChannel<R, W>,
+async fn send_exit_notification<W>(
+    writer: &mut SshChannelWriter<W>,
     status: &std::process::ExitStatus,
 ) -> Result<(), ProcessError>
 where
-    R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
     use process_error::*;
@@ -517,7 +471,7 @@ where
             .map(Cow::Borrowed)
             .unwrap_or_else(|| Cow::Owned(format!("signal-{signal_number}@genmeta-ssh3")));
 
-        channel
+        writer
             .notice(&ExitSignalChannelNotice {
                 payload: ExitSignalRequest {
                     signal_name: SshString::from(signal_name.into_owned()),
@@ -530,7 +484,7 @@ where
             .context(SendExitSnafu)?;
     } else {
         let code = status.code().unwrap_or(255) as u32;
-        channel
+        writer
             .notice(&ExitStatusChannelNotice {
                 payload: ExitStatusRequest {
                     exit_status: VarInt::from(code),
@@ -550,6 +504,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::channel::ChannelEvent;
 
     // Helper: create a mock channel pair (in-memory duplex).
     fn channel_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
@@ -601,6 +556,8 @@ mod tests {
         }
 
         assert_eq!(String::from_utf8_lossy(&all_data), "hello\n");
+        // Drop client channel so server's input relay sees stream close and exits.
+        drop(channel);
         handle.await.unwrap().unwrap();
     }
 
@@ -652,6 +609,7 @@ mod tests {
         }
 
         assert_eq!(String::from_utf8_lossy(&stderr_data), "err\n");
+        drop(channel);
         handle.await.unwrap().unwrap();
     }
 
@@ -696,6 +654,7 @@ mod tests {
         }
 
         assert_eq!(exit_code, Some(42));
+        drop(channel);
         handle.await.unwrap().unwrap();
     }
 }
