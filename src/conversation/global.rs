@@ -5,12 +5,12 @@ use h3x::{
     varint::VarInt,
 };
 use snafu::{ResultExt, Snafu};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::codec::{CodecError, SshString};
 
 use super::{
-    ControlReader, ControlWriter, ConversationShared, OrderedGuard, SSH_MSG_REQUEST_FAILURE,
+    ConversationShared, OrderedGuard, SSH_MSG_REQUEST_FAILURE,
     SSH_MSG_REQUEST_SUCCESS,
 };
 
@@ -116,9 +116,9 @@ pub enum RespondFailureError {
 // IncomingGlobal
 // ===========================================================================
 
-pub enum IncomingGlobal {
-    Notify(IncomingGlobalNotice),
-    Request(IncomingGlobalRequest),
+pub enum IncomingGlobal<R, W> {
+    Notify(IncomingGlobalNotice<R, W>),
+    Request(IncomingGlobalRequest<R, W>),
 }
 
 // ---------------------------------------------------------------------------
@@ -133,22 +133,23 @@ pub enum IncomingGlobal {
 /// Dropping without decoding poisons the session (the stream contains
 /// residual unknown bytes that cannot be skipped).
 #[must_use = "incoming global requests must be decoded and answered"]
-pub struct IncomingGlobalRequest {
+pub struct IncomingGlobalRequest<R, W> {
     request_type: SshString,
-    reader_guard: Option<OrderedGuard<ControlReader>>,
+    reader_guard: Option<OrderedGuard<R>>,
     writer_ticket: Option<u64>,
-    shared: Arc<ConversationShared>,
+    shared: Arc<ConversationShared<R, W>>,
 }
 
-impl IncomingGlobalRequest {
-    /// Create a new `IncomingGlobalRequest`.
-    ///
-    /// Used by [`super::Conversation::accept`].
+impl<R, W> IncomingGlobalRequest<R, W>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
     pub(super) fn new(
         request_type: SshString,
-        reader_guard: OrderedGuard<ControlReader>,
+        reader_guard: OrderedGuard<R>,
         writer_ticket: u64,
-        shared: Arc<ConversationShared>,
+        shared: Arc<ConversationShared<R, W>>,
     ) -> Self {
         Self {
             request_type,
@@ -170,9 +171,9 @@ impl IncomingGlobalRequest {
     ///
     /// On decode failure the stream is irrecoverably corrupted (partial
     /// bytes consumed), so the session is poisoned when `self` drops.
-    pub async fn decode_payload<T, DE>(mut self) -> Result<(T, DecodedGlobalRequest), DE>
+    pub async fn decode_payload<T, DE>(mut self) -> Result<(T, DecodedGlobalRequest<R, W>), DE>
     where
-        T: for<'r> DecodeFrom<&'r mut ControlReader, Error = DE>,
+        T: for<'r> DecodeFrom<&'r mut R, Error = DE>,
     {
         let guard = self.reader_guard.as_mut().expect("reader_guard missing");
 
@@ -200,7 +201,7 @@ impl IncomingGlobalRequest {
     }
 }
 
-impl Drop for IncomingGlobalRequest {
+impl<R, W> Drop for IncomingGlobalRequest<R, W> {
     fn drop(&mut self) {
         if self.reader_guard.is_some() {
             // Stream has residual unknown bytes — unrecoverable.
@@ -224,23 +225,26 @@ impl Drop for IncomingGlobalRequest {
 ///
 /// Dropping without responding queues an automatic failure response.
 #[must_use = "decoded global requests should be answered"]
-pub struct DecodedGlobalRequest {
+pub struct DecodedGlobalRequest<R, W> {
     writer_ticket: Option<u64>,
-    shared: Arc<ConversationShared>,
+    shared: Arc<ConversationShared<R, W>>,
 }
 
-impl DecodedGlobalRequest {
+impl<R, W> DecodedGlobalRequest<R, W>
+where
+    W: AsyncWrite + Unpin + Send,
+{
     /// Send a success response with the given payload.
     ///
     /// Waits for the writer ticket to be served (ensuring response ordering).
     /// Consumes `self`.
-    pub async fn respond_success<R, RE>(
+    pub async fn respond_success<RS, RE>(
         mut self,
-        response: R,
+        response: RS,
     ) -> Result<(), RespondSuccessError<RE>>
     where
         RE: std::error::Error + Send + Sync + 'static,
-        for<'w> R: EncodeInto<&'w mut ControlWriter, Output = (), Error = RE>,
+        for<'w> RS: EncodeInto<&'w mut W, Output = (), Error = RE>,
     {
         use respond_success_error::*;
 
@@ -304,7 +308,7 @@ impl DecodedGlobalRequest {
     }
 }
 
-impl Drop for DecodedGlobalRequest {
+impl<R, W> Drop for DecodedGlobalRequest<R, W> {
     fn drop(&mut self) {
         if let Some(ticket) = self.writer_ticket.take() {
             self.shared.auto_failures.lock().unwrap().insert(ticket);
@@ -322,20 +326,20 @@ impl Drop for DecodedGlobalRequest {
 /// Call [`decode_payload`](Self::decode_payload) to decode the notification
 /// body. Dropping without decoding poisons the session.
 #[must_use = "incoming global notices must be decoded"]
-pub struct IncomingGlobalNotice {
+pub struct IncomingGlobalNotice<R, W> {
     request_type: SshString,
-    reader_guard: Option<OrderedGuard<ControlReader>>,
-    shared: Arc<ConversationShared>,
+    reader_guard: Option<OrderedGuard<R>>,
+    shared: Arc<ConversationShared<R, W>>,
 }
 
-impl IncomingGlobalNotice {
-    /// Create a new `IncomingGlobalNotice`.
-    ///
-    /// Used by [`super::Conversation::accept`].
+impl<R, W> IncomingGlobalNotice<R, W>
+where
+    R: AsyncRead + Unpin + Send,
+{
     pub(super) fn new(
         request_type: SshString,
-        reader_guard: OrderedGuard<ControlReader>,
-        shared: Arc<ConversationShared>,
+        reader_guard: OrderedGuard<R>,
+        shared: Arc<ConversationShared<R, W>>,
     ) -> Self {
         Self {
             request_type,
@@ -355,7 +359,7 @@ impl IncomingGlobalNotice {
     /// bytes consumed make the stream irrecoverable).
     pub async fn decode_payload<T, DE>(mut self) -> Result<T, DE>
     where
-        T: for<'r> DecodeFrom<&'r mut ControlReader, Error = DE>,
+        T: for<'r> DecodeFrom<&'r mut R, Error = DE>,
     {
         let guard = self.reader_guard.as_mut().expect("reader_guard missing");
 
@@ -370,7 +374,7 @@ impl IncomingGlobalNotice {
     }
 }
 
-impl Drop for IncomingGlobalNotice {
+impl<R, W> Drop for IncomingGlobalNotice<R, W> {
     fn drop(&mut self) {
         if self.reader_guard.is_some() {
             self.shared.poison();
@@ -382,9 +386,9 @@ impl Drop for IncomingGlobalNotice {
 // PoisonOnDrop — marks session poisoned if dropped before disarming
 // ---------------------------------------------------------------------------
 
-pub(super) struct PoisonOnDrop<'a>(pub(super) &'a ConversationShared);
+pub(super) struct PoisonOnDrop<'a, R, W>(pub(super) &'a ConversationShared<R, W>);
 
-impl Drop for PoisonOnDrop<'_> {
+impl<R, W> Drop for PoisonOnDrop<'_, R, W> {
     fn drop(&mut self) {
         self.0.poison();
     }

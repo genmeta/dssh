@@ -11,6 +11,8 @@ use h3x::stream_id::StreamId;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::Empty;
 use snafu::{ResultExt, Snafu};
+use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::constants::SSH_VERSION;
 use crate::conversation::Conversation;
@@ -234,8 +236,10 @@ impl Ssh3Client {
 
         // Convert HTTP/3 message streams to AsyncRead/AsyncWrite for the
         // control stream (DATA-framed per RFC 9114 §4.4).
-        let control_reader = read_stream.into_box_reader();
-        let control_writer = write_stream.into_box_writer();
+        let control_reader: Pin<Box<dyn AsyncRead + Send>> =
+            Box::pin(read_stream.into_box_reader());
+        let control_writer: Pin<Box<dyn AsyncWrite + Send>> =
+            Box::pin(write_stream.into_box_writer());
 
         let conversation = Conversation::new(
             session_id,

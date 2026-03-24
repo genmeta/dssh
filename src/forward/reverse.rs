@@ -85,7 +85,7 @@ where
 pub struct UnixForwardListener<M: ManageSessionStream, R, W> {
     listener: UnixListener,
     conversation: Arc<Conversation<M, R, W>>,
-    socket_path: PathBuf,
+    socket_path: UnixSocketGuard,
 }
 
 impl<M: ManageSessionStream + 'static, R, W> UnixForwardListener<M, R, W>
@@ -102,19 +102,16 @@ where
     /// Cancel the enclosing task to stop the listener. The socket file is
     /// removed when this future is dropped (including on cancellation).
     pub async fn run(self) {
-        let _guard = UnixSocketGuard { path: self.socket_path };
-        unix_accept_loop(self.listener, self.conversation, &_guard.path).await;
+        unix_accept_loop(self.listener, self.conversation, &self.socket_path.0).await;
     }
 }
 
 /// Guard that removes a Unix socket file on drop.
-struct UnixSocketGuard {
-    path: PathBuf,
-}
+struct UnixSocketGuard(PathBuf);
 
 impl Drop for UnixSocketGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -168,7 +165,7 @@ where
         Ok(UnixForwardListener {
             listener,
             conversation: Arc::clone(self),
-            socket_path: path.to_path_buf(),
+            socket_path: UnixSocketGuard(path.to_path_buf()),
         })
     }
 }

@@ -146,7 +146,7 @@ fn make_half(stream_id: VarInt) -> (MockReader, MockWriter) {
     (reader, writer)
 }
 
-async fn make_conversation() -> (Conversation<TestManageStream>, MockReader, MockWriter) {
+async fn make_conversation() -> (Conversation<TestManageStream, MockReader, MockWriter>, MockReader, MockWriter) {
     let stream_id = VarInt::from_u32(42);
     // local reads ← remote writes
     let (local_reader, remote_writer) = make_half(stream_id);
@@ -924,7 +924,7 @@ async fn auto_failures_interleaved_with_real_responses() {
     }
 
     // Accept all 4
-    let mut decoded_reqs: Vec<DecodedGlobalRequest> = Vec::new();
+    let mut decoded_reqs: Vec<DecodedGlobalRequest<MockReader, MockWriter>> = Vec::new();
     for _ in 0..4 {
         match conv.accept().await.unwrap() {
             IncomingGlobal::Request(r) => {
@@ -1310,6 +1310,8 @@ async fn make_channel_conversation() -> (
             StreamWriter = MockWriter,
             Error = std::convert::Infallible,
         >,
+        MockReader,
+        MockWriter,
     >,
     MockReader,
     MockWriter,

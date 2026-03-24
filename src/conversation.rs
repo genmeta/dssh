@@ -65,11 +65,6 @@ use crate::codec::{SshBool, SshString};
 
 use self::global::PoisonOnDrop;
 
-/// Type-erased control stream reader.
-type ControlReader = Pin<Box<dyn AsyncRead + Send>>;
-/// Type-erased control stream writer.
-type ControlWriter = Pin<Box<dyn AsyncWrite + Send>>;
-
 const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
 const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
 const SSH_MSG_REQUEST_FAILURE: VarInt = VarInt::from_u32(82);
@@ -368,37 +363,33 @@ pub mod remoc;
 // Conversation shared state
 // ===========================================================================
 
-struct ConversationShared {
-    reader: OrderedAccess<Pin<Box<dyn AsyncRead + Send>>>,
-    writer: OrderedAccess<Pin<Box<dyn AsyncWrite + Send>>>,
+struct ConversationShared<R, W> {
+    reader: OrderedAccess<R>,
+    writer: OrderedAccess<W>,
     poisoned: AtomicBool,
-    /// Lock to atomically allocate paired (writer, reader) tickets for
-    /// outgoing requests, ensuring send order matches receive order.
     ticket_pair_lock: std::sync::Mutex<()>,
-    /// Writer tickets that should automatically send a failure response.
-    /// Populated when an [`IncomingGlobalRequest`] is dropped after decoding
-    /// but before responding.
     auto_failures: std::sync::Mutex<BTreeSet<u64>>,
 }
 
-impl ConversationShared {
+impl<R, W> ConversationShared<R, W> {
     fn poison(&self) {
         self.poisoned.store(true, Ordering::SeqCst);
         self.reader.notify_waiters();
         self.writer.notify_waiters();
     }
 
-    /// Atomically allocate a writer ticket and a reader ticket, ensuring the
-    /// pairing order is consistent across concurrent callers.
     fn allocate_request_ticket_pair(&self) -> (u64, u64) {
         let _lock = self.ticket_pair_lock.lock().unwrap();
         let write_ticket = self.writer.take_ticket();
         let read_ticket = self.reader.take_ticket();
         (write_ticket, read_ticket)
     }
+}
 
-    /// Drain any consecutive auto-failure responses starting from the current
-    /// writer serving position. Called before a real writer tries to acquire.
+impl<R, W> ConversationShared<R, W>
+where
+    W: AsyncWrite + Unpin + Send,
+{
     async fn drain_auto_failures(&self) -> Result<(), SessionPoisonedError> {
         loop {
             let current = self.writer.current_serving();
@@ -432,7 +423,7 @@ impl ConversationShared {
     async fn acquire_writer(
         &self,
         ticket: u64,
-    ) -> Result<OrderedGuard<Pin<Box<dyn AsyncWrite + Send>>>, SessionPoisonedError> {
+    ) -> Result<OrderedGuard<W>, SessionPoisonedError> {
         loop {
             self.drain_auto_failures().await?;
 
@@ -458,27 +449,31 @@ impl ConversationShared {
 // Conversation
 // ===========================================================================
 
-pub struct Conversation<M: ManageSessionStream> {
+pub struct Conversation<M: ManageSessionStream, R = Pin<Box<dyn AsyncRead + Send>>, W = Pin<Box<dyn AsyncWrite + Send>>> {
     id: StreamId,
     peer_version: String,
-    shared: Arc<ConversationShared>,
+    shared: Arc<ConversationShared<R, W>>,
     _manage_stream: M,
 }
 
-impl<M: ManageSessionStream> Conversation<M> {
+impl<M: ManageSessionStream, R, W> Conversation<M, R, W>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
     pub fn new(
         id: StreamId,
         peer_version: impl Into<String>,
-        control_stream_reader: impl AsyncRead + Unpin + Send + 'static,
-        control_stream_writer: impl AsyncWrite + Unpin + Send + 'static,
+        control_stream_reader: R,
+        control_stream_writer: W,
         manage_stream: M,
     ) -> Self {
         Self {
             id,
             peer_version: peer_version.into(),
             shared: Arc::new(ConversationShared {
-                reader: OrderedAccess::new(Box::pin(control_stream_reader)),
-                writer: OrderedAccess::new(Box::pin(control_stream_writer)),
+                reader: OrderedAccess::new(control_stream_reader),
+                writer: OrderedAccess::new(control_stream_writer),
                 poisoned: AtomicBool::new(false),
                 ticket_pair_lock: std::sync::Mutex::new(()),
                 auto_failures: std::sync::Mutex::new(BTreeSet::new()),
@@ -502,16 +497,16 @@ impl<M: ManageSessionStream> Conversation<M> {
     ///
     /// `PE` and `SE` are the encode/decode error types of the payload and
     /// success response respectively. They are inferred from the trait bounds.
-    pub async fn request<R, PE, SE>(
+    pub async fn request<RQ, PE, SE>(
         &self,
-        request: &R,
-    ) -> Result<R::Success, SendRequestError<PE, SE>>
+        request: &RQ,
+    ) -> Result<RQ::Success, SendRequestError<PE, SE>>
     where
-        R: WantReplyGlobalRequest,
+        RQ: WantReplyGlobalRequest,
         PE: std::error::Error + Send + Sync + 'static,
         SE: std::error::Error + Send + Sync + 'static,
-        for<'w> R::Payload: EncodeInto<&'w mut ControlWriter, Output = (), Error = PE>,
-        for<'r> R::Success: DecodeFrom<&'r mut ControlReader, Error = SE>,
+        for<'w> RQ::Payload: EncodeInto<&'w mut W, Output = (), Error = PE>,
+        for<'r> RQ::Success: DecodeFrom<&'r mut R, Error = SE>,
     {
         use self::global::send_request_error::*;
 
@@ -571,7 +566,7 @@ impl<M: ManageSessionStream> Conversation<M> {
 
             match msg_type {
                 SSH_MSG_REQUEST_SUCCESS => {
-                    let success = R::Success::decode_from(&mut *guard)
+                    let success = RQ::Success::decode_from(&mut *guard)
                         .await
                         .context(DecodeSuccessSnafu)?;
                     Ok(success)
@@ -589,7 +584,7 @@ impl<M: ManageSessionStream> Conversation<M> {
     where
         N: NotifyGlobalRequest,
         PE: std::error::Error + Send + Sync + 'static,
-        for<'w> N::Payload: EncodeInto<&'w mut ControlWriter, Output = (), Error = PE>,
+        for<'w> N::Payload: EncodeInto<&'w mut W, Output = (), Error = PE>,
     {
         use self::global::send_notify_error::*;
 
@@ -638,7 +633,7 @@ impl<M: ManageSessionStream> Conversation<M> {
     /// [`IncomingGlobalRequest::decode_payload`] or
     /// [`IncomingGlobalNotice::decode_payload`]) before the next `accept()`
     /// can proceed.
-    pub async fn accept(&self) -> Result<IncomingGlobal, AcceptError> {
+    pub async fn accept(&self) -> Result<IncomingGlobal<R, W>, AcceptError> {
         use self::global::accept_error::*;
 
         let read_ticket = self.shared.reader.take_ticket();
