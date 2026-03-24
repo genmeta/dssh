@@ -42,11 +42,10 @@
    2. 如果这个crate的代码很多，说明你的实现出现了偏移
 
 # 前置知识（你必须先确认你彻底掌握这些知识，你才可以开始工作）
-- ~/code/reimu/agents.md的代码准则
 - 对rust crate的使用：snafu，remoc，nix，tokio，futures
 - 对SSH3协议和SSH2协议的理解
 - h3x的架构（尤其是protocol体系和codec体系）
 
 # 当前阶段（你可以 也只可以编辑这一部分）
 
-当前由我指导对核心库进行调整优化。我发现了大量write_channel_data， write_channel_extended_data这样的函数，这些函数都不应该存在！更好的形态应该是一个包装类型，然后包装类型具有一些方法。
+实现长期目标

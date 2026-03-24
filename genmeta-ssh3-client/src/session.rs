@@ -4,33 +4,26 @@
 //! pty-req, window-change) and decoding session responses (stdout via
 //! ChannelData, stderr via ChannelExtendedData, exit-status, EOF, Close).
 //!
-//! The client opens a session channel by writing a channel open header on a
-//! QUIC bidi stream using [`write_channel_open`], waits for
-//! [`read_channel_open_response`], then uses [`send_channel_request`] /
-//! [`send_channel_notice`] for channel requests and [`read_channel_event`]
-//! for incoming events.
+//! The client opens a session channel via [`open_session_channel`], then uses
+//! methods on [`SessionChannel`] for requests and event reading.
 
 use std::convert::Infallible;
 
-use bytes::Bytes;
 use genmeta_ssh::{
-    ChannelEvent, ChannelOpenFailure, ChannelOpenResponse, DEFAULT_MAX_MESSAGE_SIZE,
+    AwaitOpenError, ChannelEvent, ChannelOpen, ChannelOpenFailure, DEFAULT_MAX_MESSAGE_SIZE,
     EmptyPayload, ExecChannelRequest, ExecRequest, ExitSignalRequest, ExitStatusRequest,
-    PtyChannelRequest, PtyRequest, ReadChannelEventError,
-    ReadChannelOpenResponseError, SendChannelNoticeError, SendChannelRequestError,
+    PtyChannelRequest, PtyRequest, ReadChannelEventError, SshChannel,
+    SendChannelNoticeError, SendChannelRequestError,
     SessionChannelOpen, ShellChannelRequest, SignalChannelNotice, SignalChannelRequest,
     SignalRequest, WindowChangeChannelNotice, WindowChangeRequest, WriteChannelCloseError,
-    WriteChannelDataError, WriteChannelEofError, WriteChannelOpenError,
-    read_channel_event, read_channel_open_response, send_channel_notice, send_channel_request,
-    write_channel_close, write_channel_data, write_channel_eof, write_channel_open,
+    WriteDataError, WriteChannelEofError,
+    read_channel_open_response,
 };
-use genmeta_ssh::codec::SshBytes;
 use genmeta_ssh::session::SessionCodecError;
-use h3x::codec::{SinkWriter, StreamReader};
-use h3x::stream_id::StreamId;
+use h3x::codec::{EncodeExt, EncodeInto, SinkWriter, StreamReader};
 use h3x::varint::VarInt;
 use snafu::Snafu;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Snafu)]
 pub enum ClientSessionError {
@@ -40,21 +33,20 @@ pub enum ClientSessionError {
     #[snafu(display("invalid conversation_id"))]
     InvalidConversationId { source: std::io::Error },
 
-    #[snafu(display("failed to write channel open header"))]
-    WriteChannelOpen {
-        source: WriteChannelOpenError<Infallible>,
-    },
+    #[snafu(display("failed to encode channel open max_message_size"))]
+    EncodeMaxMessageSize { source: std::io::Error },
+
+    #[snafu(display("failed to encode channel open channel_type"))]
+    EncodeChannelType { source: genmeta_ssh::codec::CodecError },
+
+    #[snafu(display("failed to flush channel open"))]
+    FlushChannelOpen { source: std::io::Error },
 
     #[snafu(display("failed to read channel open response"))]
-    ReadChannelOpenResponse {
-        source: ReadChannelOpenResponseError,
-    },
+    AwaitOpen { source: AwaitOpenError },
 
     #[snafu(display("session channel was rejected"))]
     ChannelOpenRejected { failure: ChannelOpenFailure },
-
-    #[snafu(display("unexpected channel open response message type {message_type}"))]
-    UnexpectedOpenResponse { message_type: VarInt },
 
     #[snafu(display("failed to send exec request"))]
     SendExecRequest {
@@ -87,7 +79,7 @@ pub enum ClientSessionError {
     },
 
     #[snafu(display("failed to write channel data"))]
-    WriteData { source: WriteChannelDataError },
+    WriteData { source: WriteDataError },
 
     #[snafu(display("failed to write channel EOF"))]
     WriteEof { source: WriteChannelEofError },
@@ -104,6 +96,9 @@ pub enum ClientSessionError {
     #[snafu(display("failed to decode exit-signal payload"))]
     DecodeExitSignal { source: SessionCodecError },
 
+    #[snafu(display("failed to read channel data"))]
+    ReadData { source: std::io::Error },
+
     #[snafu(display("channel request was rejected by remote"))]
     RequestRejected,
 
@@ -116,9 +111,7 @@ pub enum ClientSessionError {
 
 #[derive(Debug)]
 pub struct SessionChannel<R, W> {
-    reader: R,
-    writer: W,
-    max_message_size: VarInt,
+    channel: SshChannel<R, W>,
 }
 
 pub type ClientChannelReader<R> = StreamReader<R>;
@@ -129,16 +122,12 @@ where
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
 {
-    pub fn max_message_size(&self) -> VarInt {
-        self.max_message_size
+    pub fn reader_mut(&mut self) -> &mut R {
+        self.channel.reader_mut()
     }
 
-    pub fn reader(&mut self) -> &mut R {
-        &mut self.reader
-    }
-
-    pub fn writer(&mut self) -> &mut W {
-        &mut self.writer
+    pub fn writer_mut(&mut self) -> &mut W {
+        self.channel.writer_mut()
     }
 
     pub async fn send_exec_request(
@@ -150,7 +139,8 @@ where
                 command: command.to_vec().into(),
             },
         };
-        send_channel_request(&mut self.reader, &mut self.writer, &req)
+        self.channel
+            .request(&req)
             .await
             .map(|_: EmptyPayload| ())
             .map_err(|e| match e {
@@ -161,7 +151,8 @@ where
 
     pub async fn send_shell_request(&mut self) -> Result<(), ClientSessionError> {
         let req = ShellChannelRequest;
-        send_channel_request(&mut self.reader, &mut self.writer, &req)
+        self.channel
+            .request(&req)
             .await
             .map(|_: EmptyPayload| ())
             .map_err(|e| match e {
@@ -190,7 +181,8 @@ where
                 terminal_modes: terminal_modes.to_vec().into(),
             },
         };
-        send_channel_request(&mut self.reader, &mut self.writer, &req)
+        self.channel
+            .request(&req)
             .await
             .map(|_: EmptyPayload| ())
             .map_err(|e| match e {
@@ -214,7 +206,8 @@ where
                 height_px: height_px.into(),
             },
         };
-        send_channel_notice(&mut self.writer, &req)
+        self.channel
+            .notice(&req)
             .await
             .map_err(|e| ClientSessionError::SendWindowChange { source: e })
     }
@@ -230,7 +223,8 @@ where
                     signal_name: signal_name.to_owned().into(),
                 },
             };
-            send_channel_request(&mut self.reader, &mut self.writer, &req)
+            self.channel
+                .request(&req)
                 .await
                 .map(|_: EmptyPayload| ())
                 .map_err(|e| match e {
@@ -243,26 +237,30 @@ where
                     signal_name: signal_name.to_owned().into(),
                 },
             };
-            send_channel_notice(&mut self.writer, &req)
+            self.channel
+                .notice(&req)
                 .await
                 .map_err(|e| ClientSessionError::SendSignalNotice { source: e })
         }
     }
 
     pub async fn send_stdin(&mut self, data: &[u8]) -> Result<(), ClientSessionError> {
-        write_channel_data(&mut self.writer, SshBytes::from(data.to_vec()))
+        self.channel
+            .data(data)
             .await
             .map_err(|e| ClientSessionError::WriteData { source: e })
     }
 
     pub async fn send_eof(&mut self) -> Result<(), ClientSessionError> {
-        write_channel_eof(&mut self.writer)
+        self.channel
+            .eof()
             .await
             .map_err(|e| ClientSessionError::WriteEof { source: e })
     }
 
     pub async fn send_close(&mut self) -> Result<(), ClientSessionError> {
-        write_channel_close(&mut self.writer)
+        self.channel
+            .close()
             .await
             .map_err(|e| ClientSessionError::WriteClose { source: e })
     }
@@ -272,7 +270,7 @@ where
     /// Returns `None` on EOF (stream closed).
     pub async fn recv_event(&mut self) -> Result<Option<SessionEvent>, ClientSessionError> {
         loop {
-            let event = match read_channel_event(&mut self.reader).await {
+            let event = match self.channel.next_event().await {
                 Ok(event) => event,
                 Err(ReadChannelEventError::DecodeMessageType { source })
                     if source.kind() == std::io::ErrorKind::UnexpectedEof =>
@@ -288,45 +286,54 @@ where
     }
 
     pub fn into_parts(self) -> (R, W) {
-        (self.reader, self.writer)
+        self.channel.into_parts()
     }
 }
 
+/// Open a session channel on the given stream pair.
+///
+/// Writes the channel open header (max_message_size, channel_type, payload)
+/// and reads the confirmation/failure response.
 pub async fn open_session_channel<R, W>(
     mut reader: R,
     mut writer: W,
-    conversation_id: u64,
+    _conversation_id: u64,
 ) -> Result<SessionChannel<R, W>, ClientSessionError>
 where
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
 {
-    let session_id = StreamId::try_from(conversation_id)
-        .map_err(std::io::Error::other)
-        .map_err(|source| ClientSessionError::InvalidConversationId { source })?;
+    let open = SessionChannelOpen;
 
-    write_channel_open(
-        &mut writer,
-        session_id,
-        DEFAULT_MAX_MESSAGE_SIZE,
-        &SessionChannelOpen,
-    )
-    .await
-    .map_err(|source| ClientSessionError::WriteChannelOpen { source })?;
+    // Encode channel open: max_message_size, channel_type, payload
+    writer
+        .encode_one(DEFAULT_MAX_MESSAGE_SIZE)
+        .await
+        .map_err(|e| ClientSessionError::EncodeMaxMessageSize { source: e })?;
+    writer
+        .encode_one(open.channel_type())
+        .await
+        .map_err(|e| ClientSessionError::EncodeChannelType { source: e })?;
+    // SessionChannelOpen has no payload fields, but encode it for consistency
+    open.payload()
+        .clone()
+        .encode_into(&mut writer)
+        .await
+        .map_err(|e: Infallible| match e {})?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| ClientSessionError::FlushChannelOpen { source: e })?;
 
+    // Read confirmation or failure
     match read_channel_open_response(&mut reader).await {
-        Ok(ChannelOpenResponse::Confirmation { max_message_size }) => Ok(SessionChannel {
-            reader,
-            writer,
-            max_message_size,
+        Ok(()) => Ok(SessionChannel {
+            channel: SshChannel::new(reader, writer),
         }),
-        Ok(ChannelOpenResponse::Failure(failure)) => {
+        Err(AwaitOpenError::Rejected { failure }) => {
             Err(ClientSessionError::ChannelOpenRejected { failure })
         }
-        Err(ReadChannelOpenResponseError::UnexpectedMessageType { message_type }) => {
-            Err(ClientSessionError::UnexpectedOpenResponse { message_type })
-        }
-        Err(source) => Err(ClientSessionError::ReadChannelOpenResponse { source }),
+        Err(source) => Err(ClientSessionError::AwaitOpen { source }),
     }
 }
 
@@ -368,19 +375,28 @@ pub enum SessionEvent {
 ///
 /// Returns `None` for events not relevant to session handling (e.g., unknown
 /// channel request types).
-async fn channel_event_to_session_event<'r, R>(
-    event: ChannelEvent<'r, R>,
+async fn channel_event_to_session_event<'c, R, W>(
+    event: ChannelEvent<'c, R, W>,
 ) -> Result<Option<SessionEvent>, ClientSessionError>
 where
     R: AsyncRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin,
 {
     match event {
-        ChannelEvent::Data(data) => {
-            Ok(Some(SessionEvent::Stdout(Bytes::from(data).to_vec())))
+        ChannelEvent::Data(mut data) => {
+            let bytes = data
+                .read_all()
+                .await
+                .map_err(|e| ClientSessionError::ReadData { source: e })?;
+            Ok(Some(SessionEvent::Stdout(bytes)))
         }
-        ChannelEvent::ExtendedData { data_type, data } => {
+        ChannelEvent::ExtendedData { data_type, mut data } => {
+            let bytes = data
+                .read_all()
+                .await
+                .map_err(|e| ClientSessionError::ReadData { source: e })?;
             if data_type == VarInt::from(1u8) {
-                Ok(Some(SessionEvent::Stderr(Bytes::from(data).to_vec())))
+                Ok(Some(SessionEvent::Stderr(bytes)))
             } else {
                 tracing::warn!(%data_type, "ignoring unknown extended data type");
                 Ok(None)
@@ -430,21 +446,18 @@ where
     }
 }
 
-/// Read a single session event from a reader-only stream.
-///
-/// This is useful when the reader and writer have been split (e.g., for
-/// concurrent stdin writing and stdout reading). Unlike
-/// [`SessionChannel::recv_event`], this only requires the reader half.
+/// Read a single session event from a `SshChannel`.
 ///
 /// Returns `None` on EOF.
-pub async fn read_session_event<R>(
-    reader: &mut R,
+pub async fn read_session_event<R, W>(
+    channel: &mut SshChannel<R, W>,
 ) -> Result<Option<SessionEvent>, ClientSessionError>
 where
     R: AsyncRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin,
 {
     loop {
-        let event = match read_channel_event(reader).await {
+        let event = match channel.next_event().await {
             Ok(event) => event,
             Err(ReadChannelEventError::DecodeMessageType { source })
                 if source.kind() == std::io::ErrorKind::UnexpectedEof =>

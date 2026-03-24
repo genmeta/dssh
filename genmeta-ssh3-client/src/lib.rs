@@ -18,7 +18,7 @@ use h3x::quic::GetStreamIdExt;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::Empty;
 use snafu::{ResultExt, Snafu};
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The well-known path for SSH3 Extended CONNECT requests.
 pub const SSH3_CONNECT_PATH: &str = "/.well-known/ssh3/connect";
@@ -50,7 +50,7 @@ pub async fn run_env_client() -> Result<(), Box<dyn std::error::Error>> {
             .open_exec_channel(command.as_bytes())
             .await?;
         channel.send_eof().await?;
-        let exit = print_session_events(channel.reader()).await?;
+        let exit = print_session_events_from_channel(&mut channel).await?;
         if let Some(code) = exit {
             std::process::exit(code as i32);
         }
@@ -94,28 +94,29 @@ async fn run_env_shell(
         .await?;
     channel.send_shell_request().await?;
 
-    let (mut reader, mut writer) = channel.into_parts();
+    let (reader, writer) = channel.into_parts();
+    let mut write_ch = genmeta_ssh::SshChannel::new(tokio::io::empty(), writer);
     let stdin_task = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = vec![0u8; 8192];
         loop {
             let read = stdin.read(&mut buf).await?;
             if read == 0 {
-                genmeta_ssh::write_channel_eof(&mut writer)
+                write_ch
+                    .eof()
                     .await
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 return Ok::<(), io::Error>(());
             }
-            genmeta_ssh::write_channel_data(
-                &mut writer,
-                genmeta_ssh::codec::SshBytes::from(buf[..read].to_vec()),
-            )
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            write_ch
+                .data(&buf[..read])
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
         }
     });
 
-    let exit = print_session_events(&mut reader).await?;
+    let mut read_ch = genmeta_ssh::SshChannel::new(reader, tokio::io::sink());
+    let exit = print_session_events(&mut read_ch).await?;
     stdin_task.abort();
     let _ = stdin_task.await;
 
@@ -125,15 +126,47 @@ async fn run_env_shell(
     Ok(())
 }
 
-async fn print_session_events<R>(reader: &mut R) -> Result<Option<u32>, Box<dyn std::error::Error>>
+async fn print_session_events<R, W>(
+    channel: &mut genmeta_ssh::SshChannel<R, W>,
+) -> Result<Option<u32>, Box<dyn std::error::Error>>
 where
     R: AsyncRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin,
 {
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     let mut exit_status = None;
 
-    while let Some(event) = session::read_session_event(reader).await? {
+    while let Some(event) = session::read_session_event(channel).await? {
+        match event {
+            session::SessionEvent::Stdout(data) => stdout.write_all(&data).await?,
+            session::SessionEvent::Stderr(data) => stderr.write_all(&data).await?,
+            session::SessionEvent::ExitStatus(code) => exit_status = Some(code),
+            session::SessionEvent::ExitSignal { .. } => exit_status = Some(255),
+            session::SessionEvent::Close => break,
+            session::SessionEvent::Eof
+            | session::SessionEvent::Success
+            | session::SessionEvent::Failure => {}
+        }
+    }
+
+    stdout.flush().await?;
+    stderr.flush().await?;
+    Ok(exit_status)
+}
+
+async fn print_session_events_from_channel<R, W>(
+    channel: &mut session::SessionChannel<R, W>,
+) -> Result<Option<u32>, Box<dyn std::error::Error>>
+where
+    R: AsyncRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin,
+{
+    let mut stdout = tokio::io::stdout();
+    let mut stderr = tokio::io::stderr();
+    let mut exit_status = None;
+
+    while let Some(event) = channel.recv_event().await? {
         match event {
             session::SessionEvent::Stdout(data) => stdout.write_all(&data).await?,
             session::SessionEvent::Stderr(data) => stderr.write_all(&data).await?,

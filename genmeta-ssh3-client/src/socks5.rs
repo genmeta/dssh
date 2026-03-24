@@ -16,10 +16,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use genmeta_ssh::{
-    ChannelOpenResponse, DEFAULT_MAX_MESSAGE_SIZE, DirectTcpipChannelOpen, DirectTcpipRequest,
-    read_channel_open_response, write_channel_open,
+    AwaitOpenError, ChannelOpen, DEFAULT_MAX_MESSAGE_SIZE, DirectTcpipChannelOpen,
+    DirectTcpipRequest, read_channel_open_response,
 };
-use h3x::stream_id::StreamId;
+use h3x::codec::{EncodeExt, EncodeInto};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -129,7 +129,7 @@ pub async fn handle_socks5_client<R, W, S>(
     mut reader: R,
     mut writer: W,
     stream_factory: Arc<Mutex<S>>,
-    conversation_id: u64,
+    _conversation_id: u64,
 ) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -231,7 +231,6 @@ where
     };
 
     // Write the direct-tcpip channel open header.
-    let session_id = StreamId::try_from(conversation_id).map_err(io::Error::other)?;
     let channel = DirectTcpipChannelOpen {
         payload: DirectTcpipRequest {
             dest_host: dest_addr.clone().into(),
@@ -240,21 +239,26 @@ where
             originator_port: 0u32.into(),
         },
     };
-    write_channel_open(
-        &mut ch_writer,
-        session_id,
-        DEFAULT_MAX_MESSAGE_SIZE,
-        &channel,
-    )
-    .await
-    .map_err(|e| io::Error::other(e.to_string()))?;
+    // Encode: max_message_size, channel_type, payload
+    ch_writer
+        .encode_one(DEFAULT_MAX_MESSAGE_SIZE)
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    ch_writer
+        .encode_one(channel.channel_type())
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    channel
+        .payload()
+        .clone()
+        .encode_into(&mut ch_writer)
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    ch_writer.flush().await?;
 
     // Read the server's response: ChannelOpenConfirmation or ChannelOpenFailure.
-    match read_channel_open_response(&mut ch_reader)
-        .await
-        .map_err(|e| io::Error::other(e.to_string()))?
-    {
-        ChannelOpenResponse::Confirmation { .. } => {
+    match read_channel_open_response(&mut ch_reader).await {
+        Ok(()) => {
             // Success — send SOCKS5 success reply.
             send_reply(
                 &mut writer,
@@ -265,7 +269,7 @@ where
             )
             .await?;
         }
-        ChannelOpenResponse::Failure(_) => {
+        Err(AwaitOpenError::Rejected { .. }) => {
             // Failure — send SOCKS5 connection refused reply.
             send_reply(
                 &mut writer,
@@ -277,6 +281,9 @@ where
             .await?;
             writer.shutdown().await?;
             return Ok(());
+        }
+        Err(e) => {
+            return Err(io::Error::other(e.to_string()));
         }
     }
 
