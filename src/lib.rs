@@ -37,11 +37,10 @@ pub use conversation::{
 pub use error::{Ssh3Error, ssh3_error};
 pub use forward::{
     CancelStreamlocalForwardGlobalRequest, CancelStreamlocalForwardRequest,
-    CancelTcpipForwardGlobalRequest, CancelTcpipForwardRequest, DirectStreamlocalChannelOpen,
-    DirectStreamlocalRequest, DirectTcpipChannelOpen, DirectTcpipRequest,
-    ForwardedStreamlocalChannelOpen, ForwardedStreamlocalRequest, ForwardedTcpipChannelOpen,
-    ForwardedTcpipRequest, SessionChannelOpen, Socks5ChannelOpen, StreamlocalForwardGlobalRequest,
-    StreamlocalForwardRequest, TcpipForwardGlobalRequest, TcpipForwardReply, TcpipForwardRequest,
+    CancelTcpipForwardGlobalRequest, CancelTcpipForwardRequest, DirectStreamlocal,
+    DirectTcpip, ForwardedStreamlocal, ForwardedTcpip, SessionChannelOpen, Socks5ChannelOpen,
+    StreamlocalForwardGlobalRequest, StreamlocalForwardRequest, TcpipForwardGlobalRequest,
+    TcpipForwardReply, TcpipForwardRequest,
     direct::{self, DirectForwardError, handle_direct_streamlocal, handle_direct_tcpip},
     relay,
     reverse::{self, ForwardHandle, ReverseForwardError},

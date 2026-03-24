@@ -11,8 +11,7 @@ use crate::{
     constants::DEFAULT_MAX_MESSAGE_SIZE,
     conversation::{Conversation, ManageSessionStream},
     forward::{
-        ForwardedStreamlocalChannelOpen, ForwardedStreamlocalRequest, ForwardedTcpipChannelOpen,
-        ForwardedTcpipRequest,
+        ForwardedStreamlocal, ForwardedTcpip,
     },
     forward::relay,
 };
@@ -155,13 +154,11 @@ async fn tcp_accept_loop<M>(
 
         tokio::spawn(
             async move {
-                let channel_open = ForwardedTcpipChannelOpen {
-                    payload: ForwardedTcpipRequest {
-                        connected_address: connected_addr.into(),
-                        connected_port: (connected_port as u32).into(),
-                        originator_address: originator_addr.into(),
-                        originator_port: (originator_port as u32).into(),
-                    },
+                let channel_open = ForwardedTcpip {
+                    connected_address: connected_addr.into(),
+                    connected_port: (connected_port as u32).into(),
+                    originator_address: originator_addr.into(),
+                    originator_port: (originator_port as u32).into(),
                 };
                 let (reader, writer) = match conversation
                     .open_channel(&channel_open, DEFAULT_MAX_MESSAGE_SIZE)
@@ -219,10 +216,8 @@ async fn unix_accept_loop<M>(
 
         tokio::spawn(
             async move {
-                let channel_open = ForwardedStreamlocalChannelOpen {
-                    payload: ForwardedStreamlocalRequest {
-                        socket_path: path.into(),
-                    },
+                let channel_open = ForwardedStreamlocal {
+                    socket_path: path.into(),
                 };
                 let (reader, writer) = match conversation
                     .open_channel(&channel_open, DEFAULT_MAX_MESSAGE_SIZE)

@@ -262,21 +262,17 @@ pub trait NotifyGlobalRequest {
 
 /// A channel type that can be opened.
 ///
-/// Implementors define the channel-type-specific payload. The channel type
-/// name (e.g. `"session"`, `"direct-tcpip"`) is returned by
-/// [`channel_type`](Self::channel_type) and written as an SSH string in the
-/// channel header. Encode/decode bounds on `Payload` are checked at the
-/// call site against the concrete stream types.
-pub trait ChannelOpen {
-    /// Channel-type-specific payload (e.g. `DirectTcpipRequest` for
-    /// `"direct-tcpip"`). Types without extra payload can use `()`.
-    type Payload: Clone;
-
+/// A type that represents an SSH channel open message.
+///
+/// Each implementor provides the channel type name (e.g. `"session"`,
+/// `"direct-tcpip"`) and is itself the payload — implementing
+/// [`EncodeInto`]/[`DecodeFrom`] for wire serialisation.
+///
+/// Types without extra payload (e.g. [`SessionChannelOpen`]) should
+/// implement `EncodeInto` as a no-op.
+pub trait ChannelOpen: Clone {
     /// The SSH channel type name.
     fn channel_type(&self) -> SshString;
-
-    /// Reference to the channel-type-specific payload.
-    fn payload(&self) -> &Self::Payload;
 }
 
 // ===========================================================================
@@ -720,7 +716,7 @@ impl<M: ManageSessionStream> Conversation<M> {
     where
         C: ChannelOpen,
         PE: std::error::Error + Send + Sync + 'static,
-        for<'w> C::Payload: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = PE>,
+        for<'w> C: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = PE>,
     {
         use self::channel::open_channel_error::*;
 
@@ -739,7 +735,6 @@ impl<M: ManageSessionStream> Conversation<M> {
             .await
             .context(EncodeChannelTypeSnafu)?;
         channel
-            .payload()
             .clone()
             .encode_into(&mut writer)
             .await

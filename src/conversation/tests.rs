@@ -1355,55 +1355,42 @@ async fn make_channel_conversation() -> (
 // -- Test ChannelOpen implementation ------------------------------------
 
 /// A test channel type: "test-channel" with SshString payload.
+#[derive(Clone)]
 struct TestChannel {
     payload: TestPayload,
 }
 
 impl ChannelOpen for TestChannel {
-    type Payload = TestPayload;
-
     fn channel_type(&self) -> SshString {
         SshString::from_static("test-channel")
     }
+}
 
-    fn payload(&self) -> &Self::Payload {
-        &self.payload
+impl<S: AsyncWrite + Send> EncodeInto<S> for TestChannel {
+    type Output = ();
+    type Error = crate::codec::CodecError;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        self.payload.encode_into(stream).await
     }
 }
 
 /// A session channel with no extra payload.
+#[derive(Clone)]
 struct SessionChannel;
 
-/// Empty payload that encodes nothing.
-#[derive(Clone)]
-struct EmptyChannelPayload;
+impl ChannelOpen for SessionChannel {
+    fn channel_type(&self) -> SshString {
+        SshString::from_static("session")
+    }
+}
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for EmptyChannelPayload {
+impl<S: AsyncWrite + Send> EncodeInto<S> for SessionChannel {
     type Output = ();
     type Error = std::io::Error;
 
     async fn encode_into(self, _stream: S) -> Result<(), Self::Error> {
         Ok(())
-    }
-}
-
-impl<S: AsyncRead + Send> DecodeFrom<S> for EmptyChannelPayload {
-    type Error = std::io::Error;
-
-    async fn decode_from(_stream: S) -> Result<Self, Self::Error> {
-        Ok(EmptyChannelPayload)
-    }
-}
-
-impl ChannelOpen for SessionChannel {
-    type Payload = EmptyChannelPayload;
-
-    fn channel_type(&self) -> SshString {
-        SshString::from_static("session")
-    }
-
-    fn payload(&self) -> &Self::Payload {
-        &EmptyChannelPayload
     }
 }
 
@@ -1909,7 +1896,7 @@ async fn read_channel_event_request_decode_and_respond_success() {
 
     // 发送 success 响应（空 payload）
     responder
-        .respond_success(EmptyChannelPayload)
+        .respond_success(EmptyPayload)
         .await
         .unwrap();
 

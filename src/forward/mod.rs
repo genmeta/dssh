@@ -42,14 +42,14 @@ pub struct TcpipForwardRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct DirectTcpipRequest {
+pub struct DirectTcpip {
     pub dest_host: SshString,
     pub dest_port: VarInt,
     pub originator_host: SshString,
     pub originator_port: VarInt,
 }
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for DirectTcpipRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for DirectTcpip {
     type Output = ();
     type Error = ForwardError;
 
@@ -75,7 +75,7 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for DirectTcpipRequest {
     }
 }
 
-impl<S: AsyncRead + Send> DecodeFrom<S> for DirectTcpipRequest {
+impl<S: AsyncRead + Send> DecodeFrom<S> for DirectTcpip {
     type Error = ForwardError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
@@ -213,14 +213,14 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for TcpipForwardReply {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ForwardedTcpipRequest {
+pub struct ForwardedTcpip {
     pub connected_address: SshString,
     pub connected_port: VarInt,
     pub originator_address: SshString,
     pub originator_port: VarInt,
 }
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for ForwardedTcpipRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for ForwardedTcpip {
     type Output = ();
     type Error = ForwardError;
 
@@ -246,7 +246,7 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for ForwardedTcpipRequest {
     }
 }
 
-impl<S: AsyncRead + Send> DecodeFrom<S> for ForwardedTcpipRequest {
+impl<S: AsyncRead + Send> DecodeFrom<S> for ForwardedTcpip {
     type Error = ForwardError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
@@ -339,11 +339,11 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for CancelStreamlocalForwardRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ForwardedStreamlocalRequest {
+pub struct ForwardedStreamlocal {
     pub socket_path: SshString,
 }
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for ForwardedStreamlocalRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for ForwardedStreamlocal {
     type Output = ();
     type Error = ForwardError;
 
@@ -361,7 +361,7 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for ForwardedStreamlocalRequest {
     }
 }
 
-impl<S: AsyncRead + Send> DecodeFrom<S> for ForwardedStreamlocalRequest {
+impl<S: AsyncRead + Send> DecodeFrom<S> for ForwardedStreamlocal {
     type Error = ForwardError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
@@ -379,18 +379,18 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ForwardedStreamlocalRequest {
 }
 
 // ===========================================================================
-// DirectStreamlocalRequest — channel open payload for direct-streamlocal
+// DirectStreamlocal — channel open payload for direct-streamlocal
 // ===========================================================================
 
 /// Channel open payload for `"direct-streamlocal@openssh.com"`.
 ///
 /// Wire format: `socket_path(SshString) + reserved(SshString, empty) + reserved(VarInt, 0)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirectStreamlocalRequest {
+pub struct DirectStreamlocal {
     pub socket_path: SshString,
 }
 
-impl<S: AsyncWrite + Send> EncodeInto<S> for DirectStreamlocalRequest {
+impl<S: AsyncWrite + Send> EncodeInto<S> for DirectStreamlocal {
     type Output = ();
     type Error = ForwardError;
 
@@ -412,7 +412,7 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for DirectStreamlocalRequest {
     }
 }
 
-impl<S: AsyncRead + Send> DecodeFrom<S> for DirectStreamlocalRequest {
+impl<S: AsyncRead + Send> DecodeFrom<S> for DirectStreamlocal {
     type Error = ForwardError;
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
@@ -442,86 +442,41 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for DirectStreamlocalRequest {
 pub struct SessionChannelOpen;
 
 impl ChannelOpen for SessionChannelOpen {
-    type Payload = EmptyPayload;
-
     fn channel_type(&self) -> SshString {
         SshString::from_static("session")
     }
+}
 
-    fn payload(&self) -> &Self::Payload {
-        &EmptyPayload
+impl<S: AsyncWrite + Send> EncodeInto<S> for SessionChannelOpen {
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    async fn encode_into(self, _stream: S) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 
-/// Channel open for `"direct-tcpip"`.
-#[derive(Debug, Clone)]
-pub struct DirectTcpipChannelOpen {
-    pub payload: DirectTcpipRequest,
-}
-
-impl ChannelOpen for DirectTcpipChannelOpen {
-    type Payload = DirectTcpipRequest;
-
+impl ChannelOpen for DirectTcpip {
     fn channel_type(&self) -> SshString {
         SshString::from_static("direct-tcpip")
     }
-
-    fn payload(&self) -> &Self::Payload {
-        &self.payload
-    }
 }
 
-/// Channel open for `"forwarded-tcpip"`.
-#[derive(Debug, Clone)]
-pub struct ForwardedTcpipChannelOpen {
-    pub payload: ForwardedTcpipRequest,
-}
-
-impl ChannelOpen for ForwardedTcpipChannelOpen {
-    type Payload = ForwardedTcpipRequest;
-
+impl ChannelOpen for ForwardedTcpip {
     fn channel_type(&self) -> SshString {
         SshString::from_static("forwarded-tcpip")
     }
-
-    fn payload(&self) -> &Self::Payload {
-        &self.payload
-    }
 }
 
-/// Channel open for `"direct-streamlocal@openssh.com"`.
-#[derive(Debug, Clone)]
-pub struct DirectStreamlocalChannelOpen {
-    pub payload: DirectStreamlocalRequest,
-}
-
-impl ChannelOpen for DirectStreamlocalChannelOpen {
-    type Payload = DirectStreamlocalRequest;
-
+impl ChannelOpen for DirectStreamlocal {
     fn channel_type(&self) -> SshString {
         SshString::from_static("direct-streamlocal@openssh.com")
     }
-
-    fn payload(&self) -> &Self::Payload {
-        &self.payload
-    }
 }
 
-/// Channel open for `"forwarded-streamlocal@openssh.com"`.
-#[derive(Debug, Clone)]
-pub struct ForwardedStreamlocalChannelOpen {
-    pub payload: ForwardedStreamlocalRequest,
-}
-
-impl ChannelOpen for ForwardedStreamlocalChannelOpen {
-    type Payload = ForwardedStreamlocalRequest;
-
+impl ChannelOpen for ForwardedStreamlocal {
     fn channel_type(&self) -> SshString {
         SshString::from_static("forwarded-streamlocal@openssh.com")
-    }
-
-    fn payload(&self) -> &Self::Payload {
-        &self.payload
     }
 }
 
@@ -530,14 +485,17 @@ impl ChannelOpen for ForwardedStreamlocalChannelOpen {
 pub struct Socks5ChannelOpen;
 
 impl ChannelOpen for Socks5ChannelOpen {
-    type Payload = EmptyPayload;
-
     fn channel_type(&self) -> SshString {
         SshString::from_static("socks5")
     }
+}
 
-    fn payload(&self) -> &Self::Payload {
-        &EmptyPayload
+impl<S: AsyncWrite + Send> EncodeInto<S> for Socks5ChannelOpen {
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    async fn encode_into(self, _stream: S) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 
