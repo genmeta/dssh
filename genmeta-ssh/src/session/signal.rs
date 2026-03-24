@@ -83,8 +83,8 @@ mod tests {
     #[test]
     fn rfc4254_signals_all_mapped() {
         let rfc_signals = [
-            "ABRT", "ALRM", "FPE", "HUP", "ILL", "INT", "KILL", "PIPE",
-            "QUIT", "SEGV", "TERM", "USR1", "USR2",
+            "ABRT", "ALRM", "FPE", "HUP", "ILL", "INT", "KILL", "PIPE", "QUIT", "SEGV", "TERM",
+            "USR1", "USR2",
         ];
         for name in rfc_signals {
             assert!(

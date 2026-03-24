@@ -15,8 +15,8 @@ use crate::{
     constants::DEFAULT_MAX_MESSAGE_SIZE,
     conversation::{Conversation, ManageSessionStream},
     forward::{
-        ForwardedStreamlocalChannelOpen, ForwardedStreamlocalRequest,
-        ForwardedTcpipChannelOpen, ForwardedTcpipRequest,
+        ForwardedStreamlocalChannelOpen, ForwardedStreamlocalRequest, ForwardedTcpipChannelOpen,
+        ForwardedTcpipRequest,
     },
     forward_runtime::relay,
 };
@@ -98,16 +98,13 @@ where
         bind_addr: &str,
         bind_port: u16,
     ) -> Result<u16, ReverseForwardError> {
-        let listener = TcpListener::bind((bind_addr, bind_port))
-            .await
-            .context(reverse_forward_error::TcpBindSnafu {
+        let listener = TcpListener::bind((bind_addr, bind_port)).await.context(
+            reverse_forward_error::TcpBindSnafu {
                 addr: bind_addr,
                 port: bind_port,
-            })?;
-        let actual_port = listener
-            .local_addr()
-            .map(|a| a.port())
-            .unwrap_or(bind_port);
+            },
+        )?;
+        let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(bind_port);
 
         let conversation = Arc::clone(&self.conversation);
         let bind_addr_owned = bind_addr.to_owned();
@@ -119,10 +116,10 @@ where
             .in_current_span(),
         );
 
-        if let Some(old) = self
-            .tcp_listeners
-            .insert((bind_addr.to_owned(), actual_port), ListenerHandle { handle })
-        {
+        if let Some(old) = self.tcp_listeners.insert(
+            (bind_addr.to_owned(), actual_port),
+            ListenerHandle { handle },
+        ) {
             old.abort_and_forget();
         }
 
@@ -341,11 +338,11 @@ async fn unix_accept_loop<M>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::io::{duplex, DuplexStream};
-    use tokio::sync::Mutex as AsyncMutex;
     use h3x::stream_id::StreamId;
     use h3x::varint::VarInt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{DuplexStream, duplex};
+    use tokio::sync::Mutex as AsyncMutex;
 
     // -- Mock ManageSessionStream using DuplexStream pairs ------------------
 
@@ -376,22 +373,16 @@ mod tests {
         type StreamWriter = DuplexStream;
         type Error = std::io::Error;
 
-        async fn open_stream(
-            &self,
-        ) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
+        async fn open_stream(&self) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
             self.open_called.store(true, Ordering::SeqCst);
             self.pairs
                 .lock()
                 .await
                 .pop()
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "no pairs enqueued")
-                })
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no pairs enqueued"))
         }
 
-        async fn accept_stream(
-            &self,
-        ) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
+        async fn accept_stream(&self) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
             // Not used in reverse forwarder; pend forever.
             std::future::pending().await
         }
@@ -407,15 +398,11 @@ mod tests {
         type StreamWriter = DuplexStream;
         type Error = std::io::Error;
 
-        async fn open_stream(
-            &self,
-        ) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
+        async fn open_stream(&self) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
             self.0.open_stream().await
         }
 
-        async fn accept_stream(
-            &self,
-        ) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
+        async fn accept_stream(&self) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
             self.0.accept_stream().await
         }
     }
@@ -423,9 +410,7 @@ mod tests {
     /// Create a Conversation backed by `ArcMock`, returning both the
     /// `Arc<Conversation>` and the shared mock state for the test to
     /// enqueue stream pairs.
-    fn make_forwarder_conversation(
-        mock: Arc<MockStreamState>,
-    ) -> Arc<Conversation<ArcMock>> {
+    fn make_forwarder_conversation(mock: Arc<MockStreamState>) -> Arc<Conversation<ArcMock>> {
         Arc::new(Conversation::new(
             StreamId(VarInt::from_u32(1)),
             "test",
@@ -447,7 +432,10 @@ mod tests {
         assert_ne!(port, 0, "should get a real port");
 
         assert!(forwarder.stop_tcp("127.0.0.1", port));
-        assert!(!forwarder.stop_tcp("127.0.0.1", port), "double stop returns false");
+        assert!(
+            !forwarder.stop_tcp("127.0.0.1", port),
+            "double stop returns false"
+        );
     }
 
     #[tokio::test]
@@ -519,10 +507,7 @@ mod tests {
         assert!(sock_path.exists(), "socket file should exist");
 
         assert!(forwarder.stop_unix(sock_str));
-        assert!(
-            !sock_path.exists(),
-            "socket file should be cleaned up"
-        );
+        assert!(!sock_path.exists(), "socket file should be cleaned up");
     }
 
     #[tokio::test]

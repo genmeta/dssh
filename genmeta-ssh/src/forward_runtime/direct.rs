@@ -14,13 +14,12 @@
 use crate::{
     channel::reason_code,
     codec::SshString,
-    conversation::{PendingChannel, WriteChannelOpenConfirmationError, WriteChannelOpenFailureError},
+    conversation::{
+        PendingChannel, WriteChannelOpenConfirmationError, WriteChannelOpenFailureError,
+    },
     forward_runtime::relay,
 };
-use h3x::{
-    codec::DecodeExt,
-    varint::VarInt,
-};
+use h3x::{codec::DecodeExt, varint::VarInt};
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
@@ -38,16 +37,26 @@ pub enum DirectForwardError {
     PortOverflow { raw_port: u64 },
 
     #[snafu(display("failed to send channel open confirmation"))]
-    Accept { source: WriteChannelOpenConfirmationError },
+    Accept {
+        source: WriteChannelOpenConfirmationError,
+    },
 
     #[snafu(display("failed to send channel open failure"))]
-    Reject { source: WriteChannelOpenFailureError },
+    Reject {
+        source: WriteChannelOpenFailureError,
+    },
 
     #[snafu(display("TCP connect to {addr} failed"))]
-    TcpConnect { addr: String, source: std::io::Error },
+    TcpConnect {
+        addr: String,
+        source: std::io::Error,
+    },
 
     #[snafu(display("Unix socket connect to {path} failed"))]
-    UnixConnect { path: String, source: std::io::Error },
+    UnixConnect {
+        path: String,
+        source: std::io::Error,
+    },
 
     #[snafu(display("relay I/O failed"))]
     Relay { source: std::io::Error },
@@ -107,10 +116,7 @@ where
 /// sends confirmation, then relays raw bytes.
 ///
 /// On connect failure, sends `ChannelOpenFailure` and returns `Ok(())`.
-pub async fn handle_direct_tcpip<R, W>(
-    mut reader: R,
-    writer: W,
-) -> Result<(), DirectForwardError>
+pub async fn handle_direct_tcpip<R, W>(mut reader: R, writer: W) -> Result<(), DirectForwardError>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
@@ -133,7 +139,8 @@ where
         .context(direct_forward_error::DecodeVarintSnafu)?;
 
     let raw_port = dest_port.into_inner();
-    let port = u16::try_from(raw_port).map_err(|_| DirectForwardError::PortOverflow { raw_port })?;
+    let port =
+        u16::try_from(raw_port).map_err(|_| DirectForwardError::PortOverflow { raw_port })?;
 
     let pending = PendingChannel::from_raw_parts(reader, writer);
     let addr = format!("{}:{}", &*dest_host, port);
@@ -199,7 +206,7 @@ mod tests {
     use super::*;
     use crate::conversation::read_channel_open_response;
     use h3x::codec::{EncodeExt, EncodeInto};
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::net::TcpListener;
 
     async fn encode_tcpip_request(
@@ -218,9 +225,7 @@ mod tests {
             .encode_into(&mut buf)
             .await
             .unwrap();
-        buf.encode_one(VarInt::from(originator_port))
-            .await
-            .unwrap();
+        buf.encode_one(VarInt::from(originator_port)).await.unwrap();
         buf
     }
 

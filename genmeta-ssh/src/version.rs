@@ -4,8 +4,8 @@
 //! `ssh-version` request header. The server picks the first match from
 //! [`SUPPORTED_SSH_VERSIONS`] and echoes it back.
 
-use crate::{Ssh3Error, ssh3_error};
 use crate::constants::SUPPORTED_SSH_VERSIONS;
+use crate::{Ssh3Error, ssh3_error};
 use snafu::ResultExt;
 
 /// A negotiated SSH3 version.

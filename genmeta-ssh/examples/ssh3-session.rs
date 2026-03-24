@@ -17,9 +17,9 @@ use std::sync::Arc;
 use genmeta_ssh::{
     Conversation,
     session::{
-        dispatcher::{run_session, SessionConfig},
-        privilege::drop_privileges,
         ChildBootstrap, SessionInit,
+        dispatcher::{SessionConfig, run_session},
+        privilege::drop_privileges,
     },
 };
 
@@ -77,12 +77,8 @@ async fn main() {
     }
 
     // Convert control stream clients to AsyncRead/AsyncWrite via h3x codec wrappers.
-    let control_reader = h3x::codec::StreamReader::new(
-        bootstrap.control_reader.into_boxed_quic(),
-    );
-    let control_writer = h3x::codec::SinkWriter::new(
-        bootstrap.control_writer.into_boxed_quic(),
-    );
+    let control_reader = h3x::codec::StreamReader::new(bootstrap.control_reader.into_boxed_quic());
+    let control_writer = h3x::codec::SinkWriter::new(bootstrap.control_writer.into_boxed_quic());
 
     let conversation = Arc::new(Conversation::new(
         bootstrap.conversation_id,

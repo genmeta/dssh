@@ -27,7 +27,7 @@ use h3x::{
         ErasedPeekableUniStream, SinkWriter, StreamReader,
     },
     connection::StreamError,
-    protocol::{Protocol, ProductProtocol, Protocols, StreamVerdict},
+    protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, ConnectionError},
     stream_id::StreamId,
     varint::VarInt,
@@ -121,11 +121,7 @@ impl fmt::Debug for Ssh3Protocol {
         f.debug_struct("Ssh3Protocol")
             .field(
                 "conversations",
-                &self
-                    .registry
-                    .lock()
-                    .map(|r| r.len())
-                    .unwrap_or(0),
+                &self.registry.lock().map(|r| r.len()).unwrap_or(0),
             )
             .finish()
     }
@@ -139,10 +135,11 @@ impl Ssh3Protocol {
     /// use it when you have a connection handle that doesn't directly
     /// implement the QUIC traits (e.g., `h3x::connection::Connection<C>`).
     pub fn new(
-        open_bi: impl Fn() -> BoxFuture<'static, Result<(BoxReadStream, BoxWriteStream), ConnectionError>>
-            + Send
-            + Sync
-            + 'static,
+        open_bi: impl Fn()
+            -> BoxFuture<'static, Result<(BoxReadStream, BoxWriteStream), ConnectionError>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -154,10 +151,7 @@ impl Ssh3Protocol {
     ///
     /// Returns a [`ConversationHandle`] that receives routed streams and can
     /// open new streams. The handle unregisters the conversation when dropped.
-    pub fn register(
-        &self,
-        session_id: StreamId,
-    ) -> Result<ConversationHandle, RegisterError> {
+    pub fn register(&self, session_id: StreamId) -> Result<ConversationHandle, RegisterError> {
         use register_error::*;
 
         let (sender, receiver) = mpsc::channel(16);
@@ -346,9 +340,7 @@ impl ManageSessionStream for ConversationHandle {
     type StreamWriter = Ssh3StreamWriter;
     type Error = HandleError;
 
-    async fn open_stream(
-        &self,
-    ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+    async fn open_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
         use handle_error::*;
 
         let (reader, writer) = (self.open_bi)().await.context(OpenBiSnafu)?;
@@ -372,9 +364,7 @@ impl ManageSessionStream for ConversationHandle {
         Ok((reader, writer))
     }
 
-    async fn accept_stream(
-        &self,
-    ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+    async fn accept_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
         let (reader, writer) = self
             .receiver
             .lock()

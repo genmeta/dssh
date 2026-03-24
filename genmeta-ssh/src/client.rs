@@ -14,9 +14,7 @@ use snafu::{ResultExt, Snafu};
 
 use crate::constants::SSH_VERSION;
 use crate::conversation::Conversation;
-use crate::protocol::{
-    ConversationHandle, RegisterError, Ssh3Protocol,
-};
+use crate::protocol::{ConversationHandle, RegisterError, Ssh3Protocol};
 
 /// Well-known path for SSH3 Extended CONNECT requests.
 pub const SSH3_CONNECT_PATH: &str = "/.well-known/ssh3/connect";
@@ -112,11 +110,13 @@ impl Ssh3Client {
             .parse()
             .context(connect_error::InvalidAuthoritySnafu)?;
 
-        let connection = client.connect(authority.clone()).await.map_err(|e| {
-            ConnectError::QuicConnect {
-                source: Box::new(e),
-            }
-        })?;
+        let connection =
+            client
+                .connect(authority.clone())
+                .await
+                .map_err(|e| ConnectError::QuicConnect {
+                    source: Box::new(e),
+                })?;
 
         let uri: http::Uri = format!("https://{authority}{SSH3_CONNECT_PATH}")
             .parse()
@@ -231,7 +231,6 @@ impl Ssh3Client {
         Ok(conversation)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -10,8 +10,8 @@ use tokio::io::AsyncWriteExt;
 use crate::codec::{CodecError, SshString};
 
 use super::{
-    ControlReader, ControlWriter, ConversationShared, OrderedGuard,
-    SSH_MSG_REQUEST_FAILURE, SSH_MSG_REQUEST_SUCCESS,
+    ControlReader, ControlWriter, ConversationShared, OrderedGuard, SSH_MSG_REQUEST_FAILURE,
+    SSH_MSG_REQUEST_SUCCESS,
 };
 
 // ===========================================================================
@@ -26,7 +26,10 @@ pub struct SessionPoisonedError;
 /// Error from [`super::Conversation::request`].
 #[derive(Debug, Snafu)]
 #[snafu(module, visibility(pub(in crate::conversation)))]
-pub enum SendRequestError<PE: std::error::Error + Send + Sync + 'static, SE: std::error::Error + Send + Sync + 'static> {
+pub enum SendRequestError<
+    PE: std::error::Error + Send + Sync + 'static,
+    SE: std::error::Error + Send + Sync + 'static,
+> {
     #[snafu(display("failed to encode request message type"))]
     EncodeMessageType { source: std::io::Error },
     #[snafu(display("failed to encode request type string"))]
@@ -167,16 +170,11 @@ impl IncomingGlobalRequest {
     ///
     /// On decode failure the stream is irrecoverably corrupted (partial
     /// bytes consumed), so the session is poisoned when `self` drops.
-    pub async fn decode_payload<T, DE>(
-        mut self,
-    ) -> Result<(T, DecodedGlobalRequest), DE>
+    pub async fn decode_payload<T, DE>(mut self) -> Result<(T, DecodedGlobalRequest), DE>
     where
         T: for<'r> DecodeFrom<&'r mut ControlReader, Error = DE>,
     {
-        let guard = self
-            .reader_guard
-            .as_mut()
-            .expect("reader_guard missing");
+        let guard = self.reader_guard.as_mut().expect("reader_guard missing");
 
         let result = T::decode_from(&mut **guard).await;
 
@@ -309,11 +307,7 @@ impl DecodedGlobalRequest {
 impl Drop for DecodedGlobalRequest {
     fn drop(&mut self) {
         if let Some(ticket) = self.writer_ticket.take() {
-            self.shared
-                .auto_failures
-                .lock()
-                .unwrap()
-                .insert(ticket);
+            self.shared.auto_failures.lock().unwrap().insert(ticket);
             self.shared.writer.notify_waiters();
         }
     }
@@ -363,10 +357,7 @@ impl IncomingGlobalNotice {
     where
         T: for<'r> DecodeFrom<&'r mut ControlReader, Error = DE>,
     {
-        let guard = self
-            .reader_guard
-            .as_mut()
-            .expect("reader_guard missing");
+        let guard = self.reader_guard.as_mut().expect("reader_guard missing");
 
         let result = T::decode_from(&mut **guard).await;
 

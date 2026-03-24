@@ -6,7 +6,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use nix::libc;
-use nix::pty::{openpty, Winsize};
+use nix::pty::{Winsize, openpty};
 use snafu::prelude::*;
 
 use crate::session::{PtyRequest, WindowChangeRequest};
@@ -103,7 +103,10 @@ pub fn allocate_pty(request: &PtyRequest) -> Result<PtyPair, PtyError> {
 /// Update the terminal window size of an existing PTY.
 ///
 /// Returns `Err` if any dimension overflows `u16` or if the ioctl fails.
-pub fn set_window_size(master: &impl AsRawFd, request: &WindowChangeRequest) -> Result<(), PtyError> {
+pub fn set_window_size(
+    master: &impl AsRawFd,
+    request: &WindowChangeRequest,
+) -> Result<(), PtyError> {
     set_window_size_raw(master.as_raw_fd(), request)
 }
 
@@ -111,7 +114,10 @@ pub fn set_window_size(master: &impl AsRawFd, request: &WindowChangeRequest) -> 
 ///
 /// # Safety
 /// The caller must ensure `fd` is a valid open PTY master file descriptor.
-pub fn set_window_size_raw(fd: std::os::fd::RawFd, request: &WindowChangeRequest) -> Result<(), PtyError> {
+pub fn set_window_size_raw(
+    fd: std::os::fd::RawFd,
+    request: &WindowChangeRequest,
+) -> Result<(), PtyError> {
     let ws = winsize_from_resize(request).context(DimensionSnafu)?;
     // SAFETY: TIOCSWINSZ writes the winsize struct to the terminal driver.
     unsafe { tiocswinsz(fd, &ws as *const libc::winsize) }.context(OsSnafu)?;
@@ -188,7 +194,8 @@ mod tests {
     #[test]
     fn resize_rejects_overflow() {
         let pair = allocate_pty(&pty_request(80, 24, 0, 0)).unwrap();
-        let err = set_window_size(&pair.master, &resize_request(80, u16::MAX as u32 + 1, 0, 0)).unwrap_err();
+        let err = set_window_size(&pair.master, &resize_request(80, u16::MAX as u32 + 1, 0, 0))
+            .unwrap_err();
         assert!(matches!(err, PtyError::Dimension { source } if source.field == "height_rows"));
     }
 

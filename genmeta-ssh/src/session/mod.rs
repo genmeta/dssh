@@ -182,7 +182,10 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ExecRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
         Ok(Self {
-            command: stream.decode_one().await.context(session_codec_error::CodecSnafu)?,
+            command: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::CodecSnafu)?,
         })
     }
 }
@@ -193,7 +196,10 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for ExecRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        stream.encode_one(self.command).await.context(session_codec_error::CodecSnafu)?;
+        stream
+            .encode_one(self.command)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
         Ok(())
     }
 }
@@ -204,7 +210,10 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SubsystemRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
         Ok(Self {
-            subsystem_name: stream.decode_one().await.context(session_codec_error::CodecSnafu)?,
+            subsystem_name: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::CodecSnafu)?,
         })
     }
 }
@@ -228,7 +237,10 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ExitStatusRequest {
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
-        let exit_status: VarInt = stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?;
+        let exit_status: VarInt = stream
+            .decode_one()
+            .await
+            .context(session_codec_error::ReadIoSnafu)?;
         Ok(Self { exit_status })
     }
 }
@@ -239,7 +251,10 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for ExitStatusRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        stream.encode_one(self.exit_status).await.context(session_codec_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.exit_status)
+            .await
+            .context(session_codec_error::WriteIoSnafu)?;
         Ok(())
     }
 }
@@ -249,10 +264,22 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ExitSignalRequest {
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
-        let signal_name: SshString = stream.decode_one().await.context(session_codec_error::CodecSnafu)?;
-        let core_dumped: SshBool = stream.decode_one().await.context(session_codec_error::CodecSnafu)?;
-        let error_message: SshString = stream.decode_one().await.context(session_codec_error::CodecSnafu)?;
-        let language_tag: SshString = stream.decode_one().await.context(session_codec_error::CodecSnafu)?;
+        let signal_name: SshString = stream
+            .decode_one()
+            .await
+            .context(session_codec_error::CodecSnafu)?;
+        let core_dumped: SshBool = stream
+            .decode_one()
+            .await
+            .context(session_codec_error::CodecSnafu)?;
+        let error_message: SshString = stream
+            .decode_one()
+            .await
+            .context(session_codec_error::CodecSnafu)?;
+        let language_tag: SshString = stream
+            .decode_one()
+            .await
+            .context(session_codec_error::CodecSnafu)?;
         Ok(Self {
             signal_name,
             core_dumped,
@@ -268,10 +295,22 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for ExitSignalRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        stream.encode_one(self.signal_name).await.context(session_codec_error::CodecSnafu)?;
-        stream.encode_one(self.core_dumped).await.context(session_codec_error::CodecSnafu)?;
-        stream.encode_one(self.error_message).await.context(session_codec_error::CodecSnafu)?;
-        stream.encode_one(self.language_tag).await.context(session_codec_error::CodecSnafu)?;
+        stream
+            .encode_one(self.signal_name)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
+        stream
+            .encode_one(self.core_dumped)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
+        stream
+            .encode_one(self.error_message)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
+        stream
+            .encode_one(self.language_tag)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
         Ok(())
     }
 }
@@ -282,12 +321,30 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for PtyRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
         Ok(Self {
-            term_type: stream.decode_one().await.context(session_codec_error::CodecSnafu)?,
-            width_cols: stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?,
-            height_rows: stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?,
-            width_px: stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?,
-            height_px: stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?,
-            terminal_modes: stream.decode_one().await.context(session_codec_error::CodecSnafu)?,
+            term_type: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::CodecSnafu)?,
+            width_cols: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::ReadIoSnafu)?,
+            height_rows: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::ReadIoSnafu)?,
+            width_px: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::ReadIoSnafu)?,
+            height_px: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::ReadIoSnafu)?,
+            terminal_modes: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::CodecSnafu)?,
         })
     }
 }
@@ -298,11 +355,26 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for PtyRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        stream.encode_one(self.term_type).await.context(session_codec_error::CodecSnafu)?;
-        stream.encode_one(self.width_cols).await.context(session_codec_error::WriteIoSnafu)?;
-        stream.encode_one(self.height_rows).await.context(session_codec_error::WriteIoSnafu)?;
-        stream.encode_one(self.width_px).await.context(session_codec_error::WriteIoSnafu)?;
-        stream.encode_one(self.height_px).await.context(session_codec_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.term_type)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
+        stream
+            .encode_one(self.width_cols)
+            .await
+            .context(session_codec_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.height_rows)
+            .await
+            .context(session_codec_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.width_px)
+            .await
+            .context(session_codec_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.height_px)
+            .await
+            .context(session_codec_error::WriteIoSnafu)?;
         stream
             .encode_one(self.terminal_modes)
             .await
@@ -316,10 +388,22 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for WindowChangeRequest {
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
-        let width_cols: VarInt = stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?;
-        let height_rows: VarInt = stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?;
-        let width_px: VarInt = stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?;
-        let height_px: VarInt = stream.decode_one().await.context(session_codec_error::ReadIoSnafu)?;
+        let width_cols: VarInt = stream
+            .decode_one()
+            .await
+            .context(session_codec_error::ReadIoSnafu)?;
+        let height_rows: VarInt = stream
+            .decode_one()
+            .await
+            .context(session_codec_error::ReadIoSnafu)?;
+        let width_px: VarInt = stream
+            .decode_one()
+            .await
+            .context(session_codec_error::ReadIoSnafu)?;
+        let height_px: VarInt = stream
+            .decode_one()
+            .await
+            .context(session_codec_error::ReadIoSnafu)?;
         Ok(Self {
             width_cols,
             height_rows,
@@ -335,10 +419,22 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for WindowChangeRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        stream.encode_one(self.width_cols).await.context(session_codec_error::WriteIoSnafu)?;
-        stream.encode_one(self.height_rows).await.context(session_codec_error::WriteIoSnafu)?;
-        stream.encode_one(self.width_px).await.context(session_codec_error::WriteIoSnafu)?;
-        stream.encode_one(self.height_px).await.context(session_codec_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.width_cols)
+            .await
+            .context(session_codec_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.height_rows)
+            .await
+            .context(session_codec_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.width_px)
+            .await
+            .context(session_codec_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.height_px)
+            .await
+            .context(session_codec_error::WriteIoSnafu)?;
         Ok(())
     }
 }
@@ -349,7 +445,10 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SignalRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = pin!(stream);
         Ok(Self {
-            signal_name: stream.decode_one().await.context(session_codec_error::CodecSnafu)?,
+            signal_name: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::CodecSnafu)?,
         })
     }
 }
@@ -360,7 +459,10 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for SignalRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = pin!(stream);
-        stream.encode_one(self.signal_name).await.context(session_codec_error::CodecSnafu)?;
+        stream
+            .encode_one(self.signal_name)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
         Ok(())
     }
 }

@@ -47,8 +47,8 @@ use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use h3x::{
     codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
@@ -56,8 +56,8 @@ use h3x::{
     varint::VarInt,
 };
 use snafu::ResultExt;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::channel::ChannelOpenFailure;
@@ -111,14 +111,9 @@ pub async fn read_channel_open_response<R: AsyncRead + Unpin + Send>(
             Ok(())
         }
         SSH_MSG_CHANNEL_OPEN_FAILURE => {
-            let reason_code: VarInt = reader
-                .decode_one()
-                .await
-                .context(DecodeReasonCodeSnafu)?;
-            let description: SshString = reader
-                .decode_one()
-                .await
-                .context(DecodeDescriptionSnafu)?;
+            let reason_code: VarInt = reader.decode_one().await.context(DecodeReasonCodeSnafu)?;
+            let description: SshString =
+                reader.decode_one().await.context(DecodeDescriptionSnafu)?;
             Err(AwaitOpenError::Rejected {
                 failure: ChannelOpenFailure {
                     reason_code,
@@ -594,10 +589,7 @@ impl<M: ManageSessionStream> Conversation<M> {
     }
 
     /// Send a global notification (no reply expected).
-    pub async fn notify<N, PE>(
-        &self,
-        notice: &N,
-    ) -> Result<(), SendNotifyError<PE>>
+    pub async fn notify<N, PE>(&self, notice: &N) -> Result<(), SendNotifyError<PE>>
     where
         N: NotifyGlobalRequest,
         PE: std::error::Error + Send + Sync + 'static,
@@ -684,10 +676,7 @@ impl<M: ManageSessionStream> Conversation<M> {
             .decode_one()
             .await
             .context(DecodeRequestTypeSnafu)?;
-        let want_reply: SshBool = (*guard)
-            .decode_one()
-            .await
-            .context(DecodeWantReplySnafu)?;
+        let want_reply: SshBool = (*guard).decode_one().await.context(DecodeWantReplySnafu)?;
 
         // Header fully decoded — disarm the poison guard. From here, the
         // reader guard moves into IncomingGlobal* whose own Drop handles
@@ -777,10 +766,7 @@ impl<M: ManageSessionStream> Conversation<M> {
     /// Returns an [`IncomingChannel`] holding the channel type string and the
     /// stream pair. The caller inspects the type string and then calls
     /// [`IncomingChannel::decode_payload`] to decode the type-specific payload.
-    pub async fn accept_channel(
-        &self,
-    ) -> Result<IncomingChannel<M>, AcceptChannelError<M::Error>>
-    {
+    pub async fn accept_channel(&self) -> Result<IncomingChannel<M>, AcceptChannelError<M::Error>> {
         use self::channel::accept_channel_error::*;
 
         let (mut reader, writer) = self
@@ -793,10 +779,7 @@ impl<M: ManageSessionStream> Conversation<M> {
             .decode_one()
             .await
             .context(DecodeMaxMessageSizeSnafu)?;
-        let channel_type: SshString = reader
-            .decode_one()
-            .await
-            .context(DecodeChannelTypeSnafu)?;
+        let channel_type: SshString = reader.decode_one().await.context(DecodeChannelTypeSnafu)?;
 
         Ok(IncomingChannel::new(
             channel_type,
@@ -827,7 +810,7 @@ pub use channel::{
 };
 
 pub use global::{
-    AcceptError, DecodedGlobalRequest, IncomingGlobal, IncomingGlobalNotice,
-    IncomingGlobalRequest, RespondFailureError, RespondSuccessError, SendNotifyError,
-    SendRequestError, SessionPoisonedError,
+    AcceptError, DecodedGlobalRequest, IncomingGlobal, IncomingGlobalNotice, IncomingGlobalRequest,
+    RespondFailureError, RespondSuccessError, SendNotifyError, SendRequestError,
+    SessionPoisonedError,
 };

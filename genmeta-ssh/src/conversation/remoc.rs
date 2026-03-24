@@ -14,9 +14,7 @@ use h3x::{
     codec::{BoxReadStream, BoxWriteStream, EncodeExt, SinkWriter, StreamReader},
     dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
     quic::ConnectionError,
-    remoc::quic::{
-        ReadStreamClient, WriteStreamClient, serve_read_stream, serve_write_stream,
-    },
+    remoc::quic::{ReadStreamClient, WriteStreamClient, serve_read_stream, serve_write_stream},
 };
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 
@@ -33,13 +31,10 @@ use crate::protocol::ConversationHandle;
 /// (for the child process) and server wrapper types (for the gateway).
 #[remoc::rtc::remote]
 pub trait RemoteManageStream: Send + Sync {
-    async fn open_stream(
-        &self,
-    ) -> Result<(ReadStreamClient, WriteStreamClient), ConnectionError>;
+    async fn open_stream(&self) -> Result<(ReadStreamClient, WriteStreamClient), ConnectionError>;
 
-    async fn accept_stream(
-        &self,
-    ) -> Result<(ReadStreamClient, WriteStreamClient), ConnectionError>;
+    async fn accept_stream(&self)
+    -> Result<(ReadStreamClient, WriteStreamClient), ConnectionError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -51,17 +46,13 @@ impl super::ManageSessionStream for RemoteManageStreamClient {
     type StreamWriter = SinkWriter<BoxDynQuicStreamWriter>;
     type Error = ConnectionError;
 
-    async fn open_stream(
-        &self,
-    ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+    async fn open_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
         RemoteManageStream::open_stream(self)
             .await
             .map(into_codec_pair)
     }
 
-    async fn accept_stream(
-        &self,
-    ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+    async fn accept_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
         RemoteManageStream::accept_stream(self)
             .await
             .map(into_codec_pair)
@@ -121,9 +112,7 @@ impl ManageStreamBridge {
 }
 
 impl RemoteManageStream for ManageStreamBridge {
-    async fn open_stream(
-        &self,
-    ) -> Result<(ReadStreamClient, WriteStreamClient), ConnectionError> {
+    async fn open_stream(&self) -> Result<(ReadStreamClient, WriteStreamClient), ConnectionError> {
         // Open a raw QUIC bidirectional stream.
         let (reader, writer) = (self.handle.open_bi)().await?;
 

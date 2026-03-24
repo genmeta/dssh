@@ -12,14 +12,13 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::codec::{SshBytes, SshString};
 use crate::conversation::{
-    ChannelEvent, ReadChannelEventError,
-    SendChannelNoticeError, SendChannelRequestError, SshChannel,
-    WriteChannelCloseError, WriteDataError, WriteChannelEofError,
+    ChannelEvent, ReadChannelEventError, SendChannelNoticeError, SendChannelRequestError,
+    SshChannel, WriteChannelCloseError, WriteChannelEofError, WriteDataError,
 };
 use crate::session::{
-    ExecChannelRequest, ExecRequest, ExitSignalRequest, ExitStatusRequest,
-    PtyChannelRequest, PtyRequest, SessionCodecError, ShellChannelRequest,
-    SignalChannelNotice, SignalRequest, WindowChangeChannelNotice, WindowChangeRequest,
+    ExecChannelRequest, ExecRequest, ExitSignalRequest, ExitStatusRequest, PtyChannelRequest,
+    PtyRequest, SessionCodecError, ShellChannelRequest, SignalChannelNotice, SignalRequest,
+    WindowChangeChannelNotice, WindowChangeRequest,
 };
 
 // ============================================================================
@@ -31,19 +30,29 @@ use crate::session::{
 #[snafu(module)]
 pub enum ClientSessionError {
     #[snafu(display("failed to send exec request"))]
-    SendExec { source: SendChannelRequestError<SessionCodecError, std::convert::Infallible> },
+    SendExec {
+        source: SendChannelRequestError<SessionCodecError, std::convert::Infallible>,
+    },
 
     #[snafu(display("failed to send shell request"))]
-    SendShell { source: SendChannelRequestError<std::convert::Infallible, std::convert::Infallible> },
+    SendShell {
+        source: SendChannelRequestError<std::convert::Infallible, std::convert::Infallible>,
+    },
 
     #[snafu(display("failed to send pty-req request"))]
-    SendPty { source: SendChannelRequestError<SessionCodecError, std::convert::Infallible> },
+    SendPty {
+        source: SendChannelRequestError<SessionCodecError, std::convert::Infallible>,
+    },
 
     #[snafu(display("failed to send window-change notification"))]
-    SendWindowChange { source: SendChannelNoticeError<SessionCodecError> },
+    SendWindowChange {
+        source: SendChannelNoticeError<SessionCodecError>,
+    },
 
     #[snafu(display("failed to send signal notification"))]
-    SendSignal { source: SendChannelNoticeError<SessionCodecError> },
+    SendSignal {
+        source: SendChannelNoticeError<SessionCodecError>,
+    },
 
     #[snafu(display("failed to write stdin data"))]
     WriteStdin { source: WriteDataError },
@@ -211,10 +220,7 @@ where
     /// Send stdin data to the remote process.
     pub async fn send_stdin(&mut self, data: &[u8]) -> Result<(), ClientSessionError> {
         use client_session_error::*;
-        self.channel
-            .data(data)
-            .await
-            .context(WriteStdinSnafu)
+        self.channel.data(data).await.context(WriteStdinSnafu)
     }
 
     /// Send EOF to the remote process.
@@ -227,7 +233,11 @@ where
     pub async fn close(&mut self) -> Result<(), ClientSessionError> {
         use client_session_error::*;
         self.channel.close().await.context(WriteCloseSnafu)?;
-        self.channel.writer_mut().shutdown().await.context(ShutdownSnafu)?;
+        self.channel
+            .writer_mut()
+            .shutdown()
+            .await
+            .context(ShutdownSnafu)?;
         Ok(())
     }
 
@@ -249,15 +259,21 @@ where
 
         match event {
             ChannelEvent::Data(mut data) => {
-                let bytes = data.read_all().await.map_err(|source| {
-                    ClientSessionError::ReadEvent { source: ReadChannelEventError::DecodeData { source } }
-                })?;
+                let bytes =
+                    data.read_all()
+                        .await
+                        .map_err(|source| ClientSessionError::ReadEvent {
+                            source: ReadChannelEventError::DecodeData { source },
+                        })?;
                 Ok(Some(SessionEvent::Stdout(SshBytes::from(bytes))))
             }
             ChannelEvent::ExtendedData { mut data, .. } => {
-                let bytes = data.read_all().await.map_err(|source| {
-                    ClientSessionError::ReadEvent { source: ReadChannelEventError::DecodeData { source } }
-                })?;
+                let bytes =
+                    data.read_all()
+                        .await
+                        .map_err(|source| ClientSessionError::ReadEvent {
+                            source: ReadChannelEventError::DecodeData { source },
+                        })?;
                 Ok(Some(SessionEvent::Stderr(SshBytes::from(bytes))))
             }
             ChannelEvent::Request(incoming) => {
@@ -268,7 +284,7 @@ where
                             .await
                             .context(DecodeExitStatusSnafu)?;
                         Ok(Some(SessionEvent::ExitStatus(
-                            req.exit_status.into_inner() as u32,
+                            req.exit_status.into_inner() as u32
                         )))
                     }
                     "exit-signal" => {
@@ -326,9 +342,7 @@ mod tests {
         sw.eof().await.unwrap();
         sw.close().await.unwrap();
 
-        let mut session = ClientSession::new(
-            SshChannel::new(client_reader, client_writer),
-        );
+        let mut session = ClientSession::new(SshChannel::new(client_reader, client_writer));
 
         match session.recv_event().await.unwrap().unwrap() {
             SessionEvent::Stdout(data) => assert_eq!(data.as_ref().as_ref(), b"hello"),
@@ -361,9 +375,7 @@ mod tests {
         .unwrap();
         sw.close().await.unwrap();
 
-        let mut session = ClientSession::new(
-            SshChannel::new(client_reader, client_writer),
-        );
+        let mut session = ClientSession::new(SshChannel::new(client_reader, client_writer));
 
         match session.recv_event().await.unwrap().unwrap() {
             SessionEvent::ExitStatus(code) => assert_eq!(code, 42),
@@ -379,9 +391,7 @@ mod tests {
         // Drop server side to cause EOF.
         drop(server);
 
-        let mut session = ClientSession::new(
-            SshChannel::new(client_reader, client_writer),
-        );
+        let mut session = ClientSession::new(SshChannel::new(client_reader, client_writer));
         assert!(session.recv_event().await.unwrap().is_none());
     }
 }

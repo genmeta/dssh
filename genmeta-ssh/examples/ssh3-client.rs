@@ -6,10 +6,8 @@
 //! Usage: cargo run --example ssh3-client -- <user:pass@host:port> [command...]
 
 use genmeta_ssh::{
-    client::Ssh3Client,
+    DEFAULT_MAX_MESSAGE_SIZE, SessionChannelOpen, SshChannel, client::Ssh3Client,
     session::client::ClientSession,
-    SessionChannelOpen, SshChannel,
-    DEFAULT_MAX_MESSAGE_SIZE,
 };
 use h3x::gm_quic::H3Client;
 
@@ -60,7 +58,10 @@ async fn main() {
     // Send exec or shell request.
     match command {
         Some(cmd) => {
-            session.exec(cmd.as_bytes()).await.expect("exec request failed");
+            session
+                .exec(cmd.as_bytes())
+                .await
+                .expect("exec request failed");
         }
         None => {
             session.shell().await.expect("shell request failed");

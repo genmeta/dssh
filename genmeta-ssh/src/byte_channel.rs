@@ -141,11 +141,7 @@ mod tests {
         let (tx, rx) = remoc::rch::mpsc::channel(16);
         let mut reader = ChannelReader::new(rx);
 
-        let chunks: Vec<Vec<u8>> = vec![
-            b"chunk1".to_vec(),
-            b"chunk2".to_vec(),
-            b"chunk3".to_vec(),
-        ];
+        let chunks: Vec<Vec<u8>> = vec![b"chunk1".to_vec(), b"chunk2".to_vec(), b"chunk3".to_vec()];
 
         for chunk in &chunks {
             tx.send(chunk.clone()).await.unwrap();

@@ -24,7 +24,9 @@ impl Stream for TestQuicReader {
     type Item = Result<Bytes, StreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx).map(|opt| opt.map(Ok))
+        Pin::new(&mut self.inner)
+            .poll_next(cx)
+            .map(|opt| opt.map(Ok))
     }
 }
 
@@ -57,10 +59,7 @@ impl Unpin for TestQuicWriter {}
 impl Sink<Bytes> for TestQuicWriter {
     type Error = StreamError;
 
-    fn poll_ready(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.inner)
             .poll_ready(cx)
             .map_err(|_| StreamError::Reset {
@@ -76,10 +75,7 @@ impl Sink<Bytes> for TestQuicWriter {
             })
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.inner)
             .poll_flush(cx)
             .map_err(|_| StreamError::Reset {
@@ -87,10 +83,7 @@ impl Sink<Bytes> for TestQuicWriter {
             })
     }
 
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.inner)
             .poll_close(cx)
             .map_err(|_| StreamError::Reset {
@@ -130,15 +123,11 @@ impl ManageSessionStream for TestManageStream {
     type StreamWriter = MockWriter;
     type Error = std::convert::Infallible;
 
-    async fn open_stream(
-        &self,
-    ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+    async fn open_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
         unreachable!("not used in global request tests")
     }
 
-    async fn accept_stream(
-        &self,
-    ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+    async fn accept_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
         unreachable!("not used in global request tests")
     }
 }
@@ -242,10 +231,7 @@ async fn remote_send_global_request(
         .encode_one(SshString::from(request_type.to_string()))
         .await
         .unwrap();
-    (*writer)
-        .encode_one(SshBool(want_reply))
-        .await
-        .unwrap();
+    (*writer).encode_one(SshBool(want_reply)).await.unwrap();
     (*writer)
         .encode_one(SshString::from(payload.to_string()))
         .await
@@ -254,9 +240,7 @@ async fn remote_send_global_request(
 }
 
 /// Remote reads a global request header and returns (request_type, want_reply).
-async fn remote_read_global_request_header(
-    reader: &mut MockReader,
-) -> (SshString, bool) {
+async fn remote_read_global_request_header(reader: &mut MockReader) -> (SshString, bool) {
     let msg_type: VarInt = (*reader).decode_one().await.unwrap();
     assert_eq!(msg_type, VarInt::from_u32(80));
     let request_type: SshString = (*reader).decode_one().await.unwrap();
@@ -270,10 +254,7 @@ async fn remote_send_success(writer: &mut MockWriter, value: u32) {
         .encode_one(VarInt::from_u32(81)) // SSH_MSG_REQUEST_SUCCESS
         .await
         .unwrap();
-    (*writer)
-        .encode_one(VarInt::from_u32(value))
-        .await
-        .unwrap();
+    (*writer).encode_one(VarInt::from_u32(value)).await.unwrap();
     AsyncWriteExt::flush(&mut *writer).await.unwrap();
 }
 
@@ -303,8 +284,7 @@ async fn request_success_roundtrip() {
     let (conv, mut remote_reader, mut remote_writer) = make_conversation().await;
 
     let handle = tokio::spawn(async move {
-        let (req_type, want_reply) =
-            remote_read_global_request_header(&mut remote_reader).await;
+        let (req_type, want_reply) = remote_read_global_request_header(&mut remote_reader).await;
         assert_eq!(&*req_type, "test-request");
         assert!(want_reply);
         // Read payload
@@ -353,8 +333,7 @@ async fn notify_sends_correctly() {
     };
     conv.notify(&notice).await.unwrap();
 
-    let (req_type, want_reply) =
-        remote_read_global_request_header(&mut remote_reader).await;
+    let (req_type, want_reply) = remote_read_global_request_header(&mut remote_reader).await;
     assert_eq!(&*req_type, "test-notice");
     assert!(!want_reply);
     let payload: SshString = remote_reader.decode_one().await.unwrap();
@@ -368,8 +347,7 @@ async fn accept_incoming_request_decode_and_respond_success() {
     let (conv, mut remote_reader, mut remote_writer) = make_conversation().await;
 
     // Remote sends a want_reply=true request
-    remote_send_global_request(&mut remote_writer, "tcpip-forward", true, "bind-addr")
-        .await;
+    remote_send_global_request(&mut remote_writer, "tcpip-forward", true, "bind-addr").await;
 
     let incoming = conv.accept().await.unwrap();
     let req = match incoming {
@@ -384,7 +362,10 @@ async fn accept_incoming_request_decode_and_respond_success() {
     assert_eq!(&*payload, "bind-addr");
 
     // Respond with success (VarInt 8080)
-    decoded.respond_success(VarInt::from_u32(8080)).await.unwrap();
+    decoded
+        .respond_success(VarInt::from_u32(8080))
+        .await
+        .unwrap();
 
     // Verify remote receives success
     let msg_type: VarInt = remote_reader.decode_one().await.unwrap();
@@ -534,14 +515,20 @@ async fn incoming_request_responses_ordered_correctly() {
 
     // Respond to B first (out of order) — it should wait for A
     let b_handle = tokio::spawn(async move {
-        decoded_b.respond_success(VarInt::from_u32(200)).await.unwrap();
+        decoded_b
+            .respond_success(VarInt::from_u32(200))
+            .await
+            .unwrap();
     });
 
     // Small delay to ensure B starts waiting
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Now respond to A — this should unblock B
-    decoded_a.respond_success(VarInt::from_u32(100)).await.unwrap();
+    decoded_a
+        .respond_success(VarInt::from_u32(100))
+        .await
+        .unwrap();
     b_handle.await.unwrap();
 
     // Remote should receive A's response first, then B's
@@ -568,7 +555,10 @@ async fn unexpected_message_type_poisons_session() {
     AsyncWriteExt::flush(&mut remote_writer).await.unwrap();
 
     let result = conv.accept().await;
-    assert!(matches!(result, Err(AcceptError::UnexpectedMessageType { .. })));
+    assert!(matches!(
+        result,
+        Err(AcceptError::UnexpectedMessageType { .. })
+    ));
 
     // Session should be poisoned (unknown body on stream)
     assert!(conv.shared.poisoned.load(Ordering::SeqCst));
@@ -605,14 +595,12 @@ async fn concurrent_requests_ordered_correctly() {
     tokio::task::yield_now().await;
 
     // Remote reads the first request (A)
-    let (req_type_a, want_reply_a) =
-        remote_read_global_request_header(&mut remote_reader).await;
+    let (req_type_a, want_reply_a) = remote_read_global_request_header(&mut remote_reader).await;
     assert!(want_reply_a);
     let payload_a: SshString = remote_reader.decode_one().await.unwrap();
 
     // Remote reads the second request (B)
-    let (req_type_b, want_reply_b) =
-        remote_read_global_request_header(&mut remote_reader).await;
+    let (req_type_b, want_reply_b) = remote_read_global_request_header(&mut remote_reader).await;
     assert!(want_reply_b);
     let payload_b: SshString = remote_reader.decode_one().await.unwrap();
 
@@ -654,8 +642,7 @@ async fn consecutive_auto_failures_drained_by_next_writer() {
     for _ in 0..3 {
         match conv.accept().await.unwrap() {
             IncomingGlobal::Request(req) => {
-                let (_payload, _decoded): (SshString, _) =
-                    req.decode_payload().await.unwrap();
+                let (_payload, _decoded): (SshString, _) = req.decode_payload().await.unwrap();
                 // Drop DecodedGlobalRequest without responding → auto-failure queued
             }
             _ => panic!("expected Request"),
@@ -677,8 +664,7 @@ async fn consecutive_auto_failures_drained_by_next_writer() {
     }
 
     // Now the notify message
-    let (req_type, want_reply) =
-        remote_read_global_request_header(&mut remote_reader).await;
+    let (req_type, want_reply) = remote_read_global_request_header(&mut remote_reader).await;
     assert_eq!(req_type.as_ref() as &[u8], b"test-notice");
     assert!(!want_reply);
 }
@@ -742,10 +728,7 @@ async fn poisoned_session_rejects_respond_success() {
     conv.shared.poison();
 
     let result = decoded.respond_success(VarInt::from_u32(42)).await;
-    assert!(matches!(
-        result,
-        Err(RespondSuccessError::SessionPoisoned)
-    ));
+    assert!(matches!(result, Err(RespondSuccessError::SessionPoisoned)));
 }
 
 #[tokio::test]
@@ -788,11 +771,7 @@ async fn respond_success_cancelled_poisons_session() {
 
     let respond_fut = decoded.respond_success(VarInt::from_u32(42));
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        respond_fut,
-    )
-    .await;
+    let result = tokio::time::timeout(std::time::Duration::from_millis(50), respond_fut).await;
 
     match result {
         Ok(Ok(())) => {
@@ -838,13 +817,19 @@ async fn multiple_sequential_accepts() {
         };
 
         let expected_type = format!("req-{i}");
-        assert_eq!(req.request_type().as_ref() as &[u8], expected_type.as_bytes());
+        assert_eq!(
+            req.request_type().as_ref() as &[u8],
+            expected_type.as_bytes()
+        );
 
         let (payload, decoded): (SshString, _) = req.decode_payload().await.unwrap();
         let expected_payload = format!("data-{i}");
         assert_eq!(payload.as_ref() as &[u8], expected_payload.as_bytes());
 
-        decoded.respond_success(VarInt::from_u32(i * 10)).await.unwrap();
+        decoded
+            .respond_success(VarInt::from_u32(i * 10))
+            .await
+            .unwrap();
     }
 
     // Remote reads all 3 success responses
@@ -943,8 +928,7 @@ async fn auto_failures_interleaved_with_real_responses() {
     for _ in 0..4 {
         match conv.accept().await.unwrap() {
             IncomingGlobal::Request(r) => {
-                let (_payload, decoded): (SshString, _) =
-                    r.decode_payload().await.unwrap();
+                let (_payload, decoded): (SshString, _) = r.decode_payload().await.unwrap();
                 decoded_reqs.push(decoded);
             }
             _ => panic!("expected Request"),
@@ -1083,9 +1067,7 @@ async fn ordered_access_poison_wakes_waiters() {
 
     let access_clone = Arc::clone(&access);
     let poisoned_clone = Arc::clone(&poisoned);
-    let handle = tokio::spawn(async move {
-        access_clone.acquire(t1, &poisoned_clone).await
-    });
+    let handle = tokio::spawn(async move { access_clone.acquire(t1, &poisoned_clone).await });
 
     // Give the spawned task time to start waiting
     tokio::task::yield_now().await;
@@ -1241,9 +1223,7 @@ async fn request_with_empty_payload() {
     // No success body — EmptyPayload reads nothing
     AsyncWriteExt::flush(&mut remote_writer).await.unwrap();
 
-    let result = conv
-        .request::<EmptyRequest, _, _>(&EmptyRequest)
-        .await;
+    let result = conv.request::<EmptyRequest, _, _>(&EmptyRequest).await;
     assert!(result.is_ok());
 
     // Remote reads the request header and (empty) payload
@@ -1300,18 +1280,22 @@ impl ManageSessionStream for ChannelManageStream {
     type StreamWriter = MockWriter;
     type Error = std::convert::Infallible;
 
-    async fn open_stream(
-        &self,
-    ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-        let pair = self.open_rx.lock().unwrap().try_recv()
+    async fn open_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+        let pair = self
+            .open_rx
+            .lock()
+            .unwrap()
+            .try_recv()
             .expect("no open_stream pair provided");
         Ok(pair)
     }
 
-    async fn accept_stream(
-        &self,
-    ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-        let pair = self.accept_rx.lock().unwrap().try_recv()
+    async fn accept_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+        let pair = self
+            .accept_rx
+            .lock()
+            .unwrap()
+            .try_recv()
             .expect("no accept_stream pair provided");
         Ok(pair)
     }
@@ -1320,7 +1304,13 @@ impl ManageSessionStream for ChannelManageStream {
 /// Create a Conversation backed by ChannelManageStream plus the control
 /// stream remote ends.
 async fn make_channel_conversation() -> (
-    Conversation<impl ManageSessionStream<StreamReader = MockReader, StreamWriter = MockWriter, Error = std::convert::Infallible>>,
+    Conversation<
+        impl ManageSessionStream<
+            StreamReader = MockReader,
+            StreamWriter = MockWriter,
+            Error = std::convert::Infallible,
+        >,
+    >,
     MockReader,
     MockWriter,
     Arc<ChannelManageStream>,
@@ -1421,8 +1411,7 @@ impl ChannelOpen for SessionChannel {
 
 #[tokio::test]
 async fn open_channel_roundtrip() {
-    let (conv, _remote_reader, _remote_writer, manage) =
-        make_channel_conversation().await;
+    let (conv, _remote_reader, _remote_writer, manage) = make_channel_conversation().await;
 
     // Create a channel stream pair: the "channel reader/writer" that the
     // remote side will use.
@@ -1471,8 +1460,7 @@ async fn open_channel_roundtrip() {
 
 #[tokio::test]
 async fn accept_channel_roundtrip() {
-    let (conv, _remote_reader, _remote_writer, manage) =
-        make_channel_conversation().await;
+    let (conv, _remote_reader, _remote_writer, manage) = make_channel_conversation().await;
 
     let ch_stream_id = VarInt::from_u32(200);
     let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
@@ -1483,12 +1471,10 @@ async fn accept_channel_roundtrip() {
     let mut rw = ch_remote_writer;
     let max_msg_size = VarInt::from_u32(1 << 20);
     rw.encode_one(max_msg_size).await.unwrap();
-    rw
-        .encode_one(SshString::from_static("test-channel"))
+    rw.encode_one(SshString::from_static("test-channel"))
         .await
         .unwrap();
-    rw
-        .encode_one(SshString::from_static("world"))
+    rw.encode_one(SshString::from_static("world"))
         .await
         .unwrap();
     AsyncWriteExt::flush(&mut rw).await.unwrap();
@@ -1496,7 +1482,10 @@ async fn accept_channel_roundtrip() {
     // accept_stream will return the local side of the channel
     manage.provide_accept_stream(ch_local_reader, ch_local_writer);
 
-    let incoming = conv.accept_channel().await.expect("accept_channel should succeed");
+    let incoming = conv
+        .accept_channel()
+        .await
+        .expect("accept_channel should succeed");
 
     assert_eq!(incoming.channel_type().as_ref() as &[u8], b"test-channel");
     assert_eq!(incoming.max_message_size(), max_msg_size);
@@ -1512,8 +1501,7 @@ async fn accept_channel_roundtrip() {
 
 #[tokio::test]
 async fn accept_channel_session_no_payload() {
-    let (conv, _remote_reader, _remote_writer, manage) =
-        make_channel_conversation().await;
+    let (conv, _remote_reader, _remote_writer, manage) = make_channel_conversation().await;
 
     let ch_stream_id = VarInt::from_u32(300);
     let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
@@ -1523,8 +1511,7 @@ async fn accept_channel_session_no_payload() {
     // (signal value and session ID are handled by ManageSessionStream).
     let mut rw = ch_remote_writer;
     rw.encode_one(VarInt::from_u32(1 << 20)).await.unwrap();
-    rw
-        .encode_one(SshString::from_static("session"))
+    rw.encode_one(SshString::from_static("session"))
         .await
         .unwrap();
     AsyncWriteExt::flush(&mut rw).await.unwrap();
@@ -1540,8 +1527,7 @@ async fn accept_channel_session_no_payload() {
 
 #[tokio::test]
 async fn open_channel_session_no_payload() {
-    let (conv, _remote_reader, _remote_writer, manage) =
-        make_channel_conversation().await;
+    let (conv, _remote_reader, _remote_writer, manage) = make_channel_conversation().await;
 
     let ch_stream_id = VarInt::from_u32(600);
     let (ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
@@ -1561,8 +1547,14 @@ async fn open_channel_session_no_payload() {
         // No payload bytes follow.
 
         // Send confirmation
-        ch_remote_writer.encode_one(VarInt::from_u32(91)).await.unwrap();
-        ch_remote_writer.encode_one(VarInt::from_u32(1 << 20)).await.unwrap();
+        ch_remote_writer
+            .encode_one(VarInt::from_u32(91))
+            .await
+            .unwrap();
+        ch_remote_writer
+            .encode_one(VarInt::from_u32(1 << 20))
+            .await
+            .unwrap();
         AsyncWriteExt::flush(&mut ch_remote_writer).await.unwrap();
     });
 
@@ -1741,9 +1733,7 @@ async fn channel_request_success_roundtrip() {
         payload: TestPayload(SshString::from("hello-channel".to_string())),
     };
     let mut channel = SshChannel::new(a_reader, a_writer);
-    let result: VarInt = channel.request(&req)
-        .await
-        .unwrap();
+    let result: VarInt = channel.request(&req).await.unwrap();
     assert_eq!(result, VarInt::from_u32(42));
 
     handle.await.unwrap();
@@ -1769,8 +1759,7 @@ async fn channel_request_rejected() {
         payload: TestPayload(SshString::from_static("data")),
     };
     let mut channel = SshChannel::new(a_reader, a_writer);
-    let result: Result<VarInt, _> =
-        channel.request(&req).await;
+    let result: Result<VarInt, _> = channel.request(&req).await;
     assert!(matches!(result, Err(SendChannelRequestError::Rejected)));
 
     handle.await.unwrap();
@@ -1840,7 +1829,10 @@ async fn read_channel_event_extended_data() {
     let mut channel = SshChannel::new(a_reader, a_writer);
     let event = channel.next_event().await.unwrap();
     match event {
-        ChannelEvent::ExtendedData { data_type, mut data } => {
+        ChannelEvent::ExtendedData {
+            data_type,
+            mut data,
+        } => {
             assert_eq!(data_type, VarInt::from_u32(1));
             let bytes = data.read_all().await.unwrap();
             assert_eq!(bytes, b"err");
@@ -1855,15 +1847,30 @@ async fn read_channel_event_eof_close_success_failure() {
 
     // 依次发送 EOF, CLOSE, SUCCESS, FAILURE
     for msg_type in [96u32, 97, 99, 100] {
-        b_writer.encode_one(VarInt::from_u32(msg_type)).await.unwrap();
+        b_writer
+            .encode_one(VarInt::from_u32(msg_type))
+            .await
+            .unwrap();
     }
     AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
     let mut channel = SshChannel::new(a_reader, a_writer);
-    assert!(matches!(channel.next_event().await.unwrap(), ChannelEvent::Eof));
-    assert!(matches!(channel.next_event().await.unwrap(), ChannelEvent::Close));
-    assert!(matches!(channel.next_event().await.unwrap(), ChannelEvent::Success));
-    assert!(matches!(channel.next_event().await.unwrap(), ChannelEvent::Failure));
+    assert!(matches!(
+        channel.next_event().await.unwrap(),
+        ChannelEvent::Eof
+    ));
+    assert!(matches!(
+        channel.next_event().await.unwrap(),
+        ChannelEvent::Close
+    ));
+    assert!(matches!(
+        channel.next_event().await.unwrap(),
+        ChannelEvent::Success
+    ));
+    assert!(matches!(
+        channel.next_event().await.unwrap(),
+        ChannelEvent::Failure
+    ));
 }
 
 #[tokio::test]
@@ -1901,7 +1908,10 @@ async fn read_channel_event_request_decode_and_respond_success() {
     let responder = responder.expect("want_reply was true, should have responder");
 
     // 发送 success 响应（空 payload）
-    responder.respond_success(EmptyChannelPayload).await.unwrap();
+    responder
+        .respond_success(EmptyChannelPayload)
+        .await
+        .unwrap();
 
     // B 端验证
     let msg_type: VarInt = b_reader.decode_one().await.unwrap();
@@ -1996,9 +2006,7 @@ async fn channel_request_full_roundtrip_via_traits() {
 
     let handle = tokio::spawn(async move {
         let mut channel = SshChannel::new(b_reader, b_writer);
-        let event = channel.next_event()
-            .await
-            .unwrap();
+        let event = channel.next_event().await.unwrap();
         let req = match event {
             ChannelEvent::Request(r) => r,
             _ => panic!("expected Request"),
@@ -2011,16 +2019,17 @@ async fn channel_request_full_roundtrip_via_traits() {
         assert_eq!(payload.as_ref() as &[u8], b"roundtrip");
 
         let responder = responder.unwrap();
-        responder.respond_success(VarInt::from_u32(999)).await.unwrap();
+        responder
+            .respond_success(VarInt::from_u32(999))
+            .await
+            .unwrap();
     });
 
     let req = TestChannelReq {
         payload: TestPayload(SshString::from_static("roundtrip")),
     };
     let mut channel = SshChannel::new(a_reader, a_writer);
-    let result: VarInt = channel.request(&req)
-        .await
-        .unwrap();
+    let result: VarInt = channel.request(&req).await.unwrap();
     assert_eq!(result, VarInt::from_u32(999));
 
     handle.await.unwrap();

@@ -40,9 +40,18 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for DirectTcpipRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = std::pin::pin!(stream);
-        stream.encode_one(self.dest_host).await.context(forward_error::CodecSnafu)?;
-        stream.encode_one(self.dest_port).await.context(forward_error::WriteIoSnafu)?;
-        stream.encode_one(self.originator_host).await.context(forward_error::CodecSnafu)?;
+        stream
+            .encode_one(self.dest_host)
+            .await
+            .context(forward_error::CodecSnafu)?;
+        stream
+            .encode_one(self.dest_port)
+            .await
+            .context(forward_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.originator_host)
+            .await
+            .context(forward_error::CodecSnafu)?;
         stream
             .encode_one(self.originator_port)
             .await
@@ -57,10 +66,22 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for DirectTcpipRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = std::pin::pin!(stream);
         Ok(Self {
-            dest_host: stream.decode_one().await.context(forward_error::CodecSnafu)?,
-            dest_port: stream.decode_one().await.context(forward_error::ReadIoSnafu)?,
-            originator_host: stream.decode_one().await.context(forward_error::CodecSnafu)?,
-            originator_port: stream.decode_one().await.context(forward_error::ReadIoSnafu)?,
+            dest_host: stream
+                .decode_one()
+                .await
+                .context(forward_error::CodecSnafu)?,
+            dest_port: stream
+                .decode_one()
+                .await
+                .context(forward_error::ReadIoSnafu)?,
+            originator_host: stream
+                .decode_one()
+                .await
+                .context(forward_error::CodecSnafu)?,
+            originator_port: stream
+                .decode_one()
+                .await
+                .context(forward_error::ReadIoSnafu)?,
         })
     }
 }
@@ -71,8 +92,14 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for TcpipForwardRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = std::pin::pin!(stream);
-        stream.encode_one(self.bind_address).await.context(forward_error::CodecSnafu)?;
-        stream.encode_one(self.bind_port).await.context(forward_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.bind_address)
+            .await
+            .context(forward_error::CodecSnafu)?;
+        stream
+            .encode_one(self.bind_port)
+            .await
+            .context(forward_error::WriteIoSnafu)?;
         Ok(())
     }
 }
@@ -83,8 +110,14 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for TcpipForwardRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = std::pin::pin!(stream);
         Ok(Self {
-            bind_address: stream.decode_one().await.context(forward_error::CodecSnafu)?,
-            bind_port: stream.decode_one().await.context(forward_error::ReadIoSnafu)?,
+            bind_address: stream
+                .decode_one()
+                .await
+                .context(forward_error::CodecSnafu)?,
+            bind_port: stream
+                .decode_one()
+                .await
+                .context(forward_error::ReadIoSnafu)?,
         })
     }
 }
@@ -101,8 +134,14 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for CancelTcpipForwardRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = std::pin::pin!(stream);
-        stream.encode_one(self.bind_address).await.context(forward_error::CodecSnafu)?;
-        stream.encode_one(self.bind_port).await.context(forward_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.bind_address)
+            .await
+            .context(forward_error::CodecSnafu)?;
+        stream
+            .encode_one(self.bind_port)
+            .await
+            .context(forward_error::WriteIoSnafu)?;
         Ok(())
     }
 }
@@ -113,8 +152,14 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for CancelTcpipForwardRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = std::pin::pin!(stream);
         Ok(Self {
-            bind_address: stream.decode_one().await.context(forward_error::CodecSnafu)?,
-            bind_port: stream.decode_one().await.context(forward_error::ReadIoSnafu)?,
+            bind_address: stream
+                .decode_one()
+                .await
+                .context(forward_error::CodecSnafu)?,
+            bind_port: stream
+                .decode_one()
+                .await
+                .context(forward_error::ReadIoSnafu)?,
         })
     }
 }
@@ -144,7 +189,10 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for TcpipForwardReply {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = std::pin::pin!(stream);
         Ok(Self {
-            allocated_port: stream.decode_one().await.context(forward_error::ReadIoSnafu)?,
+            allocated_port: stream
+                .decode_one()
+                .await
+                .context(forward_error::ReadIoSnafu)?,
         })
     }
 }
@@ -167,7 +215,10 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for ForwardedTcpipRequest {
             .encode_one(self.connected_address)
             .await
             .context(forward_error::CodecSnafu)?;
-        stream.encode_one(self.connected_port).await.context(forward_error::WriteIoSnafu)?;
+        stream
+            .encode_one(self.connected_port)
+            .await
+            .context(forward_error::WriteIoSnafu)?;
         stream
             .encode_one(self.originator_address)
             .await
@@ -186,10 +237,22 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ForwardedTcpipRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = std::pin::pin!(stream);
         Ok(Self {
-            connected_address: stream.decode_one().await.context(forward_error::CodecSnafu)?,
-            connected_port: stream.decode_one().await.context(forward_error::ReadIoSnafu)?,
-            originator_address: stream.decode_one().await.context(forward_error::CodecSnafu)?,
-            originator_port: stream.decode_one().await.context(forward_error::ReadIoSnafu)?,
+            connected_address: stream
+                .decode_one()
+                .await
+                .context(forward_error::CodecSnafu)?,
+            connected_port: stream
+                .decode_one()
+                .await
+                .context(forward_error::ReadIoSnafu)?,
+            originator_address: stream
+                .decode_one()
+                .await
+                .context(forward_error::CodecSnafu)?,
+            originator_port: stream
+                .decode_one()
+                .await
+                .context(forward_error::ReadIoSnafu)?,
         })
     }
 }
@@ -205,7 +268,10 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for StreamlocalForwardRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = std::pin::pin!(stream);
-        stream.encode_one(self.socket_path).await.context(forward_error::CodecSnafu)?;
+        stream
+            .encode_one(self.socket_path)
+            .await
+            .context(forward_error::CodecSnafu)?;
         Ok(())
     }
 }
@@ -216,7 +282,10 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for StreamlocalForwardRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = std::pin::pin!(stream);
         Ok(Self {
-            socket_path: stream.decode_one().await.context(forward_error::CodecSnafu)?,
+            socket_path: stream
+                .decode_one()
+                .await
+                .context(forward_error::CodecSnafu)?,
         })
     }
 }
@@ -232,7 +301,10 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for CancelStreamlocalForwardRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = std::pin::pin!(stream);
-        stream.encode_one(self.socket_path).await.context(forward_error::CodecSnafu)?;
+        stream
+            .encode_one(self.socket_path)
+            .await
+            .context(forward_error::CodecSnafu)?;
         Ok(())
     }
 }
@@ -243,7 +315,10 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for CancelStreamlocalForwardRequest {
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = std::pin::pin!(stream);
         Ok(Self {
-            socket_path: stream.decode_one().await.context(forward_error::CodecSnafu)?,
+            socket_path: stream
+                .decode_one()
+                .await
+                .context(forward_error::CodecSnafu)?,
         })
     }
 }
@@ -259,7 +334,10 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for ForwardedStreamlocalRequest {
 
     async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
         let mut stream = std::pin::pin!(stream);
-        stream.encode_one(self.socket_path).await.context(forward_error::CodecSnafu)?;
+        stream
+            .encode_one(self.socket_path)
+            .await
+            .context(forward_error::CodecSnafu)?;
         stream
             .encode_one(SshString::from(""))
             .await
@@ -273,8 +351,14 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for ForwardedStreamlocalRequest {
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = std::pin::pin!(stream);
-        let socket_path = stream.decode_one().await.context(forward_error::CodecSnafu)?;
-        let _: SshString = stream.decode_one().await.context(forward_error::CodecSnafu)?;
+        let socket_path = stream
+            .decode_one()
+            .await
+            .context(forward_error::CodecSnafu)?;
+        let _: SshString = stream
+            .decode_one()
+            .await
+            .context(forward_error::CodecSnafu)?;
         Ok(Self { socket_path })
     }
 }
@@ -318,9 +402,18 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for DirectStreamlocalRequest {
 
     async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let mut stream = std::pin::pin!(stream);
-        let socket_path = stream.decode_one().await.context(forward_error::CodecSnafu)?;
-        let _: SshString = stream.decode_one().await.context(forward_error::CodecSnafu)?;
-        let _: VarInt = stream.decode_one().await.context(forward_error::ReadIoSnafu)?;
+        let socket_path = stream
+            .decode_one()
+            .await
+            .context(forward_error::CodecSnafu)?;
+        let _: SshString = stream
+            .decode_one()
+            .await
+            .context(forward_error::CodecSnafu)?;
+        let _: VarInt = stream
+            .decode_one()
+            .await
+            .context(forward_error::ReadIoSnafu)?;
         Ok(Self { socket_path })
     }
 }

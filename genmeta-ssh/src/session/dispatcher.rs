@@ -30,9 +30,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
 
 use crate::channel::reason_code;
-use crate::conversation::{
-    Conversation, IncomingGlobal, ManageSessionStream,
-};
+use crate::conversation::{Conversation, IncomingGlobal, ManageSessionStream};
 use crate::forward::{
     CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, ForwardError,
     StreamlocalForwardRequest, TcpipForwardReply, TcpipForwardRequest,
@@ -72,10 +70,8 @@ impl Default for SessionConfig {
 /// Concurrently accepts channels and global requests from the conversation,
 /// dispatching each to the appropriate handler. Returns when the conversation
 /// is closed (both accept methods return errors indicating shutdown).
-pub async fn run_session<M>(
-    conversation: Arc<Conversation<M>>,
-    config: SessionConfig,
-) where
+pub async fn run_session<M>(conversation: Arc<Conversation<M>>, config: SessionConfig)
+where
     M: ManageSessionStream + 'static,
     M::StreamReader: AsyncRead + Send + Unpin + 'static,
     M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
@@ -189,10 +185,8 @@ pub async fn run_session<M>(
 // Global request dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_global<M>(
-    incoming: IncomingGlobal,
-    forwarder: &mut ReverseForwarder<M>,
-) where
+async fn dispatch_global<M>(incoming: IncomingGlobal, forwarder: &mut ReverseForwarder<M>)
+where
     M: ManageSessionStream + 'static,
 {
     match incoming {
@@ -200,7 +194,10 @@ async fn dispatch_global<M>(
             let request_type = req.request_type().clone();
             match &*request_type {
                 "tcpip-forward" => {
-                    match req.decode_payload::<TcpipForwardRequest, ForwardError>().await {
+                    match req
+                        .decode_payload::<TcpipForwardRequest, ForwardError>()
+                        .await
+                    {
                         Ok((payload, decoded)) => {
                             let bind_addr: &str = &payload.bind_address;
                             let bind_port = payload.bind_port.into_inner() as u16;
@@ -225,12 +222,17 @@ async fn dispatch_global<M>(
                     }
                 }
                 "cancel-tcpip-forward" => {
-                    match req.decode_payload::<CancelTcpipForwardRequest, ForwardError>().await {
+                    match req
+                        .decode_payload::<CancelTcpipForwardRequest, ForwardError>()
+                        .await
+                    {
                         Ok((payload, decoded)) => {
                             let bind_addr: &str = &payload.bind_address;
                             let bind_port = payload.bind_port.into_inner() as u16;
                             if forwarder.stop_tcp(bind_addr, bind_port) {
-                                let _ = decoded.respond_success(crate::conversation::EmptyPayload).await;
+                                let _ = decoded
+                                    .respond_success(crate::conversation::EmptyPayload)
+                                    .await;
                             } else {
                                 let _ = decoded.respond_failure().await;
                             }
@@ -241,12 +243,17 @@ async fn dispatch_global<M>(
                     }
                 }
                 "streamlocal-forward@openssh.com" => {
-                    match req.decode_payload::<StreamlocalForwardRequest, ForwardError>().await {
+                    match req
+                        .decode_payload::<StreamlocalForwardRequest, ForwardError>()
+                        .await
+                    {
                         Ok((payload, decoded)) => {
                             let socket_path: &str = &payload.socket_path;
                             match forwarder.start_unix(socket_path).await {
                                 Ok(()) => {
-                                    let _ = decoded.respond_success(crate::conversation::EmptyPayload).await;
+                                    let _ = decoded
+                                        .respond_success(crate::conversation::EmptyPayload)
+                                        .await;
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %snafu::Report::from_error(&e), "streamlocal-forward bind failed");
@@ -260,11 +267,16 @@ async fn dispatch_global<M>(
                     }
                 }
                 "cancel-streamlocal-forward@openssh.com" => {
-                    match req.decode_payload::<CancelStreamlocalForwardRequest, ForwardError>().await {
+                    match req
+                        .decode_payload::<CancelStreamlocalForwardRequest, ForwardError>()
+                        .await
+                    {
                         Ok((payload, decoded)) => {
                             let socket_path: &str = &payload.socket_path;
                             if forwarder.stop_unix(socket_path) {
-                                let _ = decoded.respond_success(crate::conversation::EmptyPayload).await;
+                                let _ = decoded
+                                    .respond_success(crate::conversation::EmptyPayload)
+                                    .await;
                             } else {
                                 let _ = decoded.respond_failure().await;
                             }
@@ -289,7 +301,9 @@ async fn dispatch_global<M>(
                 "ignoring global notice"
             );
             // Notices don't need a response; just consume the payload.
-            let _ = notice.decode_payload::<crate::conversation::EmptyPayload, std::convert::Infallible>().await;
+            let _ = notice
+                .decode_payload::<crate::conversation::EmptyPayload, std::convert::Infallible>()
+                .await;
         }
     }
 }

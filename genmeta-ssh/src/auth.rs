@@ -1,10 +1,10 @@
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use snafu::ResultExt;
 use std::fmt;
 
-use crate::error::ssh3_error;
 use crate::error::Ssh3Error;
+use crate::error::ssh3_error;
 
 /// Authentication credential — only Basic auth is supported.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

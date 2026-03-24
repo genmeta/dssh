@@ -17,7 +17,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[snafu(visibility(pub), module)]
 pub enum CodecError {
     #[snafu(display("field length does not fit in usize"))]
-    FieldLengthOverflow { field_name: &'static str, length: u64 },
+    FieldLengthOverflow {
+        field_name: &'static str,
+        length: u64,
+    },
 
     #[snafu(display("field length exceeds maximum"))]
     FieldTooLarge {
@@ -211,9 +214,15 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for SshString {
 
     async fn encode_into(self, stream: S) -> Result<(), CodecError> {
         let mut stream = pin!(stream);
-        let len = VarInt::try_from(self.0.len()).map_err(|_overflow| CodecError::SshStringTooLong)?;
-        len.encode_into(&mut stream).await.context(codec_error::WriteIoSnafu)?;
-        stream.write_all(self.as_bytes()).await.context(codec_error::WriteIoSnafu)?;
+        let len =
+            VarInt::try_from(self.0.len()).map_err(|_overflow| CodecError::SshStringTooLong)?;
+        len.encode_into(&mut stream)
+            .await
+            .context(codec_error::WriteIoSnafu)?;
+        stream
+            .write_all(self.as_bytes())
+            .await
+            .context(codec_error::WriteIoSnafu)?;
         Ok(())
     }
 }
@@ -223,10 +232,15 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshString {
 
     async fn decode_from(stream: S) -> Result<Self, CodecError> {
         let mut stream = pin!(stream);
-        let len = VarInt::decode_from(&mut stream).await.context(codec_error::ReadIoSnafu)?;
+        let len = VarInt::decode_from(&mut stream)
+            .await
+            .context(codec_error::ReadIoSnafu)?;
         let len = checked_remote_field_len(len.into_inner(), "ssh string")?;
         let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await.context(codec_error::ReadIoSnafu)?;
+        stream
+            .read_exact(&mut buf)
+            .await
+            .context(codec_error::ReadIoSnafu)?;
         let string = String::from_utf8(buf).context(codec_error::InvalidSshStringUtf8Snafu)?;
         Ok(string.into())
     }
@@ -243,8 +257,13 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for SshBytes {
     async fn encode_into(self, stream: S) -> Result<(), CodecError> {
         let mut stream = pin!(stream);
         let len = VarInt::try_from(self.0.len() as u64).map_err(|_| CodecError::SshBytesTooLong)?;
-        len.encode_into(&mut stream).await.context(codec_error::WriteIoSnafu)?;
-        stream.write_all(&self.0).await.context(codec_error::WriteIoSnafu)?;
+        len.encode_into(&mut stream)
+            .await
+            .context(codec_error::WriteIoSnafu)?;
+        stream
+            .write_all(&self.0)
+            .await
+            .context(codec_error::WriteIoSnafu)?;
         Ok(())
     }
 }
@@ -254,10 +273,15 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshBytes {
 
     async fn decode_from(stream: S) -> Result<Self, CodecError> {
         let mut stream = pin!(stream);
-        let len = VarInt::decode_from(&mut stream).await.context(codec_error::ReadIoSnafu)?;
+        let len = VarInt::decode_from(&mut stream)
+            .await
+            .context(codec_error::ReadIoSnafu)?;
         let len = checked_remote_field_len(len.into_inner(), "ssh bytes")?;
         let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await.context(codec_error::ReadIoSnafu)?;
+        stream
+            .read_exact(&mut buf)
+            .await
+            .context(codec_error::ReadIoSnafu)?;
         Ok(buf.into())
     }
 }

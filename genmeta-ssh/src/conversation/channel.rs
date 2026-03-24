@@ -9,11 +9,10 @@ use crate::channel::ChannelOpenFailure;
 use crate::codec::{CodecError, SshBool, SshString};
 
 use super::{
-    ManageSessionStream, NotifyChannelRequest, WantReplyChannelRequest,
-    SSH_MSG_CHANNEL_CLOSE, SSH_MSG_CHANNEL_DATA, SSH_MSG_CHANNEL_EOF,
-    SSH_MSG_CHANNEL_EXTENDED_DATA, SSH_MSG_CHANNEL_FAILURE,
-    SSH_MSG_CHANNEL_OPEN_CONFIRMATION, SSH_MSG_CHANNEL_OPEN_FAILURE,
-    SSH_MSG_CHANNEL_REQUEST, SSH_MSG_CHANNEL_SUCCESS,
+    ManageSessionStream, NotifyChannelRequest, SSH_MSG_CHANNEL_CLOSE, SSH_MSG_CHANNEL_DATA,
+    SSH_MSG_CHANNEL_EOF, SSH_MSG_CHANNEL_EXTENDED_DATA, SSH_MSG_CHANNEL_FAILURE,
+    SSH_MSG_CHANNEL_OPEN_CONFIRMATION, SSH_MSG_CHANNEL_OPEN_FAILURE, SSH_MSG_CHANNEL_REQUEST,
+    SSH_MSG_CHANNEL_SUCCESS, WantReplyChannelRequest,
 };
 
 // ===========================================================================
@@ -60,7 +59,10 @@ where
 /// Error from [`SshChannelWriter::request`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum SendChannelRequestError<PE: std::error::Error + Send + Sync + 'static, SE: std::error::Error + Send + Sync + 'static> {
+pub enum SendChannelRequestError<
+    PE: std::error::Error + Send + Sync + 'static,
+    SE: std::error::Error + Send + Sync + 'static,
+> {
     #[snafu(display("failed to encode channel request message type"))]
     EncodeMessageType { source: std::io::Error },
     #[snafu(display("failed to encode channel request type string"))]
@@ -265,7 +267,12 @@ impl<M: ManageSessionStream> IncomingChannel<M> {
         reader: M::StreamReader,
         writer: M::StreamWriter,
     ) -> Self {
-        Self { channel_type, max_message_size, reader, writer }
+        Self {
+            channel_type,
+            max_message_size,
+            reader,
+            writer,
+        }
     }
 
     /// The SSH channel type string sent by the remote (e.g. `"session"`).
@@ -290,7 +297,13 @@ impl<M: ManageSessionStream> IncomingChannel<M> {
         T: for<'r> DecodeFrom<&'r mut M::StreamReader, Error = DE>,
     {
         let value = T::decode_from(&mut self.reader).await?;
-        Ok((value, PendingChannel { reader: self.reader, writer: self.writer }))
+        Ok((
+            value,
+            PendingChannel {
+                reader: self.reader,
+                writer: self.writer,
+            },
+        ))
     }
 
     /// Skip payload decoding and return a [`PendingChannel`] directly.
@@ -298,7 +311,10 @@ impl<M: ManageSessionStream> IncomingChannel<M> {
     /// Useful for channel types that carry no additional payload (e.g.
     /// `"session"` channels).
     pub fn skip_payload(self) -> PendingChannel<M::StreamReader, M::StreamWriter> {
-        PendingChannel { reader: self.reader, writer: self.writer }
+        PendingChannel {
+            reader: self.reader,
+            writer: self.writer,
+        }
     }
 
     /// Consume and return the raw stream pair without decoding anything.
@@ -361,7 +377,10 @@ impl<R, W: AsyncWrite + Unpin + Send> PendingChannel<R, W> {
         AsyncWriteExt::flush(&mut self.writer)
             .await
             .context(FlushSnafu)?;
-        Ok(SshChannel { reader: self.reader, writer: self.writer })
+        Ok(SshChannel {
+            reader: self.reader,
+            writer: self.writer,
+        })
     }
 
     /// Send a channel open failure. The channel is dead after this.
@@ -459,11 +478,7 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> SshChannel<R, W>
 
         match msg_type {
             SSH_MSG_CHANNEL_DATA => {
-                let len: VarInt = self
-                    .reader
-                    .decode_one()
-                    .await
-                    .context(DecodeDataSnafu)?;
+                let len: VarInt = self.reader.decode_one().await.context(DecodeDataSnafu)?;
                 Ok(ChannelEvent::Data(ChannelDataRead {
                     reader: &mut self.reader,
                     remaining: len.into_inner(),
@@ -523,8 +538,7 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> SshChannel<R, W>
     pub async fn data(&mut self, data: &[u8]) -> Result<(), WriteDataError> {
         use write_data_error::*;
 
-        let len = VarInt::try_from(data.len() as u64)
-            .expect("data length exceeds VarInt range");
+        let len = VarInt::try_from(data.len() as u64).expect("data length exceeds VarInt range");
 
         self.writer
             .encode_one(SSH_MSG_CHANNEL_DATA)
@@ -556,8 +570,7 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> SshChannel<R, W>
     ) -> Result<(), WriteDataError> {
         use write_data_error::*;
 
-        let len = VarInt::try_from(length)
-            .expect("data length exceeds VarInt range");
+        let len = VarInt::try_from(length).expect("data length exceeds VarInt range");
 
         self.writer
             .encode_one(SSH_MSG_CHANNEL_DATA)
@@ -587,8 +600,7 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> SshChannel<R, W>
     ) -> Result<(), WriteExtendedDataError> {
         use write_extended_data_error::*;
 
-        let len = VarInt::try_from(data.len() as u64)
-            .expect("data length exceeds VarInt range");
+        let len = VarInt::try_from(data.len() as u64).expect("data length exceeds VarInt range");
 
         self.writer
             .encode_one(SSH_MSG_CHANNEL_EXTENDED_DATA)
@@ -621,8 +633,7 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> SshChannel<R, W>
     ) -> Result<(), WriteExtendedDataError> {
         use write_extended_data_error::*;
 
-        let len = VarInt::try_from(length)
-            .expect("data length exceeds VarInt range");
+        let len = VarInt::try_from(length).expect("data length exceeds VarInt range");
 
         self.writer
             .encode_one(SSH_MSG_CHANNEL_EXTENDED_DATA)
@@ -738,10 +749,7 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> SshChannel<R, W>
     }
 
     /// Send a channel notification (no reply expected).
-    pub async fn notice<N, PE>(
-        &mut self,
-        notice: &N,
-    ) -> Result<(), SendChannelNoticeError<PE>>
+    pub async fn notice<N, PE>(&mut self, notice: &N) -> Result<(), SendChannelNoticeError<PE>>
     where
         N: NotifyChannelRequest,
         PE: std::error::Error + Send + Sync + 'static,
@@ -826,8 +834,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ChannelDataRead<'_, R> {
         let mut limited_buf = buf.take(max_read);
 
         let before = limited_buf.filled().len();
-        let result =
-            std::pin::Pin::new(&mut *self.reader).poll_read(cx, &mut limited_buf);
+        let result = std::pin::Pin::new(&mut *self.reader).poll_read(cx, &mut limited_buf);
 
         let bytes_read = limited_buf.filled().len() - before;
         self.remaining -= bytes_read as u64;
@@ -912,9 +919,7 @@ where
     /// Consumes `self`. If `want_reply` is true, returns a
     /// [`ChannelResponder`] that holds a reference to the writer and can send
     /// the reply directly. If `want_reply` is false, returns `None`.
-    pub async fn decode_payload<T, DE>(
-        self,
-    ) -> Result<(T, Option<ChannelResponder<'c, W>>), DE>
+    pub async fn decode_payload<T, DE>(self) -> Result<(T, Option<ChannelResponder<'c, W>>), DE>
     where
         T: for<'r> DecodeFrom<&'r mut R, Error = DE>,
     {

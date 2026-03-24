@@ -12,12 +12,11 @@
 use std::sync::Arc;
 
 use genmeta_ssh::{
-    Conversation,
+    Conversation, SSH3_CONNECT_PATH,
     auth::parse_authorization_header,
     constants::SSH_VERSION,
     protocol::Ssh3ProtocolFactory,
     session::dispatcher::{SessionConfig, run_session},
-    SSH3_CONNECT_PATH,
 };
 use h3x::connection::ConnectionBuilder;
 use h3x::gm_quic::H3Servers;
@@ -45,8 +44,7 @@ async fn main() {
 
     // Register Ssh3ProtocolFactory so each QUIC connection gets an Ssh3Protocol
     // instance that routes bidirectional streams by session ID.
-    let builder = ConnectionBuilder::new(Arc::default())
-        .protocol(Ssh3ProtocolFactory);
+    let builder = ConnectionBuilder::new(Arc::default()).protocol(Ssh3ProtocolFactory);
 
     let mut servers: H3Servers<_> = H3Servers::builder()
         .without_client_cert_verifier()

@@ -53,12 +53,18 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // Phase 1: Method negotiation
-    let ver = reader.read_u8().await.map_err(|e| Socks5Error::Io { source: e })?;
+    let ver = reader
+        .read_u8()
+        .await
+        .map_err(|e| Socks5Error::Io { source: e })?;
     if ver != SOCKS5_VERSION {
         return Err(Socks5Error::UnsupportedVersion { version: ver });
     }
 
-    let nmethods = reader.read_u8().await.map_err(|e| Socks5Error::Io { source: e })? as usize;
+    let nmethods = reader
+        .read_u8()
+        .await
+        .map_err(|e| Socks5Error::Io { source: e })? as usize;
     let mut methods = vec![0u8; nmethods];
     reader
         .read_exact(&mut methods)
@@ -70,7 +76,10 @@ where
             .write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE])
             .await
             .map_err(|e| Socks5Error::Io { source: e })?;
-        writer.shutdown().await.map_err(|e| Socks5Error::Io { source: e })?;
+        writer
+            .shutdown()
+            .await
+            .map_err(|e| Socks5Error::Io { source: e })?;
         return Ok(());
     }
 
@@ -80,14 +89,26 @@ where
         .map_err(|e| Socks5Error::Io { source: e })?;
 
     // Phase 2: CONNECT request
-    let ver = reader.read_u8().await.map_err(|e| Socks5Error::Io { source: e })?;
+    let ver = reader
+        .read_u8()
+        .await
+        .map_err(|e| Socks5Error::Io { source: e })?;
     if ver != SOCKS5_VERSION {
         return Err(Socks5Error::UnsupportedVersion { version: ver });
     }
 
-    let cmd = reader.read_u8().await.map_err(|e| Socks5Error::Io { source: e })?;
-    let _rsv = reader.read_u8().await.map_err(|e| Socks5Error::Io { source: e })?;
-    let atyp = reader.read_u8().await.map_err(|e| Socks5Error::Io { source: e })?;
+    let cmd = reader
+        .read_u8()
+        .await
+        .map_err(|e| Socks5Error::Io { source: e })?;
+    let _rsv = reader
+        .read_u8()
+        .await
+        .map_err(|e| Socks5Error::Io { source: e })?;
+    let atyp = reader
+        .read_u8()
+        .await
+        .map_err(|e| Socks5Error::Io { source: e })?;
 
     let (dest_addr, dest_atyp_bytes) = match atyp {
         ATYP_IPV4 => {
@@ -99,14 +120,17 @@ where
             (Ipv4Addr::from(buf).to_string(), buf.to_vec())
         }
         ATYP_DOMAIN => {
-            let len = reader.read_u8().await.map_err(|e| Socks5Error::Io { source: e })? as usize;
+            let len = reader
+                .read_u8()
+                .await
+                .map_err(|e| Socks5Error::Io { source: e })? as usize;
             let mut buf = vec![0u8; len];
             reader
                 .read_exact(&mut buf)
                 .await
                 .map_err(|e| Socks5Error::Io { source: e })?;
-            let domain =
-                String::from_utf8(buf.clone()).map_err(|e| Socks5Error::InvalidDomain { source: e })?;
+            let domain = String::from_utf8(buf.clone())
+                .map_err(|e| Socks5Error::InvalidDomain { source: e })?;
             let mut atyp_bytes = vec![len as u8];
             atyp_bytes.extend_from_slice(&buf);
             (domain, atyp_bytes)
@@ -122,12 +146,24 @@ where
         _ => return Err(Socks5Error::UnsupportedAddressType { atyp }),
     };
 
-    let dest_port = reader.read_u16().await.map_err(|e| Socks5Error::Io { source: e })?;
+    let dest_port = reader
+        .read_u16()
+        .await
+        .map_err(|e| Socks5Error::Io { source: e })?;
 
     if cmd != CMD_CONNECT {
-        send_reply(&mut writer, REP_COMMAND_NOT_SUPPORTED, atyp, &dest_atyp_bytes, dest_port)
-            .await?;
-        writer.shutdown().await.map_err(|e| Socks5Error::Io { source: e })?;
+        send_reply(
+            &mut writer,
+            REP_COMMAND_NOT_SUPPORTED,
+            atyp,
+            &dest_atyp_bytes,
+            dest_port,
+        )
+        .await?;
+        writer
+            .shutdown()
+            .await
+            .map_err(|e| Socks5Error::Io { source: e })?;
         return Ok(());
     }
 
@@ -137,9 +173,18 @@ where
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(%addr, error = %snafu::Report::from_error(&e), "socks5 connect failed");
-            send_reply(&mut writer, REP_CONNECTION_REFUSED, atyp, &dest_atyp_bytes, dest_port)
-                .await?;
-            writer.shutdown().await.map_err(|e| Socks5Error::Io { source: e })?;
+            send_reply(
+                &mut writer,
+                REP_CONNECTION_REFUSED,
+                atyp,
+                &dest_atyp_bytes,
+                dest_port,
+            )
+            .await?;
+            writer
+                .shutdown()
+                .await
+                .map_err(|e| Socks5Error::Io { source: e })?;
             return Ok(());
         }
     };
@@ -209,7 +254,7 @@ async fn send_reply_with_bound_addr<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::net::TcpListener;
 
     fn socks5_greeting(methods: &[u8]) -> Vec<u8> {
