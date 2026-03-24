@@ -218,25 +218,24 @@ where
                         .decode_payload::<TcpipForwardRequest, ForwardError>()
                         .await
                     {
-                        Ok((payload, decoded)) => {
-                            let bind_addr: &str = &payload.bind_address;
-                            let bind_port = match u16::try_from(payload.bind_port.into_inner()) {
+                        Ok(decoded) => {
+                            let bind_addr = decoded.payload().bind_address.to_string();
+                            let bind_port = match u16::try_from(decoded.payload().bind_port.into_inner()) {
                                 Ok(p) => p,
                                 Err(_) => {
-                                    tracing::warn!(port = payload.bind_port.into_inner(), "tcpip-forward port overflow");
+                                    tracing::warn!(port = decoded.payload().bind_port.into_inner(), "tcpip-forward port overflow");
                                     let _ = decoded.respond_failure().await;
                                     return;
                                 }
                             };
-                            match conversation.bind_tcp_forward((bind_addr, bind_port)).await {
-                                Ok(listener) => {
-                                    let actual_port = listener.port();
+                            match conversation.run_tcp_forward((bind_addr.as_str(), bind_port)).await {
+                                Ok((actual_port, accept_loop)) => {
                                     let abort = forward_tasks.spawn(
-                                        listener.run().instrument(
+                                        accept_loop.instrument(
                                             tracing::info_span!("tcp-forward", port = actual_port),
                                         ),
                                     );
-                                    tcp_forwards.insert((bind_addr.to_owned(), actual_port), abort);
+                                    tcp_forwards.insert((bind_addr, actual_port), abort);
                                     let reply = TcpipForwardReply {
                                         allocated_port: VarInt::from(actual_port as u32),
                                     };
@@ -260,17 +259,17 @@ where
                         .decode_payload::<CancelTcpipForwardRequest, ForwardError>()
                         .await
                     {
-                        Ok((payload, decoded)) => {
-                            let bind_addr: &str = &payload.bind_address;
-                            let bind_port = match u16::try_from(payload.bind_port.into_inner()) {
+                        Ok(decoded) => {
+                            let bind_addr = decoded.payload().bind_address.to_string();
+                            let bind_port = match u16::try_from(decoded.payload().bind_port.into_inner()) {
                                 Ok(p) => p,
                                 Err(_) => {
-                                    tracing::warn!(port = payload.bind_port.into_inner(), "cancel-tcpip-forward port overflow");
+                                    tracing::warn!(port = decoded.payload().bind_port.into_inner(), "cancel-tcpip-forward port overflow");
                                     let _ = decoded.respond_failure().await;
                                     return;
                                 }
                             };
-                            if let Some(abort) = tcp_forwards.remove(&(bind_addr.to_owned(), bind_port)) {
+                            if let Some(abort) = tcp_forwards.remove(&(bind_addr.clone(), bind_port)) {
                                 abort.abort();
                                 let _ = decoded
                                     .respond_success(crate::conversation::EmptyPayload)
@@ -289,16 +288,16 @@ where
                         .decode_payload::<StreamlocalForwardRequest, ForwardError>()
                         .await
                     {
-                        Ok((payload, decoded)) => {
-                            let socket_path: &str = &payload.socket_path;
-                            match conversation.bind_unix_forward(socket_path).await {
-                                Ok(listener) => {
+                        Ok(decoded) => {
+                            let socket_path = decoded.payload().socket_path.to_string();
+                            match conversation.run_unix_forward(&*socket_path).await {
+                                Ok(accept_loop) => {
                                     let abort = forward_tasks.spawn(
-                                        listener.run().instrument(
-                                            tracing::info_span!("unix-forward", path = socket_path),
+                                        accept_loop.instrument(
+                                            tracing::info_span!("unix-forward", path = &*socket_path),
                                         ),
                                     );
-                                    unix_forwards.insert(socket_path.to_owned(), abort);
+                                    unix_forwards.insert(socket_path, abort);
                                     let _ = decoded
                                         .respond_success(crate::conversation::EmptyPayload)
                                         .await;
@@ -319,9 +318,9 @@ where
                         .decode_payload::<CancelStreamlocalForwardRequest, ForwardError>()
                         .await
                     {
-                        Ok((payload, decoded)) => {
-                            let socket_path: &str = &payload.socket_path;
-                            if let Some(abort) = unix_forwards.remove(socket_path) {
+                        Ok(decoded) => {
+                            let socket_path = decoded.payload().socket_path.to_string();
+                            if let Some(abort) = unix_forwards.remove(&*socket_path) {
                                 abort.abort();
                                 let _ = decoded
                                     .respond_success(crate::conversation::EmptyPayload)
@@ -338,7 +337,7 @@ where
                 _ => {
                     tracing::warn!(request_type = %&*request_type, "rejecting unknown global request");
                     match req.decode_payload::<crate::conversation::EmptyPayload, std::convert::Infallible>().await {
-                        Ok((_, decoded)) => { let _ = decoded.respond_failure().await; }
+                        Ok(decoded) => { let _ = decoded.respond_failure().await; }
                         Err(e) => match e {}
                     }
                 }

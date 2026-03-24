@@ -358,8 +358,8 @@ async fn accept_incoming_request_decode_and_respond_success() {
     assert_eq!(&**req.request_type(), "tcpip-forward");
 
     // Decode payload — consumes req, returns DecodedGlobalRequest
-    let (payload, decoded): (SshString, _) = req.decode_payload().await.unwrap();
-    assert_eq!(&*payload, "bind-addr");
+    let decoded: DecodedGlobalRequest<SshString, _, _> = req.decode_payload().await.unwrap();
+    assert_eq!(&**decoded.payload(), "bind-addr");
 
     // Respond with success (VarInt 8080)
     decoded
@@ -386,7 +386,7 @@ async fn accept_incoming_request_respond_failure() {
         _ => panic!("expected Request"),
     };
 
-    let (_payload, decoded): (SshString, _) = req.decode_payload().await.unwrap();
+    let decoded = req.decode_payload::<SshString, _>().await.unwrap();
     decoded.respond_failure().await.unwrap();
 
     let msg_type: VarInt = remote_reader.decode_one().await.unwrap();
@@ -463,7 +463,7 @@ async fn drop_request_after_decode_queues_auto_failure() {
     };
 
     // Decode payload — returns DecodedGlobalRequest
-    let (_payload, decoded): (SshString, _) = req.decode_payload().await.unwrap();
+    let decoded = req.decode_payload::<SshString, _>().await.unwrap();
 
     // Drop DecodedGlobalRequest without responding → should queue auto-failure
     drop(decoded);
@@ -504,14 +504,14 @@ async fn incoming_request_responses_ordered_correctly() {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
     };
-    let (_, decoded_a): (SshString, _) = req_a.decode_payload().await.unwrap();
+    let decoded_a = req_a.decode_payload::<SshString, _>().await.unwrap();
 
     let incoming_b = conv.accept().await.unwrap();
     let req_b = match incoming_b {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
     };
-    let (_, decoded_b): (SshString, _) = req_b.decode_payload().await.unwrap();
+    let decoded_b = req_b.decode_payload::<SshString, _>().await.unwrap();
 
     // Respond to B first (out of order) — it should wait for A
     let b_handle = tokio::spawn(async move {
@@ -642,7 +642,7 @@ async fn consecutive_auto_failures_drained_by_next_writer() {
     for _ in 0..3 {
         match conv.accept().await.unwrap() {
             IncomingGlobal::Request(req) => {
-                let (_payload, _decoded): (SshString, _) = req.decode_payload().await.unwrap();
+                let _decoded = req.decode_payload::<SshString, _>().await.unwrap();
                 // Drop DecodedGlobalRequest without responding → auto-failure queued
             }
             _ => panic!("expected Request"),
@@ -722,7 +722,7 @@ async fn poisoned_session_rejects_respond_success() {
         _ => panic!("expected Request"),
     };
 
-    let (_payload, decoded): (SshString, _) = req.decode_payload().await.unwrap();
+    let decoded = req.decode_payload::<SshString, _>().await.unwrap();
 
     // Now poison the session before responding
     conv.shared.poison();
@@ -742,7 +742,7 @@ async fn poisoned_session_rejects_respond_failure() {
         _ => panic!("expected Request"),
     };
 
-    let (_payload, decoded): (SshString, _) = req.decode_payload().await.unwrap();
+    let decoded = req.decode_payload::<SshString, _>().await.unwrap();
 
     conv.shared.poison();
 
@@ -763,7 +763,7 @@ async fn respond_success_cancelled_poisons_session() {
         _ => panic!("expected Request"),
     };
 
-    let (_payload, decoded): (SshString, _) = req.decode_payload().await.unwrap();
+    let decoded = req.decode_payload::<SshString, _>().await.unwrap();
 
     // Close the remote side so writes fail/block.
     drop(_remote_reader);
@@ -822,9 +822,9 @@ async fn multiple_sequential_accepts() {
             expected_type.as_bytes()
         );
 
-        let (payload, decoded): (SshString, _) = req.decode_payload().await.unwrap();
+        let decoded: DecodedGlobalRequest<SshString, _, _> = req.decode_payload().await.unwrap();
         let expected_payload = format!("data-{i}");
-        assert_eq!(payload.as_ref() as &[u8], expected_payload.as_bytes());
+        assert_eq!(decoded.payload().as_ref() as &[u8], expected_payload.as_bytes());
 
         decoded
             .respond_success(VarInt::from_u32(i * 10))
@@ -892,7 +892,7 @@ async fn auto_failure_at_current_serving_drained_immediately() {
             IncomingGlobal::Request(r) => r,
             _ => panic!("expected Request"),
         };
-        let (_payload, _decoded): (SshString, _) = req.decode_payload().await.unwrap();
+        let _decoded = req.decode_payload::<SshString, _>().await.unwrap();
         // Drop DecodedGlobalRequest here: writer ticket 0 → auto-failure
     }
 
@@ -924,11 +924,11 @@ async fn auto_failures_interleaved_with_real_responses() {
     }
 
     // Accept all 4
-    let mut decoded_reqs: Vec<DecodedGlobalRequest<MockReader, MockWriter>> = Vec::new();
+    let mut decoded_reqs: Vec<DecodedGlobalRequest<SshString, MockReader, MockWriter>> = Vec::new();
     for _ in 0..4 {
         match conv.accept().await.unwrap() {
             IncomingGlobal::Request(r) => {
-                let (_payload, decoded): (SshString, _) = r.decode_payload().await.unwrap();
+                let decoded = r.decode_payload::<SshString, _>().await.unwrap();
                 decoded_reqs.push(decoded);
             }
             _ => panic!("expected Request"),
@@ -1100,7 +1100,7 @@ async fn accept_alternating_requests_and_notices() {
             _ => panic!("expected Request"),
         };
         assert_eq!(req.request_type().as_ref() as &[u8], b"req-1");
-        let (_, decoded): (SshString, _) = req.decode_payload().await.unwrap();
+        let decoded = req.decode_payload::<SshString, _>().await.unwrap();
         decoded.respond_success(VarInt::from_u32(10)).await.unwrap();
     }
 
@@ -1121,7 +1121,7 @@ async fn accept_alternating_requests_and_notices() {
             _ => panic!("expected Request"),
         };
         assert_eq!(req.request_type().as_ref() as &[u8], b"req-2");
-        let (_, decoded): (SshString, _) = req.decode_payload().await.unwrap();
+        let decoded = req.decode_payload::<SshString, _>().await.unwrap();
         decoded.respond_failure().await.unwrap();
     }
 
@@ -1160,8 +1160,8 @@ async fn decode_payload_success_releases_reader() {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
     };
-    let (payload, _decoded): (SshString, _) = req.decode_payload().await.unwrap();
-    assert_eq!(payload.as_ref() as &[u8], b"x");
+    let decoded = req.decode_payload::<SshString, _>().await.unwrap();
+    assert_eq!(decoded.payload().as_ref() as &[u8], b"x");
 
     // After decode_payload succeeds, the reader is released and we can
     // accept the next message without blocking.

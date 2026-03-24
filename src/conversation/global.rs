@@ -171,7 +171,7 @@ where
     ///
     /// On decode failure the stream is irrecoverably corrupted (partial
     /// bytes consumed), so the session is poisoned when `self` drops.
-    pub async fn decode_payload<T, DE>(mut self) -> Result<(T, DecodedGlobalRequest<R, W>), DE>
+    pub async fn decode_payload<T, DE>(mut self) -> Result<DecodedGlobalRequest<T, R, W>, DE>
     where
         T: for<'r> DecodeFrom<&'r mut R, Error = DE>,
     {
@@ -186,12 +186,13 @@ where
                 // Move the writer ticket into DecodedGlobalRequest.
                 let ticket = self.writer_ticket.take();
                 let decoded = DecodedGlobalRequest {
+                    payload: value,
                     writer_ticket: ticket,
                     shared: Arc::clone(&self.shared),
                 };
                 // self drops here: reader_guard=None → no poison,
                 // writer_ticket=None → no auto-failure.
-                Ok((value, decoded))
+                Ok(decoded)
             }
             Err(e) => {
                 // self drops here: reader_guard=Some → poison.
@@ -225,12 +226,20 @@ impl<R, W> Drop for IncomingGlobalRequest<R, W> {
 ///
 /// Dropping without responding queues an automatic failure response.
 #[must_use = "decoded global requests should be answered"]
-pub struct DecodedGlobalRequest<R, W> {
+pub struct DecodedGlobalRequest<T, R, W> {
+    payload: T,
     writer_ticket: Option<u64>,
     shared: Arc<ConversationShared<R, W>>,
 }
 
-impl<R, W> DecodedGlobalRequest<R, W>
+impl<T, R, W> DecodedGlobalRequest<T, R, W> {
+    /// The decoded payload.
+    pub fn payload(&self) -> &T {
+        &self.payload
+    }
+}
+
+impl<T, R, W> DecodedGlobalRequest<T, R, W>
 where
     W: AsyncWrite + Unpin + Send,
 {
@@ -308,7 +317,7 @@ where
     }
 }
 
-impl<R, W> Drop for DecodedGlobalRequest<R, W> {
+impl<T, R, W> Drop for DecodedGlobalRequest<T, R, W> {
     fn drop(&mut self) {
         if let Some(ticket) = self.writer_ticket.take() {
             self.shared.auto_failures.lock().unwrap().insert(ticket);
