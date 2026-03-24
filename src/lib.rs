@@ -17,7 +17,7 @@ pub mod version;
 pub use auth::{AuthCredential, AuthScheme, parse_authorization_header};
 pub use byte_channel::{ChannelReader, ChannelWriter};
 pub use channel::{ChannelOpenFailure, reason_code};
-pub use client::{ConnectError, SSH3_CONNECT_PATH, Ssh3Client, encode_basic_auth};
+pub use client::{SSH3_CONNECT_PATH, encode_basic_auth};
 pub use codec::{SshBool, SshString};
 pub use constants::{
     CHANNEL_SIGNAL_VALUE, DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION, SUPPORTED_SSH_VERSIONS,
