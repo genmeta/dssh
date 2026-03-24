@@ -240,10 +240,10 @@ where
     // EIO is expected when the child exits (slave side closes).
     let mut channel_writer = SshChannel::new(tokio::io::empty(), writer);
     let output_result = relay_output_pty(&mut master_reader, &mut channel_writer).await;
-    if let Err(ProcessError::ReadPty { ref source }) = output_result {
-        if source.raw_os_error() != Some(nix::libc::EIO) {
-            output_result?;
-        }
+    if let Err(ProcessError::ReadPty { ref source }) = output_result
+        && source.raw_os_error() != Some(nix::libc::EIO)
+    {
+        output_result?;
     }
 
     // Wait for child exit.

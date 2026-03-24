@@ -297,7 +297,7 @@ where
         }
         IncomingGlobal::Notify(notice) => {
             tracing::debug!(
-                request_type = %&*notice.request_type(),
+                request_type = %notice.request_type(),
                 "ignoring global notice"
             );
             // Notices don't need a response; just consume the payload.
