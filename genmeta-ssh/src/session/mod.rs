@@ -11,6 +11,7 @@
 
 pub mod client;
 pub mod dispatcher;
+pub mod privilege;
 pub mod process;
 pub mod pty;
 pub mod signal;

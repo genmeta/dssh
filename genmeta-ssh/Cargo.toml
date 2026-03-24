@@ -8,7 +8,7 @@ edition = "2024"
 h3x = { path = "../../h3x", features = ["remoc", "serde"] }
 http = "1"
 http-body-util = "0.1"
-nix = { version = "0.29", features = ["term", "ioctl", "signal", "fs", "process"] }
+nix = { version = "0.29", features = ["term", "ioctl", "signal", "fs", "process", "user"] }
 snafu = "0.9"
 tracing = "0.1"
 bytes = { version = "1", features = ["serde"] }
