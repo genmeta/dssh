@@ -9,12 +9,10 @@ use std::sync::Arc;
 
 use crate::{
     constants::DEFAULT_MAX_MESSAGE_SIZE,
-    conversation::{Conversation, ManageSessionStream},
-    forward::{
-        ForwardedStreamlocal, ForwardedTcpip,
-    },
-    forward::relay,
+    conversation::{ChannelOpen, Conversation, ManageSessionStream},
+    forward::{ForwardError, ForwardedStreamlocal, ForwardedTcpip, relay},
 };
+use h3x::codec::EncodeInto;
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, ToSocketAddrs, UnixListener};
@@ -123,6 +121,44 @@ where
     }
 }
 
+/// Open a reverse-forwarding channel and relay data bidirectionally.
+///
+/// On failure to open, logs a warning and returns silently.
+async fn open_and_relay<M, C, S>(
+    conversation: &Conversation<M>,
+    channel_open: C,
+    local_stream: S,
+) where
+    M: ManageSessionStream + 'static,
+    M::StreamReader: AsyncRead + Send + Unpin + 'static,
+    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+    C: ChannelOpen,
+    for<'w> C: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = ForwardError>,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (reader, writer) = match conversation
+        .open_channel(&channel_open, DEFAULT_MAX_MESSAGE_SIZE)
+        .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(error = %snafu::Report::from_error(&e), "reverse channel open failed");
+            return;
+        }
+    };
+
+    let (local_reader, local_writer) = tokio::io::split(local_stream);
+    let ch2s = tokio::spawn(relay(reader, local_writer).in_current_span());
+    let s2ch = tokio::spawn(relay(local_reader, writer).in_current_span());
+    let (r1, r2) = tokio::join!(ch2s, s2ch);
+    if let Err(e) = r1 {
+        tracing::warn!(error = %e, "reverse relay task panicked");
+    }
+    if let Err(e) = r2 {
+        tracing::warn!(error = %e, "reverse relay task panicked");
+    }
+}
+
 async fn tcp_accept_loop<M>(
     listener: TcpListener,
     conversation: Arc<Conversation<M>>,
@@ -149,41 +185,16 @@ async fn tcp_accept_loop<M>(
 
         let conversation = Arc::clone(&conversation);
         let connected_addr = connected_addr.clone();
-        let originator_addr = peer_addr.ip().to_string();
-        let originator_port = peer_addr.port();
 
         tokio::spawn(
             async move {
                 let channel_open = ForwardedTcpip {
                     connected_address: connected_addr.into(),
                     connected_port: (connected_port as u32).into(),
-                    originator_address: originator_addr.into(),
-                    originator_port: (originator_port as u32).into(),
+                    originator_address: peer_addr.ip().to_string().into(),
+                    originator_port: (peer_addr.port() as u32).into(),
                 };
-                let (reader, writer) = match conversation
-                    .open_channel(&channel_open, DEFAULT_MAX_MESSAGE_SIZE)
-                    .await
-                {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %snafu::Report::from_error(&e),
-                            "forwarded-tcpip open_channel failed"
-                        );
-                        return;
-                    }
-                };
-
-                let (tcp_reader, tcp_writer) = tokio::io::split(tcp_stream);
-                let ch2s = tokio::spawn(relay(reader, tcp_writer).in_current_span());
-                let s2ch = tokio::spawn(relay(tcp_reader, writer).in_current_span());
-                let (r1, r2) = tokio::join!(ch2s, s2ch);
-                if let Err(e) = r1 {
-                    tracing::warn!(error = %e, "forwarded-tcpip relay task panicked");
-                }
-                if let Err(e) = r2 {
-                    tracing::warn!(error = %e, "forwarded-tcpip relay task panicked");
-                }
+                open_and_relay(&conversation, channel_open, tcp_stream).await;
             }
             .in_current_span(),
         );
@@ -219,30 +230,7 @@ async fn unix_accept_loop<M>(
                 let channel_open = ForwardedStreamlocal {
                     socket_path: path.into(),
                 };
-                let (reader, writer) = match conversation
-                    .open_channel(&channel_open, DEFAULT_MAX_MESSAGE_SIZE)
-                    .await
-                {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %snafu::Report::from_error(&e),
-                            "forwarded-streamlocal open_channel failed"
-                        );
-                        return;
-                    }
-                };
-
-                let (unix_reader, unix_writer) = tokio::io::split(unix_stream);
-                let ch2s = tokio::spawn(relay(reader, unix_writer).in_current_span());
-                let s2ch = tokio::spawn(relay(unix_reader, writer).in_current_span());
-                let (r1, r2) = tokio::join!(ch2s, s2ch);
-                if let Err(e) = r1 {
-                    tracing::warn!(error = %e, "forwarded-streamlocal relay task panicked");
-                }
-                if let Err(e) = r2 {
-                    tracing::warn!(error = %e, "forwarded-streamlocal relay task panicked");
-                }
+                open_and_relay(&conversation, channel_open, unix_stream).await;
             }
             .in_current_span(),
         );
