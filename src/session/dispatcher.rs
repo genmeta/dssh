@@ -18,7 +18,7 @@
 //!
 //! | Request type | Action |
 //! |---|---|
-//! | `"tcpip-forward"` | Start TCP listener via [`ReverseForwarder`](crate::forward::reverse::ReverseForwarder) |
+//! | `"tcpip-forward"` | Start TCP listener via [`Conversation::bind_tcp_forward`] |
 //! | `"cancel-tcpip-forward"` | Stop TCP listener |
 //! | `"streamlocal-forward@openssh.com"` | Start Unix socket listener |
 //! | `"cancel-streamlocal-forward@openssh.com"` | Stop Unix socket listener |
@@ -29,14 +29,13 @@ use std::sync::Arc;
 use std::collections::HashMap;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 
 use crate::channel::reason_code;
 use crate::conversation::{Conversation, IncomingGlobal, ManageSessionStream};
 use crate::forward::{
     CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, ForwardError,
     StreamlocalForwardRequest, TcpipForwardReply, TcpipForwardRequest,
-    reverse::ForwardHandle,
 };
 use crate::session::process::CommandMode;
 use h3x::varint::VarInt;
@@ -73,16 +72,19 @@ impl Default for SessionConfig {
 /// Concurrently accepts channels and global requests from the conversation,
 /// dispatching each to the appropriate handler. Returns when the conversation
 /// is closed (both accept methods return errors indicating shutdown).
-pub async fn run_session<M>(conversation: Arc<Conversation<M>>, config: SessionConfig)
+pub async fn run_session<M, R, W>(conversation: Arc<Conversation<M, R, W>>, config: SessionConfig)
 where
     M: ManageSessionStream + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
     M::StreamReader: AsyncRead + Send + Unpin + 'static,
     M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
     M::Error: Send + Sync + 'static,
 {
-    let mut tcp_forwards: HashMap<(String, u16), ForwardHandle> = HashMap::new();
-    let mut unix_forwards: HashMap<String, ForwardHandle> = HashMap::new();
+    let mut tcp_forwards: HashMap<(String, u16), AbortHandle> = HashMap::new();
+    let mut unix_forwards: HashMap<String, AbortHandle> = HashMap::new();
     let mut channel_tasks: JoinSet<()> = JoinSet::new();
+    let mut forward_tasks: JoinSet<()> = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -156,7 +158,7 @@ where
             global_result = conversation.accept() => {
                 match global_result {
                     Ok(incoming) => {
-                        dispatch_global(incoming, &conversation, &mut tcp_forwards, &mut unix_forwards).await;
+                        dispatch_global(incoming, &conversation, &mut tcp_forwards, &mut unix_forwards, &mut forward_tasks).await;
                     }
                     Err(e) => {
                         tracing::debug!(error = %snafu::Report::from_error(&e), "accept global ended");
@@ -169,6 +171,15 @@ where
             Some(result) = channel_tasks.join_next() => {
                 if let Err(e) = result {
                     tracing::warn!(error = %e, "channel task panicked");
+                }
+            }
+
+            // Reap completed forward listener tasks.
+            Some(result) = forward_tasks.join_next() => {
+                if let Err(e) = result {
+                    if !e.is_cancelled() {
+                        tracing::warn!(error = %e, "forward task panicked");
+                    }
                 }
             }
         }
@@ -186,14 +197,17 @@ where
 // Global request dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_global<M>(
-    incoming: IncomingGlobal,
-    conversation: &Arc<Conversation<M>>,
-    tcp_forwards: &mut HashMap<(String, u16), ForwardHandle>,
-    unix_forwards: &mut HashMap<String, ForwardHandle>,
+async fn dispatch_global<M, R, W>(
+    incoming: IncomingGlobal<R, W>,
+    conversation: &Arc<Conversation<M, R, W>>,
+    tcp_forwards: &mut HashMap<(String, u16), AbortHandle>,
+    unix_forwards: &mut HashMap<String, AbortHandle>,
+    forward_tasks: &mut JoinSet<()>,
 )
 where
     M: ManageSessionStream + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
     M::StreamReader: AsyncRead + Send + Unpin + 'static,
     M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
 {
@@ -216,9 +230,15 @@ where
                                     return;
                                 }
                             };
-                            match conversation.forward_tcp((bind_addr, bind_port)).await {
-                                Ok((actual_port, handle)) => {
-                                    tcp_forwards.insert((bind_addr.to_owned(), actual_port), handle);
+                            match conversation.bind_tcp_forward((bind_addr, bind_port)).await {
+                                Ok(listener) => {
+                                    let actual_port = listener.port();
+                                    let abort = forward_tasks.spawn(
+                                        listener.run().instrument(
+                                            tracing::info_span!("tcp-forward", port = actual_port),
+                                        ),
+                                    );
+                                    tcp_forwards.insert((bind_addr.to_owned(), actual_port), abort);
                                     let reply = TcpipForwardReply {
                                         allocated_port: VarInt::from(actual_port as u32),
                                     };
@@ -252,7 +272,8 @@ where
                                     return;
                                 }
                             };
-                            if tcp_forwards.remove(&(bind_addr.to_owned(), bind_port)).is_some() {
+                            if let Some(abort) = tcp_forwards.remove(&(bind_addr.to_owned(), bind_port)) {
+                                abort.abort();
                                 let _ = decoded
                                     .respond_success(crate::conversation::EmptyPayload)
                                     .await;
@@ -272,9 +293,14 @@ where
                     {
                         Ok((payload, decoded)) => {
                             let socket_path: &str = &payload.socket_path;
-                            match conversation.forward_unix(socket_path).await {
-                                Ok(handle) => {
-                                    unix_forwards.insert(socket_path.to_owned(), handle);
+                            match conversation.bind_unix_forward(socket_path).await {
+                                Ok(listener) => {
+                                    let abort = forward_tasks.spawn(
+                                        listener.run().instrument(
+                                            tracing::info_span!("unix-forward", path = socket_path),
+                                        ),
+                                    );
+                                    unix_forwards.insert(socket_path.to_owned(), abort);
                                     let _ = decoded
                                         .respond_success(crate::conversation::EmptyPayload)
                                         .await;
@@ -297,7 +323,8 @@ where
                     {
                         Ok((payload, decoded)) => {
                             let socket_path: &str = &payload.socket_path;
-                            if unix_forwards.remove(socket_path).is_some() {
+                            if let Some(abort) = unix_forwards.remove(socket_path) {
+                                abort.abort();
                                 let _ = decoded
                                     .respond_success(crate::conversation::EmptyPayload)
                                     .await;

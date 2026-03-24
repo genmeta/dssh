@@ -43,7 +43,7 @@ pub use forward::{
     TcpipForwardReply, TcpipForwardRequest,
     direct::{self, DirectForwardError, handle_direct_streamlocal, handle_direct_tcpip},
     relay,
-    reverse::{self, ForwardHandle, ReverseForwardError},
+    reverse::{self, ReverseForwardError, TcpForwardListener, UnixForwardListener},
     socks5::{self, Socks5Error, handle_socks5},
 };
 pub use message::{

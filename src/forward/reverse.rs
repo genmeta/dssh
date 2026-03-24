@@ -1,10 +1,13 @@
-//! Reverse forwarding: start listeners that open SSH3 channels back to the
+//! Reverse forwarding: bind listeners that open SSH3 channels back to the
 //! client for each accepted connection.
 //!
-//! Provides [`Conversation::forward_tcp`] and [`Conversation::forward_unix`],
-//! each returning a [`ForwardHandle`] that stops the listener on drop.
+//! Provides [`Conversation::bind_tcp_forward`] and
+//! [`Conversation::bind_unix_forward`], each returning a listener object
+//! whose [`run()`](TcpForwardListener::run) method drives the accept loop.
+//! The caller decides when and how to spawn the listener (e.g. via
+//! `tokio::spawn`), keeping task lifetime management explicit.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{
@@ -16,7 +19,6 @@ use h3x::codec::EncodeInto;
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, ToSocketAddrs, UnixListener};
-use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 #[derive(Debug, Snafu)]
@@ -32,91 +34,141 @@ pub enum ReverseForwardError {
     UnixBind { source: std::io::Error },
 }
 
-/// Handle to a single active reverse-forwarding listener.
+// ---------------------------------------------------------------------------
+// TCP forward listener
+// ---------------------------------------------------------------------------
+
+/// A bound TCP listener ready to accept connections for reverse forwarding.
 ///
-/// Dropping the handle aborts the accept loop and performs cleanup
-/// (e.g., removing the Unix socket file).
-pub struct ForwardHandle {
-    handle: JoinHandle<()>,
-    cleanup: Option<Box<dyn FnOnce() + Send>>,
+/// Created by [`Conversation::bind_tcp_forward`]. Call [`run()`](Self::run)
+/// to enter the accept loop (a long-running async function).
+pub struct TcpForwardListener<M: ManageSessionStream, R, W> {
+    listener: TcpListener,
+    conversation: Arc<Conversation<M, R, W>>,
+    bound_addr: std::net::SocketAddr,
 }
 
-impl ForwardHandle {
-    /// Stop the listener explicitly.
-    pub fn stop(mut self) {
-        self.handle.abort();
-        if let Some(cleanup) = self.cleanup.take() {
-            cleanup();
-        }
+impl<M: ManageSessionStream, R, W> TcpForwardListener<M, R, W> {
+    /// The actual port the listener is bound to.
+    pub fn port(&self) -> u16 {
+        self.bound_addr.port()
     }
 }
 
-impl Drop for ForwardHandle {
-    fn drop(&mut self) {
-        self.handle.abort();
-        if let Some(cleanup) = self.cleanup.take() {
-            cleanup();
-        }
-    }
-}
-
-impl<M: ManageSessionStream + 'static> Conversation<M>
+impl<M: ManageSessionStream + 'static, R, W> TcpForwardListener<M, R, W>
 where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
     M::StreamReader: AsyncRead + Send + Unpin + 'static,
     M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
 {
-    /// Start a TCP reverse forwarding listener.
+    /// Run the accept loop, opening a `forwarded-tcpip` channel for each
+    /// accepted connection and relaying data bidirectionally.
     ///
-    /// Each accepted connection opens a `forwarded-tcpip` channel to the
-    /// client and relays data bidirectionally. Returns the actual bound port
-    /// and a [`ForwardHandle`] to control the listener's lifetime.
-    pub async fn forward_tcp(
+    /// This function runs until the listener encounters an accept error.
+    /// Cancel the enclosing task to stop the listener.
+    pub async fn run(self) {
+        tcp_accept_loop(self.listener, self.conversation, self.bound_addr).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unix forward listener
+// ---------------------------------------------------------------------------
+
+/// A bound Unix socket listener ready to accept connections for reverse
+/// forwarding.
+///
+/// Created by [`Conversation::bind_unix_forward`]. Call [`run()`](Self::run)
+/// to enter the accept loop. The socket file is automatically removed when
+/// the listener is dropped or the task is cancelled.
+pub struct UnixForwardListener<M: ManageSessionStream, R, W> {
+    listener: UnixListener,
+    conversation: Arc<Conversation<M, R, W>>,
+    socket_path: PathBuf,
+}
+
+impl<M: ManageSessionStream + 'static, R, W> UnixForwardListener<M, R, W>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    M::StreamReader: AsyncRead + Send + Unpin + 'static,
+    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+{
+    /// Run the accept loop, opening a `forwarded-streamlocal` channel for
+    /// each accepted connection and relaying data bidirectionally.
+    ///
+    /// This function runs until the listener encounters an accept error.
+    /// Cancel the enclosing task to stop the listener. The socket file is
+    /// removed when this future is dropped (including on cancellation).
+    pub async fn run(self) {
+        let _guard = UnixSocketGuard { path: self.socket_path };
+        unix_accept_loop(self.listener, self.conversation, &_guard.path).await;
+    }
+}
+
+/// Guard that removes a Unix socket file on drop.
+struct UnixSocketGuard {
+    path: PathBuf,
+}
+
+impl Drop for UnixSocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversation bind methods
+// ---------------------------------------------------------------------------
+
+impl<M: ManageSessionStream + 'static, R, W> Conversation<M, R, W>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    M::StreamReader: AsyncRead + Send + Unpin + 'static,
+    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+{
+    /// Bind a TCP reverse forwarding listener.
+    ///
+    /// Returns a [`TcpForwardListener`] whose [`port()`](TcpForwardListener::port)
+    /// gives the actual bound port. Call [`run()`](TcpForwardListener::run)
+    /// (typically inside a spawned task) to start accepting connections.
+    pub async fn bind_tcp_forward(
         self: &Arc<Self>,
         addr: impl ToSocketAddrs,
-    ) -> Result<(u16, ForwardHandle), ReverseForwardError> {
+    ) -> Result<TcpForwardListener<M, R, W>, ReverseForwardError> {
         let listener = TcpListener::bind(addr)
             .await
             .context(reverse_forward_error::TcpBindSnafu)?;
-        let local_addr = listener
+        let bound_addr = listener
             .local_addr()
             .context(reverse_forward_error::LocalAddrSnafu)?;
 
-        let conversation = Arc::clone(self);
-        let handle = tokio::spawn(
-            tcp_accept_loop(listener, conversation, local_addr).in_current_span(),
-        );
-
-        Ok((local_addr.port(), ForwardHandle { handle, cleanup: None }))
+        Ok(TcpForwardListener {
+            listener,
+            conversation: Arc::clone(self),
+            bound_addr,
+        })
     }
 
-    /// Start a Unix socket reverse forwarding listener.
+    /// Bind a Unix socket reverse forwarding listener.
     ///
-    /// Each accepted connection opens a `forwarded-streamlocal` channel.
-    /// The socket file is removed when the handle is stopped or dropped.
-    pub async fn forward_unix(
+    /// Returns a [`UnixForwardListener`] that removes the socket file when
+    /// dropped. Call [`run()`](UnixForwardListener::run) (typically inside a
+    /// spawned task) to start accepting connections.
+    pub async fn bind_unix_forward(
         self: &Arc<Self>,
         path: impl AsRef<Path>,
-    ) -> Result<ForwardHandle, ReverseForwardError> {
+    ) -> Result<UnixForwardListener<M, R, W>, ReverseForwardError> {
         let path = path.as_ref();
         let listener = UnixListener::bind(path)
             .context(reverse_forward_error::UnixBindSnafu)?;
 
-        let path_for_task = path.to_path_buf();
-        let path_for_cleanup = path.to_path_buf();
-        let conversation = Arc::clone(self);
-
-        let handle = tokio::spawn(
-            async move {
-                unix_accept_loop(listener, conversation, &path_for_task).await;
-            }
-            .in_current_span(),
-        );
-
-        Ok(ForwardHandle {
-            handle,
-            cleanup: Some(Box::new(move || {
-                let _ = std::fs::remove_file(path_for_cleanup);
-            })),
+        Ok(UnixForwardListener {
+            listener,
+            conversation: Arc::clone(self),
+            socket_path: path.to_path_buf(),
         })
     }
 }
@@ -124,12 +176,14 @@ where
 /// Open a reverse-forwarding channel and relay data bidirectionally.
 ///
 /// On failure to open, logs a warning and returns silently.
-async fn open_and_relay<M, C, S>(
-    conversation: &Conversation<M>,
+async fn open_and_relay<M, R, W, C, S>(
+    conversation: &Conversation<M, R, W>,
     channel_open: C,
     local_stream: S,
 ) where
     M: ManageSessionStream + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
     M::StreamReader: AsyncRead + Send + Unpin + 'static,
     M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
     C: ChannelOpen,
@@ -159,12 +213,14 @@ async fn open_and_relay<M, C, S>(
     }
 }
 
-async fn tcp_accept_loop<M>(
+async fn tcp_accept_loop<M, R, W>(
     listener: TcpListener,
-    conversation: Arc<Conversation<M>>,
+    conversation: Arc<Conversation<M, R, W>>,
     bound_addr: std::net::SocketAddr,
 ) where
     M: ManageSessionStream + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
     M::StreamReader: AsyncRead + Send + Unpin + 'static,
     M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
 {
@@ -201,12 +257,14 @@ async fn tcp_accept_loop<M>(
     }
 }
 
-async fn unix_accept_loop<M>(
+async fn unix_accept_loop<M, R, W>(
     listener: UnixListener,
-    conversation: Arc<Conversation<M>>,
+    conversation: Arc<Conversation<M, R, W>>,
     socket_path: &Path,
 ) where
     M: ManageSessionStream + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
     M::StreamReader: AsyncRead + Send + Unpin + 'static,
     M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
 {
@@ -299,7 +357,7 @@ mod tests {
         }
     }
 
-    fn make_conversation(mock: Arc<MockStreamState>) -> Arc<Conversation<ArcMock>> {
+    fn make_conversation(mock: Arc<MockStreamState>) -> Arc<Conversation<ArcMock, tokio::io::Empty, tokio::io::Sink>> {
         Arc::new(Conversation::new(
             StreamId(VarInt::from_u32(1)),
             "test",
@@ -310,13 +368,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_forward_and_stop() {
+    async fn tcp_forward_bind_and_cancel() {
         let mock = Arc::new(MockStreamState::new());
         let conv = make_conversation(Arc::clone(&mock));
 
-        let (port, handle) = conv.forward_tcp("127.0.0.1:0").await.unwrap();
-        assert_ne!(port, 0, "should get a real port");
-        handle.stop();
+        let listener = conv.bind_tcp_forward("127.0.0.1:0").await.unwrap();
+        assert_ne!(listener.port(), 0, "should get a real port");
+
+        let handle = tokio::spawn(listener.run());
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[tokio::test]
@@ -327,7 +388,9 @@ mod tests {
         let mock = Arc::new(MockStreamState::new());
         let conv = make_conversation(Arc::clone(&mock));
 
-        let (port, handle) = conv.forward_tcp("127.0.0.1:0").await.unwrap();
+        let listener = conv.bind_tcp_forward("127.0.0.1:0").await.unwrap();
+        let port = listener.port();
+        let handle = tokio::spawn(listener.run());
 
         let (local_rd, remote_wr) = duplex(8192);
         let (remote_rd, local_wr) = duplex(8192);
@@ -363,36 +426,50 @@ mod tests {
             "should have called open_stream via Conversation::open_channel"
         );
 
-        handle.stop();
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[tokio::test]
-    async fn unix_forward_and_stop() {
+    async fn unix_forward_bind_and_cancel() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("test.sock");
 
         let mock = Arc::new(MockStreamState::new());
         let conv = make_conversation(Arc::clone(&mock));
 
-        let handle = conv.forward_unix(&sock_path).await.unwrap();
-        assert!(sock_path.exists(), "socket file should exist");
+        let listener = conv.bind_unix_forward(&sock_path).await.unwrap();
+        assert!(sock_path.exists(), "socket file should exist after bind");
 
-        handle.stop();
-        assert!(!sock_path.exists(), "socket file should be cleaned up");
+        let sock_path_clone = sock_path.clone();
+        let handle = tokio::spawn(listener.run());
+
+        // Abort the task — the UnixSocketGuard should clean up the file.
+        handle.abort();
+        let _ = handle.await;
+
+        // Give a moment for cleanup.
+        tokio::task::yield_now().await;
+        assert!(!sock_path_clone.exists(), "socket file should be cleaned up on cancel");
     }
 
     #[tokio::test]
-    async fn drop_cleans_up() {
+    async fn drop_cleans_up_unix() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("drop-test.sock");
 
         let mock = Arc::new(MockStreamState::new());
         let conv = make_conversation(Arc::clone(&mock));
 
-        let _tcp = conv.forward_tcp("127.0.0.1:0").await.unwrap();
-        let _unix = conv.forward_unix(&sock_path).await.unwrap();
+        let listener = conv.bind_unix_forward(&sock_path).await.unwrap();
+        assert!(sock_path.exists(), "socket file should exist after bind");
 
-        drop(_unix);
+        // Spawn and immediately abort — the guard inside run() cleans up.
+        let handle = tokio::spawn(listener.run());
+        handle.abort();
+        let _ = handle.await;
+
+        tokio::task::yield_now().await;
         assert!(
             !sock_path.exists(),
             "socket file should be cleaned up on drop"
