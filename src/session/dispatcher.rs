@@ -38,6 +38,7 @@ use crate::forward::{
 use crate::forward::reverse::ReverseForwarder;
 use crate::session::process::CommandMode;
 use h3x::varint::VarInt;
+use tracing::Instrument;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -110,7 +111,7 @@ where
                             if let Err(e) = super::process::run_piped(channel, mode).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "session channel error");
                             }
-                        });
+                        }.instrument(tracing::info_span!("session")));
                     }
                     "direct-tcpip" => {
                         let (reader, writer) = incoming.into_raw_parts();
@@ -118,7 +119,7 @@ where
                             if let Err(e) = crate::forward::direct::handle_direct_tcpip(reader, writer).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "direct-tcpip error");
                             }
-                        });
+                        }.instrument(tracing::info_span!("direct-tcpip")));
                     }
                     "direct-streamlocal@openssh.com" => {
                         let (reader, writer) = incoming.into_raw_parts();
@@ -126,7 +127,7 @@ where
                             if let Err(e) = crate::forward::direct::handle_direct_streamlocal(reader, writer).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "direct-streamlocal error");
                             }
-                        });
+                        }.instrument(tracing::info_span!("direct-streamlocal")));
                     }
                     "socks5" => {
                         let (reader, writer) = incoming.into_raw_parts();
@@ -134,7 +135,7 @@ where
                             if let Err(e) = crate::forward::socks5::handle_socks5(reader, writer).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "socks5 error");
                             }
-                        });
+                        }.instrument(tracing::info_span!("socks5")));
                     }
                     _ => {
                         tracing::warn!(channel_type = %&*channel_type, "rejecting unknown channel type");
@@ -200,7 +201,14 @@ where
                     {
                         Ok((payload, decoded)) => {
                             let bind_addr: &str = &payload.bind_address;
-                            let bind_port = payload.bind_port.into_inner() as u16;
+                            let bind_port = match u16::try_from(payload.bind_port.into_inner()) {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    tracing::warn!(port = payload.bind_port.into_inner(), "tcpip-forward port overflow");
+                                    let _ = decoded.respond_failure().await;
+                                    return;
+                                }
+                            };
                             match forwarder.start_tcp(bind_addr, bind_port).await {
                                 Ok(actual_port) => {
                                     let reply = TcpipForwardReply {
@@ -228,7 +236,14 @@ where
                     {
                         Ok((payload, decoded)) => {
                             let bind_addr: &str = &payload.bind_address;
-                            let bind_port = payload.bind_port.into_inner() as u16;
+                            let bind_port = match u16::try_from(payload.bind_port.into_inner()) {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    tracing::warn!(port = payload.bind_port.into_inner(), "cancel-tcpip-forward port overflow");
+                                    let _ = decoded.respond_failure().await;
+                                    return;
+                                }
+                            };
                             if forwarder.stop_tcp(bind_addr, bind_port) {
                                 let _ = decoded
                                     .respond_success(crate::conversation::EmptyPayload)

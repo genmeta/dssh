@@ -12,6 +12,7 @@ use snafu::Snafu;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::Instrument;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -196,8 +197,8 @@ where
 
     // Phase 4: Bidirectional relay
     let (tcp_reader, tcp_writer) = tcp_stream.into_split();
-    let q2t = tokio::spawn(relay(reader, tcp_writer));
-    let t2q = tokio::spawn(relay(tcp_reader, writer));
+    let q2t = tokio::spawn(relay(reader, tcp_writer).in_current_span());
+    let t2q = tokio::spawn(relay(tcp_reader, writer).in_current_span());
 
     let (r1, r2) = tokio::join!(q2t, t2q);
     r1.map_err(|e| Socks5Error::RelayJoin { source: e })?

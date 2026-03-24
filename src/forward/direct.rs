@@ -23,6 +23,7 @@ use h3x::{codec::DecodeExt, varint::VarInt};
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
+use tracing::Instrument;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module)]
@@ -100,8 +101,8 @@ where
     SR: AsyncRead + Send + Unpin + 'static,
     SW: AsyncWrite + Send + Unpin + 'static,
 {
-    let ch2s = tokio::spawn(relay(channel_reader, stream_writer));
-    let s2ch = tokio::spawn(relay(stream_reader, channel_writer));
+    let ch2s = tokio::spawn(relay(channel_reader, stream_writer).in_current_span());
+    let s2ch = tokio::spawn(relay(stream_reader, channel_writer).in_current_span());
     let (r1, r2) = tokio::join!(ch2s, s2ch);
     r1.context(direct_forward_error::RelayJoinSnafu)?
         .context(direct_forward_error::RelaySnafu)?;

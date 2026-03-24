@@ -11,16 +11,6 @@ use h3x::{
 use snafu::{ResultExt, Snafu};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub), module)]
-pub enum ForwardRuntimeError {
-    #[snafu(display("forward runtime I/O failed"))]
-    Io { source: std::io::Error },
-
-    #[snafu(display("forward relay task failed"))]
-    RelayTaskJoin { source: tokio::task::JoinError },
-}
-
 /// Copy all bytes from `reader` to `writer`, then shut down the writer.
 pub async fn relay<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
 where
