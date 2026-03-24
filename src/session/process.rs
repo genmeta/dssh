@@ -18,6 +18,7 @@ use std::process::Stdio;
 use h3x::varint::VarInt;
 use nix::unistd::{Pid, setpgid};
 use snafu::prelude::*;
+use tracing::Instrument;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::codec::{SshBool, SshString};
@@ -152,7 +153,7 @@ where
         SshChannel::new(reader, tokio::io::sink()),
         stdin,
         pid,
-    ));
+    ).in_current_span());
 
     // Output relay: stdout/stderr → channel (in main task, using select!).
     let mut channel_writer = SshChannel::new(tokio::io::empty(), writer);
@@ -234,7 +235,7 @@ where
         master_writer,
         pid,
         master_raw_fd,
-    ));
+    ).in_current_span());
 
     // Output relay: PTY master → channel data.
     // EIO is expected when the child exits (slave side closes).
