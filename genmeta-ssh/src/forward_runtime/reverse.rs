@@ -2,25 +2,26 @@
 //!
 //! When a client sends `tcpip-forward` or `streamlocal-forward@openssh.com`
 //! global requests, the server starts listeners. For each accepted connection,
-//! a new SSH3 channel is opened back to the client and raw bytes are relayed.
+//! a new SSH3 channel is opened back to the client via
+//! [`Conversation::open_channel`] and raw bytes are relayed.
 //!
 //! The [`ReverseForwarder`] manages the lifecycle of all active listeners for
-//! a single conversation, parameterized over the stream management trait.
+//! a single conversation.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
     constants::DEFAULT_MAX_MESSAGE_SIZE,
-    conversation::{ManageSessionStream, ChannelOpen},
+    conversation::{Conversation, ManageSessionStream},
     forward::{
-        ForwardedTcpipChannelOpen, ForwardedTcpipRequest,
         ForwardedStreamlocalChannelOpen, ForwardedStreamlocalRequest,
+        ForwardedTcpipChannelOpen, ForwardedTcpipRequest,
     },
     forward_runtime::relay,
 };
-use h3x::codec::EncodeInto;
 use snafu::{ResultExt, Snafu};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
@@ -69,15 +70,19 @@ impl UnixListenerHandle {
 /// Generic over `M: ManageSessionStream` to work with any transport
 /// implementation (direct QUIC, remoc RPC, etc.).
 pub struct ReverseForwarder<M: ManageSessionStream + 'static> {
-    manage: Arc<M>,
+    conversation: Arc<Conversation<M>>,
     tcp_listeners: HashMap<(String, u16), ListenerHandle>,
     unix_listeners: HashMap<String, UnixListenerHandle>,
 }
 
-impl<M: ManageSessionStream + 'static> ReverseForwarder<M> {
-    pub fn new(manage: Arc<M>) -> Self {
+impl<M: ManageSessionStream + 'static> ReverseForwarder<M>
+where
+    M::StreamReader: AsyncRead + Send + Unpin + 'static,
+    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+{
+    pub fn new(conversation: Arc<Conversation<M>>) -> Self {
         Self {
-            manage,
+            conversation,
             tcp_listeners: HashMap::new(),
             unix_listeners: HashMap::new(),
         }
@@ -87,7 +92,7 @@ impl<M: ManageSessionStream + 'static> ReverseForwarder<M> {
     ///
     /// Binds to `bind_addr:bind_port` (port 0 = OS-assigned) and returns
     /// the actual bound port. Each accepted connection opens a
-    /// `forwarded-tcpip` channel via the stream manager.
+    /// `forwarded-tcpip` channel via [`Conversation::open_channel`].
     pub async fn start_tcp(
         &mut self,
         bind_addr: &str,
@@ -104,17 +109,16 @@ impl<M: ManageSessionStream + 'static> ReverseForwarder<M> {
             .map(|a| a.port())
             .unwrap_or(bind_port);
 
-        let manage = Arc::clone(&self.manage);
+        let conversation = Arc::clone(&self.conversation);
         let bind_addr_owned = bind_addr.to_owned();
 
         let handle = tokio::spawn(
             async move {
-                tcp_accept_loop(listener, manage, &bind_addr_owned).await;
+                tcp_accept_loop(listener, conversation, &bind_addr_owned).await;
             }
             .in_current_span(),
         );
 
-        // If there was a previous listener on this addr:port, abort it.
         if let Some(old) = self
             .tcp_listeners
             .insert((bind_addr.to_owned(), actual_port), ListenerHandle { handle })
@@ -146,12 +150,12 @@ impl<M: ManageSessionStream + 'static> ReverseForwarder<M> {
                 source,
             })?;
 
-        let manage = Arc::clone(&self.manage);
+        let conversation = Arc::clone(&self.conversation);
         let path_owned = socket_path.to_owned();
 
         let handle = tokio::spawn(
             async move {
-                unix_accept_loop(listener, manage, &path_owned).await;
+                unix_accept_loop(listener, conversation, &path_owned).await;
             }
             .in_current_span(),
         );
@@ -181,7 +185,6 @@ impl<M: ManageSessionStream + 'static> ReverseForwarder<M> {
 
     /// Shut down all active listeners.
     pub fn shutdown(mut self) {
-        // drain to avoid double-cleanup in Drop
         for (_, handle) in self.tcp_listeners.drain() {
             handle.abort_and_forget();
         }
@@ -191,7 +194,11 @@ impl<M: ManageSessionStream + 'static> ReverseForwarder<M> {
     }
 }
 
-impl<M: ManageSessionStream + 'static> Drop for ReverseForwarder<M> {
+impl<M: ManageSessionStream + 'static> Drop for ReverseForwarder<M>
+where
+    M::StreamReader: AsyncRead + Send + Unpin + 'static,
+    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+{
     fn drop(&mut self) {
         for (_, handle) in self.tcp_listeners.drain() {
             handle.abort_and_forget();
@@ -202,11 +209,17 @@ impl<M: ManageSessionStream + 'static> Drop for ReverseForwarder<M> {
     }
 }
 
-async fn tcp_accept_loop<M: ManageSessionStream + 'static>(
+async fn tcp_accept_loop<M>(
     listener: TcpListener,
-    manage: Arc<M>,
+    conversation: Arc<Conversation<M>>,
     bind_addr: &str,
-) {
+) where
+    M: ManageSessionStream + 'static,
+    M::StreamReader: AsyncRead + Send + Unpin + 'static,
+    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+{
+    let connected_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+
     loop {
         let (tcp_stream, peer_addr) = match listener.accept().await {
             Ok(pair) => pair,
@@ -219,12 +232,8 @@ async fn tcp_accept_loop<M: ManageSessionStream + 'static>(
             }
         };
 
-        let manage = Arc::clone(&manage);
+        let conversation = Arc::clone(&conversation);
         let connected_addr = bind_addr.to_owned();
-        let connected_port = listener
-            .local_addr()
-            .map(|a| a.port())
-            .unwrap_or(0);
         let originator_addr = peer_addr.ip().to_string();
         let originator_port = peer_addr.port();
 
@@ -238,11 +247,29 @@ async fn tcp_accept_loop<M: ManageSessionStream + 'static>(
                         originator_port: (originator_port as u32).into(),
                     },
                 };
-                if let Err(e) = open_and_relay_forwarded(manage, &channel_open, tcp_stream).await {
-                    tracing::warn!(
-                        error = %e,
-                        "forwarded-tcpip channel error"
-                    );
+                let (reader, writer) = match conversation
+                    .open_channel(&channel_open, DEFAULT_MAX_MESSAGE_SIZE)
+                    .await
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %snafu::Report::from_error(&e),
+                            "forwarded-tcpip open_channel failed"
+                        );
+                        return;
+                    }
+                };
+
+                let (tcp_reader, tcp_writer) = tokio::io::split(tcp_stream);
+                let ch2s = tokio::spawn(relay(reader, tcp_writer));
+                let s2ch = tokio::spawn(relay(tcp_reader, writer));
+                let (r1, r2) = tokio::join!(ch2s, s2ch);
+                if let Err(e) = r1 {
+                    tracing::warn!(error = %e, "forwarded-tcpip relay task panicked");
+                }
+                if let Err(e) = r2 {
+                    tracing::warn!(error = %e, "forwarded-tcpip relay task panicked");
                 }
             }
             .in_current_span(),
@@ -250,11 +277,15 @@ async fn tcp_accept_loop<M: ManageSessionStream + 'static>(
     }
 }
 
-async fn unix_accept_loop<M: ManageSessionStream + 'static>(
+async fn unix_accept_loop<M>(
     listener: UnixListener,
-    manage: Arc<M>,
+    conversation: Arc<Conversation<M>>,
     socket_path: &str,
-) {
+) where
+    M: ManageSessionStream + 'static,
+    M::StreamReader: AsyncRead + Send + Unpin + 'static,
+    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+{
     loop {
         let (unix_stream, _) = match listener.accept().await {
             Ok(pair) => pair,
@@ -267,7 +298,7 @@ async fn unix_accept_loop<M: ManageSessionStream + 'static>(
             }
         };
 
-        let manage = Arc::clone(&manage);
+        let conversation = Arc::clone(&conversation);
         let path = socket_path.to_owned();
 
         tokio::spawn(
@@ -277,11 +308,29 @@ async fn unix_accept_loop<M: ManageSessionStream + 'static>(
                         socket_path: path.into(),
                     },
                 };
-                if let Err(e) = open_and_relay_forwarded(manage, &channel_open, unix_stream).await {
-                    tracing::warn!(
-                        error = %e,
-                        "forwarded-streamlocal channel error"
-                    );
+                let (reader, writer) = match conversation
+                    .open_channel(&channel_open, DEFAULT_MAX_MESSAGE_SIZE)
+                    .await
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %snafu::Report::from_error(&e),
+                            "forwarded-streamlocal open_channel failed"
+                        );
+                        return;
+                    }
+                };
+
+                let (unix_reader, unix_writer) = tokio::io::split(unix_stream);
+                let ch2s = tokio::spawn(relay(reader, unix_writer));
+                let s2ch = tokio::spawn(relay(unix_reader, writer));
+                let (r1, r2) = tokio::join!(ch2s, s2ch);
+                if let Err(e) = r1 {
+                    tracing::warn!(error = %e, "forwarded-streamlocal relay task panicked");
+                }
+                if let Err(e) = r2 {
+                    tracing::warn!(error = %e, "forwarded-streamlocal relay task panicked");
                 }
             }
             .in_current_span(),
@@ -289,165 +338,169 @@ async fn unix_accept_loop<M: ManageSessionStream + 'static>(
     }
 }
 
-/// Open a new channel via the stream manager, write the channel open header,
-/// wait for confirmation, then relay bytes bidirectionally.
-///
-/// Uses the same protocol as [`Conversation::open_channel`] — writes
-/// `max_message_size + channel_type + payload` (transport framing is handled
-/// by [`ManageSessionStream::open_stream`]), reads confirmation, then relays
-/// raw bytes.
-async fn open_and_relay_forwarded<M, C, PE, S>(
-    manage: Arc<M>,
-    channel_open: &C,
-    stream: S,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    M: ManageSessionStream + 'static,
-    C: ChannelOpen,
-    PE: std::error::Error + Send + Sync + 'static,
-    for<'w> C::Payload: h3x::codec::EncodeInto<&'w mut M::StreamWriter, Output = (), Error = PE>,
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-{
-    use h3x::codec::EncodeExt;
-
-    let (mut reader, mut writer) = manage
-        .open_stream()
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-
-    // Write channel open header (MSS already wrote signal_value + session_id).
-    writer
-        .encode_one(DEFAULT_MAX_MESSAGE_SIZE)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-    writer
-        .encode_one(channel_open.channel_type())
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::other(e)) })?;
-    channel_open
-        .payload()
-        .clone()
-        .encode_into(&mut writer)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-    tokio::io::AsyncWriteExt::flush(&mut writer)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-
-    // Read confirmation.
-    crate::conversation::read_channel_open_response(&mut reader)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-
-    // Relay raw bytes bidirectionally.
-    let (stream_reader, stream_writer) = tokio::io::split(stream);
-    let ch2s = tokio::spawn(relay(reader, stream_writer));
-    let s2ch = tokio::spawn(relay(stream_reader, writer));
-    let (r1, r2) = tokio::join!(ch2s, s2ch);
-    r1.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-    r2.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use h3x::varint::VarInt;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
-    use tokio::sync::Mutex;
+    use tokio::io::{duplex, DuplexStream};
+    use tokio::sync::Mutex as AsyncMutex;
+    use h3x::stream_id::StreamId;
+    use h3x::varint::VarInt;
 
-    /// A mock ManageSessionStream that returns duplex pairs and stores
-    /// the "remote" ends for the test to interact with.
-    struct MockManage {
-        remote_pairs: Mutex<Vec<(DuplexStream, DuplexStream)>>,
+    // -- Mock ManageSessionStream using DuplexStream pairs ------------------
+
+    /// Internal state shared between the mock and the test.
+    struct MockStreamState {
+        /// Pre-queued (local_reader, local_writer) pairs for open_stream().
+        /// The test holds the matching remote ends.
+        pairs: AsyncMutex<Vec<(DuplexStream, DuplexStream)>>,
         open_called: AtomicBool,
     }
 
-    impl MockManage {
-        fn new() -> (Arc<Self>, Arc<Mutex<Vec<(DuplexStream, DuplexStream)>>>) {
-            let remote = Arc::new(Mutex::new(Vec::new()));
-            let manage = Arc::new(Self {
-                remote_pairs: Mutex::new(Vec::new()),
+    impl MockStreamState {
+        fn new() -> Self {
+            Self {
+                pairs: AsyncMutex::new(Vec::new()),
                 open_called: AtomicBool::new(false),
-            });
-            (manage, remote)
+            }
+        }
+
+        /// Enqueue a pair that the next `open_stream()` call will return.
+        async fn provide_pair(&self, reader: DuplexStream, writer: DuplexStream) {
+            self.pairs.lock().await.push((reader, writer));
         }
     }
 
-    impl ManageSessionStream for MockManage {
+    impl ManageSessionStream for MockStreamState {
         type StreamReader = DuplexStream;
         type StreamWriter = DuplexStream;
         type Error = std::io::Error;
 
         async fn open_stream(
             &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+        ) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
             self.open_called.store(true, Ordering::SeqCst);
-            // Create two duplex pairs: one for the "channel" side, one for the "remote" side
-            let (local_rd, remote_wr) = duplex(8192);
-            let (remote_rd, local_wr) = duplex(8192);
-            self.remote_pairs
+            self.pairs
                 .lock()
                 .await
-                .push((remote_rd, remote_wr));
-            Ok((local_rd, local_wr))
+                .pop()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "no pairs enqueued")
+                })
         }
 
         async fn accept_stream(
             &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "not used in reverse forwarder tests",
-            ))
+        ) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
+            // Not used in reverse forwarder; pend forever.
+            std::future::pending().await
         }
     }
 
+    /// Thin newtype so we can pass `Arc<MockStreamState>` into
+    /// `Conversation::new()` (which takes M by value) while retaining
+    /// an Arc clone for the test to interact with.
+    struct ArcMock(Arc<MockStreamState>);
+
+    impl ManageSessionStream for ArcMock {
+        type StreamReader = DuplexStream;
+        type StreamWriter = DuplexStream;
+        type Error = std::io::Error;
+
+        async fn open_stream(
+            &self,
+        ) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
+            self.0.open_stream().await
+        }
+
+        async fn accept_stream(
+            &self,
+        ) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
+            self.0.accept_stream().await
+        }
+    }
+
+    /// Create a Conversation backed by `ArcMock`, returning both the
+    /// `Arc<Conversation>` and the shared mock state for the test to
+    /// enqueue stream pairs.
+    fn make_forwarder_conversation(
+        mock: Arc<MockStreamState>,
+    ) -> Arc<Conversation<ArcMock>> {
+        Arc::new(Conversation::new(
+            StreamId(VarInt::from_u32(1)),
+            "test",
+            tokio::io::empty(),
+            tokio::io::sink(),
+            ArcMock(mock),
+        ))
+    }
+
+    // -- Tests --------------------------------------------------------------
+
     #[tokio::test]
     async fn tcp_start_and_stop() {
-        let (manage, _remote) = MockManage::new();
-        let mut forwarder = ReverseForwarder::new(manage);
+        let mock = Arc::new(MockStreamState::new());
+        let conv = make_forwarder_conversation(Arc::clone(&mock));
+        let mut forwarder = ReverseForwarder::new(conv);
 
         let port = forwarder.start_tcp("127.0.0.1", 0).await.unwrap();
         assert_ne!(port, 0, "should get a real port");
-
-        // Verify we can connect (listener is active)
-        let _tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
 
         assert!(forwarder.stop_tcp("127.0.0.1", port));
         assert!(!forwarder.stop_tcp("127.0.0.1", port), "double stop returns false");
     }
 
     #[tokio::test]
-    async fn tcp_connection_opens_channel() {
-        let (manage, _remote) = MockManage::new();
-        let mut forwarder = ReverseForwarder::new(Arc::clone(&manage));
+    async fn tcp_connection_triggers_open_channel() {
+        use h3x::codec::DecodeExt;
+        use tokio::io::AsyncWriteExt;
+
+        let mock = Arc::new(MockStreamState::new());
+        let conv = make_forwarder_conversation(Arc::clone(&mock));
+        let mut forwarder = ReverseForwarder::new(Arc::clone(&conv));
 
         let port = forwarder.start_tcp("127.0.0.1", 0).await.unwrap();
 
-        // Connect to trigger the accept loop
+        // Prepare a stream pair: Conversation gets (local_rd, local_wr),
+        // we keep (remote_rd, remote_wr) to simulate the remote peer.
+        let (local_rd, remote_wr) = duplex(8192);
+        let (remote_rd, local_wr) = duplex(8192);
+        mock.provide_pair(local_rd, local_wr).await;
+
+        // Connect to trigger the accept loop → open_channel().
         let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        tcp.write_all(b"test-data").await.unwrap();
-        drop(tcp);
+        tcp.write_all(b"hello").await.unwrap();
 
-        // Wait a bit for the spawned task to open the channel
+        // On the "remote" side, read the channel open header that
+        // Conversation::open_channel wrote, then send confirmation.
+        let mut remote_rd = remote_rd;
+        let mut remote_wr = remote_wr;
+
+        // open_channel writes: max_message_size (VarInt) + channel_type (SshString) + payload.
+        let _max_msg: VarInt = remote_rd.decode_one().await.unwrap();
+        let _channel_type: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
+        // ForwardedTcpipRequest payload: connected_address, connected_port,
+        // originator_address, originator_port.
+        let _connected_addr: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
+        let _connected_port: VarInt = remote_rd.decode_one().await.unwrap();
+        let _orig_addr: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
+        let _orig_port: VarInt = remote_rd.decode_one().await.unwrap();
+
+        // Send SSH_MSG_CHANNEL_OPEN_CONFIRMATION (VarInt 0) + max_message_size.
+        use h3x::codec::EncodeExt;
+        remote_wr.encode_one(VarInt::from_u32(0)).await.unwrap(); // confirmation
+        remote_wr.encode_one(VarInt::from_u32(32768)).await.unwrap(); // max_msg_size
+        remote_wr.flush().await.unwrap();
+
+        // Give the relay a moment to start.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         assert!(
-            manage.open_called.load(Ordering::SeqCst),
-            "should have called open_stream"
+            mock.open_called.load(Ordering::SeqCst),
+            "should have called open_stream via Conversation::open_channel"
         );
-
-        // The remote_pairs should have one entry
-        let pairs = manage.remote_pairs.lock().await;
-        assert_eq!(pairs.len(), 1, "should have opened one channel");
 
         forwarder.shutdown();
     }
@@ -458,8 +511,9 @@ mod tests {
         let sock_path = dir.path().join("test.sock");
         let sock_str = sock_path.to_str().unwrap();
 
-        let (manage, _remote) = MockManage::new();
-        let mut forwarder = ReverseForwarder::new(manage);
+        let mock = Arc::new(MockStreamState::new());
+        let conv = make_forwarder_conversation(Arc::clone(&mock));
+        let mut forwarder = ReverseForwarder::new(conv);
 
         forwarder.start_unix(sock_str).await.unwrap();
         assert!(sock_path.exists(), "socket file should exist");
@@ -477,8 +531,9 @@ mod tests {
         let sock_path = dir.path().join("drop-test.sock");
         let sock_str = sock_path.to_str().unwrap();
 
-        let (manage, _remote) = MockManage::new();
-        let mut forwarder = ReverseForwarder::new(manage);
+        let mock = Arc::new(MockStreamState::new());
+        let conv = make_forwarder_conversation(Arc::clone(&mock));
+        let mut forwarder = ReverseForwarder::new(conv);
 
         let _port = forwarder.start_tcp("127.0.0.1", 0).await.unwrap();
         forwarder.start_unix(sock_str).await.unwrap();

@@ -300,6 +300,14 @@ impl<M: ManageSessionStream> IncomingChannel<M> {
     pub fn skip_payload(self) -> PendingChannel<M::StreamReader, M::StreamWriter> {
         PendingChannel { reader: self.reader, writer: self.writer }
     }
+
+    /// Consume and return the raw stream pair without decoding anything.
+    ///
+    /// Useful when passing streams to a handler that performs its own payload
+    /// decoding (e.g. direct forwarding handlers).
+    pub fn into_raw_parts(self) -> (M::StreamReader, M::StreamWriter) {
+        (self.reader, self.writer)
+    }
 }
 
 // ===========================================================================

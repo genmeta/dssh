@@ -10,6 +10,7 @@
 //! - Bootstrap types for privilege-separated child processes
 
 pub mod client;
+pub mod dispatcher;
 pub mod process;
 pub mod pty;
 pub mod signal;
