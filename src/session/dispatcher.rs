@@ -317,23 +317,17 @@ where
                     }
                 }
                 _ => {
-                    tracing::warn!(request_type = %&*request_type, "rejecting unknown global request");
-                    match req.decode_payload::<crate::conversation::EmptyPayload, std::convert::Infallible>().await {
-                        Ok(decoded) => { let _ = decoded.respond_failure().await; }
-                        Err(e) => match e {}
-                    }
+                    tracing::warn!(request_type = %&*request_type, "poisoning session: unknown global request type");
+                    req.poison();
                 }
             }
         }
         IncomingGlobal::Notify(notice) => {
-            tracing::debug!(
+            tracing::warn!(
                 request_type = %notice.request_type(),
-                "ignoring global notice"
+                "poisoning session: unknown global notice type"
             );
-            // Notices don't need a response; just consume the payload.
-            let _ = notice
-                .decode_payload::<crate::conversation::EmptyPayload, std::convert::Infallible>()
-                .await;
+            notice.poison();
         }
     }
 }

@@ -164,6 +164,15 @@ where
         &self.request_type
     }
 
+    /// Explicitly poison the session, indicating that the payload format is
+    /// unknown and the control stream cannot be recovered.
+    ///
+    /// Use this when the request type is not recognized and the payload
+    /// cannot be decoded. The session becomes permanently unusable.
+    pub fn poison(self) {
+        // self drops with reader_guard=Some → Drop impl calls shared.poison().
+    }
+
     /// Decode the request payload directly from the control stream.
     ///
     /// Consumes `self` and returns the decoded value together with a
@@ -360,6 +369,15 @@ where
     /// The SSH request type string sent by the remote.
     pub fn request_type(&self) -> &SshString {
         &self.request_type
+    }
+
+    /// Explicitly poison the session, indicating that the payload format is
+    /// unknown and the control stream cannot be recovered.
+    ///
+    /// Use this when the notification type is not recognized and the payload
+    /// cannot be decoded. The session becomes permanently unusable.
+    pub fn poison(self) {
+        // self drops with reader_guard=Some → Drop impl calls shared.poison().
     }
 
     /// Decode the notification payload directly from the control stream.
