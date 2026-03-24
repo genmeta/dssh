@@ -1,12 +1,13 @@
-//! SSH3 session types, PTY, signal handling, and transport traits.
+//! SSH3 session types, PTY, signal handling, and process management.
 //!
-//! The [`Ssh3Transport`] trait is marked with `#[remoc::rtc::remote]`, which generates:
-//! - [`Ssh3TransportClient`] — serializable proxy sent to the child process
-//! - [`Ssh3TransportServer`] / [`Ssh3TransportServerShared`] / [`Ssh3TransportServerSharedMut`] —
-//!   wrappers for serving the trait implementation
-//!
-//! The main server process implements the trait and serves it; the child
-//! process uses the client to accept and open channels.
+//! This module provides:
+//! - Session channel request/notice types (exec, shell, PTY, signal, window-change)
+//! - [`ClientSession`](client::ClientSession) for client-side session channel management
+//! - [`run_piped`](process::run_piped) / [`run_pty`](process::run_pty) for server-side
+//!   command execution with I/O relay
+//! - [`PtyPair`](pty::PtyPair) for PTY allocation
+//! - [`Signal`](signal::Signal) for SSH signal handling
+//! - Bootstrap types for privilege-separated child processes
 
 pub mod client;
 pub mod process;

@@ -370,6 +370,7 @@ pub trait ManageSessionStream: Send + Sync {
     ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Self::Error>> + Send;
 }
 
+#[allow(dead_code)] // Server-side bridge; used by server binary, not within library.
 pub mod remoc;
 
 // ===========================================================================
