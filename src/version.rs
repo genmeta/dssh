@@ -5,7 +5,7 @@
 //! [`SUPPORTED_SSH_VERSIONS`] and echoes it back.
 
 use crate::constants::SUPPORTED_SSH_VERSIONS;
-use crate::{Ssh3Error, ssh3_error};
+use crate::error::{Ssh3Error, ssh3_error};
 use snafu::ResultExt;
 
 /// A negotiated SSH3 version.

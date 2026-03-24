@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use genmeta_ssh::{
-    Conversation, SSH3_CONNECT_PATH,
-    auth::parse_authorization_header,
+    client::SSH3_CONNECT_PATH,
     constants::SSH_VERSION,
+    conversation::Conversation,
+    auth::parse_authorization_header,
     protocol::Ssh3ProtocolFactory,
     session::dispatcher::{SessionConfig, run_session},
 };

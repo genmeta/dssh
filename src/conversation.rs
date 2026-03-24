@@ -792,11 +792,12 @@ mod tests;
 
 pub use channel::{
     AcceptChannelError, AwaitOpenError, ChannelDataRead, ChannelEvent, ChannelResponder,
-    IncomingChannel, IncomingChannelRequest, OpenChannelError, PendingChannel,
-    ReadChannelEventError, RespondChannelFailureError, RespondChannelSuccessError,
-    SendChannelNoticeError, SendChannelRequestError, SshChannel, WriteChannelCloseError,
-    WriteChannelEofError, WriteChannelOpenConfirmationError, WriteChannelOpenFailureError,
-    WriteDataError, WriteExtendedDataError,
+    IncomingChannel, IncomingChannelNotice, IncomingChannelRequest, OpenChannelError,
+    PendingChannel, ReadChannelEventError, ReaderEvent, RespondChannelFailureError,
+    RespondChannelSuccessError, SendChannelNoticeError, SendChannelRequestError, SshChannel,
+    SshChannelReader, SshChannelWriter, WriteChannelCloseError, WriteChannelEofError,
+    WriteChannelOpenConfirmationError, WriteChannelOpenFailureError, WriteDataError,
+    WriteExtendedDataError,
 };
 
 pub use global::{

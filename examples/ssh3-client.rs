@@ -7,9 +7,11 @@ use std::pin::Pin;
 
 use clap::Parser;
 use genmeta_ssh::{
-    Conversation, DEFAULT_MAX_MESSAGE_SIZE, SSH3_CONNECT_PATH, SessionChannelOpen, SshChannel,
-    constants::SSH_VERSION,
-    encode_basic_auth,
+    client::SSH3_CONNECT_PATH,
+    client::encode_basic_auth,
+    constants::{DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION},
+    conversation::{Conversation, SshChannel},
+    forward::SessionChannelOpen,
     protocol::{ConversationHandle, Ssh3Protocol},
     session::client::ClientSession,
 };

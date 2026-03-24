@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use genmeta_ssh::{
-    Conversation,
+    conversation::Conversation,
     session::{
         ChildBootstrap, SessionInit,
         dispatcher::{SessionConfig, run_session},
