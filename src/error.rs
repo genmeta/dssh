@@ -1,8 +1,9 @@
 use snafu::Snafu;
 
+/// Error returned by [`crate::version::negotiate_version`].
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), module)]
-pub enum Ssh3Error {
+pub enum NegotiateVersionError {
     #[snafu(display("missing ssh-version header"))]
     MissingSshVersionHeader,
 
@@ -14,10 +15,12 @@ pub enum Ssh3Error {
 
     #[snafu(display("no supported ssh-version found in client offer: {offered:?}"))]
     UnsupportedSshVersion { offered: String },
+}
 
-    #[snafu(display("unknown channel type"))]
-    UnknownChannelType,
-
+/// Error returned by [`crate::auth::parse_authorization_header`].
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub), module)]
+pub enum ParseAuthError {
     #[snafu(display("missing scheme/credentials separator"))]
     MissingSchemeSeparator,
 
@@ -35,13 +38,4 @@ pub enum Ssh3Error {
 
     #[snafu(display("missing ':' separator in decoded credentials"))]
     MissingCredentialSeparator,
-
-    #[snafu(display("invalid credentials"))]
-    InvalidCredentials,
-
-    #[snafu(display("channel closed"))]
-    ChannelClosed,
-
-    #[snafu(display("exec failed"))]
-    ExecFailed,
 }

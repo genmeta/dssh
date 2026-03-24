@@ -62,30 +62,19 @@ use tokio::sync::Notify;
 
 use crate::channel::ChannelOpenFailure;
 use crate::codec::{SshBool, SshString};
+use crate::message::{
+    SSH_MSG_CHANNEL_CLOSE, SSH_MSG_CHANNEL_DATA,
+    SSH_MSG_CHANNEL_EOF, SSH_MSG_CHANNEL_EXTENDED_DATA, SSH_MSG_CHANNEL_FAILURE,
+    SSH_MSG_CHANNEL_OPEN_CONFIRMATION, SSH_MSG_CHANNEL_OPEN_FAILURE, SSH_MSG_CHANNEL_REQUEST,
+    SSH_MSG_CHANNEL_SUCCESS, SSH_MSG_GLOBAL_REQUEST, SSH_MSG_REQUEST_FAILURE,
+    SSH_MSG_REQUEST_SUCCESS,
+};
 
 use self::channel::{AcceptChannelError, AwaitOpenError, IncomingChannel, OpenChannelError};
 use self::global::{
     AcceptError, IncomingGlobal, IncomingGlobalNotice, IncomingGlobalRequest, PoisonOnDrop,
     SendNotifyError, SendRequestError, SessionPoisonedError,
 };
-
-const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
-const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
-const SSH_MSG_REQUEST_FAILURE: VarInt = VarInt::from_u32(82);
-
-const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: VarInt = VarInt::from_u32(91);
-const SSH_MSG_CHANNEL_OPEN_FAILURE: VarInt = VarInt::from_u32(92);
-const SSH_MSG_CHANNEL_DATA: VarInt = VarInt::from_u32(94);
-const SSH_MSG_CHANNEL_EXTENDED_DATA: VarInt = VarInt::from_u32(95);
-const SSH_MSG_CHANNEL_EOF: VarInt = VarInt::from_u32(96);
-const SSH_MSG_CHANNEL_CLOSE: VarInt = VarInt::from_u32(97);
-const SSH_MSG_CHANNEL_REQUEST: VarInt = VarInt::from_u32(98);
-
-const SSH_MSG_CHANNEL_SUCCESS: VarInt = VarInt::from_u32(99);
-const SSH_MSG_CHANNEL_FAILURE: VarInt = VarInt::from_u32(100);
-
-/// SSH extended data type for stderr (RFC 4254 Section 5.2).
-pub const SSH_EXTENDED_DATA_STDERR: VarInt = VarInt::from_u32(1);
 
 // ===========================================================================
 // Channel open response reader (shared helper)

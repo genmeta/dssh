@@ -5,7 +5,7 @@
 //! [`SUPPORTED_SSH_VERSIONS`] and echoes it back.
 
 use crate::constants::SUPPORTED_SSH_VERSIONS;
-use crate::error::{Ssh3Error, ssh3_error};
+use crate::error::{NegotiateVersionError, negotiate_version_error};
 use snafu::ResultExt;
 
 /// A negotiated SSH3 version.
@@ -17,15 +17,15 @@ pub struct SshVersion {
 /// Negotiate an SSH3 version from the client's `ssh-version` request header.
 ///
 /// Returns the first client-offered version that the server also supports.
-pub fn negotiate_version(headers: &http::HeaderMap) -> Result<SshVersion, Ssh3Error> {
+pub fn negotiate_version(headers: &http::HeaderMap) -> Result<SshVersion, NegotiateVersionError> {
     let header_value = headers
         .get("ssh-version")
-        .ok_or(Ssh3Error::MissingSshVersionHeader)?
+        .ok_or(NegotiateVersionError::MissingSshVersionHeader)?
         .to_str()
-        .context(ssh3_error::InvalidSshVersionHeaderValueSnafu)?;
+        .context(negotiate_version_error::InvalidSshVersionHeaderValueSnafu)?;
 
     if header_value.is_empty() {
-        return Err(Ssh3Error::EmptySshVersionHeader);
+        return Err(NegotiateVersionError::EmptySshVersionHeader);
     }
 
     for offered in header_value.split(',') {
@@ -37,7 +37,7 @@ pub fn negotiate_version(headers: &http::HeaderMap) -> Result<SshVersion, Ssh3Er
         }
     }
 
-    Err(Ssh3Error::UnsupportedSshVersion {
+    Err(NegotiateVersionError::UnsupportedSshVersion {
         offered: header_value.to_owned(),
     })
 }

@@ -3,8 +3,8 @@ use base64::engine::general_purpose::STANDARD;
 use snafu::ResultExt;
 use std::fmt;
 
-use crate::error::Ssh3Error;
-use crate::error::ssh3_error;
+use crate::error::ParseAuthError;
+use crate::error::parse_auth_error;
 
 /// Authentication credential — only Basic auth is supported.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -54,30 +54,31 @@ pub enum AuthScheme {
 /// let cred = parse_authorization_header("Basic dXNlcjpwYXNz").unwrap();
 /// assert_eq!(cred, AuthCredential::Basic { username: "user".into(), password: "pass".into() });
 /// ```
-pub fn parse_authorization_header(header_value: &str) -> Result<AuthCredential, Ssh3Error> {
+pub fn parse_authorization_header(header_value: &str) -> Result<AuthCredential, ParseAuthError> {
     let (scheme, credentials) = header_value
         .split_once(' ')
-        .ok_or(Ssh3Error::MissingSchemeSeparator)?;
+        .ok_or(ParseAuthError::MissingSchemeSeparator)?;
 
     if !scheme.eq_ignore_ascii_case("Basic") {
-        return Err(Ssh3Error::UnsupportedAuthScheme {
+        return Err(ParseAuthError::UnsupportedAuthScheme {
             scheme: scheme.to_owned(),
         });
     }
 
     if credentials.is_empty() {
-        return Err(Ssh3Error::EmptyCredentials);
+        return Err(ParseAuthError::EmptyCredentials);
     }
 
     let decoded_bytes = STANDARD
         .decode(credentials)
-        .context(ssh3_error::InvalidBase64CredentialsSnafu)?;
+        .context(parse_auth_error::InvalidBase64CredentialsSnafu)?;
 
-    let decoded = String::from_utf8(decoded_bytes).context(ssh3_error::CredentialsNotUtf8Snafu)?;
+    let decoded =
+        String::from_utf8(decoded_bytes).context(parse_auth_error::CredentialsNotUtf8Snafu)?;
 
     let (username, password) = decoded
         .split_once(':')
-        .ok_or(Ssh3Error::MissingCredentialSeparator)?;
+        .ok_or(ParseAuthError::MissingCredentialSeparator)?;
 
     Ok(AuthCredential::Basic {
         username: username.to_owned(),

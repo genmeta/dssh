@@ -27,6 +27,7 @@ use h3x::varint::VarInt;
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UnixListener};
+use tokio::task::JoinSet;
 use tracing::Instrument;
 
 // ---------------------------------------------------------------------------
@@ -99,6 +100,7 @@ impl TcpForwardListener {
     {
         let connected_port = self.bound_addr.port();
         let connected_addr = self.bound_addr.ip().to_string();
+        let mut tasks = JoinSet::new();
 
         loop {
             let (tcp_stream, peer_addr) = match self.listener.accept().await {
@@ -115,7 +117,7 @@ impl TcpForwardListener {
             let conversation = Arc::clone(&conversation);
             let connected_addr = connected_addr.clone();
 
-            tokio::spawn(
+            tasks.spawn(
                 async move {
                     let channel_open = ForwardedTcpip {
                         connected_address: connected_addr.into(),
@@ -173,6 +175,7 @@ impl UnixForwardListener {
     {
         let _guard = self.guard;
         let socket_path = &_guard.0;
+        let mut tasks = JoinSet::new();
 
         loop {
             let (unix_stream, _) = match self.listener.accept().await {
@@ -189,7 +192,7 @@ impl UnixForwardListener {
             let conversation = Arc::clone(&conversation);
             let path = socket_path.display().to_string();
 
-            tokio::spawn(
+            tasks.spawn(
                 async move {
                     let channel_open = ForwardedStreamlocal {
                         socket_path: path.into(),
