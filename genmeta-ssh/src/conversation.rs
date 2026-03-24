@@ -96,7 +96,7 @@ pub const SSH_EXTENDED_DATA_STDERR: VarInt = VarInt::from_u32(1);
 /// This is the initiator-side counterpart of [`PendingChannel::accept`] /
 /// [`PendingChannel::reject`]. Used by [`Conversation::open_channel`] and
 /// by direct callers that bypass the `Conversation` layer (e.g. the client).
-pub(crate) async fn read_channel_open_response<R: AsyncRead + Unpin + Send>(
+pub async fn read_channel_open_response<R: AsyncRead + Unpin + Send>(
     reader: &mut R,
 ) -> Result<(), AwaitOpenError> {
     use self::channel::await_open_error::*;
@@ -817,12 +817,12 @@ mod global;
 mod tests;
 
 pub use channel::{
-    AcceptChannelError, AwaitOpenError, ChannelEvent, ChannelResponder, IncomingChannel,
-    IncomingChannelRequest, OpenChannelError, PendingChannel, ReadChannelEventError,
-    RespondChannelFailureError, RespondChannelSuccessError, SendChannelNoticeError,
-    SendChannelRequestError, SshChannelReader, SshChannelWriter, WriteChannelCloseError,
-    WriteChannelDataError, WriteChannelEofError, WriteChannelExtendedDataError,
-    WriteChannelOpenConfirmationError, WriteChannelOpenFailureError,
+    AcceptChannelError, AwaitOpenError, ChannelDataRead, ChannelEvent, ChannelResponder,
+    IncomingChannel, IncomingChannelRequest, OpenChannelError, PendingChannel,
+    ReadChannelEventError, RespondChannelFailureError, RespondChannelSuccessError,
+    SendChannelNoticeError, SendChannelRequestError, SshChannel, WriteChannelCloseError,
+    WriteChannelEofError, WriteChannelOpenConfirmationError, WriteChannelOpenFailureError,
+    WriteDataError, WriteExtendedDataError,
 };
 
 pub use global::{

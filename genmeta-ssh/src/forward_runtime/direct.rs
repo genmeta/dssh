@@ -75,6 +75,7 @@ async fn send_open_confirmation<R, W: AsyncWrite + Unpin + Send>(
         .accept(crate::constants::DEFAULT_MAX_MESSAGE_SIZE)
         .await
         .context(direct_forward_error::AcceptSnafu)
+        .map(|ch| ch.into_parts())
 }
 
 /// Spawn bidirectional relay between a channel stream pair and a split I/O stream.

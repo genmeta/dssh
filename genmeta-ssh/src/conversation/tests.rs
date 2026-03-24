@@ -1659,7 +1659,7 @@ async fn open_and_accept_channel_full_roundtrip() {
     assert_eq!(payload.as_ref() as &[u8], b"roundtrip");
 
     // B accepts, sending confirmation back to A.
-    let (_b_reader, _b_writer) = pending.accept(max_msg).await.unwrap();
+    let _b_channel = pending.accept(max_msg).await.unwrap();
 
     // A's open_channel should now complete.
     let (_a_reader, _a_writer) = open_task.await.unwrap();
@@ -1714,7 +1714,7 @@ fn make_channel_pair() -> (MockReader, MockWriter, MockReader, MockWriter) {
     (a_reader, a_writer, b_reader, b_writer)
 }
 
-// -- SshChannelWriter/SshChannelReader tests ------------------------------
+// -- SshChannel tests -----------------------------------------------------
 
 #[tokio::test]
 async fn channel_request_success_roundtrip() {
@@ -1740,9 +1740,8 @@ async fn channel_request_success_roundtrip() {
     let req = TestChannelReq {
         payload: TestPayload(SshString::from("hello-channel".to_string())),
     };
-    let mut ch_writer = SshChannelWriter::new(a_writer);
-    let mut ch_reader = SshChannelReader::new(a_reader);
-    let result: VarInt = ch_writer.request(&mut ch_reader, &req)
+    let mut channel = SshChannel::new(a_reader, a_writer);
+    let result: VarInt = channel.request(&req)
         .await
         .unwrap();
     assert_eq!(result, VarInt::from_u32(42));
@@ -1769,26 +1768,25 @@ async fn channel_request_rejected() {
     let req = TestChannelReq {
         payload: TestPayload(SshString::from_static("data")),
     };
-    let mut ch_writer = SshChannelWriter::new(a_writer);
-    let mut ch_reader = SshChannelReader::new(a_reader);
+    let mut channel = SshChannel::new(a_reader, a_writer);
     let result: Result<VarInt, _> =
-        ch_writer.request(&mut ch_reader, &req).await;
+        channel.request(&req).await;
     assert!(matches!(result, Err(SendChannelRequestError::Rejected)));
 
     handle.await.unwrap();
 }
 
-// -- SshChannelWriter::notice tests -------------------------------------
+// -- SshChannel::notice tests ---------------------------------------------
 
 #[tokio::test]
 async fn channel_notice_sends_correctly() {
-    let (_a_reader, a_writer, mut b_reader, _b_writer) = make_channel_pair();
+    let (a_reader, a_writer, mut b_reader, _b_writer) = make_channel_pair();
 
     let notice = TestChannelNotice {
         payload: TestPayload(SshString::from("notice-data".to_string())),
     };
-    let mut ch_writer = SshChannelWriter::new(a_writer);
-    ch_writer.notice(&notice).await.unwrap();
+    let mut channel = SshChannel::new(a_reader, a_writer);
+    channel.notice(&notice).await.unwrap();
 
     // B 端验证
     let msg_type: VarInt = b_reader.decode_one().await.unwrap();
@@ -1801,11 +1799,11 @@ async fn channel_notice_sends_correctly() {
     assert_eq!(payload.as_ref() as &[u8], b"notice-data");
 }
 
-// -- SshChannelReader::next_event tests ---------------------------------
+// -- SshChannel::next_event tests -----------------------------------------
 
 #[tokio::test]
 async fn read_channel_event_data() {
-    let (a_reader, _a_writer, _b_reader, mut b_writer) = make_channel_pair();
+    let (a_reader, a_writer, _b_reader, mut b_writer) = make_channel_pair();
 
     // B 发送 DATA
     b_writer.encode_one(VarInt::from_u32(94)).await.unwrap(); // SSH_MSG_CHANNEL_DATA
@@ -1815,11 +1813,12 @@ async fn read_channel_event_data() {
         .unwrap();
     AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-    let mut ch_reader = SshChannelReader::new(a_reader);
-    let event = ch_reader.next_event().await.unwrap();
+    let mut channel = SshChannel::new(a_reader, a_writer);
+    let event = channel.next_event().await.unwrap();
     match event {
-        ChannelEvent::Data(data) => {
-            assert_eq!(data.as_ref() as &[u8], b"hello");
+        ChannelEvent::Data(mut data) => {
+            let bytes = data.read_all().await.unwrap();
+            assert_eq!(bytes, b"hello");
         }
         _ => panic!("expected Data event"),
     }
@@ -1827,7 +1826,7 @@ async fn read_channel_event_data() {
 
 #[tokio::test]
 async fn read_channel_event_extended_data() {
-    let (a_reader, _a_writer, _b_reader, mut b_writer) = make_channel_pair();
+    let (a_reader, a_writer, _b_reader, mut b_writer) = make_channel_pair();
 
     // B 发送 EXTENDED_DATA (stderr = 1)
     b_writer.encode_one(VarInt::from_u32(95)).await.unwrap();
@@ -1838,12 +1837,13 @@ async fn read_channel_event_extended_data() {
         .unwrap();
     AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-    let mut ch_reader = SshChannelReader::new(a_reader);
-    let event = ch_reader.next_event().await.unwrap();
+    let mut channel = SshChannel::new(a_reader, a_writer);
+    let event = channel.next_event().await.unwrap();
     match event {
-        ChannelEvent::ExtendedData { data_type, data } => {
+        ChannelEvent::ExtendedData { data_type, mut data } => {
             assert_eq!(data_type, VarInt::from_u32(1));
-            assert_eq!(data.as_ref() as &[u8], b"err");
+            let bytes = data.read_all().await.unwrap();
+            assert_eq!(bytes, b"err");
         }
         _ => panic!("expected ExtendedData event"),
     }
@@ -1851,7 +1851,7 @@ async fn read_channel_event_extended_data() {
 
 #[tokio::test]
 async fn read_channel_event_eof_close_success_failure() {
-    let (a_reader, _a_writer, _b_reader, mut b_writer) = make_channel_pair();
+    let (a_reader, a_writer, _b_reader, mut b_writer) = make_channel_pair();
 
     // 依次发送 EOF, CLOSE, SUCCESS, FAILURE
     for msg_type in [96u32, 97, 99, 100] {
@@ -1859,11 +1859,11 @@ async fn read_channel_event_eof_close_success_failure() {
     }
     AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-    let mut ch_reader = SshChannelReader::new(a_reader);
-    assert!(matches!(ch_reader.next_event().await.unwrap(), ChannelEvent::Eof));
-    assert!(matches!(ch_reader.next_event().await.unwrap(), ChannelEvent::Close));
-    assert!(matches!(ch_reader.next_event().await.unwrap(), ChannelEvent::Success));
-    assert!(matches!(ch_reader.next_event().await.unwrap(), ChannelEvent::Failure));
+    let mut channel = SshChannel::new(a_reader, a_writer);
+    assert!(matches!(channel.next_event().await.unwrap(), ChannelEvent::Eof));
+    assert!(matches!(channel.next_event().await.unwrap(), ChannelEvent::Close));
+    assert!(matches!(channel.next_event().await.unwrap(), ChannelEvent::Success));
+    assert!(matches!(channel.next_event().await.unwrap(), ChannelEvent::Failure));
 }
 
 #[tokio::test]
@@ -1883,9 +1883,8 @@ async fn read_channel_event_request_decode_and_respond_success() {
         .unwrap();
     AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-    let mut ch_reader = SshChannelReader::new(a_reader);
-    let mut ch_writer = SshChannelWriter::new(a_writer);
-    let event = ch_reader.next_event().await.unwrap();
+    let mut channel = SshChannel::new(a_reader, a_writer);
+    let event = channel.next_event().await.unwrap();
     let req = match event {
         ChannelEvent::Request(r) => r,
         _ => panic!("expected Request event"),
@@ -1902,7 +1901,7 @@ async fn read_channel_event_request_decode_and_respond_success() {
     let responder = responder.expect("want_reply was true, should have responder");
 
     // 发送 success 响应（空 payload）
-    responder.respond_success(&mut ch_writer, EmptyChannelPayload).await.unwrap();
+    responder.respond_success(EmptyChannelPayload).await.unwrap();
 
     // B 端验证
     let msg_type: VarInt = b_reader.decode_one().await.unwrap();
@@ -1926,9 +1925,8 @@ async fn read_channel_event_request_respond_failure() {
         .unwrap();
     AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-    let mut ch_reader = SshChannelReader::new(a_reader);
-    let mut ch_writer = SshChannelWriter::new(a_writer);
-    let event = ch_reader.next_event().await.unwrap();
+    let mut channel = SshChannel::new(a_reader, a_writer);
+    let event = channel.next_event().await.unwrap();
     let req = match event {
         ChannelEvent::Request(r) => r,
         _ => panic!("expected Request event"),
@@ -1936,7 +1934,7 @@ async fn read_channel_event_request_respond_failure() {
 
     let (_payload, responder): (SshString, _) = req.decode_payload().await.unwrap();
     let responder = responder.unwrap();
-    responder.respond_failure(&mut ch_writer).await.unwrap();
+    responder.respond_failure().await.unwrap();
 
     // B 端验证
     let msg_type: VarInt = b_reader.decode_one().await.unwrap();
@@ -1945,7 +1943,7 @@ async fn read_channel_event_request_respond_failure() {
 
 #[tokio::test]
 async fn read_channel_event_request_no_reply() {
-    let (a_reader, _a_writer, _b_reader, mut b_writer) = make_channel_pair();
+    let (a_reader, a_writer, _b_reader, mut b_writer) = make_channel_pair();
 
     // B 发送 want_reply=false 的通知
     b_writer.encode_one(VarInt::from_u32(98)).await.unwrap();
@@ -1960,8 +1958,8 @@ async fn read_channel_event_request_no_reply() {
         .unwrap();
     AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-    let mut ch_reader = SshChannelReader::new(a_reader);
-    let event = ch_reader.next_event().await.unwrap();
+    let mut channel = SshChannel::new(a_reader, a_writer);
+    let event = channel.next_event().await.unwrap();
     let req = match event {
         ChannelEvent::Request(r) => r,
         _ => panic!("expected Request event"),
@@ -1977,14 +1975,14 @@ async fn read_channel_event_request_no_reply() {
 
 #[tokio::test]
 async fn read_channel_event_unknown_message_type() {
-    let (a_reader, _a_writer, _b_reader, mut b_writer) = make_channel_pair();
+    let (a_reader, a_writer, _b_reader, mut b_writer) = make_channel_pair();
 
     // 发送一个未知的消息类型
     b_writer.encode_one(VarInt::from_u32(200)).await.unwrap();
     AsyncWriteExt::flush(&mut b_writer).await.unwrap();
 
-    let mut ch_reader = SshChannelReader::new(a_reader);
-    let result = ch_reader.next_event().await;
+    let mut channel = SshChannel::new(a_reader, a_writer);
+    let result = channel.next_event().await;
     assert!(matches!(
         result,
         Err(ReadChannelEventError::UnexpectedMessageType { .. })
@@ -1997,9 +1995,8 @@ async fn channel_request_full_roundtrip_via_traits() {
     let (a_reader, a_writer, b_reader, b_writer) = make_channel_pair();
 
     let handle = tokio::spawn(async move {
-        let mut ch_reader = SshChannelReader::new(b_reader);
-        let mut ch_writer = SshChannelWriter::new(b_writer);
-        let event = ch_reader.next_event()
+        let mut channel = SshChannel::new(b_reader, b_writer);
+        let event = channel.next_event()
             .await
             .unwrap();
         let req = match event {
@@ -2014,15 +2011,14 @@ async fn channel_request_full_roundtrip_via_traits() {
         assert_eq!(payload.as_ref() as &[u8], b"roundtrip");
 
         let responder = responder.unwrap();
-        responder.respond_success(&mut ch_writer, VarInt::from_u32(999)).await.unwrap();
+        responder.respond_success(VarInt::from_u32(999)).await.unwrap();
     });
 
     let req = TestChannelReq {
         payload: TestPayload(SshString::from_static("roundtrip")),
     };
-    let mut ch_writer = SshChannelWriter::new(a_writer);
-    let mut ch_reader = SshChannelReader::new(a_reader);
-    let result: VarInt = ch_writer.request(&mut ch_reader, &req)
+    let mut channel = SshChannel::new(a_reader, a_writer);
+    let result: VarInt = channel.request(&req)
         .await
         .unwrap();
     assert_eq!(result, VarInt::from_u32(999));
