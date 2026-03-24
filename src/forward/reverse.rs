@@ -1,39 +1,207 @@
 //! Reverse forwarding: bind listeners that open SSH3 channels back to the
 //! client for each accepted connection.
 //!
-//! Provides [`Conversation::run_tcp_forward`] and
-//! [`Conversation::run_unix_forward`], which bind a listener and return a
-//! future driving the accept loop. The caller decides when and how to spawn
-//! the future (e.g. via `tokio::spawn`), keeping task lifetime management
-//! explicit.
+//! Use [`DecodedGlobalRequest::accept_tcp_forward`] and
+//! [`DecodedGlobalRequest::accept_unix_forward`] to accept a forwarding
+//! request (bind listener + respond to remote). The returned listener
+//! struct has a [`run`](TcpForwardListener::run) method that drives the
+//! accept loop.
 
-use std::future::Future;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::{
     constants::DEFAULT_MAX_MESSAGE_SIZE,
-    conversation::{ChannelOpen, Conversation, ManageSessionStream},
-    forward::{ForwardError, ForwardedStreamlocal, ForwardedTcpip, relay},
+    conversation::{
+        ChannelOpen, Conversation, DecodedGlobalRequest, ManageSessionStream,
+        RespondSuccessError,
+    },
+    forward::{
+        ForwardError, ForwardedStreamlocal, ForwardedTcpip, TcpipForwardReply,
+        TcpipForwardRequest, StreamlocalForwardRequest, relay,
+    },
 };
 use h3x::codec::EncodeInto;
+use h3x::varint::VarInt;
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, ToSocketAddrs, UnixListener};
+use tokio::net::{TcpListener, UnixListener};
 use tracing::Instrument;
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module)]
-pub enum ReverseForwardError {
+pub enum AcceptTcpForwardError {
+    #[snafu(display("bind port overflows u16"))]
+    PortOverflow,
+
     #[snafu(display("failed to bind TCP listener"))]
     TcpBind { source: std::io::Error },
 
     #[snafu(display("failed to get local address of TCP listener"))]
     LocalAddr { source: std::io::Error },
 
+    #[snafu(display("failed to send success response"))]
+    Respond { source: RespondSuccessError<ForwardError> },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)), module)]
+pub enum AcceptUnixForwardError {
     #[snafu(display("failed to bind Unix listener"))]
     UnixBind { source: std::io::Error },
+
+    #[snafu(display("failed to send success response"))]
+    Respond { source: RespondSuccessError<std::convert::Infallible> },
+}
+
+// ---------------------------------------------------------------------------
+// TCP forward listener
+// ---------------------------------------------------------------------------
+
+/// A bound TCP listener ready to accept reverse-forwarded connections.
+///
+/// Obtained from [`DecodedGlobalRequest::accept_tcp_forward`].
+pub struct TcpForwardListener {
+    listener: TcpListener,
+    bound_addr: SocketAddr,
+}
+
+impl TcpForwardListener {
+    /// Bind a TCP listener at the given address.
+    pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> Result<Self, std::io::Error> {
+        let listener = TcpListener::bind(addr).await?;
+        let bound_addr = listener.local_addr()?;
+        Ok(Self { listener, bound_addr })
+    }
+
+    /// The address the listener is bound to.
+    pub fn bound_addr(&self) -> SocketAddr {
+        self.bound_addr
+    }
+
+    /// Run the accept loop, opening a `forwarded-tcpip` channel for each
+    /// accepted connection and relaying data bidirectionally.
+    ///
+    /// Runs until the listener encounters an accept error. Cancel the
+    /// enclosing task to stop the listener.
+    pub async fn run<M, R, W>(self, conversation: Arc<Conversation<M, R, W>>)
+    where
+        M: ManageSessionStream + 'static,
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+        M::StreamReader: AsyncRead + Send + Unpin + 'static,
+        M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+    {
+        let connected_port = self.bound_addr.port();
+        let connected_addr = self.bound_addr.ip().to_string();
+
+        loop {
+            let (tcp_stream, peer_addr) = match self.listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %snafu::Report::from_error(&e),
+                        "reverse-tcp accept error, stopping listener"
+                    );
+                    break;
+                }
+            };
+
+            let conversation = Arc::clone(&conversation);
+            let connected_addr = connected_addr.clone();
+
+            tokio::spawn(
+                async move {
+                    let channel_open = ForwardedTcpip {
+                        connected_address: connected_addr.into(),
+                        connected_port: (connected_port as u32).into(),
+                        originator_address: peer_addr.ip().to_string().into(),
+                        originator_port: (peer_addr.port() as u32).into(),
+                    };
+                    conversation
+                        .open_channel_and_relay(channel_open, tcp_stream)
+                        .await;
+                }
+                .in_current_span(),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unix forward listener
+// ---------------------------------------------------------------------------
+
+/// A bound Unix socket listener ready to accept reverse-forwarded connections.
+///
+/// Obtained from [`DecodedGlobalRequest::accept_unix_forward`].
+/// The socket file is automatically removed when this value is dropped.
+pub struct UnixForwardListener {
+    listener: UnixListener,
+    guard: UnixSocketGuard,
+}
+
+impl UnixForwardListener {
+    /// Bind a Unix socket at the given path.
+    pub fn bind(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        let path = path.as_ref();
+        let listener = UnixListener::bind(path)?;
+        Ok(Self {
+            listener,
+            guard: UnixSocketGuard(path.to_path_buf()),
+        })
+    }
+
+    /// Run the accept loop, opening a `forwarded-streamlocal` channel for
+    /// each accepted connection and relaying data bidirectionally.
+    ///
+    /// Runs until the listener encounters an accept error. Cancel the
+    /// enclosing task to stop the listener. The socket file is removed
+    /// when this future is dropped (including on cancellation).
+    pub async fn run<M, R, W>(self, conversation: Arc<Conversation<M, R, W>>)
+    where
+        M: ManageSessionStream + 'static,
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+        M::StreamReader: AsyncRead + Send + Unpin + 'static,
+        M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+    {
+        let _guard = self.guard;
+        let socket_path = &_guard.0;
+
+        loop {
+            let (unix_stream, _) = match self.listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %snafu::Report::from_error(&e),
+                        "reverse-streamlocal accept error, stopping listener"
+                    );
+                    break;
+                }
+            };
+
+            let conversation = Arc::clone(&conversation);
+            let path = socket_path.display().to_string();
+
+            tokio::spawn(
+                async move {
+                    let channel_open = ForwardedStreamlocal {
+                        socket_path: path.into(),
+                    };
+                    conversation
+                        .open_channel_and_relay(channel_open, unix_stream)
+                        .await;
+                }
+                .in_current_span(),
+            );
+        }
+    }
 }
 
 /// Guard that removes a Unix socket file on drop.
@@ -45,6 +213,90 @@ impl Drop for UnixSocketGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DecodedGlobalRequest methods for accepting forward requests
+// ---------------------------------------------------------------------------
+
+impl<R, W> DecodedGlobalRequest<TcpipForwardRequest, R, W>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    /// Accept a `tcpip-forward` request: bind a TCP listener, respond with
+    /// the allocated port, and return the listener.
+    ///
+    /// On bind failure, responds with failure automatically.
+    pub async fn accept_tcp_forward(self) -> Result<TcpForwardListener, AcceptTcpForwardError> {
+        use accept_tcp_forward_error::*;
+
+        let bind_address = self.payload().bind_address.to_string();
+        let bind_port = u16::try_from(self.payload().bind_port.into_inner())
+            .map_err(|_| AcceptTcpForwardError::PortOverflow)?;
+
+        let listener = match TcpListener::bind((bind_address.as_str(), bind_port)).await {
+            Ok(l) => l,
+            Err(source) => {
+                let _ = self.respond_failure().await;
+                return Err(AcceptTcpForwardError::TcpBind { source });
+            }
+        };
+        let bound_addr = match listener.local_addr() {
+            Ok(a) => a,
+            Err(source) => {
+                let _ = self.respond_failure().await;
+                return Err(AcceptTcpForwardError::LocalAddr { source });
+            }
+        };
+
+        let reply = TcpipForwardReply {
+            allocated_port: VarInt::from(bound_addr.port() as u32),
+        };
+        self.respond_success(reply).await.context(RespondSnafu)?;
+
+        Ok(TcpForwardListener {
+            listener,
+            bound_addr,
+        })
+    }
+}
+
+impl<R, W> DecodedGlobalRequest<StreamlocalForwardRequest, R, W>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    /// Accept a `streamlocal-forward` request: bind a Unix socket, respond
+    /// with success, and return the listener.
+    ///
+    /// On bind failure, responds with failure automatically.
+    pub async fn accept_unix_forward(
+        self,
+    ) -> Result<UnixForwardListener, AcceptUnixForwardError> {
+        use accept_unix_forward_error::*;
+
+        let socket_path = self.payload().socket_path.to_string();
+
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(source) => {
+                let _ = self.respond_failure().await;
+                return Err(AcceptUnixForwardError::UnixBind { source });
+            }
+        };
+
+        self.respond_success(crate::conversation::EmptyPayload)
+            .await
+            .context(RespondSnafu)?;
+
+        Ok(UnixForwardListener {
+            listener,
+            guard: UnixSocketGuard(PathBuf::from(socket_path)),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversation helper: open channel and relay
+// ---------------------------------------------------------------------------
+
 impl<M: ManageSessionStream + 'static, R, W> Conversation<M, R, W>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -52,11 +304,15 @@ where
     M::StreamReader: AsyncRead + Send + Unpin + 'static,
     M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
 {
-    /// Open a channel for reverse forwarding and relay `local_stream` through it.
+    /// Open a channel for reverse forwarding and relay `local_stream`
+    /// through it bidirectionally.
     ///
     /// On failure to open the channel, logs a warning and returns silently.
-    async fn open_channel_and_relay<C, S>(&self, channel_open: C, local_stream: S)
-    where
+    pub(crate) async fn open_channel_and_relay<C, S>(
+        &self,
+        channel_open: C,
+        local_stream: S,
+    ) where
         C: ChannelOpen,
         for<'w> C: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = ForwardError>,
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -82,114 +338,6 @@ where
         if let Err(e) = r2 {
             tracing::warn!(error = %e, "reverse relay task panicked");
         }
-    }
-
-    /// Bind a TCP listener for reverse forwarding.
-    ///
-    /// Returns `(bound_port, accept_loop)`. Spawn the accept loop (e.g. via
-    /// `tokio::spawn`) to start accepting connections. Each accepted
-    /// connection opens a `forwarded-tcpip` channel and relays data
-    /// bidirectionally.
-    pub async fn run_tcp_forward(
-        self: &Arc<Self>,
-        addr: impl ToSocketAddrs,
-    ) -> Result<(u16, Pin<Box<dyn Future<Output = ()> + Send>>), ReverseForwardError> {
-        let listener = TcpListener::bind(addr)
-            .await
-            .context(reverse_forward_error::TcpBindSnafu)?;
-        let bound_addr = listener
-            .local_addr()
-            .context(reverse_forward_error::LocalAddrSnafu)?;
-        let conversation = Arc::clone(self);
-
-        let accept_loop = async move {
-            let connected_port = bound_addr.port();
-            let connected_addr = bound_addr.ip().to_string();
-
-            loop {
-                let (tcp_stream, peer_addr) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %snafu::Report::from_error(&e),
-                            "reverse-tcp accept error, stopping listener"
-                        );
-                        break;
-                    }
-                };
-
-                let conversation = Arc::clone(&conversation);
-                let connected_addr = connected_addr.clone();
-
-                tokio::spawn(
-                    async move {
-                        let channel_open = ForwardedTcpip {
-                            connected_address: connected_addr.into(),
-                            connected_port: (connected_port as u32).into(),
-                            originator_address: peer_addr.ip().to_string().into(),
-                            originator_port: (peer_addr.port() as u32).into(),
-                        };
-                        conversation
-                            .open_channel_and_relay(channel_open, tcp_stream)
-                            .await;
-                    }
-                    .in_current_span(),
-                );
-            }
-        };
-
-        Ok((bound_addr.port(), Box::pin(accept_loop)))
-    }
-
-    /// Bind a Unix socket for reverse forwarding.
-    ///
-    /// Returns the accept loop future. The socket file is automatically
-    /// removed when the future is dropped (including on cancellation). Spawn
-    /// the future to start accepting connections.
-    pub async fn run_unix_forward(
-        self: &Arc<Self>,
-        path: impl AsRef<Path>,
-    ) -> Result<Pin<Box<dyn Future<Output = ()> + Send>>, ReverseForwardError> {
-        let path = path.as_ref();
-        let listener = UnixListener::bind(path)
-            .context(reverse_forward_error::UnixBindSnafu)?;
-        let guard = UnixSocketGuard(path.to_path_buf());
-        let conversation = Arc::clone(self);
-
-        let accept_loop = async move {
-            let _guard = guard;
-            let socket_path = &_guard.0;
-
-            loop {
-                let (unix_stream, _) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %snafu::Report::from_error(&e),
-                            "reverse-streamlocal accept error, stopping listener"
-                        );
-                        break;
-                    }
-                };
-
-                let conversation = Arc::clone(&conversation);
-                let path = socket_path.display().to_string();
-
-                tokio::spawn(
-                    async move {
-                        let channel_open = ForwardedStreamlocal {
-                            socket_path: path.into(),
-                        };
-                        conversation
-                            .open_channel_and_relay(channel_open, unix_stream)
-                            .await;
-                    }
-                    .in_current_span(),
-                );
-            }
-        };
-
-        Ok(Box::pin(accept_loop))
     }
 }
 
@@ -270,10 +418,10 @@ mod tests {
         let mock = Arc::new(MockStreamState::new());
         let conv = make_conversation(Arc::clone(&mock));
 
-        let (port, accept_loop) = conv.run_tcp_forward("127.0.0.1:0").await.unwrap();
-        assert_ne!(port, 0, "should get a real port");
+        let listener = TcpForwardListener::bind("127.0.0.1:0").await.unwrap();
+        assert_ne!(listener.bound_addr().port(), 0, "should get a real port");
 
-        let handle = tokio::spawn(accept_loop);
+        let handle = tokio::spawn(listener.run(conv));
         handle.abort();
         let _ = handle.await;
     }
@@ -286,8 +434,9 @@ mod tests {
         let mock = Arc::new(MockStreamState::new());
         let conv = make_conversation(Arc::clone(&mock));
 
-        let (port, accept_loop) = conv.run_tcp_forward("127.0.0.1:0").await.unwrap();
-        let handle = tokio::spawn(accept_loop);
+        let listener = TcpForwardListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.bound_addr().port();
+        let handle = tokio::spawn(listener.run(Arc::clone(&conv)));
 
         let (local_rd, remote_wr) = duplex(8192);
         let (remote_rd, local_wr) = duplex(8192);
@@ -335,17 +484,15 @@ mod tests {
         let mock = Arc::new(MockStreamState::new());
         let conv = make_conversation(Arc::clone(&mock));
 
-        let accept_loop = conv.run_unix_forward(&sock_path).await.unwrap();
+        let listener = UnixForwardListener::bind(&sock_path).unwrap();
         assert!(sock_path.exists(), "socket file should exist after bind");
 
         let sock_path_clone = sock_path.clone();
-        let handle = tokio::spawn(accept_loop);
+        let handle = tokio::spawn(listener.run(conv));
 
-        // Abort the task — the UnixSocketGuard should clean up the file.
         handle.abort();
         let _ = handle.await;
 
-        // Give a moment for cleanup.
         tokio::task::yield_now().await;
         assert!(!sock_path_clone.exists(), "socket file should be cleaned up on cancel");
     }
@@ -358,11 +505,10 @@ mod tests {
         let mock = Arc::new(MockStreamState::new());
         let conv = make_conversation(Arc::clone(&mock));
 
-        let accept_loop = conv.run_unix_forward(&sock_path).await.unwrap();
+        let listener = UnixForwardListener::bind(&sock_path).unwrap();
         assert!(sock_path.exists(), "socket file should exist after bind");
 
-        // Spawn and immediately abort — the guard inside the future cleans up.
-        let handle = tokio::spawn(accept_loop);
+        let handle = tokio::spawn(listener.run(conv));
         handle.abort();
         let _ = handle.await;
 

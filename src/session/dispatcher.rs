@@ -18,7 +18,7 @@
 //!
 //! | Request type | Action |
 //! |---|---|
-//! | `"tcpip-forward"` | Start TCP listener via [`Conversation::bind_tcp_forward`] |
+//! | `"tcpip-forward"` | Start TCP listener via [`DecodedGlobalRequest::accept_tcp_forward`] |
 //! | `"cancel-tcpip-forward"` | Stop TCP listener |
 //! | `"streamlocal-forward@openssh.com"` | Start Unix socket listener |
 //! | `"cancel-streamlocal-forward@openssh.com"` | Stop Unix socket listener |
@@ -35,7 +35,7 @@ use crate::channel::reason_code;
 use crate::conversation::{Conversation, IncomingGlobal, ManageSessionStream};
 use crate::forward::{
     CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, ForwardError,
-    StreamlocalForwardRequest, TcpipForwardReply, TcpipForwardRequest,
+    StreamlocalForwardRequest, TcpipForwardRequest,
 };
 use crate::session::process::CommandMode;
 use h3x::varint::VarInt;
@@ -220,32 +220,18 @@ where
                     {
                         Ok(decoded) => {
                             let bind_addr = decoded.payload().bind_address.to_string();
-                            let bind_port = match u16::try_from(decoded.payload().bind_port.into_inner()) {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    tracing::warn!(port = decoded.payload().bind_port.into_inner(), "tcpip-forward port overflow");
-                                    let _ = decoded.respond_failure().await;
-                                    return;
-                                }
-                            };
-                            match conversation.run_tcp_forward((bind_addr.as_str(), bind_port)).await {
-                                Ok((actual_port, accept_loop)) => {
+                            match decoded.accept_tcp_forward().await {
+                                Ok(listener) => {
+                                    let port = listener.bound_addr().port();
                                     let abort = forward_tasks.spawn(
-                                        accept_loop.instrument(
-                                            tracing::info_span!("tcp-forward", port = actual_port),
+                                        listener.run(conversation.clone()).instrument(
+                                            tracing::info_span!("tcp-forward", port),
                                         ),
                                     );
-                                    tcp_forwards.insert((bind_addr, actual_port), abort);
-                                    let reply = TcpipForwardReply {
-                                        allocated_port: VarInt::from(actual_port as u32),
-                                    };
-                                    if let Err(e) = decoded.respond_success(reply).await {
-                                        tracing::warn!(error = %snafu::Report::from_error(&e), "failed to send tcpip-forward reply");
-                                    }
+                                    tcp_forwards.insert((bind_addr, port), abort);
                                 }
                                 Err(e) => {
-                                    tracing::warn!(error = %snafu::Report::from_error(&e), "tcpip-forward bind failed");
-                                    let _ = decoded.respond_failure().await;
+                                    tracing::warn!(error = %snafu::Report::from_error(&e), "tcpip-forward failed");
                                 }
                             }
                         }
@@ -290,21 +276,17 @@ where
                     {
                         Ok(decoded) => {
                             let socket_path = decoded.payload().socket_path.to_string();
-                            match conversation.run_unix_forward(&*socket_path).await {
-                                Ok(accept_loop) => {
+                            match decoded.accept_unix_forward().await {
+                                Ok(listener) => {
                                     let abort = forward_tasks.spawn(
-                                        accept_loop.instrument(
+                                        listener.run(conversation.clone()).instrument(
                                             tracing::info_span!("unix-forward", path = &*socket_path),
                                         ),
                                     );
                                     unix_forwards.insert(socket_path, abort);
-                                    let _ = decoded
-                                        .respond_success(crate::conversation::EmptyPayload)
-                                        .await;
                                 }
                                 Err(e) => {
-                                    tracing::warn!(error = %snafu::Report::from_error(&e), "streamlocal-forward bind failed");
-                                    let _ = decoded.respond_failure().await;
+                                    tracing::warn!(error = %snafu::Report::from_error(&e), "streamlocal-forward failed");
                                 }
                             }
                         }
