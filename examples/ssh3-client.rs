@@ -209,52 +209,23 @@ async fn main() {
     }
 
     // Relay I/O: stdin → channel, channel events → stdout/stderr.
-    use genmeta_ssh::session::client::SessionEvent;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    let stderr = tokio::io::stderr();
 
-    let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
-    let mut stdin = tokio::io::stdin();
-    let mut stdin_buf = [0u8; 4096];
-    let mut stdin_eof = false;
-    let mut exit_code: Option<u32> = None;
+    let exit = session
+        .run(stdin, stdout, stderr)
+        .await
+        .expect("session IO relay failed");
 
-    loop {
-        tokio::select! {
-            result = stdin.read(&mut stdin_buf), if !stdin_eof => {
-                match result {
-                    Ok(0) | Err(_) => {
-                        stdin_eof = true;
-                        let _ = session.send_eof().await;
-                    }
-                    Ok(n) => {
-                        if session.send_stdin(&stdin_buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            result = session.recv_event() => {
-                match result {
-                    Ok(Some(SessionEvent::Stdout(data))) => {
-                        stdout.write_all(data.as_ref()).await.expect("stdout write");
-                    }
-                    Ok(Some(SessionEvent::Stderr(data))) => {
-                        stderr.write_all(data.as_ref()).await.expect("stderr write");
-                    }
-                    Ok(Some(SessionEvent::ExitStatus(code))) => {
-                        exit_code = Some(code);
-                    }
-                    Ok(Some(SessionEvent::Close)) | Ok(None) => break,
-                    Ok(Some(_)) => {}
-                    Err(e) => {
-                        tracing::error!(error = %snafu::Report::from_error(&e), "session error");
-                        break;
-                    }
-                }
-            }
+    let exit_code = match exit {
+        Some(genmeta_ssh::session::client::ExitResult::Status(code)) => code,
+        Some(genmeta_ssh::session::client::ExitResult::Signal { signal_name, .. }) => {
+            tracing::info!(%signal_name, "process killed by signal");
+            128
         }
-    }
+        None => 1,
+    };
 
-    std::process::exit(exit_code.unwrap_or(1) as i32);
+    std::process::exit(exit_code as i32);
 }
