@@ -26,6 +26,8 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
 
@@ -34,8 +36,8 @@ use crate::conversation::{Conversation, IncomingGlobal, ManageSessionStream};
 use crate::forward::{
     CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, ForwardError,
     StreamlocalForwardRequest, TcpipForwardReply, TcpipForwardRequest,
+    reverse::ForwardHandle,
 };
-use crate::forward::reverse::ReverseForwarder;
 use crate::session::process::CommandMode;
 use h3x::varint::VarInt;
 use tracing::Instrument;
@@ -78,7 +80,8 @@ where
     M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
     M::Error: Send + Sync + 'static,
 {
-    let mut forwarder = ReverseForwarder::new(Arc::clone(&conversation));
+    let mut tcp_forwards: HashMap<(String, u16), ForwardHandle> = HashMap::new();
+    let mut unix_forwards: HashMap<String, ForwardHandle> = HashMap::new();
     let mut channel_tasks: JoinSet<()> = JoinSet::new();
 
     loop {
@@ -153,7 +156,7 @@ where
             global_result = conversation.accept() => {
                 match global_result {
                     Ok(incoming) => {
-                        dispatch_global(incoming, &mut forwarder).await;
+                        dispatch_global(incoming, &conversation, &mut tcp_forwards, &mut unix_forwards).await;
                     }
                     Err(e) => {
                         tracing::debug!(error = %snafu::Report::from_error(&e), "accept global ended");
@@ -171,9 +174,6 @@ where
         }
     }
 
-    // Shut down reverse forwarders.
-    forwarder.shutdown();
-
     // Wait for all remaining channel tasks.
     while let Some(result) = channel_tasks.join_next().await {
         if let Err(e) = result {
@@ -186,9 +186,16 @@ where
 // Global request dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_global<M>(incoming: IncomingGlobal, forwarder: &mut ReverseForwarder<M>)
+async fn dispatch_global<M>(
+    incoming: IncomingGlobal,
+    conversation: &Arc<Conversation<M>>,
+    tcp_forwards: &mut HashMap<(String, u16), ForwardHandle>,
+    unix_forwards: &mut HashMap<String, ForwardHandle>,
+)
 where
     M: ManageSessionStream + 'static,
+    M::StreamReader: AsyncRead + Send + Unpin + 'static,
+    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
 {
     match incoming {
         IncomingGlobal::Request(req) => {
@@ -209,8 +216,9 @@ where
                                     return;
                                 }
                             };
-                            match forwarder.start_tcp(bind_addr, bind_port).await {
-                                Ok(actual_port) => {
+                            match conversation.forward_tcp((bind_addr, bind_port)).await {
+                                Ok((actual_port, handle)) => {
+                                    tcp_forwards.insert((bind_addr.to_owned(), actual_port), handle);
                                     let reply = TcpipForwardReply {
                                         allocated_port: VarInt::from(actual_port as u32),
                                     };
@@ -244,7 +252,7 @@ where
                                     return;
                                 }
                             };
-                            if forwarder.stop_tcp(bind_addr, bind_port) {
+                            if tcp_forwards.remove(&(bind_addr.to_owned(), bind_port)).is_some() {
                                 let _ = decoded
                                     .respond_success(crate::conversation::EmptyPayload)
                                     .await;
@@ -264,8 +272,9 @@ where
                     {
                         Ok((payload, decoded)) => {
                             let socket_path: &str = &payload.socket_path;
-                            match forwarder.start_unix(socket_path).await {
-                                Ok(()) => {
+                            match conversation.forward_unix(socket_path).await {
+                                Ok(handle) => {
+                                    unix_forwards.insert(socket_path.to_owned(), handle);
                                     let _ = decoded
                                         .respond_success(crate::conversation::EmptyPayload)
                                         .await;
@@ -288,7 +297,7 @@ where
                     {
                         Ok((payload, decoded)) => {
                             let socket_path: &str = &payload.socket_path;
-                            if forwarder.stop_unix(socket_path) {
+                            if unix_forwards.remove(socket_path).is_some() {
                                 let _ = decoded
                                     .respond_success(crate::conversation::EmptyPayload)
                                     .await;
