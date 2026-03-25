@@ -91,7 +91,7 @@ fn build_examples_in_docker(repo: &Path) -> PathBuf {
              tar cf - --exclude='target' --exclude='.git' . | (mkdir -p /build && cd /build && tar xf -) && \
              apt-get update && apt-get install -y --no-install-recommends libpam0g-dev libclang-dev && \
              cd /build/{repo_name} && \
-             cargo build --examples --features pam && \
+             cargo build --examples --features pam,cli && \
              cp /build-target/debug/examples/ssh3-server \
                 /build-target/debug/examples/ssh3-client \
                 /build-target/debug/examples/ssh3-session \
