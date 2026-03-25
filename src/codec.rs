@@ -68,9 +68,7 @@ pub fn checked_remote_field_len(len: u64, field_name: &'static str) -> Result<us
 }
 
 /// A UTF-8 string encoded as varint length-prefix + UTF-8 bytes.
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(transparent)]
 pub struct SshString(Bytes);
 
@@ -124,6 +122,17 @@ impl TryFrom<Bytes> for SshString {
 impl From<SshString> for Bytes {
     fn from(ssh_string: SshString) -> Self {
         ssh_string.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SshString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Bytes::deserialize(deserializer)?;
+        std::str::from_utf8(&bytes).map_err(serde::de::Error::custom)?;
+        Ok(SshString(bytes))
     }
 }
 

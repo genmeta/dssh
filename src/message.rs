@@ -1,23 +1,4 @@
 use h3x::varint::VarInt;
-use snafu::Snafu;
-
-use crate::codec::CodecError;
-
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub), module)]
-pub enum MessageError {
-    #[snafu(display("message codec failed"))]
-    Codec { source: CodecError },
-
-    #[snafu(display("message stream read failed"))]
-    ReadIo { source: std::io::Error },
-
-    #[snafu(display("message stream write failed"))]
-    WriteIo { source: std::io::Error },
-
-    #[snafu(display("unknown ssh message type {message_type}"))]
-    UnknownMessageType { message_type: VarInt },
-}
 
 /// SSH global request/response message type constants (RFC 4254 / SSH3 draft).
 pub const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);

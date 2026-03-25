@@ -23,7 +23,6 @@ use std::pin::pin;
 use crate::{
     codec::{CodecError, SshBool, SshBytes, SshString},
     conversation::{EmptyPayload, NotifyChannelRequest, WantReplyChannelRequest},
-    message::MessageError,
 };
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
 use h3x::stream_id::StreamId;
@@ -43,25 +42,6 @@ pub enum SessionCodecError {
 
     #[snafu(display("session stream write failed"))]
     WriteIo { source: std::io::Error },
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub), module)]
-pub enum SessionProtocolError {
-    #[snafu(display("session message codec failed"))]
-    Message { source: MessageError },
-
-    #[snafu(display("session operation failed while {operation}"))]
-    Io {
-        operation: &'static str,
-        source: std::io::Error,
-    },
-
-    #[snafu(display("session stream write failed"))]
-    WriteIo { source: std::io::Error },
-
-    #[snafu(display("session stream shutdown failed"))]
-    ShutdownIo { source: std::io::Error },
 }
 
 /// Argument to the outer [`AuthenticateFn`]: carries the credential to the child

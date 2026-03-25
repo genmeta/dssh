@@ -88,7 +88,9 @@ pub enum SessionSetupError {
     },
 
     #[snafu(display("failed to respond to channel request"))]
-    Respond { source: std::io::Error },
+    Respond {
+        source: crate::conversation::channel::RespondChannelSuccessError<std::convert::Infallible>,
+    },
 
     #[snafu(display("channel closed before exec or shell request"))]
     ChannelClosed,
@@ -145,7 +147,6 @@ where
                             let _ = r
                                 .respond_success(EmptyPayload)
                                 .await
-                                .map_err(|e| std::io::Error::other(e.to_string()))
                                 .context(RespondSnafu);
                         }
                     }
@@ -161,7 +162,6 @@ where
                             let _ = r
                                 .respond_success(EmptyPayload)
                                 .await
-                                .map_err(|e| std::io::Error::other(e.to_string()))
                                 .context(RespondSnafu);
                         }
                         break;
@@ -177,7 +177,6 @@ where
                             let _ = r
                                 .respond_success(EmptyPayload)
                                 .await
-                                .map_err(|e| std::io::Error::other(e.to_string()))
                                 .context(RespondSnafu);
                         }
                         break;
@@ -363,14 +362,14 @@ where
             // Reap completed channel tasks (prevents unbounded growth).
             Some(result) = channel_tasks.join_next() => {
                 if let Err(e) = result {
-                    tracing::warn!(error = %e, "channel task panicked");
+                    tracing::warn!(error = %snafu::Report::from_error(&e), "channel task panicked");
                 }
             }
 
             // Reap completed forward listener tasks.
             Some(result) = forward_tasks.join_next() => {
                 if let Err(e) = result && !e.is_cancelled() {
-                    tracing::warn!(error = %e, "forward task panicked");
+                    tracing::warn!(error = %snafu::Report::from_error(&e), "forward task panicked");
                 }
             }
         }
@@ -379,7 +378,7 @@ where
     // Wait for all remaining channel tasks.
     while let Some(result) = channel_tasks.join_next().await {
         if let Err(e) = result {
-            tracing::warn!(error = %e, "channel task panicked during shutdown");
+            tracing::warn!(error = %snafu::Report::from_error(&e), "channel task panicked during shutdown");
         }
     }
 }

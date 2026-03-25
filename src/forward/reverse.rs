@@ -336,10 +336,10 @@ where
         let s2ch = tokio::spawn(relay(local_reader, writer).in_current_span());
         let (r1, r2) = tokio::join!(ch2s, s2ch);
         if let Err(e) = r1 {
-            tracing::warn!(error = %e, "reverse relay task panicked");
+            tracing::warn!(error = %snafu::Report::from_error(&e), "reverse relay task panicked");
         }
         if let Err(e) = r2 {
-            tracing::warn!(error = %e, "reverse relay task panicked");
+            tracing::warn!(error = %snafu::Report::from_error(&e), "reverse relay task panicked");
         }
     }
 }

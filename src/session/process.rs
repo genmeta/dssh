@@ -423,7 +423,7 @@ async fn handle_pty_notice<R: AsyncRead + Unpin + Send>(
             };
             if let Err(e) = super::pty::set_window_size_raw(master_raw_fd, &req) {
                 tracing::warn!(
-                    error = %e,
+                    error = %snafu::Report::from_error(&e),
                     cols = %req.width_cols,
                     rows = %req.height_rows,
                     "window-change resize failed"
@@ -445,7 +445,7 @@ fn deliver_to_pid(pid: Option<Pid>, signal_name: &SshString) {
     };
     if let Err(e) = signal::deliver(pid, sig) {
         tracing::warn!(
-            error = %e,
+            error = %snafu::Report::from_error(&e),
             signal = %signal_name,
             pid = pid.as_raw(),
             "failed to deliver signal"

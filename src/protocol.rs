@@ -198,7 +198,7 @@ impl Ssh3Protocol {
         let session_id: StreamId = match reader.decode_one().await {
             Ok(id) => id,
             Err(e) => {
-                tracing::warn!(error = %e, "failed to decode session ID from SSH3 stream");
+                tracing::warn!(error = %snafu::Report::from_error(&e), "failed to decode session ID from SSH3 stream");
                 return Ok(StreamVerdict::Accepted);
             }
         };
