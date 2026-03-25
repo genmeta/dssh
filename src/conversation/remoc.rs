@@ -11,17 +11,16 @@
 use std::sync::Mutex;
 
 use h3x::{
-    codec::{BoxReadStream, BoxWriteStream, EncodeExt, SinkWriter, StreamReader},
+    codec::{BoxReadStream, BoxWriteStream, SinkWriter, StreamReader},
     dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
     quic::ConnectionError,
     remoc::quic::{ReadStreamClient, ReadStreamServer, WriteStreamClient, WriteStreamServer},
 };
 use remoc::prelude::Server;
-use tokio::{io::AsyncWriteExt, task::JoinSet};
+use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use crate::constants::CHANNEL_SIGNAL_VALUE;
-use crate::protocol::ConversationHandle;
+use crate::protocol::{ConversationHandle, HandleError};
 
 // ---------------------------------------------------------------------------
 // RPC trait
@@ -104,7 +103,6 @@ impl ManageStreamBridge {
         let (ws, wc) = WriteStreamServer::new(writer, 1);
 
         let mut tasks = self.tasks.lock().expect("task set lock not poisoned");
-        // Drain completed tasks to avoid unbounded growth.
         while tasks.try_join_next().is_some() {}
         tasks.spawn(
             async move {
@@ -123,27 +121,26 @@ impl ManageStreamBridge {
     }
 }
 
+/// Convert a [`HandleError`] to a [`ConnectionError`] for the remoc RPC boundary.
+///
+/// This is a lossy conversion at the process boundary — the structured
+/// [`HandleError`] is flattened into a [`ConnectionError`] with the full
+/// error chain as the reason string.
+fn handle_error_to_connection_error(e: HandleError) -> ConnectionError {
+    h3x::quic::ApplicationError {
+        code: h3x::error::Code::from(h3x::varint::VarInt::from_u32(0)),
+        reason: std::borrow::Cow::Owned(snafu::Report::from_error(e).to_string()),
+    }
+    .into()
+}
+
 impl RemoteManageStream for ManageStreamBridge {
     async fn open_stream(&self) -> Result<(ReadStreamClient, WriteStreamClient), ConnectionError> {
-        // Open a raw QUIC bidirectional stream.
-        let (reader, writer) = (self.handle.open_bi)().await?;
-
-        // Write the routing header (signal value + session ID) so that the
-        // protocol layer on the receiving end routes this stream correctly.
-        let mut codec_writer = SinkWriter::new(writer);
-        codec_writer
-            .encode_one(CHANNEL_SIGNAL_VALUE)
+        let (reader, writer) = self
+            .handle
+            .open_raw_stream()
             .await
-            .map_err(|e| connection_error(&e))?;
-        codec_writer
-            .encode_one(self.handle.session_id)
-            .await
-            .map_err(|e| connection_error(&e))?;
-        AsyncWriteExt::flush(&mut codec_writer)
-            .await
-            .map_err(|e| connection_error(&e))?;
-        let writer = codec_writer.into_inner();
-
+            .map_err(handle_error_to_connection_error)?;
         Ok(self.serve_pair(reader, writer))
     }
 
@@ -152,31 +149,9 @@ impl RemoteManageStream for ManageStreamBridge {
     ) -> Result<(ReadStreamClient, WriteStreamClient), ConnectionError> {
         let (reader, writer) = self
             .handle
-            .receiver
-            .lock()
+            .accept_raw_stream()
             .await
-            .recv()
-            .await
-            .ok_or_else(channel_closed)?;
-
+            .map_err(handle_error_to_connection_error)?;
         Ok(self.serve_pair(reader, writer))
     }
-}
-
-/// Construct a [`ConnectionError`] from an I/O error.
-fn connection_error(e: &std::io::Error) -> ConnectionError {
-    h3x::quic::ApplicationError {
-        code: h3x::error::Code::from(h3x::varint::VarInt::from_u32(0)),
-        reason: std::borrow::Cow::Owned(e.to_string()),
-    }
-    .into()
-}
-
-/// Construct a [`ConnectionError`] indicating the channel is closed.
-fn channel_closed() -> ConnectionError {
-    h3x::quic::ApplicationError {
-        code: h3x::error::Code::from(h3x::varint::VarInt::from_u32(0)),
-        reason: std::borrow::Cow::Borrowed("conversation stream channel closed"),
-    }
-    .into()
 }

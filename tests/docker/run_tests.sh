@@ -44,18 +44,10 @@ generate_certs() {
 }
 
 start_server() {
-    local mode="${1:-inprocess}"
-
-    if [ "$mode" = "inprocess" ]; then
-        ssh3-server "$CERT_DIR/server.crt" "$CERT_DIR/server.key" \
-            --bind "${SERVER_ADDR}:${SERVER_PORT}" 2>/tmp/server.log &
-        SERVER_PID=$!
-    else
-        ssh3-server "$CERT_DIR/server.crt" "$CERT_DIR/server.key" \
-            --bind "${SERVER_ADDR}:${SERVER_PORT}" \
-            --session-binary /usr/local/bin/ssh3-session 2>/tmp/server.log &
-        SERVER_PID=$!
-    fi
+    ssh3-server "$CERT_DIR/server.crt" "$CERT_DIR/server.key" \
+        --bind "${SERVER_ADDR}:${SERVER_PORT}" \
+        --session-binary /usr/local/bin/ssh3-session 2>/tmp/server.log &
+    SERVER_PID=$!
 
     # Wait for the server to be ready (up to 5 seconds).
     local retries=50
@@ -155,20 +147,20 @@ run_test() {
 run_session_tests() {
     # 1. exec echo
     run_test "exec echo" 0 "hello" \
-        ssh3-client "$CLIENT_AUTHORITY" -u user -p pass "echo hello"
+        ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass "echo hello"
 
     # 2. exec exit code
     run_test "exec exit code 42" 42 "" \
-        ssh3-client "$CLIENT_AUTHORITY" -u user -p pass "exit 42"
+        ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass "exit 42"
 
     # 3. exec cat with stdin
     run_test "exec cat stdin" 0 "inputdata" \
-        sh -c 'echo inputdata | ssh3-client '"$CLIENT_AUTHORITY"' -u user -p pass cat'
+        sh -c 'echo inputdata | ssh3-client '"$CLIENT_AUTHORITY"' -u testuser -p testpass cat'
 
     # 4. exec stderr (capture stderr too)
     # For this test, we check exit code only since stderr goes to fd 2.
     run_test "exec stderr" 0 "" \
-        ssh3-client "$CLIENT_AUTHORITY" -u user -p pass "echo err >&2"
+        ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass "echo err >&2"
 }
 
 run_pam_tests() {
@@ -193,7 +185,7 @@ run_forward_tests() {
 
     # 8. Local forward (-L): client binds 8888 → server connects to 127.0.0.1:9999.
     # Launch ssh3-client with -L in background, send data through the tunnel, verify.
-    ssh3-client "$CLIENT_AUTHORITY" -u user -p pass \
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
         -L 8888:127.0.0.1:9999 "sleep 5" &
     local FWD_PID=$!
     sleep 1
@@ -215,7 +207,7 @@ run_forward_tests() {
     kill "$FWD_PID" 2>/dev/null; wait "$FWD_PID" 2>/dev/null || true
 
     # 9. Remote forward (-R): client asks server to listen on 7777 → client connects to 127.0.0.1:9999.
-    ssh3-client "$CLIENT_AUTHORITY" -u user -p pass \
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
         -R 7777:127.0.0.1:9999 "sleep 5" &
     local RFWD_PID=$!
     sleep 1
@@ -253,19 +245,18 @@ main() {
 
     generate_certs
 
-    echo "# --- Session tests (in-process mode) ---"
-    start_server inprocess
+    echo "# --- Starting server (child-process mode) ---"
+    start_server
+
+    echo "# --- Session tests ---"
     run_session_tests
-    stop_server
 
-    echo "# --- PAM tests (child-process mode) ---"
-    start_server childprocess
+    echo "# --- PAM tests ---"
     run_pam_tests
-    stop_server
 
-    echo "# --- Forwarding tests (in-process mode) ---"
-    start_server inprocess
+    echo "# --- Forwarding tests ---"
     run_forward_tests
+
     stop_server
 
     # Summary

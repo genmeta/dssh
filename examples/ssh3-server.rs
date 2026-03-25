@@ -1,19 +1,15 @@
 //! SSH3 server (gateway) example.
 //!
 //! Listens for QUIC connections, handles SSH3 Extended CONNECT requests,
-//! and dispatches sessions.
+//! and dispatches sessions via privilege-separated child processes.
 //!
 //! Uses tower service + h3x upgrade pattern: the handler returns an HTTP
 //! response, then a spawned task obtains the underlying streams via the
 //! upgrade/takeover mechanism for the SSH3 session.
 //!
-//! **In-process mode** (default): runs sessions directly in the gateway
-//! process without PAM authentication — any credential is accepted.
-//!
-//! **Child-process mode** (`--session-binary <path>`): spawns a privilege-
-//! separated subprocess per session that performs PAM authentication and
-//! runs the session after dropping privileges. Communication uses remoc
-//! RFnOnce over stdin/stdout.
+//! Each session spawns a child process (`--session-binary <path>`) that
+//! performs PAM authentication and runs the session after dropping
+//! privileges. Communication uses remoc RFnOnce over stdin/stdout.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -29,14 +25,10 @@ use genmeta_ssh::{
     auth::parse_authorization_header,
     client::SSH3_CONNECT_PATH,
     constants::SSH_VERSION,
-    conversation::{
-        remoc::{ManageStreamBridge, RemoteManageStreamServerShared},
-        Conversation,
-    },
+    conversation::remoc::{ManageStreamBridge, RemoteManageStreamServerShared},
     protocol::Ssh3ProtocolFactory,
     session::{
         AuthRequest, AuthenticateFn, SessionBootstrap,
-        dispatcher::{SessionConfig, run_session},
     },
 };
 use h3x::connection::ConnectionBuilder;
@@ -72,10 +64,10 @@ struct Cli {
     bind: String,
 
     /// Path to session binary for privilege-separated mode.
-    /// When set, each session spawns a child process that handles
-    /// PAM authentication and runs the session after dropping privileges.
+    /// Each session spawns a child process that handles PAM authentication
+    /// and runs the session after dropping privileges.
     #[arg(long)]
-    session_binary: Option<PathBuf>,
+    session_binary: PathBuf,
 }
 
 /// Tower service that handles SSH3 Extended CONNECT requests.
@@ -84,7 +76,7 @@ struct Cli {
 /// and the tower service interface.
 #[derive(Clone)]
 struct Ssh3ConnectService {
-    session_binary: Option<PathBuf>,
+    session_binary: PathBuf,
 }
 
 impl tower_service::Service<http::Request<BoxBody>> for Ssh3ConnectService {
@@ -162,7 +154,7 @@ fn ok_response() -> Result<http::Response<BoxBody>, Infallible> {
 
 async fn handle_ssh3_connect(
     request: http::Request<BoxBody>,
-    session_binary: Option<PathBuf>,
+    session_binary: PathBuf,
 ) -> Result<http::Response<BoxBody>, Infallible> {
     let auth_header = request
         .headers()
@@ -206,66 +198,15 @@ async fn handle_ssh3_connect(
         }
     };
 
-    if let Some(session_binary) = session_binary {
-        handle_child_process(
-            request,
-            handle,
-            credential,
-            peer_version,
-            conversation_id,
-            &session_binary,
-        )
-        .await
-    } else {
-        handle_in_process(request, handle, peer_version, credential, conversation_id)
-    }
-}
-
-/// In-process session: no PAM, accepts any credential.
-///
-/// Spawns a task that waits for the upgrade to complete, then runs
-/// the session directly in-process.
-fn handle_in_process(
-    request: http::Request<BoxBody>,
-    handle: genmeta_ssh::protocol::ConversationHandle,
-    peer_version: String,
-    credential: genmeta_ssh::auth::AuthCredential,
-    conversation_id: StreamId,
-) -> Result<http::Response<BoxBody>, Infallible> {
-    let user = credential.username().to_owned();
-
-    tokio::spawn(
-        async move {
-            let (control_reader, control_writer) =
-                match h3x::hyper::upgrade::on(request).await {
-                    Ok(streams) => streams,
-                    Err(e) => {
-                        tracing::error!(error = ?e, "takeover failed");
-                        return;
-                    }
-                };
-
-            let conversation = Arc::new(Conversation::new(
-                conversation_id,
-                peer_version,
-                control_reader,
-                control_writer,
-                handle,
-            ));
-
-            tracing::info!(%conversation_id, %user, "session starting (in-process)");
-
-            let config = SessionConfig {
-                shell: "/bin/sh".into(),
-                ..Default::default()
-            };
-            run_session(conversation, config).await;
-            tracing::info!(%conversation_id, "session ended");
-        }
-        .in_current_span(),
-    );
-
-    ok_response()
+    handle_child_process(
+        request,
+        handle,
+        credential,
+        peer_version,
+        conversation_id,
+        &session_binary,
+    )
+    .await
 }
 
 /// Child-process session: spawn ssh3-session, PAM auth via remoc RFnOnce.

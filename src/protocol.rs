@@ -312,15 +312,56 @@ impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory
 /// Dropping the handle automatically unregisters the conversation from the
 /// protocol registry.
 pub struct ConversationHandle {
-    pub(crate) session_id: StreamId,
-    pub(crate) receiver: tokio::sync::Mutex<mpsc::Receiver<RoutedBiStream>>,
-    pub(crate) open_bi: OpenBiFn,
+    session_id: StreamId,
+    receiver: tokio::sync::Mutex<mpsc::Receiver<RoutedBiStream>>,
+    open_bi: OpenBiFn,
     registry: Registry,
 }
 
 impl ConversationHandle {
     pub fn session_id(&self) -> StreamId {
         self.session_id
+    }
+
+    /// Open a raw bidirectional stream with the routing header already written.
+    ///
+    /// Returns raw boxed streams without codec wrappers. The routing header
+    /// (signal value + session ID) is written so the remote protocol layer
+    /// routes this stream to the correct conversation.
+    pub async fn open_raw_stream(&self) -> Result<(BoxReadStream, BoxWriteStream), HandleError> {
+        use handle_error::*;
+
+        let (reader, writer) = (self.open_bi)().await.context(OpenBiSnafu)?;
+        let mut codec_writer = SinkWriter::new(writer);
+
+        tracing::trace!(session_id = %self.session_id, "writing channel routing header");
+
+        codec_writer
+            .encode_one(CHANNEL_SIGNAL_VALUE)
+            .await
+            .context(EncodeSignalValueSnafu)?;
+        codec_writer
+            .encode_one(self.session_id)
+            .await
+            .context(EncodeSessionIdSnafu)?;
+        AsyncWriteExt::flush(&mut codec_writer)
+            .await
+            .context(FlushSnafu)?;
+        let writer = codec_writer.into_inner();
+
+        tracing::trace!(session_id = %self.session_id, "channel routing header written and flushed");
+
+        Ok((reader, writer))
+    }
+
+    /// Accept a raw bidirectional stream routed by the protocol layer.
+    ///
+    /// Returns raw boxed streams without codec wrappers. The protocol layer
+    /// has already consumed the signal value and session ID, so the streams
+    /// are positioned at the channel-specific data.
+    pub async fn accept_raw_stream(&self) -> Result<(BoxReadStream, BoxWriteStream), HandleError> {
+        let mut rx = self.receiver.lock().await;
+        rx.recv().await.ok_or(HandleError::ChannelClosed)
     }
 }
 
@@ -346,36 +387,12 @@ impl ManageSessionStream for ConversationHandle {
     type Error = HandleError;
 
     async fn open_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-        use handle_error::*;
-
-        let (reader, writer) = (self.open_bi)().await.context(OpenBiSnafu)?;
-        let reader = StreamReader::new(reader);
-        let mut writer = SinkWriter::new(writer);
-
-        tracing::trace!(session_id = %self.session_id, "writing channel routing header");
-
-        // Write SSH3 channel framing: signal value + session ID.
-        // The conversation will write max_message_size + channel_type + payload.
-        writer
-            .encode_one(CHANNEL_SIGNAL_VALUE)
-            .await
-            .context(EncodeSignalValueSnafu)?;
-        writer
-            .encode_one(self.session_id)
-            .await
-            .context(EncodeSessionIdSnafu)?;
-        AsyncWriteExt::flush(&mut writer)
-            .await
-            .context(FlushSnafu)?;
-
-        tracing::trace!(session_id = %self.session_id, "channel routing header written and flushed");
-
-        Ok((reader, writer))
+        let (reader, writer) = self.open_raw_stream().await?;
+        Ok((StreamReader::new(reader), SinkWriter::new(writer)))
     }
 
     async fn accept_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-        let mut rx = self.receiver.lock().await;
-        let (reader, writer) = rx.recv().await.ok_or(HandleError::ChannelClosed)?;
+        let (reader, writer) = self.accept_raw_stream().await?;
         Ok((StreamReader::new(reader), SinkWriter::new(writer)))
     }
 }
