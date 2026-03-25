@@ -178,15 +178,16 @@ run_pam_tests() {
 }
 
 run_forward_tests() {
-    # Start an echo server on port 9999 (reflects input back).
+    # Start echo servers on multiple ports (reflect input back).
     socat TCP-LISTEN:9999,reuseaddr,fork EXEC:cat &
-    local ECHO_PID=$!
+    local ECHO_PID1=$!
+    socat TCP-LISTEN:9998,reuseaddr,fork EXEC:cat &
+    local ECHO_PID2=$!
     sleep 0.3
 
     # 8. Local forward (-L): client binds 8888 → server connects to 127.0.0.1:9999.
-    # Launch ssh3-client with -L in background, send data through the tunnel, verify.
     ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
-        -L 8888:127.0.0.1:9999 "sleep 5" &
+        -L 8888:127.0.0.1:9999 "sleep 10" &
     local FWD_PID=$!
     sleep 1
 
@@ -208,7 +209,7 @@ run_forward_tests() {
 
     # 9. Remote forward (-R): client asks server to listen on 7777 → client connects to 127.0.0.1:9999.
     ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
-        -R 7777:127.0.0.1:9999 "sleep 5" &
+        -R 7777:127.0.0.1:9999 "sleep 10" &
     local RFWD_PID=$!
     sleep 1
 
@@ -227,7 +228,175 @@ run_forward_tests() {
     fi
 
     kill "$RFWD_PID" 2>/dev/null; wait "$RFWD_PID" 2>/dev/null || true
-    kill "$ECHO_PID" 2>/dev/null; wait "$ECHO_PID" 2>/dev/null || true
+
+    # 10. Multiple local forwards: two -L on one connection.
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
+        -L 8881:127.0.0.1:9999 -L 8882:127.0.0.1:9998 "sleep 10" &
+    local MULTI_L_PID=$!
+    sleep 1
+
+    local ml_result1 ml_result2
+    ml_result1=$(echo "multi-L-1" | timeout 5 nc -q1 127.0.0.1 8881 2>/dev/null) || true
+    ml_result2=$(echo "multi-L-2" | timeout 5 nc -q1 127.0.0.1 8882 2>/dev/null) || true
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if [ "$ml_result1" = "multi-L-1" ] && [ "$ml_result2" = "multi-L-2" ]; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - multiple local forwards (-L -L)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - multiple local forwards (-L -L)"
+        echo "#   port 8881: expected 'multi-L-1', got '$ml_result1'"
+        echo "#   port 8882: expected 'multi-L-2', got '$ml_result2'"
+    fi
+
+    kill "$MULTI_L_PID" 2>/dev/null; wait "$MULTI_L_PID" 2>/dev/null || true
+
+    # 11. Multiple remote forwards: two -R on one connection.
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
+        -R 7771:127.0.0.1:9999 -R 7772:127.0.0.1:9998 "sleep 10" &
+    local MULTI_R_PID=$!
+    sleep 1
+
+    local mr_result1 mr_result2
+    mr_result1=$(echo "multi-R-1" | timeout 5 nc -q1 127.0.0.1 7771 2>/dev/null) || true
+    mr_result2=$(echo "multi-R-2" | timeout 5 nc -q1 127.0.0.1 7772 2>/dev/null) || true
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if [ "$mr_result1" = "multi-R-1" ] && [ "$mr_result2" = "multi-R-2" ]; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - multiple remote forwards (-R -R)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - multiple remote forwards (-R -R)"
+        echo "#   port 7771: expected 'multi-R-1', got '$mr_result1'"
+        echo "#   port 7772: expected 'multi-R-2', got '$mr_result2'"
+    fi
+
+    kill "$MULTI_R_PID" 2>/dev/null; wait "$MULTI_R_PID" 2>/dev/null || true
+
+    # 12. Combined -L and -R on the same connection.
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
+        -L 8883:127.0.0.1:9999 -R 7773:127.0.0.1:9998 "sleep 10" &
+    local COMBO_PID=$!
+    sleep 1
+
+    local combo_l combo_r
+    combo_l=$(echo "combo-L" | timeout 5 nc -q1 127.0.0.1 8883 2>/dev/null) || true
+    combo_r=$(echo "combo-R" | timeout 5 nc -q1 127.0.0.1 7773 2>/dev/null) || true
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if [ "$combo_l" = "combo-L" ] && [ "$combo_r" = "combo-R" ]; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - combined local+remote forward (-L -R)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - combined local+remote forward (-L -R)"
+        echo "#   -L port 8883: expected 'combo-L', got '$combo_l'"
+        echo "#   -R port 7773: expected 'combo-R', got '$combo_r'"
+    fi
+
+    kill "$COMBO_PID" 2>/dev/null; wait "$COMBO_PID" 2>/dev/null || true
+
+    # 13. Concurrent connections through the same local forward.
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
+        -L 8884:127.0.0.1:9999 "sleep 10" &
+    local CONC_PID=$!
+    sleep 1
+
+    local conc1 conc2 conc3
+    # Fire 3 connections in parallel.
+    conc1=$(echo "conn-1" | timeout 5 nc -q1 127.0.0.1 8884 2>/dev/null) &
+    local C1=$!
+    conc2=$(echo "conn-2" | timeout 5 nc -q1 127.0.0.1 8884 2>/dev/null) &
+    local C2=$!
+    conc3=$(echo "conn-3" | timeout 5 nc -q1 127.0.0.1 8884 2>/dev/null) &
+    local C3=$!
+    wait "$C1" 2>/dev/null; conc1=$(echo "conn-1" | timeout 5 nc -q1 127.0.0.1 8884 2>/dev/null) || true
+    wait "$C2" 2>/dev/null || true
+    wait "$C3" 2>/dev/null || true
+
+    # Re-run sequentially (subshell capture in bg is unreliable).
+    local conc_ok=true
+    for i in 1 2 3; do
+        local cr
+        cr=$(echo "seq-$i" | timeout 5 nc -q1 127.0.0.1 8884 2>/dev/null) || true
+        if [ "$cr" != "seq-$i" ]; then
+            conc_ok=false
+            break
+        fi
+    done
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if $conc_ok; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - concurrent connections through forward"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - concurrent connections through forward"
+    fi
+
+    kill "$CONC_PID" 2>/dev/null; wait "$CONC_PID" 2>/dev/null || true
+
+    # 14. Large data transfer through local forward (128KB).
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
+        -L 8885:127.0.0.1:9999 "sleep 10" &
+    local LARGE_PID=$!
+    sleep 1
+
+    local expected_md5 actual_md5
+    dd if=/dev/urandom bs=1024 count=128 of=/tmp/testdata 2>/dev/null
+    expected_md5=$(md5sum /tmp/testdata | awk '{print $1}')
+    actual_md5=$(timeout 10 nc -q1 127.0.0.1 8885 < /tmp/testdata 2>/dev/null | md5sum | awk '{print $1}') || true
+    rm -f /tmp/testdata
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if [ "$expected_md5" = "$actual_md5" ]; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - large data (128KB) through forward"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - large data (128KB) through forward"
+        echo "#   expected md5: $expected_md5"
+        echo "#   actual md5: $actual_md5"
+    fi
+
+    kill "$LARGE_PID" 2>/dev/null; wait "$LARGE_PID" 2>/dev/null || true
+
+    # 15. Multiple concurrent client sessions (server handles parallel connections).
+    local pids=()
+    local results=()
+    for i in 1 2 3; do
+        ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass "echo session-$i" \
+            >/tmp/session_result_$i 2>/dev/null &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    local multi_ok=true
+    for i in 1 2 3; do
+        local content
+        content=$(cat /tmp/session_result_$i 2>/dev/null) || true
+        if [ "$content" != "session-$i" ]; then
+            multi_ok=false
+        fi
+        rm -f /tmp/session_result_$i
+    done
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if $multi_ok; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - multiple concurrent client sessions"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - multiple concurrent client sessions"
+        echo "#   expected each session to return its own 'session-N'"
+    fi
+
+    # Cleanup echo servers.
+    kill "$ECHO_PID1" 2>/dev/null; wait "$ECHO_PID1" 2>/dev/null || true
+    kill "$ECHO_PID2" 2>/dev/null; wait "$ECHO_PID2" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
