@@ -81,10 +81,10 @@ pub struct AuthRequest {
 pub struct SessionBootstrap {
     /// Remoc proxy for opening/accepting QUIC streams.
     pub manage_stream: crate::conversation::remoc::RemoteManageStreamClient,
-    /// Remoc-proxied control stream reader.
-    pub control_reader: h3x::remoc::quic::ReadStreamClient,
-    /// Remoc-proxied control stream writer.
-    pub control_writer: h3x::remoc::quic::WriteStreamClient,
+    /// Remoc-proxied control stream reader (message-level, HTTP/3 DATA framed).
+    pub control_reader: h3x::remoc::message::ReadMessageStreamClient,
+    /// Remoc-proxied control stream writer (message-level, HTTP/3 DATA framed).
+    pub control_writer: h3x::remoc::message::WriteMessageStreamClient,
     /// Unique session identifier.
     #[serde(
         serialize_with = "serialize_stream_id",

@@ -1,27 +1,62 @@
 //! SSH3 server (gateway) example.
 //!
 //! Listens for QUIC connections, handles SSH3 Extended CONNECT requests,
-//! and runs session handlers directly.
+//! and dispatches sessions.
 //!
-//! In a production deployment the server would spawn a privilege-separated
-//! child process (ssh3-session) per session, bridging QUIC streams via remoc.
-//! This example runs sessions in-process for simplicity.
+//! Uses tower service + h3x upgrade pattern: the handler returns an HTTP
+//! response, then a spawned task obtains the underlying streams via the
+//! upgrade/takeover mechanism for the SSH3 session.
+//!
+//! **In-process mode** (default): runs sessions directly in the gateway
+//! process without PAM authentication — any credential is accepted.
+//!
+//! **Child-process mode** (`--session-binary <path>`): spawns a privilege-
+//! separated subprocess per session that performs PAM authentication and
+//! runs the session after dropping privileges. Communication uses remoc
+//! RFnOnce over stdin/stdout.
 
+use std::convert::Infallible;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use clap::Parser;
 use genmeta_ssh::{
     auth::parse_authorization_header,
     client::SSH3_CONNECT_PATH,
     constants::SSH_VERSION,
-    conversation::Conversation,
+    conversation::{
+        remoc::{ManageStreamBridge, RemoteManageStreamServerShared},
+        Conversation,
+    },
     protocol::Ssh3ProtocolFactory,
-    session::dispatcher::{SessionConfig, run_session},
+    session::{
+        AuthRequest, AuthenticateFn, SessionBootstrap,
+        dispatcher::{SessionConfig, run_session},
+    },
 };
 use h3x::connection::ConnectionBuilder;
 use h3x::gm_quic::H3Servers;
-use h3x::server::{Request, Response, Router};
-use http::{HeaderValue, StatusCode};
+use h3x::hyper::server::TowerService;
+use h3x::message::stream::MessageStreamError;
+use h3x::protocol::Protocols;
+use h3x::remoc::message::{ReadMessageStreamServer, WriteMessageStreamServer};
+use h3x::server::Router;
+use h3x::stream_id::StreamId;
+use http::StatusCode;
+use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
+use remoc::prelude::*;
+use tracing::Instrument;
+
+type BoxBody = UnsyncBoxBody<Bytes, MessageStreamError>;
+
+fn empty_body() -> BoxBody {
+    UnsyncBoxBody::new(Empty::new().map_err(|n: Infallible| match n {}))
+}
 
 #[derive(Parser)]
 #[command(about = "SSH3 server example")]
@@ -35,10 +70,43 @@ struct Cli {
     /// Bind address
     #[arg(short, long, default_value = "0.0.0.0:443")]
     bind: String,
+
+    /// Path to session binary for privilege-separated mode.
+    /// When set, each session spawns a child process that handles
+    /// PAM authentication and runs the session after dropping privileges.
+    #[arg(long)]
+    session_binary: Option<PathBuf>,
+}
+
+/// Tower service that handles SSH3 Extended CONNECT requests.
+///
+/// Wrapped by [`TowerService`] to bridge between h3x's server framework
+/// and the tower service interface.
+#[derive(Clone)]
+struct Ssh3ConnectService {
+    session_binary: Option<PathBuf>,
+}
+
+impl tower_service::Service<http::Request<BoxBody>> for Ssh3ConnectService {
+    type Response = http::Response<BoxBody>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<BoxBody>) -> Self::Future {
+        let session_binary = self.session_binary.clone();
+        Box::pin(handle_ssh3_connect(request, session_binary))
+    }
 }
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install default crypto provider");
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
@@ -46,7 +114,11 @@ async fn main() {
     let cert_pem = std::fs::read(&cli.cert).expect("failed to read certificate");
     let key_pem = std::fs::read(&cli.key).expect("failed to read private key");
 
-    let router = Router::new().connect(SSH3_CONNECT_PATH, handle_ssh3_connect);
+    let service = TowerService(Ssh3ConnectService {
+        session_binary: cli.session_binary,
+    });
+
+    let router = Router::new().connect(SSH3_CONNECT_PATH, service);
 
     let builder = ConnectionBuilder::new(Arc::default()).protocol(Ssh3ProtocolFactory);
 
@@ -74,9 +146,26 @@ async fn main() {
     tracing::error!(error = %err, "server stopped");
 }
 
-async fn handle_ssh3_connect(req: &mut Request, res: &mut Response) {
-    // Parse and validate auth credential.
-    let auth_header = req
+fn error_response(status: StatusCode) -> Result<http::Response<BoxBody>, Infallible> {
+    Ok(http::Response::builder()
+        .status(status)
+        .body(empty_body())
+        .unwrap())
+}
+
+fn ok_response() -> Result<http::Response<BoxBody>, Infallible> {
+    Ok(http::Response::builder()
+        .status(StatusCode::OK)
+        .header("ssh-version", SSH_VERSION)
+        .body(empty_body())
+        .unwrap())
+}
+
+async fn handle_ssh3_connect(
+    request: http::Request<BoxBody>,
+    session_binary: Option<PathBuf>,
+) -> Result<http::Response<BoxBody>, Infallible> {
+    let auth_header = request
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -85,59 +174,249 @@ async fn handle_ssh3_connect(req: &mut Request, res: &mut Response) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %snafu::Report::from_error(&e), "auth parse failed");
-            res.set_status(StatusCode::UNAUTHORIZED);
-            return;
+            return error_response(StatusCode::UNAUTHORIZED);
         }
     };
 
-    // Validate SSH version.
-    let peer_version = match req.header("ssh-version").and_then(|v| v.to_str().ok()) {
+    let peer_version = match request
+        .headers()
+        .get("ssh-version")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(v) if v == SSH_VERSION => v.to_owned(),
-        _ => {
-            res.set_status(StatusCode::BAD_REQUEST);
-            return;
-        }
+        _ => return error_response(StatusCode::BAD_REQUEST),
     };
 
-    let conversation_id = res.stream_id();
-
-    // Retrieve the per-connection Ssh3Protocol to register this session.
-    let ssh3_proto = res
-        .protocols()
+    let conversation_id = *request
+        .extensions()
+        .get::<StreamId>()
+        .expect("StreamId not in extensions");
+    let protocols = request
+        .extensions()
+        .get::<Arc<Protocols>>()
+        .expect("Protocols not in extensions")
+        .clone();
+    let ssh3_proto = protocols
         .get::<genmeta_ssh::protocol::Ssh3Protocol>()
         .expect("Ssh3ProtocolFactory not registered");
     let handle = match ssh3_proto.register(conversation_id) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %snafu::Report::from_error(&e), "register failed");
-            res.set_status(StatusCode::INTERNAL_SERVER_ERROR);
-            return;
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
-    // Respond 200 — the request/response streams become the control tunnel.
-    res.set_status(StatusCode::OK);
-    res.set_header("ssh-version", HeaderValue::from_static(SSH_VERSION));
+    if let Some(session_binary) = session_binary {
+        handle_child_process(
+            request,
+            handle,
+            credential,
+            peer_version,
+            conversation_id,
+            &session_binary,
+        )
+        .await
+    } else {
+        handle_in_process(request, handle, peer_version, credential, conversation_id)
+    }
+}
 
-    // Take the HTTP/3 message streams and convert to AsyncRead/AsyncWrite.
-    let control_reader = req.read_stream().take().into_box_reader();
-    let control_writer = res.write_stream().take().into_box_writer();
+/// In-process session: no PAM, accepts any credential.
+///
+/// Spawns a task that waits for the upgrade to complete, then runs
+/// the session directly in-process.
+fn handle_in_process(
+    request: http::Request<BoxBody>,
+    handle: genmeta_ssh::protocol::ConversationHandle,
+    peer_version: String,
+    credential: genmeta_ssh::auth::AuthCredential,
+    conversation_id: StreamId,
+) -> Result<http::Response<BoxBody>, Infallible> {
+    let user = credential.username().to_owned();
 
-    let conversation = Arc::new(Conversation::new(
-        conversation_id,
-        peer_version,
-        control_reader,
-        control_writer,
-        handle,
-    ));
+    tokio::spawn(
+        async move {
+            let (control_reader, control_writer) =
+                match h3x::hyper::upgrade::on(request).await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "takeover failed");
+                        return;
+                    }
+                };
 
-    tracing::info!(%conversation_id, user = %credential.username(), "session starting");
+            let conversation = Arc::new(Conversation::new(
+                conversation_id,
+                peer_version,
+                control_reader,
+                control_writer,
+                handle,
+            ));
 
-    let config = SessionConfig {
-        shell: "/bin/sh".into(),
-        ..Default::default()
+            tracing::info!(%conversation_id, %user, "session starting (in-process)");
+
+            let config = SessionConfig {
+                shell: "/bin/sh".into(),
+                ..Default::default()
+            };
+            run_session(conversation, config).await;
+            tracing::info!(%conversation_id, "session ended");
+        }
+        .in_current_span(),
+    );
+
+    ok_response()
+}
+
+/// Child-process session: spawn ssh3-session, PAM auth via remoc RFnOnce.
+///
+/// PAM authentication happens synchronously before the response is sent.
+/// On success, spawns a task that waits for upgrade, sets up remoc stream
+/// serving, and calls the child's StartSessionFn.
+async fn handle_child_process(
+    request: http::Request<BoxBody>,
+    handle: genmeta_ssh::protocol::ConversationHandle,
+    credential: genmeta_ssh::auth::AuthCredential,
+    peer_version: String,
+    conversation_id: StreamId,
+    session_binary: &std::path::Path,
+) -> Result<http::Response<BoxBody>, Infallible> {
+    let span =
+        tracing::info_span!("child-session", %conversation_id, user = %credential.username());
+
+    // Spawn the session child process.
+    let mut child = match tokio::process::Command::new(session_binary)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to spawn session binary");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     };
 
-    run_session(conversation, config).await;
-    tracing::info!(%conversation_id, "session ended");
+    let child_stdin = child.stdin.take().unwrap();
+    let child_stdout = child.stdout.take().unwrap();
+
+    // Establish remoc channel: we receive AuthenticateFn from the child.
+    let (conn, _tx, mut rx) =
+        match remoc::Connect::io::<_, _, (), AuthenticateFn, remoc::codec::Default>(
+            remoc::Cfg::default(),
+            child_stdout,
+            child_stdin,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to establish remoc channel with child");
+                let _ = child.kill().await;
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+    let conn_handle = tokio::spawn(conn.instrument(span.clone()));
+
+    // Receive the AuthenticateFn from the child.
+    let auth_fn: AuthenticateFn = match rx.recv().await {
+        Ok(Some(f)) => f,
+        _ => {
+            tracing::error!("child did not send AuthenticateFn");
+            let _ = child.kill().await;
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    // Call the child's PAM authentication.
+    let auth_request = AuthRequest {
+        username: credential.username().to_owned(),
+        credential,
+    };
+
+    let start_session_fn = match auth_fn.call(auth_request).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %snafu::Report::from_error(&e), "authentication failed");
+            let _ = child.kill().await;
+            return error_response(StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    // Auth succeeded — spawn session task. The response is returned below,
+    // and h3x sends it on the wire. The spawned task waits for the upgrade
+    // to complete (streams become available after the response is sent).
+    tokio::spawn(
+        async move {
+            // on_raw returns the raw ReadStream/WriteStream before conversion
+            // to AsyncRead/AsyncWrite, so we can obtain bytes_stream/bytes_sink
+            // for remoc message-level serving.
+            let (read_stream, write_stream) =
+                match h3x::hyper::upgrade::on_raw(request).await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "takeover failed");
+                        let _ = child.kill().await;
+                        return;
+                    }
+                };
+
+            // Serve control streams via remoc so the child can use them.
+            let (rs, rc) =
+                ReadMessageStreamServer::new(Box::pin(read_stream.into_bytes_stream()), 1);
+            tokio::spawn(
+                async move {
+                    let _ = rs.serve().await;
+                }
+                .in_current_span(),
+            );
+
+            let (ws, wc) =
+                WriteMessageStreamServer::new(Box::pin(write_stream.into_bytes_sink()), 1);
+            tokio::spawn(
+                async move {
+                    let _ = ws.serve().await;
+                }
+                .in_current_span(),
+            );
+
+            // Serve the stream management bridge via remoc.
+            let bridge = ManageStreamBridge::new(handle);
+            let (ms, mc) = RemoteManageStreamServerShared::new(Arc::new(bridge), 1);
+            tokio::spawn(
+                async move {
+                    let _ = ms.serve(true).await;
+                }
+                .in_current_span(),
+            );
+
+            let bootstrap = SessionBootstrap {
+                manage_stream: mc,
+                control_reader: rc,
+                control_writer: wc,
+                conversation_id,
+                peer_version,
+            };
+
+            tracing::info!(%conversation_id, "calling StartSessionFn in child");
+
+            match start_session_fn.call(bootstrap).await {
+                Ok(()) => tracing::info!(%conversation_id, "child session completed"),
+                Err(e) => tracing::error!(
+                    error = %snafu::Report::from_error(&e),
+                    "child session failed"
+                ),
+            }
+
+            // Wait for the child process and remoc connection to finish.
+            let _ = child.wait().await;
+            let _ = conn_handle.await;
+            tracing::info!(%conversation_id, "session ended (child-process)");
+        }
+        .instrument(span),
+    );
+
+    ok_response()
 }

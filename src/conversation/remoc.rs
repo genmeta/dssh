@@ -18,8 +18,9 @@ use h3x::{
         ReadStreamClient, ReadStreamServer, WriteStreamClient, WriteStreamServer,
     },
 };
-use remoc::rtc::Server;
+use remoc::prelude::Server;
 use tokio::{io::AsyncWriteExt, task::JoinSet};
+use tracing::Instrument;
 
 use crate::constants::CHANNEL_SIGNAL_VALUE;
 use crate::protocol::ConversationHandle;
@@ -101,18 +102,24 @@ impl ManageStreamBridge {
         reader: BoxReadStream,
         writer: BoxWriteStream,
     ) -> (ReadStreamClient, WriteStreamClient) {
-        let (read_server, rc) = ReadStreamServer::new(reader, 1);
-        let (write_server, wc) = WriteStreamServer::new(writer, 1);
+        let (rs, rc) = ReadStreamServer::new(reader, 1);
+        let (ws, wc) = WriteStreamServer::new(writer, 1);
 
         let mut tasks = self.tasks.lock().expect("task set lock not poisoned");
         // Drain completed tasks to avoid unbounded growth.
         while tasks.try_join_next().is_some() {}
-        tasks.spawn(async move {
-            let _ = read_server.serve().await;
-        });
-        tasks.spawn(async move {
-            let _ = write_server.serve().await;
-        });
+        tasks.spawn(
+            async move {
+                let _ = rs.serve().await;
+            }
+            .in_current_span(),
+        );
+        tasks.spawn(
+            async move {
+                let _ = ws.serve().await;
+            }
+            .in_current_span(),
+        );
 
         (rc, wc)
     }

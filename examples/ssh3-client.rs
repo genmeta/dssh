@@ -163,6 +163,9 @@ async fn connect(
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install default crypto provider");
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();

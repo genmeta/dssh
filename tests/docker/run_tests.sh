@@ -12,6 +12,8 @@ set -euo pipefail
 CERT_DIR=/tmp/certs
 SERVER_ADDR="127.0.0.1"
 SERVER_PORT="8443"
+# Client connects via "localhost" to match the server's TLS certificate name.
+CLIENT_AUTHORITY="localhost:${SERVER_PORT}"
 SERVER_PID=""
 PASS=0
 FAIL=0
@@ -95,13 +97,19 @@ run_test() {
     local actual_stdout=""
     local actual_exit=0
 
-    # Run client with a 10-second timeout.
-    actual_stdout=$(timeout 10 "$@" 2>/dev/null) || actual_exit=$?
+    # Run client with a 10-second timeout.  Capture stderr for diagnostics.
+    local tmpstderr
+    tmpstderr=$(mktemp)
+    actual_stdout=$(timeout 10 "$@" 2>"$tmpstderr") || actual_exit=$?
+    local actual_stderr
+    actual_stderr=$(cat "$tmpstderr")
+    rm -f "$tmpstderr"
 
     # timeout(1) returns 124 on timeout.
     if [ "$actual_exit" -eq 124 ]; then
         FAIL=$((FAIL + 1))
         echo "not ok $TEST_NUM - $name (timed out after 10s)"
+        [ -n "$actual_stderr" ] && echo "#   client stderr: $actual_stderr"
         return
     fi
 
@@ -138,24 +146,22 @@ run_test() {
 # ---------------------------------------------------------------------------
 
 run_session_tests() {
-    local authority="${SERVER_ADDR}:${SERVER_PORT}"
-
     # 1. exec echo
     run_test "exec echo" 0 "hello" \
-        ssh3-client "$authority" -u user -p pass "echo hello"
+        ssh3-client "$CLIENT_AUTHORITY" -u user -p pass "echo hello"
 
     # 2. exec exit code
     run_test "exec exit code 42" 42 "" \
-        ssh3-client "$authority" -u user -p pass "exit 42"
+        ssh3-client "$CLIENT_AUTHORITY" -u user -p pass "exit 42"
 
     # 3. exec cat with stdin
     run_test "exec cat stdin" 0 "inputdata" \
-        sh -c 'echo inputdata | ssh3-client '"$authority"' -u user -p pass cat'
+        sh -c 'echo inputdata | ssh3-client '"$CLIENT_AUTHORITY"' -u user -p pass cat'
 
     # 4. exec stderr (capture stderr too)
     # For this test, we check exit code only since stderr goes to fd 2.
     run_test "exec stderr" 0 "" \
-        ssh3-client "$authority" -u user -p pass "echo err >&2"
+        ssh3-client "$CLIENT_AUTHORITY" -u user -p pass "echo err >&2"
 }
 
 # ---------------------------------------------------------------------------

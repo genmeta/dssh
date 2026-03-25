@@ -40,41 +40,68 @@ fn build_examples_in_docker(repo: &Path) -> PathBuf {
     let out_dir = repo.join("target").join("docker-build");
     fs::create_dir_all(&out_dir).expect("failed to create docker-build output dir");
 
+    // Prefer mounting the host cargo registry (read-only) so builds don't
+    // need network access.  Fall back to named Docker volumes when the host
+    // registry directory does not exist.
+    let cargo_home = env::var("CARGO_HOME")
+        .unwrap_or_else(|_| format!("{}/.cargo", env::var("HOME").unwrap()));
+    let host_registry = PathBuf::from(&cargo_home).join("registry");
+    let use_host_registry = host_registry.is_dir();
+
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        // Mount workspace (read-only) so all path deps are available.
+        "-v".into(),
+        format!("{}:/workspace:ro", workspace_root.display()),
+        // Mount a writable overlay for the build output.
+        "-v".into(),
+        format!("{}:/output", out_dir.display()),
+    ];
+
+    if use_host_registry {
+        // Mount host cargo registry read-only to avoid network downloads.
+        args.extend([
+            "-v".into(),
+            format!("{}:/usr/local/cargo/registry:ro", host_registry.display()),
+        ]);
+    } else {
+        // Fall back to named Docker volumes (requires network).
+        args.extend([
+            "-v".into(),
+            "ssh3-test-cargo-registry:/usr/local/cargo/registry".into(),
+        ]);
+    }
+
+    args.extend([
+        "-v".into(),
+        "ssh3-test-cargo-target:/build-target".into(),
+        "-e".into(),
+        "CARGO_TARGET_DIR=/build-target".into(),
+        "-w".into(),
+        format!("/workspace/{repo_name}"),
+        "rust:1-bookworm".into(),
+        "sh".into(),
+        "-c".into(),
+        // Copy source (excluding target/ and .git/ dirs) to a writable
+        // location, build, and copy binaries out. Uses tar with --exclude
+        // to avoid installing extra packages.
+        format!(
+            "cd /workspace && \
+             tar cf - --exclude='target' --exclude='.git' . | (mkdir -p /build && cd /build && tar xf -) && \
+             cd /build/{repo_name} && \
+             cargo build --examples && \
+             cp /build-target/debug/examples/ssh3-server \
+                /build-target/debug/examples/ssh3-client \
+                /build-target/debug/examples/ssh3-session \
+                /output/",
+            repo_name = repo_name,
+        ),
+    ]);
+
     // Build inside Docker, mounting the workspace and an output volume.
     let status = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            // Mount workspace (read-only) so all path deps are available.
-            "-v",
-            &format!("{}:/workspace:ro", workspace_root.display()),
-            // Mount a writable overlay for the build output.
-            "-v",
-            &format!("{}:/output", out_dir.display()),
-            // Use named volumes for cargo caches (persist across runs).
-            "-v",
-            "ssh3-test-cargo-registry:/usr/local/cargo/registry",
-            "-v",
-            "ssh3-test-cargo-target:/build-target",
-            "-e",
-            "CARGO_TARGET_DIR=/build-target",
-            "-w",
-            &format!("/workspace/{repo_name}"),
-            "rust:1-bookworm",
-            "sh",
-            "-c",
-            // Copy source to a writable location, build, copy binaries out.
-            &format!(
-                "cp -a /workspace /build && \
-                 cd /build/{repo_name} && \
-                 cargo build --examples && \
-                 cp /build-target/debug/examples/ssh3-server \
-                    /build-target/debug/examples/ssh3-client \
-                    /build-target/debug/examples/ssh3-session \
-                    /output/",
-                repo_name = repo_name,
-            ),
-        ])
+        .args(&args)
         .status()
         .expect("failed to run docker for building examples");
 

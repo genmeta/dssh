@@ -180,11 +180,15 @@ impl Ssh3Protocol {
         &self,
         (mut reader, writer): ErasedPeekableBiStream,
     ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
+        tracing::trace!("Ssh3Protocol::accept_bi called");
+
         // Peek the first VarInt to identify SSH3 streams.
         let signal_value: VarInt = match reader.decode_one().await {
             Ok(v) => v,
             Err(_) => return Ok(StreamVerdict::Passed((reader, writer))),
         };
+
+        tracing::trace!(signal_value = %signal_value.into_inner(), "decoded first VarInt");
 
         if signal_value != CHANNEL_SIGNAL_VALUE {
             return Ok(StreamVerdict::Passed((reader, writer)));
@@ -199,8 +203,12 @@ impl Ssh3Protocol {
             }
         };
 
-        // Convert to raw QUIC stream, consuming the peeked bytes.
-        let raw_reader = reader.into_stream_reader().into_inner();
+        tracing::debug!(%session_id, "SSH3 channel stream accepted, routing to conversation");
+
+        // Convert to StreamReader (preserving buffered bytes from the peek
+        // operation), then re-box as a BoxReadStream so downstream consumers
+        // receive all remaining data (max_message_size, channel_type, etc.).
+        let reader: BoxReadStream = Box::pin(reader.into_stream_reader());
 
         // Lookup and route.
         let sender = {
@@ -214,7 +222,7 @@ impl Ssh3Protocol {
         match sender {
             Some(sender) => {
                 let raw_writer = writer.into_inner();
-                if sender.send((raw_reader, raw_writer)).await.is_err() {
+                if sender.send((reader, raw_writer)).await.is_err() {
                     tracing::debug!(
                         %session_id,
                         "conversation channel closed, dropping SSH3 stream"
@@ -263,7 +271,7 @@ impl Protocol for Ssh3Protocol {
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ssh3ProtocolFactory;
 
-impl<C: quic::Connection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
+impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
     type Protocol = Ssh3Protocol;
 
     fn init<'a>(
@@ -276,11 +284,8 @@ impl<C: quic::Connection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
             let open_bi: OpenBiFn = Arc::new(move || {
                 let conn = conn.clone();
                 Box::pin(async move {
-                    let (reader, writer) = quic::ManageStream::open_bi(&*conn).await?;
-                    Ok((
-                        Box::pin(reader) as BoxReadStream,
-                        Box::pin(writer) as BoxWriteStream,
-                    ))
+                    let (reader, writer) = quic::DynManageStream::open_bi(&*conn).await?;
+                    Ok((reader, writer))
                 })
             });
 
@@ -347,6 +352,8 @@ impl ManageSessionStream for ConversationHandle {
         let reader = StreamReader::new(reader);
         let mut writer = SinkWriter::new(writer);
 
+        tracing::trace!(session_id = %self.session_id, "writing channel routing header");
+
         // Write SSH3 channel framing: signal value + session ID.
         // The conversation will write max_message_size + channel_type + payload.
         writer
@@ -361,17 +368,14 @@ impl ManageSessionStream for ConversationHandle {
             .await
             .context(FlushSnafu)?;
 
+        tracing::trace!(session_id = %self.session_id, "channel routing header written and flushed");
+
         Ok((reader, writer))
     }
 
     async fn accept_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-        let (reader, writer) = self
-            .receiver
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(HandleError::ChannelClosed)?;
+        let mut rx = self.receiver.lock().await;
+        let (reader, writer) = rx.recv().await.ok_or(HandleError::ChannelClosed)?;
         Ok((StreamReader::new(reader), SinkWriter::new(writer)))
     }
 }

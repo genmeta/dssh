@@ -28,17 +28,23 @@ use std::sync::Arc;
 
 use std::collections::HashMap;
 
+use snafu::prelude::*;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::channel::reason_code;
+use crate::conversation::channel::{
+    ChannelEvent, ReadChannelEventError, SshChannel,
+};
 use crate::conversation::global::IncomingGlobal;
-use crate::conversation::{Conversation, ManageSessionStream};
+use crate::conversation::{Conversation, EmptyPayload, ManageSessionStream};
 use crate::forward::{
     CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, ForwardError,
     StreamlocalForwardRequest, TcpipForwardRequest,
 };
+use crate::session::{ExecRequest, PtyRequest, SessionCodecError};
 use crate::session::process::CommandMode;
+use crate::session::pty::PtyPair;
 use h3x::varint::VarInt;
 use tracing::Instrument;
 
@@ -65,6 +71,156 @@ impl Default for SessionConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Session setup — read exec/shell/pty-req before spawning a process
+// ---------------------------------------------------------------------------
+
+/// Error during the session setup phase.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum SessionSetupError {
+    #[snafu(display("failed to read channel event during session setup"))]
+    ReadEvent { source: ReadChannelEventError },
+
+    #[snafu(display("failed to decode '{request_type}' request payload"))]
+    DecodePayload {
+        request_type: String,
+        source: SessionCodecError,
+    },
+
+    #[snafu(display("failed to respond to channel request"))]
+    Respond { source: std::io::Error },
+
+    #[snafu(display("channel closed before exec or shell request"))]
+    ChannelClosed,
+
+    #[snafu(display("failed to allocate PTY"))]
+    AllocPty {
+        source: crate::session::pty::PtyError,
+    },
+}
+
+/// Result of the session setup phase.
+struct SessionSetup {
+    command: Vec<u8>,
+    is_shell: bool,
+    pty: Option<PtyPair>,
+}
+
+/// Read session channel requests (pty-req, exec, shell) and respond.
+///
+/// The SSH3 protocol expects the client to send setup requests before any
+/// data. This function reads those requests using [`SshChannel::next_event`]
+/// (which has writer access for sending replies), then returns the determined
+/// command mode and optional PTY allocation.
+async fn session_setup<R, W>(
+    channel: &mut SshChannel<R, W>,
+) -> Result<SessionSetup, SessionSetupError>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    use session_setup_error::*;
+
+    let mut pty_request: Option<PtyRequest> = None;
+    let mut command: Option<Vec<u8>> = None;
+    let mut is_shell = false;
+
+    loop {
+        let event = channel.next_event().await.context(ReadEventSnafu)?;
+
+        match event {
+            ChannelEvent::Request(incoming) => {
+                let request_type = incoming.request_type().clone();
+                match &*request_type {
+                    "pty-req" => {
+                        let (payload, responder) = incoming
+                            .decode_payload::<PtyRequest, SessionCodecError>()
+                            .await
+                            .context(DecodePayloadSnafu {
+                                request_type: "pty-req",
+                            })?;
+                        pty_request = Some(payload);
+                        if let Some(r) = responder {
+                            // Respond with success; PTY allocation happens later.
+                            let _ = r
+                                .respond_success(EmptyPayload)
+                                .await
+                                .map_err(|e| std::io::Error::other(e.to_string()))
+                                .context(RespondSnafu);
+                        }
+                    }
+                    "exec" => {
+                        let (payload, responder) = incoming
+                            .decode_payload::<ExecRequest, SessionCodecError>()
+                            .await
+                            .context(DecodePayloadSnafu {
+                                request_type: "exec",
+                            })?;
+                        command = Some(bytes::Bytes::from(payload.command).to_vec());
+                        if let Some(r) = responder {
+                            let _ = r
+                                .respond_success(EmptyPayload)
+                                .await
+                                .map_err(|e| std::io::Error::other(e.to_string()))
+                                .context(RespondSnafu);
+                        }
+                        break;
+                    }
+                    "shell" => {
+                        // EmptyPayload::DecodeFrom is infallible.
+                        let (_, responder) = incoming
+                            .decode_payload::<EmptyPayload, std::convert::Infallible>()
+                            .await
+                            .unwrap();
+                        is_shell = true;
+                        if let Some(r) = responder {
+                            let _ = r
+                                .respond_success(EmptyPayload)
+                                .await
+                                .map_err(|e| std::io::Error::other(e.to_string()))
+                                .context(RespondSnafu);
+                        }
+                        break;
+                    }
+                    other => {
+                        tracing::debug!(request_type = %other, "ignoring unknown session setup request");
+                        if incoming.want_reply() {
+                            // Decode an empty payload to get the responder.
+                            if let Ok((_, Some(r))) = incoming
+                                .decode_payload::<EmptyPayload, std::convert::Infallible>()
+                                .await
+                            {
+                                let _ = r.respond_failure().await;
+                            }
+                        }
+                    }
+                }
+            }
+            ChannelEvent::Eof | ChannelEvent::Close => {
+                return ChannelClosedSnafu.fail();
+            }
+            _ => {
+                tracing::debug!("ignoring unexpected event during session setup");
+            }
+        }
+    }
+
+    // Allocate PTY if requested.
+    let pty = match pty_request {
+        Some(req) => Some(
+            crate::session::pty::allocate_pty(&req).context(AllocPtySnafu)?,
+        ),
+        None => None,
+    };
+
+    Ok(SessionSetup {
+        command: command.unwrap_or_default(),
+        is_shell,
+        pty,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
 
@@ -87,9 +243,17 @@ where
     let mut channel_tasks: JoinSet<()> = JoinSet::new();
     let mut forward_tasks: JoinSet<()> = JoinSet::new();
 
+    // Pin the accept() future so it survives across select! iterations.
+    // accept() is NOT cancellation-safe: it eagerly takes a reader ticket,
+    // and if cancelled before completing, the ticket blocks subsequent reads.
+    let mut accept_global = std::pin::pin!(conversation.accept());
+
+    tracing::debug!("run_session: entering main loop");
+
     loop {
         tokio::select! {
             channel_result = conversation.accept_channel() => {
+                tracing::debug!("run_session: accept_channel returned");
                 let incoming = match channel_result {
                     Ok(ch) => ch,
                     Err(e) => {
@@ -106,15 +270,41 @@ where
                     "session" => {
                         let pending = incoming.skip_payload();
                         channel_tasks.spawn(async move {
-                            let channel = match pending.accept(max_msg).await {
+                            let mut channel = match pending.accept(max_msg).await {
                                 Ok(ch) => ch,
                                 Err(e) => {
                                     tracing::warn!(error = %snafu::Report::from_error(&e), "failed to accept session channel");
                                     return;
                                 }
                             };
-                            let mode = CommandMode::Shell { shell: config.shell.as_os_str() };
-                            if let Err(e) = super::process::run_piped(channel, mode).await {
+
+                            // Setup phase: read exec/shell/pty-req requests.
+                            let setup = match session_setup(&mut channel).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::warn!(error = %snafu::Report::from_error(&e), "session setup failed");
+                                    return;
+                                }
+                            };
+
+                            let shell = config.shell.as_os_str();
+                            let result = if let Some(pty) = setup.pty {
+                                let mode = if setup.is_shell {
+                                    CommandMode::Shell { shell }
+                                } else {
+                                    CommandMode::Exec { shell, command: &setup.command }
+                                };
+                                super::process::run_pty(channel, mode, pty).await
+                            } else {
+                                let mode = if setup.is_shell {
+                                    CommandMode::Shell { shell }
+                                } else {
+                                    CommandMode::Exec { shell, command: &setup.command }
+                                };
+                                super::process::run_piped(channel, mode).await
+                            };
+
+                            if let Err(e) = result {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "session channel error");
                             }
                         }.instrument(tracing::info_span!("session")));
@@ -156,10 +346,12 @@ where
                 }
             }
 
-            global_result = conversation.accept() => {
+            global_result = &mut accept_global => {
                 match global_result {
                     Ok(incoming) => {
                         dispatch_global(incoming, &conversation, &mut tcp_forwards, &mut unix_forwards, &mut forward_tasks).await;
+                        // Reset the pinned future for the next global request.
+                        accept_global.set(conversation.accept());
                     }
                     Err(e) => {
                         tracing::debug!(error = %snafu::Report::from_error(&e), "accept global ended");

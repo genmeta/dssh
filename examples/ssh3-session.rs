@@ -26,6 +26,9 @@ use tracing::Instrument;
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install default crypto provider");
     tracing_subscriber::fmt::init();
 
     let stdin = tokio::io::stdin();
@@ -100,10 +103,8 @@ async fn main() {
                     }
 
                     // Build Conversation from remoc-proxied streams.
-                    let control_reader =
-                        h3x::codec::StreamReader::new(bootstrap.control_reader.into_boxed_quic());
-                    let control_writer =
-                        h3x::codec::SinkWriter::new(bootstrap.control_writer.into_boxed_quic());
+                    let control_reader = bootstrap.control_reader.into_box_reader();
+                    let control_writer = bootstrap.control_writer.into_box_writer();
 
                     let conversation = Arc::new(Conversation::new(
                         bootstrap.conversation_id,
