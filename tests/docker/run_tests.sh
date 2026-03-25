@@ -399,6 +399,127 @@ run_forward_tests() {
     kill "$ECHO_PID2" 2>/dev/null; wait "$ECHO_PID2" 2>/dev/null || true
 }
 
+run_unix_socket_tests() {
+    # Start a Unix domain socket echo server.
+    local ECHO_SOCK="/tmp/echo.sock"
+    rm -f "$ECHO_SOCK"
+    socat UNIX-LISTEN:"$ECHO_SOCK",reuseaddr,fork,mode=0666 EXEC:cat &
+    local ECHO_PID=$!
+    sleep 0.3
+
+    # 16. Local forward: TCP bind → Unix socket connect (-L port:/path).
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
+        -L 8886:/tmp/echo.sock "sleep 10" &
+    local TCP2UNIX_PID=$!
+    sleep 1
+
+    local t2u_result
+    t2u_result=$(echo "tcp-to-unix" | timeout 5 nc -q1 127.0.0.1 8886 2>/dev/null) || true
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if [ "$t2u_result" = "tcp-to-unix" ]; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - local forward TCP→Unix (-L port:/path)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - local forward TCP→Unix (-L port:/path)"
+        echo "#   expected: tcp-to-unix"
+        echo "#   got: $t2u_result"
+    fi
+
+    kill "$TCP2UNIX_PID" 2>/dev/null; wait "$TCP2UNIX_PID" 2>/dev/null || true
+
+    # 17. Local forward: Unix socket bind → TCP connect (-L /path:host:port).
+    # Start TCP echo server on port 9997.
+    socat TCP-LISTEN:9997,reuseaddr,fork EXEC:cat &
+    local TCP_ECHO_PID=$!
+    sleep 0.3
+
+    local CLIENT_SOCK="/tmp/client_fwd.sock"
+    rm -f "$CLIENT_SOCK"
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
+        -L "$CLIENT_SOCK":127.0.0.1:9997 "sleep 10" &
+    local UNIX2TCP_PID=$!
+    sleep 1
+
+    local u2t_result
+    u2t_result=$(echo "unix-to-tcp" | timeout 5 socat - UNIX-CONNECT:"$CLIENT_SOCK" 2>/dev/null) || true
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if [ "$u2t_result" = "unix-to-tcp" ]; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - local forward Unix→TCP (-L /path:host:port)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - local forward Unix→TCP (-L /path:host:port)"
+        echo "#   expected: unix-to-tcp"
+        echo "#   got: $u2t_result"
+    fi
+
+    kill "$UNIX2TCP_PID" 2>/dev/null; wait "$UNIX2TCP_PID" 2>/dev/null || true
+    kill "$TCP_ECHO_PID" 2>/dev/null; wait "$TCP_ECHO_PID" 2>/dev/null || true
+    rm -f "$CLIENT_SOCK"
+
+    # 18. Local forward: Unix socket bind → Unix socket connect (-L /local:/remote).
+    local CLIENT_SOCK2="/tmp/client_fwd2.sock"
+    rm -f "$CLIENT_SOCK2"
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
+        -L "$CLIENT_SOCK2":/tmp/echo.sock "sleep 10" &
+    local UNIX2UNIX_PID=$!
+    sleep 1
+
+    local u2u_result
+    u2u_result=$(echo "unix-to-unix" | timeout 5 socat - UNIX-CONNECT:"$CLIENT_SOCK2" 2>/dev/null) || true
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if [ "$u2u_result" = "unix-to-unix" ]; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - local forward Unix→Unix (-L /local:/remote)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - local forward Unix→Unix (-L /local:/remote)"
+        echo "#   expected: unix-to-unix"
+        echo "#   got: $u2u_result"
+    fi
+
+    kill "$UNIX2UNIX_PID" 2>/dev/null; wait "$UNIX2UNIX_PID" 2>/dev/null || true
+    rm -f "$CLIENT_SOCK2"
+
+    # 19. Remote forward: Unix socket → TCP (-R /remote/path:host:port).
+    socat TCP-LISTEN:9996,reuseaddr,fork EXEC:cat &
+    local RTCP_ECHO_PID=$!
+    sleep 0.3
+
+    local REMOTE_SOCK="/tmp/remote_fwd.sock"
+    rm -f "$REMOTE_SOCK"
+    ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass \
+        -R "$REMOTE_SOCK":127.0.0.1:9996 "sleep 10" &
+    local RUNIX_PID=$!
+    sleep 1
+
+    local ru_result
+    ru_result=$(echo "remote-unix" | timeout 5 socat - UNIX-CONNECT:"$REMOTE_SOCK" 2>/dev/null) || true
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if [ "$ru_result" = "remote-unix" ]; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - remote forward Unix→TCP (-R /path:host:port)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - remote forward Unix→TCP (-R /path:host:port)"
+        echo "#   expected: remote-unix"
+        echo "#   got: $ru_result"
+    fi
+
+    kill "$RUNIX_PID" 2>/dev/null; wait "$RUNIX_PID" 2>/dev/null || true
+    kill "$RTCP_ECHO_PID" 2>/dev/null; wait "$RTCP_ECHO_PID" 2>/dev/null || true
+    rm -f "$REMOTE_SOCK"
+
+    # Cleanup.
+    kill "$ECHO_PID" 2>/dev/null; wait "$ECHO_PID" 2>/dev/null || true
+    rm -f "$ECHO_SOCK"
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -425,6 +546,9 @@ main() {
 
     echo "# --- Forwarding tests ---"
     run_forward_tests
+
+    echo "# --- Unix socket forwarding tests ---"
+    run_unix_socket_tests
 
     stop_server
 
