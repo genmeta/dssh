@@ -33,18 +33,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::channel::reason_code;
-use crate::conversation::channel::{
-    ChannelEvent, ReadChannelEventError, SshChannel,
-};
+use crate::conversation::channel::{ChannelEvent, ReadChannelEventError, SshChannel};
 use crate::conversation::global::IncomingGlobal;
 use crate::conversation::{Conversation, EmptyPayload, ManageSessionStream};
 use crate::forward::{
     CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, ForwardError,
     StreamlocalForwardRequest, TcpipForwardRequest,
 };
-use crate::session::{ExecRequest, PtyRequest, SessionCodecError};
 use crate::session::process::CommandMode;
 use crate::session::pty::PtyPair;
+use crate::session::{ExecRequest, PtyRequest, SessionCodecError};
 use h3x::varint::VarInt;
 use tracing::Instrument;
 
@@ -144,10 +142,7 @@ where
                         pty_request = Some(payload);
                         if let Some(r) = responder {
                             // Respond with success; PTY allocation happens later.
-                            let _ = r
-                                .respond_success(EmptyPayload)
-                                .await
-                                .context(RespondSnafu);
+                            let _ = r.respond_success(EmptyPayload).await.context(RespondSnafu);
                         }
                     }
                     "exec" => {
@@ -159,10 +154,7 @@ where
                             })?;
                         command = Some(bytes::Bytes::from(payload.command).to_vec());
                         if let Some(r) = responder {
-                            let _ = r
-                                .respond_success(EmptyPayload)
-                                .await
-                                .context(RespondSnafu);
+                            let _ = r.respond_success(EmptyPayload).await.context(RespondSnafu);
                         }
                         break;
                     }
@@ -174,10 +166,7 @@ where
                             .unwrap();
                         is_shell = true;
                         if let Some(r) = responder {
-                            let _ = r
-                                .respond_success(EmptyPayload)
-                                .await
-                                .context(RespondSnafu);
+                            let _ = r.respond_success(EmptyPayload).await.context(RespondSnafu);
                         }
                         break;
                     }
@@ -206,9 +195,7 @@ where
 
     // Allocate PTY if requested.
     let pty = match pty_request {
-        Some(req) => Some(
-            crate::session::pty::allocate_pty(&req).context(AllocPtySnafu)?,
-        ),
+        Some(req) => Some(crate::session::pty::allocate_pty(&req).context(AllocPtySnafu)?),
         None => None,
     };
 
@@ -393,8 +380,7 @@ async fn dispatch_global<M, R, W>(
     tcp_forwards: &mut HashMap<(String, u16), AbortHandle>,
     unix_forwards: &mut HashMap<String, AbortHandle>,
     forward_tasks: &mut JoinSet<()>,
-)
-where
+) where
     M: ManageSessionStream + 'static,
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -416,9 +402,9 @@ where
                                 Ok(listener) => {
                                     let port = listener.bound_addr().port();
                                     let abort = forward_tasks.spawn(
-                                        listener.run(conversation.clone()).instrument(
-                                            tracing::info_span!("tcp-forward", port),
-                                        ),
+                                        listener
+                                            .run(conversation.clone())
+                                            .instrument(tracing::info_span!("tcp-forward", port)),
                                     );
                                     tcp_forwards.insert((bind_addr, port), abort);
                                 }
@@ -439,15 +425,21 @@ where
                     {
                         Ok(decoded) => {
                             let bind_addr = decoded.payload().bind_address.to_string();
-                            let bind_port = match u16::try_from(decoded.payload().bind_port.into_inner()) {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    tracing::warn!(port = decoded.payload().bind_port.into_inner(), "cancel-tcpip-forward port overflow");
-                                    let _ = decoded.respond_failure().await;
-                                    return;
-                                }
-                            };
-                            if let Some(abort) = tcp_forwards.remove(&(bind_addr.clone(), bind_port)) {
+                            let bind_port =
+                                match u16::try_from(decoded.payload().bind_port.into_inner()) {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            port = decoded.payload().bind_port.into_inner(),
+                                            "cancel-tcpip-forward port overflow"
+                                        );
+                                        let _ = decoded.respond_failure().await;
+                                        return;
+                                    }
+                                };
+                            if let Some(abort) =
+                                tcp_forwards.remove(&(bind_addr.clone(), bind_port))
+                            {
                                 abort.abort();
                                 let _ = decoded
                                     .respond_success(crate::conversation::EmptyPayload)
@@ -472,7 +464,10 @@ where
                                 Ok(listener) => {
                                     let abort = forward_tasks.spawn(
                                         listener.run(conversation.clone()).instrument(
-                                            tracing::info_span!("unix-forward", path = &*socket_path),
+                                            tracing::info_span!(
+                                                "unix-forward",
+                                                path = &*socket_path
+                                            ),
                                         ),
                                     );
                                     unix_forwards.insert(socket_path, abort);

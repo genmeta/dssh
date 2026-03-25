@@ -20,9 +20,9 @@ use genmeta_ssh::{
     constants::{DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION},
     conversation::{Conversation, channel::SshChannel},
     forward::{
-        DirectStreamlocal, DirectTcpip, ForwardedStreamlocal, ForwardedTcpip,
-        SessionChannelOpen, StreamlocalForwardGlobalRequest, StreamlocalForwardRequest,
-        TcpipForwardGlobalRequest, TcpipForwardRequest, relay,
+        DirectStreamlocal, DirectTcpip, ForwardedStreamlocal, ForwardedTcpip, SessionChannelOpen,
+        StreamlocalForwardGlobalRequest, StreamlocalForwardRequest, TcpipForwardGlobalRequest,
+        TcpipForwardRequest, relay,
     },
     protocol::{ConversationHandle, Ssh3Protocol},
     session::client::ClientSession,
@@ -260,8 +260,7 @@ peg::parser! {
 impl std::str::FromStr for LocalForward {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        forward_spec::local_forward(s)
-            .map_err(|e| format!("invalid local forward spec '{s}': {e}"))
+        forward_spec::local_forward(s).map_err(|e| format!("invalid local forward spec '{s}': {e}"))
     }
 }
 
@@ -341,9 +340,8 @@ async fn connect(
     auth_header: HeaderValue,
     client: &H3Client,
 ) -> Result<Conversation<ConversationHandle>, Whatever> {
-    let authority_parsed: http::uri::Authority = authority
-        .parse()
-        .whatever_context("invalid authority")?;
+    let authority_parsed: http::uri::Authority =
+        authority.parse().whatever_context("invalid authority")?;
 
     let connection = client
         .connect(authority_parsed.clone())
@@ -397,13 +395,15 @@ async fn connect(
     );
     ensure_whatever!(
         response.status == StatusCode::OK,
-        "unexpected HTTP status: {}", response.status
+        "unexpected HTTP status: {}",
+        response.status
     );
 
-    let server_version_header = response
-        .headers
-        .get("ssh-version");
-    ensure_whatever!(server_version_header.is_some(), "missing ssh-version response header");
+    let server_version_header = response.headers.get("ssh-version");
+    ensure_whatever!(
+        server_version_header.is_some(),
+        "missing ssh-version response header"
+    );
     let server_version = server_version_header
         .unwrap()
         .to_str()
@@ -450,10 +450,8 @@ async fn connect(
             .whatever_context("failed to register conversation")?
     };
 
-    let control_reader: Pin<Box<dyn AsyncRead + Send>> =
-        Box::pin(read_stream.into_box_reader());
-    let control_writer: Pin<Box<dyn AsyncWrite + Send>> =
-        Box::pin(write_stream.into_box_writer());
+    let control_reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(read_stream.into_box_reader());
+    let control_writer: Pin<Box<dyn AsyncWrite + Send>> = Box::pin(write_stream.into_box_writer());
 
     Ok(Conversation::new(
         session_id,
@@ -473,7 +471,9 @@ async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install default crypto provider");
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     let cli = Cli::parse();
 
     let command: Option<String> = if cli.command.is_empty() {
@@ -516,8 +516,7 @@ async fn main() {
         let conv = conversation.clone();
         let label = spec.to_string();
         forward_tasks.spawn(
-            run_local_forward(conv, spec)
-                .instrument(tracing::info_span!("local_forward", %label)),
+            run_local_forward(conv, spec).instrument(tracing::info_span!("local_forward", %label)),
         );
     }
 
@@ -543,7 +542,10 @@ async fn main() {
                     "remote forward established"
                 );
                 remote_mappings.push(RemoteForwardMapping {
-                    bind: Endpoint::Tcp { host: host.clone(), port: allocated_port },
+                    bind: Endpoint::Tcp {
+                        host: host.clone(),
+                        port: allocated_port,
+                    },
                     connect: spec.connect.clone(),
                 });
             }
@@ -645,7 +647,11 @@ async fn run_local_forward(
 ) {
     match &spec.bind {
         Endpoint::Tcp { host, port } => {
-            let bind_addr = if host.is_empty() { "0.0.0.0" } else { host.as_str() };
+            let bind_addr = if host.is_empty() {
+                "0.0.0.0"
+            } else {
+                host.as_str()
+            };
             let listener = TcpListener::bind((bind_addr, *port))
                 .await
                 .unwrap_or_else(|e| panic!("failed to bind {}: {e}", spec.bind));
@@ -687,8 +693,7 @@ async fn run_local_forward(
                 let connect = spec.connect.clone();
                 let (r, w) = stream.into_split();
                 tasks.spawn(
-                    forward_local_conn(conv, connect, Box::pin(r), Box::pin(w))
-                        .in_current_span(),
+                    forward_local_conn(conv, connect, Box::pin(r), Box::pin(w)).in_current_span(),
                 );
             }
         }
@@ -797,17 +802,17 @@ async fn run_channel_acceptor(
 
         match channel_type.as_str() {
             "forwarded-tcpip" => {
-                let (payload, pending): (ForwardedTcpip, _) =
-                    match incoming.decode_payload().await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %snafu::Report::from_error(&e),
-                                "decode forwarded-tcpip failed"
-                            );
-                            continue;
-                        }
-                    };
+                let (payload, pending): (ForwardedTcpip, _) = match incoming.decode_payload().await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %snafu::Report::from_error(&e),
+                            "decode forwarded-tcpip failed"
+                        );
+                        continue;
+                    }
+                };
 
                 let server_port = payload.connected_port.into_inner() as u16;
                 let server_addr = payload.connected_address.to_string();
@@ -874,10 +879,8 @@ async fn run_channel_acceptor(
                                 }
                             };
 
-                        let ch2s =
-                            tokio::spawn(relay(ch_reader, local_writer).in_current_span());
-                        let s2ch =
-                            tokio::spawn(relay(local_reader, ch_writer).in_current_span());
+                        let ch2s = tokio::spawn(relay(ch_reader, local_writer).in_current_span());
+                        let s2ch = tokio::spawn(relay(local_reader, ch_writer).in_current_span());
                         let _ = tokio::join!(ch2s, s2ch);
                     }
                     .instrument(tracing::info_span!(
@@ -958,10 +961,8 @@ async fn run_channel_acceptor(
                                 }
                             };
 
-                        let ch2s =
-                            tokio::spawn(relay(ch_reader, local_writer).in_current_span());
-                        let s2ch =
-                            tokio::spawn(relay(local_reader, ch_writer).in_current_span());
+                        let ch2s = tokio::spawn(relay(ch_reader, local_writer).in_current_span());
+                        let s2ch = tokio::spawn(relay(local_reader, ch_writer).in_current_span());
                         let _ = tokio::join!(ch2s, s2ch);
                     }
                     .instrument(tracing::info_span!(
@@ -971,14 +972,9 @@ async fn run_channel_acceptor(
                 );
             }
             _ => {
-                tracing::warn!(
-                    channel_type,
-                    "rejecting unknown incoming channel"
-                );
+                tracing::warn!(channel_type, "rejecting unknown incoming channel");
                 // Best-effort reject — decode as ForwardedTcpip to get PendingChannel.
-                if let Ok((_, pending)) =
-                    incoming.decode_payload::<ForwardedTcpip, _>().await
-                {
+                if let Ok((_, pending)) = incoming.decode_payload::<ForwardedTcpip, _>().await {
                     let _ = pending
                         .reject(
                             VarInt::from(1u32),
@@ -1004,57 +1000,149 @@ mod tests {
     #[test]
     fn local_tcp_3part() {
         let f: LocalForward = "8080:remote:80".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: "127.0.0.1".into(), port: 8080 });
-        assert_eq!(f.connect, Endpoint::Tcp { host: "remote".into(), port: 80 });
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8080
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Endpoint::Tcp {
+                host: "remote".into(),
+                port: 80
+            }
+        );
     }
 
     #[test]
     fn local_tcp_4part() {
         let f: LocalForward = "0.0.0.0:8080:remote:80".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: "0.0.0.0".into(), port: 8080 });
-        assert_eq!(f.connect, Endpoint::Tcp { host: "remote".into(), port: 80 });
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: "0.0.0.0".into(),
+                port: 8080
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Endpoint::Tcp {
+                host: "remote".into(),
+                port: 80
+            }
+        );
     }
 
     #[test]
     fn local_tcp_ipv6_bind() {
         let f: LocalForward = "[::1]:8080:remote:80".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: "::1".into(), port: 8080 });
-        assert_eq!(f.connect, Endpoint::Tcp { host: "remote".into(), port: 80 });
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: "::1".into(),
+                port: 8080
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Endpoint::Tcp {
+                host: "remote".into(),
+                port: 80
+            }
+        );
     }
 
     #[test]
     fn local_tcp_ipv6_connect() {
         let f: LocalForward = "8080:[::1]:80".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: "127.0.0.1".into(), port: 8080 });
-        assert_eq!(f.connect, Endpoint::Tcp { host: "::1".into(), port: 80 });
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8080
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Endpoint::Tcp {
+                host: "::1".into(),
+                port: 80
+            }
+        );
     }
 
     #[test]
     fn local_wildcard_bind() {
         let f: LocalForward = "*:8080:remote:80".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: String::new(), port: 8080 });
-        assert_eq!(f.connect, Endpoint::Tcp { host: "remote".into(), port: 80 });
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: String::new(),
+                port: 8080
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Endpoint::Tcp {
+                host: "remote".into(),
+                port: 80
+            }
+        );
     }
 
     #[test]
     fn local_tcp_to_unix() {
         let f: LocalForward = "8080:/tmp/remote.sock".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: "127.0.0.1".into(), port: 8080 });
-        assert_eq!(f.connect, Endpoint::Unix { path: "/tmp/remote.sock".into() });
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8080
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Endpoint::Unix {
+                path: "/tmp/remote.sock".into()
+            }
+        );
     }
 
     #[test]
     fn local_unix_to_tcp() {
         let f: LocalForward = "/tmp/local.sock:remote:80".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Unix { path: "/tmp/local.sock".into() });
-        assert_eq!(f.connect, Endpoint::Tcp { host: "remote".into(), port: 80 });
+        assert_eq!(
+            f.bind,
+            Endpoint::Unix {
+                path: "/tmp/local.sock".into()
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Endpoint::Tcp {
+                host: "remote".into(),
+                port: 80
+            }
+        );
     }
 
     #[test]
     fn local_unix_to_unix() {
         let f: LocalForward = "/tmp/local.sock:/tmp/remote.sock".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Unix { path: "/tmp/local.sock".into() });
-        assert_eq!(f.connect, Endpoint::Unix { path: "/tmp/remote.sock".into() });
+        assert_eq!(
+            f.bind,
+            Endpoint::Unix {
+                path: "/tmp/local.sock".into()
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Endpoint::Unix {
+                path: "/tmp/remote.sock".into()
+            }
+        );
     }
 
     // --- RemoteForward parsing ---
@@ -1062,43 +1150,101 @@ mod tests {
     #[test]
     fn remote_tcp_3part() {
         let f: RemoteForward = "8080:localhost:80".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: String::new(), port: 8080 });
-        assert_eq!(f.connect, Some(Endpoint::Tcp { host: "localhost".into(), port: 80 }));
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: String::new(),
+                port: 8080
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Some(Endpoint::Tcp {
+                host: "localhost".into(),
+                port: 80
+            })
+        );
     }
 
     #[test]
     fn remote_tcp_4part() {
         let f: RemoteForward = "0.0.0.0:8080:localhost:80".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: "0.0.0.0".into(), port: 8080 });
-        assert_eq!(f.connect, Some(Endpoint::Tcp { host: "localhost".into(), port: 80 }));
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: "0.0.0.0".into(),
+                port: 8080
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Some(Endpoint::Tcp {
+                host: "localhost".into(),
+                port: 80
+            })
+        );
     }
 
     #[test]
     fn remote_listen_only_port() {
         let f: RemoteForward = "8080".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: String::new(), port: 8080 });
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: String::new(),
+                port: 8080
+            }
+        );
         assert_eq!(f.connect, None);
     }
 
     #[test]
     fn remote_listen_only_host_port() {
         let f: RemoteForward = "localhost:8080".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: "localhost".into(), port: 8080 });
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: "localhost".into(),
+                port: 8080
+            }
+        );
         assert_eq!(f.connect, None);
     }
 
     #[test]
     fn remote_unix_to_tcp() {
         let f: RemoteForward = "/tmp/remote.sock:localhost:80".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Unix { path: "/tmp/remote.sock".into() });
-        assert_eq!(f.connect, Some(Endpoint::Tcp { host: "localhost".into(), port: 80 }));
+        assert_eq!(
+            f.bind,
+            Endpoint::Unix {
+                path: "/tmp/remote.sock".into()
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Some(Endpoint::Tcp {
+                host: "localhost".into(),
+                port: 80
+            })
+        );
     }
 
     #[test]
     fn remote_tcp_to_unix() {
         let f: RemoteForward = "8080:/tmp/local.sock".parse().unwrap();
-        assert_eq!(f.bind, Endpoint::Tcp { host: String::new(), port: 8080 });
-        assert_eq!(f.connect, Some(Endpoint::Unix { path: "/tmp/local.sock".into() }));
+        assert_eq!(
+            f.bind,
+            Endpoint::Tcp {
+                host: String::new(),
+                port: 8080
+            }
+        );
+        assert_eq!(
+            f.connect,
+            Some(Endpoint::Unix {
+                path: "/tmp/local.sock".into()
+            })
+        );
     }
 
     // --- DynamicForward parsing ---
@@ -1135,13 +1281,40 @@ mod tests {
 
     #[test]
     fn display_endpoint_tcp() {
-        assert_eq!(Endpoint::Tcp { host: "h".into(), port: 80 }.to_string(), "h:80");
-        assert_eq!(Endpoint::Tcp { host: "::1".into(), port: 80 }.to_string(), "[::1]:80");
-        assert_eq!(Endpoint::Tcp { host: String::new(), port: 80 }.to_string(), "*:80");
+        assert_eq!(
+            Endpoint::Tcp {
+                host: "h".into(),
+                port: 80
+            }
+            .to_string(),
+            "h:80"
+        );
+        assert_eq!(
+            Endpoint::Tcp {
+                host: "::1".into(),
+                port: 80
+            }
+            .to_string(),
+            "[::1]:80"
+        );
+        assert_eq!(
+            Endpoint::Tcp {
+                host: String::new(),
+                port: 80
+            }
+            .to_string(),
+            "*:80"
+        );
     }
 
     #[test]
     fn display_endpoint_unix() {
-        assert_eq!(Endpoint::Unix { path: "/tmp/s".into() }.to_string(), "/tmp/s");
+        assert_eq!(
+            Endpoint::Unix {
+                path: "/tmp/s".into()
+            }
+            .to_string(),
+            "/tmp/s"
+        );
     }
 }

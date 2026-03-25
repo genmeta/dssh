@@ -9,10 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::codec::{CodecError, SshString};
 
-use super::{
-    ConversationShared, OrderedGuard, SSH_MSG_REQUEST_FAILURE,
-    SSH_MSG_REQUEST_SUCCESS,
-};
+use super::{ConversationShared, OrderedGuard, SSH_MSG_REQUEST_FAILURE, SSH_MSG_REQUEST_SUCCESS};
 
 // ===========================================================================
 // Error types

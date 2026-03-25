@@ -27,9 +27,7 @@ use genmeta_ssh::{
     constants::SSH_VERSION,
     conversation::remoc::{ManageStreamBridge, RemoteManageStreamServerShared},
     protocol::Ssh3ProtocolFactory,
-    session::{
-        AuthRequest, AuthenticateFn, SessionBootstrap,
-    },
+    session::{AuthRequest, AuthenticateFn, SessionBootstrap},
 };
 use h3x::connection::ConnectionBuilder;
 use h3x::gm_quic::H3Servers;
@@ -99,7 +97,9 @@ async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install default crypto provider");
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     let cli = Cli::parse();
 
     let cert_pem = std::fs::read(&cli.cert).expect("failed to read certificate");
@@ -293,15 +293,14 @@ async fn handle_child_process(
             // on_raw returns the raw ReadStream/WriteStream before conversion
             // to AsyncRead/AsyncWrite, so we can obtain bytes_stream/bytes_sink
             // for remoc message-level serving.
-            let (read_stream, write_stream) =
-                match h3x::hyper::upgrade::on_raw(request).await {
-                    Ok(streams) => streams,
-                    Err(e) => {
-                        tracing::error!(error = ?e, "takeover failed");
-                        let _ = child.kill().await;
-                        return;
-                    }
-                };
+            let (read_stream, write_stream) = match h3x::hyper::upgrade::on_raw(request).await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    tracing::error!(error = ?e, "takeover failed");
+                    let _ = child.kill().await;
+                    return;
+                }
+            };
 
             // Serve control streams via remoc so the child can use them.
             let (rs, rc) =

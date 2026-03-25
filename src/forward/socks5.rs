@@ -54,18 +54,12 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // Phase 1: Method negotiation
-    let ver = reader
-        .read_u8()
-        .await
-        .context(socks5_error::IoSnafu)?;
+    let ver = reader.read_u8().await.context(socks5_error::IoSnafu)?;
     if ver != SOCKS5_VERSION {
         return Err(Socks5Error::UnsupportedVersion { version: ver });
     }
 
-    let nmethods = reader
-        .read_u8()
-        .await
-        .context(socks5_error::IoSnafu)? as usize;
+    let nmethods = reader.read_u8().await.context(socks5_error::IoSnafu)? as usize;
     let mut methods = vec![0u8; nmethods];
     reader
         .read_exact(&mut methods)
@@ -77,10 +71,7 @@ where
             .write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE])
             .await
             .context(socks5_error::IoSnafu)?;
-        writer
-            .shutdown()
-            .await
-            .context(socks5_error::IoSnafu)?;
+        writer.shutdown().await.context(socks5_error::IoSnafu)?;
         return Ok(());
     }
 
@@ -90,26 +81,14 @@ where
         .context(socks5_error::IoSnafu)?;
 
     // Phase 2: CONNECT request
-    let ver = reader
-        .read_u8()
-        .await
-        .context(socks5_error::IoSnafu)?;
+    let ver = reader.read_u8().await.context(socks5_error::IoSnafu)?;
     if ver != SOCKS5_VERSION {
         return Err(Socks5Error::UnsupportedVersion { version: ver });
     }
 
-    let cmd = reader
-        .read_u8()
-        .await
-        .context(socks5_error::IoSnafu)?;
-    let _rsv = reader
-        .read_u8()
-        .await
-        .context(socks5_error::IoSnafu)?;
-    let atyp = reader
-        .read_u8()
-        .await
-        .context(socks5_error::IoSnafu)?;
+    let cmd = reader.read_u8().await.context(socks5_error::IoSnafu)?;
+    let _rsv = reader.read_u8().await.context(socks5_error::IoSnafu)?;
+    let atyp = reader.read_u8().await.context(socks5_error::IoSnafu)?;
 
     let (dest_addr, dest_atyp_bytes) = match atyp {
         ATYP_IPV4 => {
@@ -121,17 +100,14 @@ where
             (Ipv4Addr::from(buf).to_string(), buf.to_vec())
         }
         ATYP_DOMAIN => {
-            let len = reader
-                .read_u8()
-                .await
-                .context(socks5_error::IoSnafu)? as usize;
+            let len = reader.read_u8().await.context(socks5_error::IoSnafu)? as usize;
             let mut buf = vec![0u8; len];
             reader
                 .read_exact(&mut buf)
                 .await
                 .context(socks5_error::IoSnafu)?;
-            let domain = String::from_utf8(buf.clone())
-                .context(socks5_error::InvalidDomainSnafu)?;
+            let domain =
+                String::from_utf8(buf.clone()).context(socks5_error::InvalidDomainSnafu)?;
             let mut atyp_bytes = vec![len as u8];
             atyp_bytes.extend_from_slice(&buf);
             (domain, atyp_bytes)
@@ -147,10 +123,7 @@ where
         _ => return Err(Socks5Error::UnsupportedAddressType { atyp }),
     };
 
-    let dest_port = reader
-        .read_u16()
-        .await
-        .context(socks5_error::IoSnafu)?;
+    let dest_port = reader.read_u16().await.context(socks5_error::IoSnafu)?;
 
     if cmd != CMD_CONNECT {
         send_reply(
@@ -161,10 +134,7 @@ where
             dest_port,
         )
         .await?;
-        writer
-            .shutdown()
-            .await
-            .context(socks5_error::IoSnafu)?;
+        writer.shutdown().await.context(socks5_error::IoSnafu)?;
         return Ok(());
     }
 
@@ -182,17 +152,12 @@ where
                 dest_port,
             )
             .await?;
-            writer
-                .shutdown()
-                .await
-                .context(socks5_error::IoSnafu)?;
+            writer.shutdown().await.context(socks5_error::IoSnafu)?;
             return Ok(());
         }
     };
 
-    let local_addr = tcp_stream
-        .local_addr()
-        .context(socks5_error::IoSnafu)?;
+    let local_addr = tcp_stream.local_addr().context(socks5_error::IoSnafu)?;
     send_reply_with_bound_addr(&mut writer, REP_SUCCEEDED, &local_addr).await?;
 
     // Phase 4: Bidirectional relay

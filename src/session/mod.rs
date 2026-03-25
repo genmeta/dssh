@@ -833,7 +833,10 @@ mod tests {
         let err = AuthError::PamFailed {
             reason: "invalid password".into(),
         };
-        assert_eq!(err.to_string(), "PAM authentication failed: invalid password");
+        assert_eq!(
+            err.to_string(),
+            "PAM authentication failed: invalid password"
+        );
 
         let err = AuthError::UserNotFound {
             username: "nobody".into(),

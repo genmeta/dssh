@@ -13,13 +13,11 @@ use std::sync::Arc;
 
 use crate::{
     constants::DEFAULT_MAX_MESSAGE_SIZE,
-    conversation::{
-        ChannelOpen, Conversation, ManageSessionStream,
-    },
     conversation::global::{DecodedGlobalRequest, RespondSuccessError},
+    conversation::{ChannelOpen, Conversation, ManageSessionStream},
     forward::{
-        ForwardError, ForwardedStreamlocal, ForwardedTcpip, TcpipForwardReply,
-        TcpipForwardRequest, StreamlocalForwardRequest, relay,
+        ForwardError, ForwardedStreamlocal, ForwardedTcpip, StreamlocalForwardRequest,
+        TcpipForwardReply, TcpipForwardRequest, relay,
     },
 };
 use h3x::codec::EncodeInto;
@@ -47,7 +45,9 @@ pub enum AcceptTcpForwardError {
     LocalAddr { source: std::io::Error },
 
     #[snafu(display("failed to send success response"))]
-    Respond { source: RespondSuccessError<ForwardError> },
+    Respond {
+        source: RespondSuccessError<ForwardError>,
+    },
 }
 
 #[derive(Debug, Snafu)]
@@ -57,7 +57,9 @@ pub enum AcceptUnixForwardError {
     UnixBind { source: std::io::Error },
 
     #[snafu(display("failed to send success response"))]
-    Respond { source: RespondSuccessError<std::convert::Infallible> },
+    Respond {
+        source: RespondSuccessError<std::convert::Infallible>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -77,7 +79,10 @@ impl TcpForwardListener {
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind(addr).await?;
         let bound_addr = listener.local_addr()?;
-        Ok(Self { listener, bound_addr })
+        Ok(Self {
+            listener,
+            bound_addr,
+        })
     }
 
     /// The address the listener is bound to.
@@ -270,9 +275,7 @@ where
     /// with success, and return the listener.
     ///
     /// On bind failure, responds with failure automatically.
-    pub async fn accept_unix_forward(
-        self,
-    ) -> Result<UnixForwardListener, AcceptUnixForwardError> {
+    pub async fn accept_unix_forward(self) -> Result<UnixForwardListener, AcceptUnixForwardError> {
         use accept_unix_forward_error::*;
 
         let socket_path = self.payload().socket_path.to_string();
@@ -311,11 +314,8 @@ where
     /// through it bidirectionally.
     ///
     /// On failure to open the channel, logs a warning and returns silently.
-    pub(crate) async fn open_channel_and_relay<C, S>(
-        &self,
-        channel_open: C,
-        local_stream: S,
-    ) where
+    pub(crate) async fn open_channel_and_relay<C, S>(&self, channel_open: C, local_stream: S)
+    where
         C: ChannelOpen,
         for<'w> C: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = ForwardError>,
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -406,7 +406,9 @@ mod tests {
         }
     }
 
-    fn make_conversation(mock: Arc<MockStreamState>) -> Arc<Conversation<ArcMock, tokio::io::Empty, tokio::io::Sink>> {
+    fn make_conversation(
+        mock: Arc<MockStreamState>,
+    ) -> Arc<Conversation<ArcMock, tokio::io::Empty, tokio::io::Sink>> {
         Arc::new(Conversation::new(
             StreamId(VarInt::from_u32(1)),
             "test",
@@ -462,10 +464,7 @@ mod tests {
 
         use h3x::codec::EncodeExt;
         remote_wr.encode_one(VarInt::from_u32(0)).await.unwrap();
-        remote_wr
-            .encode_one(VarInt::from_u32(32768))
-            .await
-            .unwrap();
+        remote_wr.encode_one(VarInt::from_u32(32768)).await.unwrap();
         remote_wr.flush().await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -497,7 +496,10 @@ mod tests {
         let _ = handle.await;
 
         tokio::task::yield_now().await;
-        assert!(!sock_path_clone.exists(), "socket file should be cleaned up on cancel");
+        assert!(
+            !sock_path_clone.exists(),
+            "socket file should be cleaned up on cancel"
+        );
     }
 
     #[tokio::test]

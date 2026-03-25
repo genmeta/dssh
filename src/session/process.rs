@@ -149,18 +149,19 @@ where
 
     let (reader, mut writer) = channel.into_split();
 
-    let (_, output_result) = tokio::join!(
-        relay_input_piped(reader, stdin, pid),
-        async {
-            relay_output_piped(&mut stdout, &mut stderr, &mut writer).await?;
-            let status = child.wait().await.context(WaitSnafu)?;
-            send_exit_notification(&mut writer, &status).await?;
-            writer.eof().await.context(WriteEofSnafu)?;
-            writer.close().await.context(WriteCloseSnafu)?;
-            writer.writer_mut().shutdown().await.context(ShutdownSnafu)?;
-            Ok::<_, ProcessError>(())
-        },
-    );
+    let (_, output_result) = tokio::join!(relay_input_piped(reader, stdin, pid), async {
+        relay_output_piped(&mut stdout, &mut stderr, &mut writer).await?;
+        let status = child.wait().await.context(WaitSnafu)?;
+        send_exit_notification(&mut writer, &status).await?;
+        writer.eof().await.context(WriteEofSnafu)?;
+        writer.close().await.context(WriteCloseSnafu)?;
+        writer
+            .writer_mut()
+            .shutdown()
+            .await
+            .context(ShutdownSnafu)?;
+        Ok::<_, ProcessError>(())
+    },);
     output_result
 }
 
@@ -222,7 +223,11 @@ where
             send_exit_notification(&mut writer, &status).await?;
             writer.eof().await.context(WriteEofSnafu)?;
             writer.close().await.context(WriteCloseSnafu)?;
-            writer.writer_mut().shutdown().await.context(ShutdownSnafu)?;
+            writer
+                .writer_mut()
+                .shutdown()
+                .await
+                .context(ShutdownSnafu)?;
             Ok::<_, ProcessError>(())
         },
     );

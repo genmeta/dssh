@@ -327,7 +327,6 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for SshBool {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,10 +348,7 @@ mod tests {
     #[tokio::test]
     async fn ssh_string_empty_roundtrip() {
         let (mut writer, mut reader) = duplex(1024);
-        SshString::from("")
-            .encode_into(&mut writer)
-            .await
-            .unwrap();
+        SshString::from("").encode_into(&mut writer).await.unwrap();
         drop(writer);
         let decoded = SshString::decode_from(&mut reader).await.unwrap();
         assert_eq!(decoded, SshString::from(""));

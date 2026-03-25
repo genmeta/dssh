@@ -1,8 +1,6 @@
 use super::*;
 
-use super::channel::{
-    ChannelEvent, ReadChannelEventError, SendChannelRequestError, SshChannel,
-};
+use super::channel::{ChannelEvent, ReadChannelEventError, SendChannelRequestError, SshChannel};
 use super::global::{DecodedGlobalRequest, RespondFailureError, RespondSuccessError};
 use crate::codec::SshBytes;
 use std::pin::Pin;
@@ -150,7 +148,11 @@ fn make_half(stream_id: VarInt) -> (MockReader, MockWriter) {
     (reader, writer)
 }
 
-async fn make_conversation() -> (Conversation<TestManageStream, MockReader, MockWriter>, MockReader, MockWriter) {
+async fn make_conversation() -> (
+    Conversation<TestManageStream, MockReader, MockWriter>,
+    MockReader,
+    MockWriter,
+) {
     let stream_id = VarInt::from_u32(42);
     // local reads ← remote writes
     let (local_reader, remote_writer) = make_half(stream_id);
@@ -828,7 +830,10 @@ async fn multiple_sequential_accepts() {
 
         let decoded: DecodedGlobalRequest<SshString, _, _> = req.decode_payload().await.unwrap();
         let expected_payload = format!("data-{i}");
-        assert_eq!(decoded.payload().as_ref() as &[u8], expected_payload.as_bytes());
+        assert_eq!(
+            decoded.payload().as_ref() as &[u8],
+            expected_payload.as_bytes()
+        );
 
         decoded
             .respond_success(VarInt::from_u32(i * 10))
@@ -1901,10 +1906,7 @@ async fn read_channel_event_request_decode_and_respond_success() {
     let responder = responder.expect("want_reply was true, should have responder");
 
     // 发送 success 响应（空 payload）
-    responder
-        .respond_success(EmptyPayload)
-        .await
-        .unwrap();
+    responder.respond_success(EmptyPayload).await.unwrap();
 
     // B 端验证
     let msg_type: VarInt = b_reader.decode_one().await.unwrap();

@@ -43,8 +43,8 @@ fn build_examples_in_docker(repo: &Path) -> PathBuf {
     // Prefer mounting the host cargo registry (read-only) so builds don't
     // need network access.  Fall back to named Docker volumes when the host
     // registry directory does not exist.
-    let cargo_home = env::var("CARGO_HOME")
-        .unwrap_or_else(|_| format!("{}/.cargo", env::var("HOME").unwrap()));
+    let cargo_home =
+        env::var("CARGO_HOME").unwrap_or_else(|_| format!("{}/.cargo", env::var("HOME").unwrap()));
     let host_registry = PathBuf::from(&cargo_home).join("registry");
     let use_host_registry = host_registry.is_dir();
 
@@ -161,7 +161,14 @@ fn docker_run() -> (String, bool) {
         // Print container stderr in both stdout and stderr for visibility
         // (cargo test captures stdout for failed tests, but may truncate stderr).
         println!("--- container stderr (last 200 lines) ---");
-        for line in stderr.lines().rev().take(200).collect::<Vec<_>>().into_iter().rev() {
+        for line in stderr
+            .lines()
+            .rev()
+            .take(200)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
             println!("{line}");
         }
         println!("--- end container stderr ---");

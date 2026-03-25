@@ -117,7 +117,9 @@ pub enum ReadChannelEventError {
     DecodeWantReply { source: CodecError },
     #[snafu(display("unexpected channel message type {message_type}"))]
     UnexpectedMessageType { message_type: VarInt },
-    #[snafu(display("unexpected want_reply=true channel request '{request_type}' on reader-only channel"))]
+    #[snafu(display(
+        "unexpected want_reply=true channel request '{request_type}' on reader-only channel"
+    ))]
     UnexpectedWantReply { request_type: SshString },
 }
 
@@ -453,8 +455,11 @@ impl<R: AsyncRead + Unpin + Send> SshChannelReader<R> {
                 }))
             }
             SSH_MSG_CHANNEL_EXTENDED_DATA => {
-                let data_type: VarInt =
-                    self.0.decode_one().await.context(DecodeExtendedDataTypeSnafu)?;
+                let data_type: VarInt = self
+                    .0
+                    .decode_one()
+                    .await
+                    .context(DecodeExtendedDataTypeSnafu)?;
                 let len: VarInt = self.0.decode_one().await.context(DecodeExtendedDataSnafu)?;
                 Ok(ReaderEvent::ExtendedData {
                     data_type,
@@ -528,10 +533,7 @@ impl<W: AsyncWrite + Unpin + Send> SshChannelWriter<W> {
             .await
             .context(EncodeMessageTypeSnafu)?;
         self.0.encode_one(len).await.context(EncodeLengthSnafu)?;
-        self.0
-            .write_all(data)
-            .await
-            .context(WritePayloadSnafu)?;
+        self.0.write_all(data).await.context(WritePayloadSnafu)?;
         AsyncWriteExt::flush(&mut self.0)
             .await
             .context(FlushSnafu)?;
@@ -594,10 +596,7 @@ impl<W: AsyncWrite + Unpin + Send> SshChannelWriter<W> {
             .await
             .context(EncodeDataTypeSnafu)?;
         self.0.encode_one(len).await.context(EncodeLengthSnafu)?;
-        self.0
-            .write_all(data)
-            .await
-            .context(WritePayloadSnafu)?;
+        self.0.write_all(data).await.context(WritePayloadSnafu)?;
         AsyncWriteExt::flush(&mut self.0)
             .await
             .context(FlushSnafu)?;
@@ -885,7 +884,9 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> SshChannel<R, W>
         source: &mut S,
         length: u64,
     ) -> Result<(), WriteExtendedDataError> {
-        self.writer.extended_data_from(data_type, source, length).await
+        self.writer
+            .extended_data_from(data_type, source, length)
+            .await
     }
 
     /// Write channel EOF (`SSH_MSG_CHANNEL_EOF`).

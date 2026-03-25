@@ -246,10 +246,14 @@ async fn relay_output<R: AsyncRead + Unpin + Send>(
 
             match event {
                 ReaderEvent::Data(mut data) => {
-                    io::copy(&mut data, &mut stdout).await.context(WriteStdoutSnafu)?;
+                    io::copy(&mut data, &mut stdout)
+                        .await
+                        .context(WriteStdoutSnafu)?;
                 }
                 ReaderEvent::ExtendedData { mut data, .. } => {
-                    io::copy(&mut data, &mut stderr).await.context(WriteStderrSnafu)?;
+                    io::copy(&mut data, &mut stderr)
+                        .await
+                        .context(WriteStderrSnafu)?;
                 }
                 ReaderEvent::Notice(incoming) => match &**incoming.request_type() {
                     "exit-status" => {
@@ -257,8 +261,7 @@ async fn relay_output<R: AsyncRead + Unpin + Send>(
                             .decode_payload::<ExitStatusRequest, SessionCodecError>()
                             .await
                             .context(DecodeExitStatusSnafu)?;
-                        exit_result =
-                            Some(ExitResult::Status(req.exit_status.into_inner() as u32));
+                        exit_result = Some(ExitResult::Status(req.exit_status.into_inner() as u32));
                     }
                     "exit-signal" => {
                         let req = incoming
