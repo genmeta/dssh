@@ -14,8 +14,11 @@ use h3x::{
     codec::{BoxReadStream, BoxWriteStream, EncodeExt, SinkWriter, StreamReader},
     dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
     quic::ConnectionError,
-    remoc::quic::{ReadStreamClient, WriteStreamClient, serve_read_stream, serve_write_stream},
+    remoc::quic::{
+        ReadStreamClient, ReadStreamServer, WriteStreamClient, WriteStreamServer,
+    },
 };
+use remoc::rtc::Server;
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 
 use crate::constants::CHANNEL_SIGNAL_VALUE;
@@ -98,14 +101,18 @@ impl ManageStreamBridge {
         reader: BoxReadStream,
         writer: BoxWriteStream,
     ) -> (ReadStreamClient, WriteStreamClient) {
-        let (rc, rf) = serve_read_stream(reader);
-        let (wc, wf) = serve_write_stream(writer);
+        let (read_server, rc) = ReadStreamServer::new(reader, 1);
+        let (write_server, wc) = WriteStreamServer::new(writer, 1);
 
         let mut tasks = self.tasks.lock().expect("task set lock not poisoned");
         // Drain completed tasks to avoid unbounded growth.
         while tasks.try_join_next().is_some() {}
-        tasks.spawn(rf);
-        tasks.spawn(wf);
+        tasks.spawn(async move {
+            let _ = read_server.serve().await;
+        });
+        tasks.spawn(async move {
+            let _ = write_server.serve().await;
+        });
 
         (rc, wc)
     }
