@@ -48,12 +48,12 @@ start_server() {
 
     if [ "$mode" = "inprocess" ]; then
         ssh3-server "$CERT_DIR/server.crt" "$CERT_DIR/server.key" \
-            --bind "${SERVER_ADDR}:${SERVER_PORT}" &
+            --bind "${SERVER_ADDR}:${SERVER_PORT}" 2>/tmp/server.log &
         SERVER_PID=$!
     else
         ssh3-server "$CERT_DIR/server.crt" "$CERT_DIR/server.key" \
             --bind "${SERVER_ADDR}:${SERVER_PORT}" \
-            --session-binary /usr/local/bin/ssh3-session &
+            --session-binary /usr/local/bin/ssh3-session 2>/tmp/server.log &
         SERVER_PID=$!
     fi
 
@@ -79,6 +79,13 @@ stop_server() {
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
         SERVER_PID=""
+    fi
+    # Dump server log for diagnostics.
+    if [ -f /tmp/server.log ]; then
+        echo "# --- server log ---"
+        tail -100 /tmp/server.log | sed 's/^/# /'
+        echo "# --- end server log ---"
+        rm -f /tmp/server.log
     fi
 }
 
@@ -164,17 +171,43 @@ run_session_tests() {
         ssh3-client "$CLIENT_AUTHORITY" -u user -p pass "echo err >&2"
 }
 
+run_pam_tests() {
+    # 5. PAM correct credentials — whoami should return testuser
+    run_test "pam auth correct" 0 "testuser" \
+        ssh3-client "$CLIENT_AUTHORITY" -u testuser -p testpass "whoami"
+
+    # 6. PAM wrong password — should fail (non-zero exit)
+    run_test "pam auth wrong password" 101 "" \
+        ssh3-client "$CLIENT_AUTHORITY" -u testuser -p wrongpass "whoami"
+
+    # 7. PAM non-existent user — should fail (non-zero exit)
+    run_test "pam auth no such user" 101 "" \
+        ssh3-client "$CLIENT_AUTHORITY" -u nobody99 -p x "whoami"
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 main() {
     echo "# SSH3 integration tests"
+
+    # Verify binaries have all required libraries.
+    echo "# Checking library dependencies..."
+    ldd /usr/local/bin/ssh3-server 2>&1 | grep "not found" && echo "# WARNING: ssh3-server missing libs"
+    ldd /usr/local/bin/ssh3-client 2>&1 | grep "not found" && echo "# WARNING: ssh3-client missing libs"
+    ldd /usr/local/bin/ssh3-session 2>&1 | grep "not found" && echo "# WARNING: ssh3-session missing libs"
+
     generate_certs
 
     echo "# --- Session tests (in-process mode) ---"
     start_server inprocess
     run_session_tests
+    stop_server
+
+    echo "# --- PAM tests (child-process mode) ---"
+    start_server childprocess
+    run_pam_tests
     stop_server
 
     # Summary

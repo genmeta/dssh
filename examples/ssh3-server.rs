@@ -107,8 +107,7 @@ async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install default crypto provider");
-    tracing_subscriber::fmt::init();
-
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     let cli = Cli::parse();
 
     let cert_pem = std::fs::read(&cli.cert).expect("failed to read certificate");

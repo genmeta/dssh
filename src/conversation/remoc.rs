@@ -14,9 +14,7 @@ use h3x::{
     codec::{BoxReadStream, BoxWriteStream, EncodeExt, SinkWriter, StreamReader},
     dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
     quic::ConnectionError,
-    remoc::quic::{
-        ReadStreamClient, ReadStreamServer, WriteStreamClient, WriteStreamServer,
-    },
+    remoc::quic::{ReadStreamClient, ReadStreamServer, WriteStreamClient, WriteStreamServer},
 };
 use remoc::prelude::Server;
 use tokio::{io::AsyncWriteExt, task::JoinSet};

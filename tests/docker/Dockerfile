@@ -16,7 +16,12 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssl \
         ca-certificates \
+        libpam0g \
     && rm -rf /var/lib/apt/lists/*
+
+# Create a test user for PAM authentication tests.
+RUN useradd -m -s /bin/sh testuser \
+    && echo 'testuser:testpass' | chpasswd
 
 COPY ssh3-server /usr/local/bin/ssh3-server
 COPY ssh3-client /usr/local/bin/ssh3-client

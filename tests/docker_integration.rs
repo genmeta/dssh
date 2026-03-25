@@ -89,8 +89,9 @@ fn build_examples_in_docker(repo: &Path) -> PathBuf {
         format!(
             "cd /workspace && \
              tar cf - --exclude='target' --exclude='.git' . | (mkdir -p /build && cd /build && tar xf -) && \
+             apt-get update && apt-get install -y --no-install-recommends libpam0g-dev libclang-dev && \
              cd /build/{repo_name} && \
-             cargo build --examples && \
+             cargo build --examples --features pam && \
              cp /build-target/debug/examples/ssh3-server \
                 /build-target/debug/examples/ssh3-client \
                 /build-target/debug/examples/ssh3-session \
@@ -157,7 +158,13 @@ fn docker_run() -> (String, bool) {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     if !stderr.is_empty() {
-        eprintln!("--- container stderr ---\n{stderr}--- end stderr ---");
+        // Print container stderr in both stdout and stderr for visibility
+        // (cargo test captures stdout for failed tests, but may truncate stderr).
+        println!("--- container stderr (last 200 lines) ---");
+        for line in stderr.lines().rev().take(200).collect::<Vec<_>>().into_iter().rev() {
+            println!("{line}");
+        }
+        println!("--- end container stderr ---");
     }
 
     (stdout, output.status.success())

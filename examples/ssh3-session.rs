@@ -29,8 +29,7 @@ async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install default crypto provider");
-    tracing_subscriber::fmt::init();
-
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
