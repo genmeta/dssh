@@ -237,10 +237,15 @@ where
         use accept_tcp_forward_error::*;
 
         let bind_address = self.payload().bind_address.to_string();
+        // Empty or wildcard bind address means "all interfaces" (OpenSSH convention).
+        let bind_addr = match bind_address.as_str() {
+            "" | "*" => "0.0.0.0",
+            other => other,
+        };
         let bind_port = u16::try_from(self.payload().bind_port.into_inner())
             .map_err(|_| AcceptTcpForwardError::PortOverflow)?;
 
-        let listener = match TcpListener::bind((bind_address.as_str(), bind_port)).await {
+        let listener = match TcpListener::bind((bind_addr, bind_port)).await {
             Ok(l) => l,
             Err(source) => {
                 let _ = self.respond_failure().await;
