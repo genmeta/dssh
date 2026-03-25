@@ -185,6 +185,59 @@ run_pam_tests() {
         ssh3-client "$CLIENT_AUTHORITY" -u nobody99 -p x "whoami"
 }
 
+run_forward_tests() {
+    # Start an echo server on port 9999 (reflects input back).
+    socat TCP-LISTEN:9999,reuseaddr,fork EXEC:cat &
+    local ECHO_PID=$!
+    sleep 0.3
+
+    # 8. Local forward (-L): client binds 8888 → server connects to 127.0.0.1:9999.
+    # Launch ssh3-client with -L in background, send data through the tunnel, verify.
+    ssh3-client "$CLIENT_AUTHORITY" -u user -p pass \
+        -L 8888:127.0.0.1:9999 "sleep 5" &
+    local FWD_PID=$!
+    sleep 1
+
+    local fwd_result
+    fwd_result=$(echo "hello-forward" | timeout 5 nc -q1 127.0.0.1 8888 2>/dev/null) || true
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if [ "$fwd_result" = "hello-forward" ]; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - local forward (-L)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - local forward (-L)"
+        echo "#   expected: hello-forward"
+        echo "#   got: $fwd_result"
+    fi
+
+    kill "$FWD_PID" 2>/dev/null; wait "$FWD_PID" 2>/dev/null || true
+
+    # 9. Remote forward (-R): client asks server to listen on 7777 → client connects to 127.0.0.1:9999.
+    ssh3-client "$CLIENT_AUTHORITY" -u user -p pass \
+        -R 7777:127.0.0.1:9999 "sleep 5" &
+    local RFWD_PID=$!
+    sleep 1
+
+    local rfwd_result
+    rfwd_result=$(echo "hello-reverse" | timeout 5 nc -q1 127.0.0.1 7777 2>/dev/null) || true
+
+    TEST_NUM=$((TEST_NUM + 1))
+    if [ "$rfwd_result" = "hello-reverse" ]; then
+        PASS=$((PASS + 1))
+        echo "ok $TEST_NUM - remote forward (-R)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "not ok $TEST_NUM - remote forward (-R)"
+        echo "#   expected: hello-reverse"
+        echo "#   got: $rfwd_result"
+    fi
+
+    kill "$RFWD_PID" 2>/dev/null; wait "$RFWD_PID" 2>/dev/null || true
+    kill "$ECHO_PID" 2>/dev/null; wait "$ECHO_PID" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -208,6 +261,11 @@ main() {
     echo "# --- PAM tests (child-process mode) ---"
     start_server childprocess
     run_pam_tests
+    stop_server
+
+    echo "# --- Forwarding tests (in-process mode) ---"
+    start_server inprocess
+    run_forward_tests
     stop_server
 
     # Summary
