@@ -271,7 +271,10 @@ async fn main() {
         let conv = conversation.clone();
         let label = spec.to_string();
         forward_tasks.spawn(async move {
-            let Err(e) = spec.run(conv).instrument(tracing::info_span!("local_forward", %label)).await;
+            let Err(e) = spec
+                .run(conv)
+                .instrument(tracing::info_span!("local_forward", %label))
+                .await;
             tracing::error!(error = %snafu::Report::from_error(&e), "local forward failed");
         });
     }

@@ -352,17 +352,17 @@ pub async fn accept_forwarded_channels<M>(
 
         match channel_type.as_str() {
             "forwarded-tcpip" => {
-                let (payload, pending): (ForwardedTcpip, _) =
-                    match incoming.decode_payload().await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %snafu::Report::from_error(&e),
-                                "decode forwarded-tcpip failed"
-                            );
-                            continue;
-                        }
-                    };
+                let (payload, pending): (ForwardedTcpip, _) = match incoming.decode_payload().await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %snafu::Report::from_error(&e),
+                            "decode forwarded-tcpip failed"
+                        );
+                        continue;
+                    }
+                };
 
                 let server_port = payload.connected_port.into_inner() as u16;
                 let server_addr = payload.connected_address.to_string();
@@ -397,14 +397,13 @@ pub async fn accept_forwarded_channels<M>(
                 };
 
                 let connect = connect.clone();
-                tasks.spawn(
-                    handle_forwarded_channel(pending, connect)
-                        .instrument(tracing::info_span!(
-                            "remote_forward_conn",
-                            %server_addr,
-                            server_port,
-                        )),
-                );
+                tasks.spawn(handle_forwarded_channel(pending, connect).instrument(
+                    tracing::info_span!(
+                        "remote_forward_conn",
+                        %server_addr,
+                        server_port,
+                    ),
+                ));
             }
             "forwarded-streamlocal@openssh.com" => {
                 let (payload, pending): (ForwardedStreamlocal, _) =
@@ -445,13 +444,12 @@ pub async fn accept_forwarded_channels<M>(
                 };
 
                 let connect = connect.clone();
-                tasks.spawn(
-                    handle_forwarded_channel(pending, connect)
-                        .instrument(tracing::info_span!(
-                            "remote_forward_conn",
-                            %socket_path,
-                        )),
-                );
+                tasks.spawn(handle_forwarded_channel(pending, connect).instrument(
+                    tracing::info_span!(
+                        "remote_forward_conn",
+                        %socket_path,
+                    ),
+                ));
             }
             _ => {
                 tracing::warn!(channel_type, "rejecting unknown incoming channel");
@@ -485,10 +483,7 @@ async fn handle_forwarded_channel<R, W>(
                 "failed to connect to local target"
             );
             let _ = pending
-                .reject(
-                    VarInt::from(2u32),
-                    SshString::from_static("connect failed"),
-                )
+                .reject(VarInt::from(2u32), SshString::from_static("connect failed"))
                 .await;
             return;
         }

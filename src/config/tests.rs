@@ -404,7 +404,10 @@ fn parse_args_port_too_many() {
         panic!("expected Directive");
     };
     let err = d.parse_args::<PortArgs>().unwrap_err();
-    assert!(matches!(err, ParseIntegerArgError::WrongArgumentCount { .. }));
+    assert!(matches!(
+        err,
+        ParseIntegerArgError::WrongArgumentCount { .. }
+    ));
 }
 
 #[test]
@@ -525,14 +528,20 @@ fn secondary_parse_span_correctness() {
     let entries = sf.parse();
 
     // Find Port directive
-    let port_d = entries.iter().find_map(|e| match e {
-        Entry::Directive(d) if d.keyword.value.eq_ignore_ascii_case("port") => Some(d),
-        _ => None,
-    }).unwrap();
+    let port_d = entries
+        .iter()
+        .find_map(|e| match e {
+            Entry::Directive(d) if d.keyword.value.eq_ignore_ascii_case("port") => Some(d),
+            _ => None,
+        })
+        .unwrap();
 
     let port_args = port_d.parse_args::<PortArgs>().unwrap();
     // The span should point to "2222" in the original source
-    assert_eq!(&input[port_args.port.span.start..port_args.port.span.end], "2222");
+    assert_eq!(
+        &input[port_args.port.span.start..port_args.port.span.end],
+        "2222"
+    );
     let (line, col) = sf.line_col(port_args.port.span.start);
     assert_eq!(line, 2);
 }
@@ -547,9 +556,18 @@ fn proxy_jump_sub_spans() {
     let args = d.parse_args::<ProxyJumpArgs>().unwrap();
 
     // Each jump's span should point to the correct substring
-    assert_eq!(&input[args.jumps[0].span.start..args.jumps[0].span.end], "hop1");
-    assert_eq!(&input[args.jumps[1].span.start..args.jumps[1].span.end], "hop2");
-    assert_eq!(&input[args.jumps[2].span.start..args.jumps[2].span.end], "hop3");
+    assert_eq!(
+        &input[args.jumps[0].span.start..args.jumps[0].span.end],
+        "hop1"
+    );
+    assert_eq!(
+        &input[args.jumps[1].span.start..args.jumps[1].span.end],
+        "hop2"
+    );
+    assert_eq!(
+        &input[args.jumps[2].span.start..args.jumps[2].span.end],
+        "hop3"
+    );
 }
 
 // ===========================================================================
@@ -662,7 +680,9 @@ Host *
     // Verify equals separator works
     let hostname_eq = directives
         .iter()
-        .find(|d| d.keyword.value == "HostName" && d.arguments[0].value == "prod.internal.example.com")
+        .find(|d| {
+            d.keyword.value == "HostName" && d.arguments[0].value == "prod.internal.example.com"
+        })
         .expect("should find HostName with = separator");
     assert_eq!(
         &input[hostname_eq.arguments[0].span.start..hostname_eq.arguments[0].span.end],

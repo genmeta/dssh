@@ -48,10 +48,7 @@ pub enum ParseIntegerArgError {
     WrongArgumentCount { actual: usize, span: Span },
 
     #[snafu(display("invalid integer value"))]
-    InvalidValue {
-        span: Span,
-        source: ParseIntError,
-    },
+    InvalidValue { span: Span, source: ParseIntError },
 }
 
 /// Error specific to RemoteForward argument parsing (1 or 2 arguments).
@@ -111,13 +108,14 @@ fn parse_single_integer<T: std::str::FromStr<Err = ParseIntError>>(
             span: args_span(args),
         });
     }
-    let value = args[0]
-        .value
-        .parse::<T>()
-        .map_err(|source| ParseIntegerArgError::InvalidValue {
-            span: args[0].span,
-            source,
-        })?;
+    let value =
+        args[0]
+            .value
+            .parse::<T>()
+            .map_err(|source| ParseIntegerArgError::InvalidValue {
+                span: args[0].span,
+                source,
+            })?;
     Ok(Spanned {
         value,
         span: args[0].span,
@@ -158,7 +156,9 @@ impl<'a> ParseArguments<'a> for HostArgs<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_at_least_one(args)?;
-        Ok(Self { patterns: args.to_vec() })
+        Ok(Self {
+            patterns: args.to_vec(),
+        })
     }
 }
 
@@ -173,7 +173,9 @@ impl<'a> ParseArguments<'a> for MatchArgs<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_at_least_one(args)?;
-        Ok(Self { criteria: args.to_vec() })
+        Ok(Self {
+            criteria: args.to_vec(),
+        })
     }
 }
 
@@ -188,7 +190,9 @@ impl<'a> ParseArguments<'a> for IncludeArgs<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_at_least_one(args)?;
-        Ok(Self { paths: args.to_vec() })
+        Ok(Self {
+            paths: args.to_vec(),
+        })
     }
 }
 
@@ -204,7 +208,9 @@ impl<'a> ParseArguments<'a> for MultiArg<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_at_least_one(args)?;
-        Ok(Self { values: args.to_vec() })
+        Ok(Self {
+            values: args.to_vec(),
+        })
     }
 }
 
@@ -223,7 +229,9 @@ impl<'a> ParseArguments<'a> for HostNameArgs<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_exactly(args, 1)?;
-        Ok(Self { hostname: args[0].clone() })
+        Ok(Self {
+            hostname: args[0].clone(),
+        })
     }
 }
 
@@ -238,7 +246,9 @@ impl<'a> ParseArguments<'a> for UserArgs<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_exactly(args, 1)?;
-        Ok(Self { username: args[0].clone() })
+        Ok(Self {
+            username: args[0].clone(),
+        })
     }
 }
 
@@ -253,7 +263,9 @@ impl<'a> ParseArguments<'a> for IdentityFileArgs<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_exactly(args, 1)?;
-        Ok(Self { path: args[0].clone() })
+        Ok(Self {
+            path: args[0].clone(),
+        })
     }
 }
 
@@ -268,7 +280,9 @@ impl<'a> ParseArguments<'a> for CertificateFileArgs<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_exactly(args, 1)?;
-        Ok(Self { path: args[0].clone() })
+        Ok(Self {
+            path: args[0].clone(),
+        })
     }
 }
 
@@ -283,7 +297,9 @@ impl<'a> ParseArguments<'a> for DynamicForwardArgs<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_exactly(args, 1)?;
-        Ok(Self { bind: args[0].clone() })
+        Ok(Self {
+            bind: args[0].clone(),
+        })
     }
 }
 
@@ -301,7 +317,9 @@ impl<'a> ParseArguments<'a> for ProxyJumpArgs<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_exactly(args, 1)?;
-        Ok(Self { jumps: split_comma_spanned(&args[0]) })
+        Ok(Self {
+            jumps: split_comma_spanned(&args[0]),
+        })
     }
 }
 
@@ -318,7 +336,9 @@ impl<'a> ParseArguments<'a> for SingleArg<'a> {
 
     fn parse_arguments(args: &[Spanned<&'a str>]) -> Result<Self, Self::Error> {
         expect_exactly(args, 1)?;
-        Ok(Self { value: args[0].clone() })
+        Ok(Self {
+            value: args[0].clone(),
+        })
     }
 }
 
@@ -359,7 +379,9 @@ impl ParseArguments<'_> for PortArgs {
     type Error = ParseIntegerArgError;
 
     fn parse_arguments(args: &[Spanned<&str>]) -> Result<Self, Self::Error> {
-        Ok(Self { port: parse_single_integer(args)? })
+        Ok(Self {
+            port: parse_single_integer(args)?,
+        })
     }
 }
 
@@ -373,7 +395,9 @@ impl ParseArguments<'_> for ServerAliveIntervalArgs {
     type Error = ParseIntegerArgError;
 
     fn parse_arguments(args: &[Spanned<&str>]) -> Result<Self, Self::Error> {
-        Ok(Self { seconds: parse_single_integer(args)? })
+        Ok(Self {
+            seconds: parse_single_integer(args)?,
+        })
     }
 }
 
@@ -387,7 +411,9 @@ impl ParseArguments<'_> for ServerAliveCountMaxArgs {
     type Error = ParseIntegerArgError;
 
     fn parse_arguments(args: &[Spanned<&str>]) -> Result<Self, Self::Error> {
-        Ok(Self { count: parse_single_integer(args)? })
+        Ok(Self {
+            count: parse_single_integer(args)?,
+        })
     }
 }
 
@@ -401,7 +427,9 @@ impl ParseArguments<'_> for ConnectTimeoutArgs {
     type Error = ParseIntegerArgError;
 
     fn parse_arguments(args: &[Spanned<&str>]) -> Result<Self, Self::Error> {
-        Ok(Self { seconds: parse_single_integer(args)? })
+        Ok(Self {
+            seconds: parse_single_integer(args)?,
+        })
     }
 }
 
@@ -415,7 +443,9 @@ impl ParseArguments<'_> for ConnectionAttemptsArgs {
     type Error = ParseIntegerArgError;
 
     fn parse_arguments(args: &[Spanned<&str>]) -> Result<Self, Self::Error> {
-        Ok(Self { count: parse_single_integer(args)? })
+        Ok(Self {
+            count: parse_single_integer(args)?,
+        })
     }
 }
 
