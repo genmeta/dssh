@@ -426,9 +426,25 @@ fn parse_args_host() {
     };
     let host = d.parse_args::<HostArgs>().unwrap();
     assert_eq!(host.value.patterns.len(), 3);
-    assert_eq!(host.value.patterns[0].value, "server1");
-    assert_eq!(host.value.patterns[1].value, "server2");
-    assert_eq!(host.value.patterns[2].value, "*.example.com");
+    assert_eq!(host.value.patterns[0].value.value, "server1");
+    assert!(!host.value.patterns[0].value.negated);
+    assert_eq!(host.value.patterns[1].value.value, "server2");
+    assert_eq!(host.value.patterns[2].value.value, "*.example.com");
+}
+
+#[test]
+fn parse_args_host_negated() {
+    let sf = source("Host *.example.com !*.internal.example.com");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let host = d.parse_args::<HostArgs>().unwrap();
+    assert_eq!(host.value.patterns.len(), 2);
+    assert!(!host.value.patterns[0].value.negated);
+    assert_eq!(host.value.patterns[0].value.value, "*.example.com");
+    assert!(host.value.patterns[1].value.negated);
+    assert_eq!(host.value.patterns[1].value.value, "*.internal.example.com");
 }
 
 #[test]
@@ -694,6 +710,194 @@ fn location_from_source_file() {
 }
 
 // ===========================================================================
+// Match criteria parsing tests
+// ===========================================================================
+
+#[test]
+fn parse_match_all() {
+    let sf = source("Match all");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let args = d.parse_args::<MatchArgs>().unwrap();
+    assert_eq!(args.value.entries.len(), 1);
+    assert!(matches!(
+        args.value.entries[0].value.criterion,
+        MatchCriterion::All
+    ));
+    assert!(!args.value.entries[0].value.negated);
+}
+
+#[test]
+fn parse_match_canonical_all() {
+    let sf = source("Match canonical final all");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let args = d.parse_args::<MatchArgs>().unwrap();
+    assert_eq!(args.value.entries.len(), 3);
+    assert!(matches!(
+        args.value.entries[0].value.criterion,
+        MatchCriterion::Canonical
+    ));
+    assert!(matches!(
+        args.value.entries[1].value.criterion,
+        MatchCriterion::Final
+    ));
+    assert!(matches!(
+        args.value.entries[2].value.criterion,
+        MatchCriterion::All
+    ));
+}
+
+#[test]
+fn parse_match_host_pattern() {
+    let sf = source("Match host *.example.com,!*.internal");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let args = d.parse_args::<MatchArgs>().unwrap();
+    assert_eq!(args.value.entries.len(), 1);
+    let entry = &args.value.entries[0].value;
+    assert!(!entry.negated);
+    let MatchCriterion::Host { patterns } = &entry.criterion else {
+        panic!("expected Host criterion");
+    };
+    assert_eq!(patterns.len(), 2);
+    assert!(!patterns[0].value.negated);
+    assert_eq!(patterns[0].value.value, "*.example.com");
+    assert!(patterns[1].value.negated);
+    assert_eq!(patterns[1].value.value, "*.internal");
+}
+
+#[test]
+fn parse_match_negated_criterion() {
+    let sf = source("Match !host *.bad");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let args = d.parse_args::<MatchArgs>().unwrap();
+    assert!(args.value.entries[0].value.negated);
+    assert!(matches!(
+        args.value.entries[0].value.criterion,
+        MatchCriterion::Host { .. }
+    ));
+}
+
+#[test]
+fn parse_match_exec() {
+    let sf = source(r#"Match exec "test -f /etc/myconfig""#);
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let args = d.parse_args::<MatchArgs>().unwrap();
+    let MatchCriterion::Exec { command } = &args.value.entries[0].value.criterion else {
+        panic!("expected Exec criterion");
+    };
+    assert_eq!(command.value, "test -f /etc/myconfig");
+}
+
+#[test]
+fn parse_match_multi_criteria() {
+    let sf = source("Match host *.example.com user alice,bob");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let args = d.parse_args::<MatchArgs>().unwrap();
+    assert_eq!(args.value.entries.len(), 2);
+    assert!(matches!(
+        args.value.entries[0].value.criterion,
+        MatchCriterion::Host { .. }
+    ));
+    let MatchCriterion::User { patterns } = &args.value.entries[1].value.criterion else {
+        panic!("expected User criterion");
+    };
+    assert_eq!(patterns.len(), 2);
+    assert_eq!(patterns[0].value.value, "alice");
+    assert_eq!(patterns[1].value.value, "bob");
+}
+
+#[test]
+fn parse_match_localnetwork() {
+    let sf = source("Match localnetwork 192.168.0.0/16,10.0.0.0/8");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let args = d.parse_args::<MatchArgs>().unwrap();
+    let MatchCriterion::LocalNetwork { networks } = &args.value.entries[0].value.criterion else {
+        panic!("expected LocalNetwork criterion");
+    };
+    assert_eq!(networks.len(), 2);
+    assert_eq!(networks[0].value, "192.168.0.0/16");
+    assert_eq!(networks[1].value, "10.0.0.0/8");
+}
+
+#[test]
+fn parse_match_invalid_all_placement() {
+    let sf = source("Match host *.example.com all");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let err = d.parse_args::<MatchArgs>().unwrap_err();
+    assert!(matches!(
+        err.value,
+        ParseMatchArgsError::InvalidAllPlacement
+    ));
+}
+
+#[test]
+fn parse_match_unknown_criterion() {
+    let sf = source("Match bogus *.example.com");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let err = d.parse_args::<MatchArgs>().unwrap_err();
+    assert!(matches!(
+        err.value,
+        ParseMatchArgsError::UnknownCriterion { .. }
+    ));
+}
+
+#[test]
+fn parse_match_missing_argument() {
+    let sf = source("Match host");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let err = d.parse_args::<MatchArgs>().unwrap_err();
+    assert!(matches!(
+        err.value,
+        ParseMatchArgsError::MissingArgument { .. }
+    ));
+}
+
+#[test]
+fn parse_match_sessiontype() {
+    let sf = source("Match sessiontype shell,exec");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let args = d.parse_args::<MatchArgs>().unwrap();
+    let MatchCriterion::SessionType { patterns } = &args.value.entries[0].value.criterion else {
+        panic!("expected SessionType criterion");
+    };
+    assert_eq!(patterns.len(), 2);
+    assert_eq!(patterns[0].value.value, "shell");
+    assert_eq!(patterns[1].value.value, "exec");
+}
+
+// ===========================================================================
 // Realistic config integration test
 // ===========================================================================
 
@@ -752,7 +956,7 @@ Host *
         .find(|d| d.keyword.value.eq_ignore_ascii_case("host") && d.arguments.value == "*")
         .unwrap();
     let host_args = host_star.parse_args::<HostArgs>().unwrap();
-    assert_eq!(host_args.value.patterns[0].value, "*");
+    assert_eq!(host_args.value.patterns[0].value.value, "*");
 
     // Verify all paths share the same Arc
     let path1 = &ds[0].keyword.location.path;

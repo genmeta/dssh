@@ -10,16 +10,45 @@
 //! Error types are split by failure domain:
 //!
 //! - [`ArgumentCountError`] — for types whose only failure mode is wrong
-//!   argument count (HostName, User, IdentityFile, Host, Include, …).
+//!   argument count (HostName, User, IdentityFile, Include, …).
 //! - [`ParseIntegerArgError`] — for types that also parse an integer
 //!   (Port, ServerAliveInterval, ConnectTimeout, …).
 //! - [`ParseRemoteForwardArgsError`] — RemoteForward's unique 1-or-2 count.
+//! - [`ParseMatchArgsError`] — Match criteria parsing failures.
 
 use std::num::ParseIntError;
 
 use snafu::Snafu;
 
 use super::{Located, ParseArguments};
+
+// ---------------------------------------------------------------------------
+// Common types
+// ---------------------------------------------------------------------------
+
+/// A possibly-negated glob pattern.
+///
+/// Used in `Host` patterns (space-separated) and `Match` criterion
+/// pattern-lists (comma-separated).  The `!` prefix is parsed out and
+/// stored in [`negated`](Self::negated); [`value`](Self::value) contains
+/// the pattern text without the leading `!`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pattern<'a> {
+    pub negated: bool,
+    pub value: &'a str,
+}
+
+fn parse_pattern<'a>(token: Located<&'a str>) -> Located<Pattern<'a>> {
+    let (negated, value) = match token.value.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, token.value),
+    };
+    token.with_value(Pattern { negated, value })
+}
+
+fn parse_pattern_list<'a>(token: &Located<&'a str>) -> Vec<Located<Pattern<'a>>> {
+    token.split_comma().into_iter().map(parse_pattern).collect()
+}
 
 // ---------------------------------------------------------------------------
 // Error types — split by failure domain (no location info; wrapped by Located)
@@ -55,6 +84,23 @@ pub enum ParseIntegerArgError {
 #[snafu(display("expected 1 or 2 arguments, got {actual}"))]
 pub struct ParseRemoteForwardArgsError {
     pub actual: usize,
+}
+
+/// Error when parsing `Match` criteria arguments.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ParseMatchArgsError {
+    #[snafu(display("empty match criteria"))]
+    Empty,
+
+    #[snafu(display("unknown match criterion `{keyword}`"))]
+    UnknownCriterion { keyword: String },
+
+    #[snafu(display("criterion `{keyword}` requires an argument"))]
+    MissingArgument { keyword: String },
+
+    #[snafu(display("`all` must appear alone or immediately after `canonical`/`final`"))]
+    InvalidAllPlacement,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,13 +167,16 @@ fn parse_single_integer<T: std::str::FromStr<Err = ParseIntError>>(
 }
 
 // ---------------------------------------------------------------------------
-// Argument types — "at least 1" arguments (Error = ArgumentCountError)
+// Host — space-separated, possibly-negated glob patterns
 // ---------------------------------------------------------------------------
 
 /// `Host pattern1 pattern2 ...`
+///
+/// Each pattern may be negated with a `!` prefix.  See the `PATTERNS`
+/// section of `ssh_config(5)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostArgs<'a> {
-    pub patterns: Vec<Located<&'a str>>,
+    pub patterns: Vec<Located<Pattern<'a>>>,
 }
 
 impl<'a> ParseArguments<'a> for HostArgs<'a> {
@@ -135,24 +184,170 @@ impl<'a> ParseArguments<'a> for HostArgs<'a> {
 
     fn parse_arguments(args: &Located<&'a str>) -> Result<Located<Self>, Located<Self::Error>> {
         let tokens = tokenize_at_least_one(args)?;
-        Ok(args.with_value(Self { patterns: tokens }))
+        let patterns = tokens.into_iter().map(parse_pattern).collect();
+        Ok(args.with_value(Self { patterns }))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Match — structured criteria parsing
+// ---------------------------------------------------------------------------
+
+/// A single `Match` criterion.
+///
+/// Criteria that take arguments carry comma-separated pattern-lists
+/// (each element is a possibly-negated glob pattern).  `exec` takes
+/// a single command string instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchCriterion<'a> {
+    /// Always matches.  Must appear alone or immediately after
+    /// `Canonical`/`Final`.
+    All,
+    /// Matches only during hostname canonicalization re-parse.
+    Canonical,
+    /// Matches only during the final configuration re-parse.
+    Final,
+    /// Matches if the command exits with status 0.
+    Exec { command: Located<&'a str> },
+    /// Matches against the target hostname (after canonicalization).
+    Host { patterns: Vec<Located<Pattern<'a>>> },
+    /// Matches against the original hostname from the command line.
+    OriginalHost { patterns: Vec<Located<Pattern<'a>>> },
+    /// Matches against the target remote username.
+    User { patterns: Vec<Located<Pattern<'a>>> },
+    /// Matches against the local username running ssh.
+    LocalUser { patterns: Vec<Located<Pattern<'a>>> },
+    /// Matches against local network interfaces (CIDR notation).
+    LocalNetwork { networks: Vec<Located<&'a str>> },
+    /// Matches against a tag set by a prior `Tag` directive.
+    Tagged { patterns: Vec<Located<Pattern<'a>>> },
+    /// Matches against the remote command or subsystem name.
+    Command { patterns: Vec<Located<Pattern<'a>>> },
+    /// Matches against the SSH version string.
+    Version { patterns: Vec<Located<Pattern<'a>>> },
+    /// Matches against the session type (shell, exec, subsystem, none).
+    SessionType { patterns: Vec<Located<Pattern<'a>>> },
+}
+
+/// A possibly-negated match criterion.
+///
+/// The `!` prefix on the criterion keyword negates the entire criterion.
+/// This is distinct from `!` on individual patterns within a pattern-list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchEntry<'a> {
+    pub negated: bool,
+    pub criterion: MatchCriterion<'a>,
 }
 
 /// `Match criteria ...`
+///
+/// Parsed into structured [`MatchEntry`] values.  See `ssh_config(5)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchArgs<'a> {
-    pub criteria: Vec<Located<&'a str>>,
+    pub entries: Vec<Located<MatchEntry<'a>>>,
 }
 
 impl<'a> ParseArguments<'a> for MatchArgs<'a> {
-    type Error = ArgumentCountError;
+    type Error = ParseMatchArgsError;
 
     fn parse_arguments(args: &Located<&'a str>) -> Result<Located<Self>, Located<Self::Error>> {
-        let tokens = tokenize_at_least_one(args)?;
-        Ok(args.with_value(Self { criteria: tokens }))
+        let tokens = args.tokenize();
+        if tokens.is_empty() {
+            return Err(args.with_value(ParseMatchArgsError::Empty));
+        }
+
+        let mut entries: Vec<Located<MatchEntry<'a>>> = Vec::new();
+        let mut i = 0;
+
+        while i < tokens.len() {
+            let kw_token = &tokens[i];
+            let (negated, keyword) = match kw_token.value.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, kw_token.value),
+            };
+
+            let kw_lower = keyword.to_ascii_lowercase();
+            let (criterion, advance) = match kw_lower.as_str() {
+                "all" => (MatchCriterion::All, 1),
+                "canonical" => (MatchCriterion::Canonical, 1),
+                "final" => (MatchCriterion::Final, 1),
+                kw @ ("exec" | "host" | "originalhost" | "user" | "localuser" | "localnetwork"
+                | "tagged" | "command" | "version" | "sessiontype") => {
+                    let arg = tokens.get(i + 1).ok_or_else(|| {
+                        kw_token.with_value(ParseMatchArgsError::MissingArgument {
+                            keyword: kw.to_string(),
+                        })
+                    })?;
+                    let criterion = match kw {
+                        "exec" => MatchCriterion::Exec {
+                            command: arg.clone(),
+                        },
+                        "localnetwork" => MatchCriterion::LocalNetwork {
+                            networks: arg.split_comma(),
+                        },
+                        "host" => MatchCriterion::Host {
+                            patterns: parse_pattern_list(arg),
+                        },
+                        "originalhost" => MatchCriterion::OriginalHost {
+                            patterns: parse_pattern_list(arg),
+                        },
+                        "user" => MatchCriterion::User {
+                            patterns: parse_pattern_list(arg),
+                        },
+                        "localuser" => MatchCriterion::LocalUser {
+                            patterns: parse_pattern_list(arg),
+                        },
+                        "tagged" => MatchCriterion::Tagged {
+                            patterns: parse_pattern_list(arg),
+                        },
+                        "command" => MatchCriterion::Command {
+                            patterns: parse_pattern_list(arg),
+                        },
+                        "version" => MatchCriterion::Version {
+                            patterns: parse_pattern_list(arg),
+                        },
+                        "sessiontype" => MatchCriterion::SessionType {
+                            patterns: parse_pattern_list(arg),
+                        },
+                        _ => unreachable!(),
+                    };
+                    (criterion, 2)
+                }
+                _ => {
+                    return Err(kw_token.with_value(ParseMatchArgsError::UnknownCriterion {
+                        keyword: keyword.to_string(),
+                    }));
+                }
+            };
+
+            entries.push(kw_token.with_value(MatchEntry { negated, criterion }));
+            i += advance;
+        }
+
+        // Validate `all` placement: must be last, preceded only by canonical/final.
+        if let Some(all_idx) = entries
+            .iter()
+            .position(|e| matches!(e.value.criterion, MatchCriterion::All))
+        {
+            for entry in &entries[..all_idx] {
+                if !matches!(
+                    entry.value.criterion,
+                    MatchCriterion::Canonical | MatchCriterion::Final
+                ) {
+                    return Err(
+                        entries[all_idx].with_value(ParseMatchArgsError::InvalidAllPlacement)
+                    );
+                }
+            }
+        }
+
+        Ok(args.with_value(Self { entries }))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Other argument types — "at least 1" (Error = ArgumentCountError)
+// ---------------------------------------------------------------------------
 
 /// `Include path1 path2 ...`
 #[derive(Debug, Clone, PartialEq, Eq)]
