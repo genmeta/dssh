@@ -1,4 +1,5 @@
 use super::*;
+use std::path::PathBuf;
 
 // ===========================================================================
 // First-layer parsing tests
@@ -388,10 +389,10 @@ fn parse_args_port_invalid() {
     };
     let err = d.parse_args::<PortArgs>().unwrap_err();
     match err {
-        ParseArgsError::InvalidInteger { span, .. } => {
+        ParseIntegerArgError::InvalidValue { span, .. } => {
             assert_eq!(&input[span.start..span.end], "notanumber");
         }
-        other => panic!("expected InvalidInteger, got {other:?}"),
+        other => panic!("expected InvalidValue, got {other:?}"),
     }
 }
 
@@ -403,7 +404,7 @@ fn parse_args_port_too_many() {
         panic!("expected Directive");
     };
     let err = d.parse_args::<PortArgs>().unwrap_err();
-    assert!(matches!(err, ParseArgsError::TooManyArguments { .. }));
+    assert!(matches!(err, ParseIntegerArgError::WrongArgumentCount { .. }));
 }
 
 #[test]
@@ -549,6 +550,68 @@ fn proxy_jump_sub_spans() {
     assert_eq!(&input[args.jumps[0].span.start..args.jumps[0].span.end], "hop1");
     assert_eq!(&input[args.jumps[1].span.start..args.jumps[1].span.end], "hop2");
     assert_eq!(&input[args.jumps[2].span.start..args.jumps[2].span.end], "hop3");
+}
+
+// ===========================================================================
+// Location and SpanDisplay tests
+// ===========================================================================
+
+#[test]
+fn location_display_with_path() {
+    let sf = SourceFile::new(
+        Some(PathBuf::from("/home/user/.ssh/config")),
+        "Host myserver\nPort 2222\n".to_string(),
+    );
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[1] else {
+        panic!("expected Directive");
+    };
+    let display = d.keyword.span.display_in(&sf);
+    assert_eq!(display.to_string(), "/home/user/.ssh/config:2:1");
+}
+
+#[test]
+fn location_display_without_path() {
+    let sf = SourceFile::new(None, "Port 2222\n".to_string());
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let display = d.arguments[0].span.display_in(&sf);
+    assert_eq!(display.to_string(), "<input>:1:6");
+}
+
+#[test]
+fn location_from_source_file() {
+    let sf = SourceFile::new(
+        Some(PathBuf::from("config")),
+        "Host a\n    HostName b\n".to_string(),
+    );
+    let loc = sf.location(11); // 'H' of HostName
+    assert_eq!(loc.to_string(), "config:2:5");
+    assert_eq!(loc.line, 2);
+    assert_eq!(loc.column, 5);
+}
+
+#[test]
+fn span_location_on_error() {
+    let input = "Port notanumber";
+    let sf = SourceFile::new(
+        Some(PathBuf::from("/etc/ssh/ssh_config")),
+        input.to_string(),
+    );
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let err = d.parse_args::<PortArgs>().unwrap_err();
+    match &err {
+        ParseIntegerArgError::InvalidValue { span, .. } => {
+            let loc = sf.span_location(*span);
+            assert_eq!(loc.to_string(), "/etc/ssh/ssh_config:1:6");
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
 }
 
 // ===========================================================================

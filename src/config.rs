@@ -13,6 +13,7 @@ mod tests;
 
 pub use directives::*;
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Byte offset range in source text.
@@ -20,6 +21,52 @@ use std::path::{Path, PathBuf};
 pub struct Span {
     pub start: usize,
     pub end: usize,
+}
+
+impl Span {
+    /// Create a displayable representation of this span's start position
+    /// within the given source file.
+    ///
+    /// The returned value implements [`Display`](fmt::Display) and formats as
+    /// `path:line:col` (terminal-clickable) or `<input>:line:col` when no path
+    /// is available.
+    pub fn display_in<'a>(&self, source: &'a SourceFile) -> SpanDisplay {
+        SpanDisplay {
+            location: source.location(self.start),
+        }
+    }
+}
+
+/// A resolved source location: file path + 1-based line and column.
+///
+/// [`Display`](fmt::Display) produces `path:line:col` (e.g.,
+/// `~/.ssh/config:5:12`) which most terminals recognise as a clickable
+/// file link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub path: Option<PathBuf>,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl fmt::Display for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.path {
+            Some(p) => write!(f, "{}:{}:{}", p.display(), self.line, self.column),
+            None => write!(f, "<input>:{}:{}", self.line, self.column),
+        }
+    }
+}
+
+/// Helper returned by [`Span::display_in`]; implements [`Display`](fmt::Display).
+pub struct SpanDisplay {
+    location: Location,
+}
+
+impl fmt::Display for SpanDisplay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.location.fmt(f)
+    }
 }
 
 /// A value annotated with its source location.
@@ -132,6 +179,21 @@ impl SourceFile {
             .saturating_sub(1);
         let col = offset - self.line_starts[line_idx] + 1;
         (line_idx + 1, col)
+    }
+
+    /// Resolve a byte offset to a [`Location`] (path + line + column).
+    pub fn location(&self, offset: usize) -> Location {
+        let (line, column) = self.line_col(offset);
+        Location {
+            path: self.path.clone(),
+            line,
+            column,
+        }
+    }
+
+    /// Resolve a [`Span`]'s start position to a [`Location`].
+    pub fn span_location(&self, span: Span) -> Location {
+        self.location(span.start)
     }
 
     fn compute_line_starts(content: &str) -> Vec<usize> {
