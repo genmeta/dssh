@@ -5,6 +5,8 @@ pub mod byte_channel;
 pub mod channel;
 pub mod client;
 pub mod codec;
+#[cfg(feature = "config")]
+pub mod config;
 pub mod constants;
 pub mod conversation;
 pub mod error;
