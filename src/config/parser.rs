@@ -1,4 +1,31 @@
-use super::{Directive, Entry, Span, Spanned};
+// Internal span types used only by the PEG parser.
+// The public API uses `Located<T>` from the parent module.
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct Spanned<T> {
+    pub value: T,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RawDirective<'a> {
+    pub keyword: Spanned<&'a str>,
+    pub arguments: Spanned<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum RawEntry<'a> {
+    Empty(Span),
+    Comment(Spanned<&'a str>),
+    Directive(RawDirective<'a>),
+    Unknown(Spanned<&'a str>),
+}
 
 peg::parser! {
     grammar ssh_config() for str {
@@ -14,26 +41,13 @@ peg::parser! {
             = s:position!() k:$(['a'..='z' | 'A'..='Z'] ['a'..='z' | 'A'..='Z' | '0'..='9']*) e:position!()
             { Spanned { value: k, span: Span { start: s, end: e } } }
 
-        // A double-quoted argument. Span covers the content (inside quotes).
-        rule quoted_argument() -> Spanned<&'input str>
-            = "\"" s:position!() v:$([^ '"']*) e:position!() "\""
-            { Spanned { value: v, span: Span { start: s, end: e } } }
-
-        // An unquoted argument: non-whitespace, non-quote, non-comment characters.
-        rule unquoted_argument() -> Spanned<&'input str>
-            = s:position!() v:$([^ ' ' | '\t' | '\n' | '\r' | '"']+) e:position!()
-            { Spanned { value: v, span: Span { start: s, end: e } } }
-
-        // A single argument (quoted or unquoted).
-        rule argument() -> Spanned<&'input str>
-            = quoted_argument() / unquoted_argument()
-
-        // One or more arguments separated by horizontal whitespace.
-        rule arguments() -> Vec<Spanned<&'input str>>
-            = first:argument() rest:(__() a:argument() { a })* {
-                let mut v = vec![first];
-                v.extend(rest);
-                v
+        // Raw arguments: everything after separator until end of line,
+        // trailing whitespace trimmed. Not tokenized.
+        rule raw_arguments() -> Spanned<&'input str>
+            = arg_s:position!() v:$([^ '\n' | '\r']*) {
+                let trimmed = v.trim_end();
+                let arg_e = arg_s + trimmed.len();
+                Spanned { value: trimmed, span: Span { start: arg_s, end: arg_e } }
             }
 
         // Separator between keyword and arguments: `=` (with optional surrounding
@@ -41,35 +55,40 @@ peg::parser! {
         rule separator() = _ "=" _ / __()
 
         // A directive line: keyword separator arguments
-        rule directive() -> Entry<'input>
-            = s:position!() _ kw:keyword() separator() args:arguments() _ e:position!()
-            { Entry::Directive(Directive { keyword: kw, arguments: args, span: Span { start: s, end: e } }) }
-            / s:position!() _ kw:keyword() _ e:position!()
-            { Entry::Directive(Directive { keyword: kw, arguments: vec![], span: Span { start: s, end: e } }) }
+        rule directive() -> RawEntry<'input>
+            = _ kw:keyword() separator() args:raw_arguments() {
+                RawEntry::Directive(RawDirective { keyword: kw, arguments: args })
+            }
+            / _ kw:keyword() _ e:position!() {
+                RawEntry::Directive(RawDirective {
+                    keyword: kw,
+                    arguments: Spanned { value: "", span: Span { start: e, end: e } },
+                })
+            }
 
         // A comment line: optional leading whitespace, then `#`.
-        rule comment() -> Entry<'input>
+        rule comment() -> RawEntry<'input>
             = s:position!() _ "#" v:$([^ '\n' | '\r']*) e:position!()
-            { Entry::Comment(Spanned { value: v.trim(), span: Span { start: s, end: e } }) }
+            { RawEntry::Comment(Spanned { value: v.trim(), span: Span { start: s, end: e } }) }
 
         // An empty (or whitespace-only) line.
-        rule empty_line() -> Entry<'input>
+        rule empty_line() -> RawEntry<'input>
             = s:position!() &(newline() / ![_]) e:position!()
-            { Entry::Empty(Span { start: s, end: e }) }
+            { RawEntry::Empty(Span { start: s, end: e }) }
             / s:position!() [' ' | '\t']+ &(newline() / ![_]) e:position!()
-            { Entry::Empty(Span { start: s, end: e }) }
+            { RawEntry::Empty(Span { start: s, end: e }) }
 
         // Catch-all for lines that don't match any known pattern.
-        rule unknown_line() -> Entry<'input>
+        rule unknown_line() -> RawEntry<'input>
             = s:position!() v:$([^ '\n' | '\r']+) e:position!()
-            { Entry::Unknown(Spanned { value: v, span: Span { start: s, end: e } }) }
+            { RawEntry::Unknown(Spanned { value: v, span: Span { start: s, end: e } }) }
 
         // A single line (tried in order: empty, comment, directive, unknown).
-        rule line() -> Entry<'input>
+        rule line() -> RawEntry<'input>
             = empty_line() / comment() / directive() / unknown_line()
 
         // A complete config file.
-        pub rule config() -> Vec<Entry<'input>>
+        pub rule config() -> Vec<RawEntry<'input>>
             = first:line() rest:(newline() l:line() { l })* newline()? {
                 let mut v = vec![first];
                 v.extend(rest);
@@ -78,15 +97,13 @@ peg::parser! {
     }
 }
 
-/// Parse an SSH config string into a list of entries.
+/// Parse an SSH config string into a list of raw entries.
 ///
 /// This function never fails; unparseable lines are captured as
-/// [`Entry::Unknown`].
-pub(super) fn parse(input: &str) -> Vec<Entry<'_>> {
-    // The grammar is designed to always succeed (unknown_line is a catch-all),
-    // but if somehow it doesn't, fall back to a single Unknown entry.
+/// [`RawEntry::Unknown`].
+pub(super) fn parse(input: &str) -> Vec<RawEntry<'_>> {
     ssh_config::config(input).unwrap_or_else(|_| {
-        vec![Entry::Unknown(Spanned {
+        vec![RawEntry::Unknown(Spanned {
             value: input,
             span: Span {
                 start: 0,

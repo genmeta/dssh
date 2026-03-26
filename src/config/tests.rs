@@ -1,5 +1,19 @@
 use super::*;
-use std::path::PathBuf;
+use std::sync::Arc;
+
+fn source(input: &str) -> SourceFile {
+    SourceFile::new("<test>", input.to_string())
+}
+
+fn directives<'a>(entries: &'a [Entry<'a>]) -> Vec<&'a Directive<'a>> {
+    entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Directive(d) => Some(d),
+            _ => None,
+        })
+        .collect()
+}
 
 // ===========================================================================
 // First-layer parsing tests
@@ -7,20 +21,23 @@ use std::path::PathBuf;
 
 #[test]
 fn empty_input() {
-    let entries = parse("");
+    let sf = source("");
+    let entries = sf.parse();
     assert_eq!(entries.len(), 1);
     assert!(matches!(entries[0], Entry::Empty(_)));
 }
 
 #[test]
 fn blank_lines() {
-    let entries = parse("\n\n\n");
+    let sf = source("\n\n\n");
+    let entries = sf.parse();
     assert!(entries.iter().all(|e| matches!(e, Entry::Empty(_))));
 }
 
 #[test]
 fn comment_line() {
-    let entries = parse("# this is a comment");
+    let sf = source("# this is a comment");
+    let entries = sf.parse();
     assert_eq!(entries.len(), 1);
     match &entries[0] {
         Entry::Comment(c) => {
@@ -32,7 +49,8 @@ fn comment_line() {
 
 #[test]
 fn comment_with_leading_whitespace() {
-    let entries = parse("   # indented comment");
+    let sf = source("   # indented comment");
+    let entries = sf.parse();
     assert_eq!(entries.len(), 1);
     match &entries[0] {
         Entry::Comment(c) => {
@@ -44,259 +62,262 @@ fn comment_with_leading_whitespace() {
 
 #[test]
 fn simple_directive_whitespace_separator() {
-    let input = "HostName example.com";
-    let entries = parse(input);
+    let sf = source("HostName example.com");
+    let entries = sf.parse();
     assert_eq!(entries.len(), 1);
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     assert_eq!(d.keyword.value, "HostName");
-    assert_eq!(d.arguments.len(), 1);
-    assert_eq!(d.arguments[0].value, "example.com");
+    assert_eq!(d.arguments.value, "example.com");
 }
 
 #[test]
 fn simple_directive_equals_separator() {
-    let input = "HostName=example.com";
-    let entries = parse(input);
+    let sf = source("HostName=example.com");
+    let entries = sf.parse();
     assert_eq!(entries.len(), 1);
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     assert_eq!(d.keyword.value, "HostName");
-    assert_eq!(d.arguments[0].value, "example.com");
+    assert_eq!(d.arguments.value, "example.com");
 }
 
 #[test]
 fn directive_equals_with_spaces() {
-    let input = "HostName = example.com";
-    let entries = parse(input);
+    let sf = source("HostName = example.com");
+    let entries = sf.parse();
     assert_eq!(entries.len(), 1);
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     assert_eq!(d.keyword.value, "HostName");
-    assert_eq!(d.arguments[0].value, "example.com");
+    assert_eq!(d.arguments.value, "example.com");
 }
 
 #[test]
-fn multiple_arguments() {
-    let input = "Host server1 server2 *.example.com";
-    let entries = parse(input);
+fn multiple_arguments_raw() {
+    let sf = source("Host server1 server2 *.example.com");
+    let entries = sf.parse();
     assert_eq!(entries.len(), 1);
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     assert_eq!(d.keyword.value, "Host");
-    assert_eq!(d.arguments.len(), 3);
-    assert_eq!(d.arguments[0].value, "server1");
-    assert_eq!(d.arguments[1].value, "server2");
-    assert_eq!(d.arguments[2].value, "*.example.com");
+    assert_eq!(d.arguments.value, "server1 server2 *.example.com");
+}
+
+#[test]
+fn multiple_arguments_tokenized() {
+    let sf = source("Host server1 server2 *.example.com");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let tokens = d.arguments.tokenize();
+    assert_eq!(tokens.len(), 3);
+    assert_eq!(tokens[0].value, "server1");
+    assert_eq!(tokens[1].value, "server2");
+    assert_eq!(tokens[2].value, "*.example.com");
 }
 
 #[test]
 fn quoted_argument() {
-    let input = r#"ProxyCommand "ssh -W %h:%p bastion""#;
-    let entries = parse(input);
+    let sf = source(r#"ProxyCommand "ssh -W %h:%p bastion""#);
+    let entries = sf.parse();
     assert_eq!(entries.len(), 1);
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     assert_eq!(d.keyword.value, "ProxyCommand");
-    assert_eq!(d.arguments.len(), 1);
-    assert_eq!(d.arguments[0].value, "ssh -W %h:%p bastion");
+    let tokens = d.arguments.tokenize();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].value, "ssh -W %h:%p bastion");
 }
 
 #[test]
 fn mixed_quoted_and_unquoted() {
-    let input = r#"Host "my server" otherhost"#;
-    let entries = parse(input);
+    let sf = source(r#"Host "my server" otherhost"#);
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
-    assert_eq!(d.arguments.len(), 2);
-    assert_eq!(d.arguments[0].value, "my server");
-    assert_eq!(d.arguments[1].value, "otherhost");
+    let tokens = d.arguments.tokenize();
+    assert_eq!(tokens.len(), 2);
+    assert_eq!(tokens[0].value, "my server");
+    assert_eq!(tokens[1].value, "otherhost");
 }
 
 #[test]
 fn keyword_case_preserved() {
-    let input = "HostName example.com\nhostname other.com\nHOSTNAME third.com";
-    let entries = parse(input);
-    let directives: Vec<_> = entries
-        .iter()
-        .filter_map(|e| match e {
-            Entry::Directive(d) => Some(d),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(directives[0].keyword.value, "HostName");
-    assert_eq!(directives[1].keyword.value, "hostname");
-    assert_eq!(directives[2].keyword.value, "HOSTNAME");
+    let sf = source("HostName example.com\nhostname other.com\nHOSTNAME third.com");
+    let entries = sf.parse();
+    let ds = directives(&entries);
+    assert_eq!(ds[0].keyword.value, "HostName");
+    assert_eq!(ds[1].keyword.value, "hostname");
+    assert_eq!(ds[2].keyword.value, "HOSTNAME");
 }
 
 #[test]
 fn multiline_config() {
-    let input = "\
+    let sf = source(
+        "\
 Host myserver
     HostName 192.168.1.1
     User admin
     Port 2222
-";
-    let entries = parse(input);
-    let directives: Vec<_> = entries
-        .iter()
-        .filter_map(|e| match e {
-            Entry::Directive(d) => Some(d),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(directives.len(), 4);
-    assert_eq!(directives[0].keyword.value, "Host");
-    assert_eq!(directives[0].arguments[0].value, "myserver");
-    assert_eq!(directives[1].keyword.value, "HostName");
-    assert_eq!(directives[1].arguments[0].value, "192.168.1.1");
-    assert_eq!(directives[2].keyword.value, "User");
-    assert_eq!(directives[2].arguments[0].value, "admin");
-    assert_eq!(directives[3].keyword.value, "Port");
-    assert_eq!(directives[3].arguments[0].value, "2222");
+",
+    );
+    let entries = sf.parse();
+    let ds = directives(&entries);
+    assert_eq!(ds.len(), 4);
+    assert_eq!(ds[0].keyword.value, "Host");
+    assert_eq!(ds[0].arguments.value, "myserver");
+    assert_eq!(ds[1].keyword.value, "HostName");
+    assert_eq!(ds[1].arguments.value, "192.168.1.1");
+    assert_eq!(ds[2].keyword.value, "User");
+    assert_eq!(ds[2].arguments.value, "admin");
+    assert_eq!(ds[3].keyword.value, "Port");
+    assert_eq!(ds[3].arguments.value, "2222");
 }
 
 #[test]
 fn comments_and_blanks_interleaved() {
-    let input = "\
+    let sf = source(
+        "\
 # Global settings
 ServerAliveInterval 60
 
 # My server
 Host myserver
     HostName 10.0.0.1
-";
-    let entries = parse(input);
+",
+    );
+    let entries = sf.parse();
 
     let mut comments = 0;
     let mut empties = 0;
-    let mut directives = 0;
+    let mut directive_count = 0;
     for e in &entries {
         match e {
             Entry::Comment(_) => comments += 1,
             Entry::Empty(_) => empties += 1,
-            Entry::Directive(_) => directives += 1,
+            Entry::Directive(_) => directive_count += 1,
             Entry::Unknown(_) => panic!("unexpected Unknown entry"),
         }
     }
     assert_eq!(comments, 2);
     assert!(empties >= 1);
-    assert_eq!(directives, 3);
+    assert_eq!(directive_count, 3);
 }
 
 #[test]
 fn no_trailing_newline() {
-    let input = "Port 22";
-    let entries = parse(input);
+    let sf = source("Port 22");
+    let entries = sf.parse();
     assert_eq!(entries.len(), 1);
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     assert_eq!(d.keyword.value, "Port");
-    assert_eq!(d.arguments[0].value, "22");
+    assert_eq!(d.arguments.value, "22");
 }
 
 #[test]
 fn crlf_line_endings() {
-    let input = "Host a\r\nPort 22\r\n";
-    let entries = parse(input);
-    let directives: Vec<_> = entries
-        .iter()
-        .filter_map(|e| match e {
-            Entry::Directive(d) => Some(d),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(directives.len(), 2);
-    assert_eq!(directives[0].keyword.value, "Host");
-    assert_eq!(directives[1].keyword.value, "Port");
+    let sf = source("Host a\r\nPort 22\r\n");
+    let entries = sf.parse();
+    let ds = directives(&entries);
+    assert_eq!(ds.len(), 2);
+    assert_eq!(ds[0].keyword.value, "Host");
+    assert_eq!(ds[1].keyword.value, "Port");
 }
 
 #[test]
 fn leading_whitespace_on_directive() {
-    let input = "    HostName example.com";
-    let entries = parse(input);
+    let sf = source("    HostName example.com");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     assert_eq!(d.keyword.value, "HostName");
-    assert_eq!(d.arguments[0].value, "example.com");
+    assert_eq!(d.arguments.value, "example.com");
 }
 
 // ===========================================================================
-// Span accuracy tests
+// Location accuracy tests
 // ===========================================================================
 
 #[test]
-fn keyword_span_accuracy() {
-    let input = "HostName example.com";
-    let entries = parse(input);
+fn keyword_location_accuracy() {
+    let sf = source("HostName example.com");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
-    assert_eq!(d.keyword.span, Span { start: 0, end: 8 });
-    assert_eq!(&input[d.keyword.span.start..d.keyword.span.end], "HostName");
+    assert_eq!(d.keyword.location.line, 1);
+    assert_eq!(d.keyword.location.column, 1);
 }
 
 #[test]
-fn argument_span_accuracy() {
-    let input = "HostName example.com";
-    let entries = parse(input);
+fn argument_location_accuracy() {
+    let sf = source("HostName example.com");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
-    let arg = &d.arguments[0];
-    assert_eq!(&input[arg.span.start..arg.span.end], "example.com");
-    assert_eq!(arg.value, &input[arg.span.start..arg.span.end]);
+    // "example.com" starts at byte 9, column 10
+    assert_eq!(d.arguments.location.line, 1);
+    assert_eq!(d.arguments.location.column, 10);
 }
 
 #[test]
-fn quoted_argument_span_excludes_quotes() {
-    let input = r#"Host "my server""#;
-    let entries = parse(input);
+fn tokenized_location_accuracy() {
+    let sf = source("Host alpha beta gamma");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
-    let arg = &d.arguments[0];
-    assert_eq!(arg.value, "my server");
-    // Span covers the content inside quotes
-    assert_eq!(&input[arg.span.start..arg.span.end], "my server");
+    let tokens = d.arguments.tokenize();
+    // "alpha" at col 6, "beta" at col 12, "gamma" at col 17
+    assert_eq!(tokens[0].location.column, 6);
+    assert_eq!(tokens[0].value, "alpha");
+    assert_eq!(tokens[1].location.column, 12);
+    assert_eq!(tokens[1].value, "beta");
+    assert_eq!(tokens[2].location.column, 17);
+    assert_eq!(tokens[2].value, "gamma");
 }
 
 #[test]
-fn multiple_arguments_span_accuracy() {
-    let input = "Host alpha beta gamma";
-    let entries = parse(input);
+fn quoted_argument_location() {
+    let sf = source(r#"Host "my server" otherhost"#);
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
-    for arg in &d.arguments {
-        assert_eq!(arg.value, &input[arg.span.start..arg.span.end]);
-    }
+    let tokens = d.arguments.tokenize();
+    // "my server" content starts at column 7 (inside opening quote)
+    assert_eq!(tokens[0].value, "my server");
+    assert_eq!(tokens[0].location.column, 7);
+    // "otherhost" starts at column 18
+    assert_eq!(tokens[1].value, "otherhost");
+    assert_eq!(tokens[1].location.column, 18);
 }
 
 #[test]
-fn span_on_second_line() {
-    let input = "Host a\nPort 443";
-    let entries = parse(input);
-    let directives: Vec<_> = entries
-        .iter()
-        .filter_map(|e| match e {
-            Entry::Directive(d) => Some(d),
-            _ => None,
-        })
-        .collect();
-    let port_kw = &directives[1].keyword;
+fn location_on_second_line() {
+    let sf = source("Host a\nPort 443");
+    let entries = sf.parse();
+    let ds = directives(&entries);
+    let port_kw = &ds[1].keyword;
     assert_eq!(port_kw.value, "Port");
-    assert_eq!(&input[port_kw.span.start..port_kw.span.end], "Port");
-    let port_arg = &directives[1].arguments[0];
-    assert_eq!(&input[port_arg.span.start..port_arg.span.end], "443");
+    assert_eq!(port_kw.location.line, 2);
+    assert_eq!(port_kw.location.column, 1);
+    let port_arg = &ds[1].arguments;
+    assert_eq!(port_arg.value, "443");
+    assert_eq!(port_arg.location.line, 2);
+    assert_eq!(port_arg.location.column, 6);
 }
 
 // ===========================================================================
@@ -305,8 +326,7 @@ fn span_on_second_line() {
 
 #[test]
 fn source_file_line_col_basic() {
-    let content = "line1\nline2\nline3".to_string();
-    let sf = SourceFile::new(None, content);
+    let sf = SourceFile::new("<test>", "line1\nline2\nline3".to_string());
 
     assert_eq!(sf.line_col(0), (1, 1)); // 'l' of line1
     assert_eq!(sf.line_col(4), (1, 5)); // '1' of line1
@@ -316,28 +336,22 @@ fn source_file_line_col_basic() {
 
 #[test]
 fn source_file_line_col_with_config() {
-    let content = "Host myserver\n    HostName 192.168.1.1\n    Port 2222\n".to_string();
-    let sf = SourceFile::new(None, content);
+    let sf = SourceFile::new(
+        "<test>",
+        "Host myserver\n    HostName 192.168.1.1\n    Port 2222\n".to_string(),
+    );
 
     let entries = sf.parse();
-    let directives: Vec<_> = entries
-        .iter()
-        .filter_map(|e| match e {
-            Entry::Directive(d) => Some(d),
-            _ => None,
-        })
-        .collect();
+    let ds = directives(&entries);
 
-    // HostName keyword on line 2
-    let hostname_kw = &directives[1].keyword;
-    let (line, col) = sf.line_col(hostname_kw.span.start);
-    assert_eq!(line, 2);
-    assert_eq!(col, 5); // after 4 spaces of indentation
+    // HostName keyword on line 2, after 4 spaces
+    let hostname_kw = &ds[1].keyword;
+    assert_eq!(hostname_kw.location.line, 2);
+    assert_eq!(hostname_kw.location.column, 5);
 
     // Port argument "2222" on line 3
-    let port_arg = &directives[2].arguments[0];
-    let (line, col) = sf.line_col(port_arg.span.start);
-    assert_eq!(line, 3);
+    let port_arg = &ds[2].arguments;
+    assert_eq!(port_arg.location.line, 3);
 }
 
 // ===========================================================================
@@ -346,51 +360,53 @@ fn source_file_line_col_with_config() {
 
 #[test]
 fn parse_args_host() {
-    let input = "Host server1 server2 *.example.com";
-    let entries = parse(input);
+    let sf = source("Host server1 server2 *.example.com");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let host = d.parse_args::<HostArgs>().unwrap();
-    assert_eq!(host.patterns.len(), 3);
-    assert_eq!(host.patterns[0].value, "server1");
-    assert_eq!(host.patterns[1].value, "server2");
-    assert_eq!(host.patterns[2].value, "*.example.com");
+    assert_eq!(host.value.patterns.len(), 3);
+    assert_eq!(host.value.patterns[0].value, "server1");
+    assert_eq!(host.value.patterns[1].value, "server2");
+    assert_eq!(host.value.patterns[2].value, "*.example.com");
 }
 
 #[test]
 fn parse_args_hostname() {
-    let input = "HostName example.com";
-    let entries = parse(input);
+    let sf = source("HostName example.com");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<HostNameArgs>().unwrap();
-    assert_eq!(args.hostname.value, "example.com");
+    assert_eq!(args.value.hostname.value, "example.com");
 }
 
 #[test]
 fn parse_args_port() {
-    let input = "Port 2222";
-    let entries = parse(input);
+    let sf = source("Port 2222");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<PortArgs>().unwrap();
-    assert_eq!(args.port.value, 2222u16);
+    assert_eq!(args.value.port.value, 2222u16);
 }
 
 #[test]
 fn parse_args_port_invalid() {
-    let input = "Port notanumber";
-    let entries = parse(input);
+    let sf = source("Port notanumber");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let err = d.parse_args::<PortArgs>().unwrap_err();
-    match err {
-        ParseIntegerArgError::InvalidValue { span, .. } => {
-            assert_eq!(&input[span.start..span.end], "notanumber");
+    match &err.value {
+        ParseIntegerArgError::InvalidValue { .. } => {
+            // Error location points to the bad token
+            assert_eq!(err.location.line, 1);
+            assert_eq!(err.location.column, 6);
         }
         other => panic!("expected InvalidValue, got {other:?}"),
     }
@@ -398,136 +414,140 @@ fn parse_args_port_invalid() {
 
 #[test]
 fn parse_args_port_too_many() {
-    let input = "Port 22 80";
-    let entries = parse(input);
+    let sf = source("Port 22 80");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let err = d.parse_args::<PortArgs>().unwrap_err();
     assert!(matches!(
-        err,
+        err.value,
         ParseIntegerArgError::WrongArgumentCount { .. }
     ));
 }
 
 #[test]
 fn parse_args_user() {
-    let input = "User admin";
-    let entries = parse(input);
+    let sf = source("User admin");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<UserArgs>().unwrap();
-    assert_eq!(args.username.value, "admin");
+    assert_eq!(args.value.username.value, "admin");
 }
 
 #[test]
 fn parse_args_identity_file() {
-    let input = "IdentityFile ~/.ssh/id_ed25519";
-    let entries = parse(input);
+    let sf = source("IdentityFile ~/.ssh/id_ed25519");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<IdentityFileArgs>().unwrap();
-    assert_eq!(args.path.value, "~/.ssh/id_ed25519");
+    assert_eq!(args.value.path.value, "~/.ssh/id_ed25519");
 }
 
 #[test]
 fn parse_args_proxy_jump_single() {
-    let input = "ProxyJump bastion.example.com";
-    let entries = parse(input);
+    let sf = source("ProxyJump bastion.example.com");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<ProxyJumpArgs>().unwrap();
-    assert_eq!(args.jumps.len(), 1);
-    assert_eq!(args.jumps[0].value, "bastion.example.com");
+    assert_eq!(args.value.jumps.len(), 1);
+    assert_eq!(args.value.jumps[0].value, "bastion.example.com");
 }
 
 #[test]
 fn parse_args_proxy_jump_multiple() {
-    let input = "ProxyJump hop1,hop2,hop3";
-    let entries = parse(input);
+    let sf = source("ProxyJump hop1,hop2,hop3");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<ProxyJumpArgs>().unwrap();
-    assert_eq!(args.jumps.len(), 3);
-    assert_eq!(args.jumps[0].value, "hop1");
-    assert_eq!(args.jumps[1].value, "hop2");
-    assert_eq!(args.jumps[2].value, "hop3");
+    assert_eq!(args.value.jumps.len(), 3);
+    assert_eq!(args.value.jumps[0].value, "hop1");
+    assert_eq!(args.value.jumps[1].value, "hop2");
+    assert_eq!(args.value.jumps[2].value, "hop3");
 }
 
 #[test]
 fn parse_args_include() {
-    let input = "Include ~/.ssh/config.d/*";
-    let entries = parse(input);
+    let sf = source("Include ~/.ssh/config.d/*");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<IncludeArgs>().unwrap();
-    assert_eq!(args.paths.len(), 1);
-    assert_eq!(args.paths[0].value, "~/.ssh/config.d/*");
+    assert_eq!(args.value.paths.len(), 1);
+    assert_eq!(args.value.paths[0].value, "~/.ssh/config.d/*");
 }
 
 #[test]
 fn parse_args_local_forward() {
-    let input = "LocalForward 8080 remote:80";
-    let entries = parse(input);
+    let sf = source("LocalForward 8080 remote:80");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<LocalForwardArgs>().unwrap();
-    assert_eq!(args.bind.value, "8080");
-    assert_eq!(args.destination.value, "remote:80");
+    assert_eq!(args.value.bind.value, "8080");
+    assert_eq!(args.value.destination.value, "remote:80");
 }
 
 #[test]
 fn parse_args_remote_forward_with_destination() {
-    let input = "RemoteForward 9090 localhost:3000";
-    let entries = parse(input);
+    let sf = source("RemoteForward 9090 localhost:3000");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<RemoteForwardArgs>().unwrap();
-    assert_eq!(args.bind.value, "9090");
-    assert_eq!(args.destination.as_ref().unwrap().value, "localhost:3000");
+    assert_eq!(args.value.bind.value, "9090");
+    assert_eq!(
+        args.value.destination.as_ref().unwrap().value,
+        "localhost:3000"
+    );
 }
 
 #[test]
 fn parse_args_remote_forward_socks() {
-    let input = "RemoteForward 1080";
-    let entries = parse(input);
+    let sf = source("RemoteForward 1080");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<RemoteForwardArgs>().unwrap();
-    assert_eq!(args.bind.value, "1080");
-    assert!(args.destination.is_none());
+    assert_eq!(args.value.bind.value, "1080");
+    assert!(args.value.destination.is_none());
 }
 
 #[test]
 fn parse_args_single_arg() {
-    let input = "Compression yes";
-    let entries = parse(input);
+    let sf = source("Compression yes");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<SingleArg>().unwrap();
-    assert_eq!(args.value.value, "yes");
+    assert_eq!(args.value.value.value, "yes");
 }
 
 // ===========================================================================
-// Secondary parsing span correctness
+// Secondary parsing location correctness
 // ===========================================================================
 
 #[test]
-fn secondary_parse_span_correctness() {
-    let input = "Host myserver\n    Port 2222\n    HostName 10.0.0.1";
-    let sf = SourceFile::new(None, input.to_string());
+fn secondary_parse_location_correctness() {
+    let sf = SourceFile::new(
+        "/etc/ssh/config",
+        "Host myserver\n    Port 2222\n    HostName 10.0.0.1".to_string(),
+    );
     let entries = sf.parse();
 
-    // Find Port directive
     let port_d = entries
         .iter()
         .find_map(|e| match e {
@@ -537,99 +557,81 @@ fn secondary_parse_span_correctness() {
         .unwrap();
 
     let port_args = port_d.parse_args::<PortArgs>().unwrap();
-    // The span should point to "2222" in the original source
-    assert_eq!(
-        &input[port_args.port.span.start..port_args.port.span.end],
-        "2222"
-    );
-    let (line, col) = sf.line_col(port_args.port.span.start);
-    assert_eq!(line, 2);
+    // The port value location should point to "2222" on line 2
+    assert_eq!(port_args.value.port.location.line, 2);
+    assert_eq!(port_args.value.port.location.column, 10);
 }
 
 #[test]
-fn proxy_jump_sub_spans() {
-    let input = "ProxyJump hop1,hop2,hop3";
-    let entries = parse(input);
+fn proxy_jump_sub_locations() {
+    let sf = source("ProxyJump hop1,hop2,hop3");
+    let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let args = d.parse_args::<ProxyJumpArgs>().unwrap();
 
-    // Each jump's span should point to the correct substring
-    assert_eq!(
-        &input[args.jumps[0].span.start..args.jumps[0].span.end],
-        "hop1"
-    );
-    assert_eq!(
-        &input[args.jumps[1].span.start..args.jumps[1].span.end],
-        "hop2"
-    );
-    assert_eq!(
-        &input[args.jumps[2].span.start..args.jumps[2].span.end],
-        "hop3"
-    );
+    // hop1 at col 11, hop2 at col 16, hop3 at col 21
+    assert_eq!(args.value.jumps[0].location.column, 11);
+    assert_eq!(args.value.jumps[1].location.column, 16);
+    assert_eq!(args.value.jumps[2].location.column, 21);
 }
 
 // ===========================================================================
-// Location and SpanDisplay tests
+// Location display tests
 // ===========================================================================
 
 #[test]
 fn location_display_with_path() {
     let sf = SourceFile::new(
-        Some(PathBuf::from("/home/user/.ssh/config")),
+        "/home/user/.ssh/config",
         "Host myserver\nPort 2222\n".to_string(),
     );
     let entries = sf.parse();
-    let Entry::Directive(d) = &entries[1] else {
-        panic!("expected Directive");
-    };
-    let display = d.keyword.span.display_in(&sf);
-    assert_eq!(display.to_string(), "/home/user/.ssh/config:2:1");
-}
-
-#[test]
-fn location_display_without_path() {
-    let sf = SourceFile::new(None, "Port 2222\n".to_string());
-    let entries = sf.parse();
-    let Entry::Directive(d) = &entries[0] else {
-        panic!("expected Directive");
-    };
-    let display = d.arguments[0].span.display_in(&sf);
-    assert_eq!(display.to_string(), "<input>:1:6");
-}
-
-#[test]
-fn location_from_source_file() {
-    let sf = SourceFile::new(
-        Some(PathBuf::from("config")),
-        "Host a\n    HostName b\n".to_string(),
+    let ds = directives(&entries);
+    // Port keyword on line 2
+    assert_eq!(
+        ds[1].keyword.location.to_string(),
+        "/home/user/.ssh/config:2:1"
     );
-    let loc = sf.location(11); // 'H' of HostName
-    assert_eq!(loc.to_string(), "config:2:5");
-    assert_eq!(loc.line, 2);
-    assert_eq!(loc.column, 5);
 }
 
 #[test]
-fn span_location_on_error() {
-    let input = "Port notanumber";
-    let sf = SourceFile::new(
-        Some(PathBuf::from("/etc/ssh/ssh_config")),
-        input.to_string(),
-    );
+fn located_error_display() {
+    let sf = SourceFile::new("/etc/ssh/ssh_config", "Port notanumber".to_string());
     let entries = sf.parse();
     let Entry::Directive(d) = &entries[0] else {
         panic!("expected Directive");
     };
     let err = d.parse_args::<PortArgs>().unwrap_err();
-    match &err {
-        ParseIntegerArgError::InvalidValue { span, .. } => {
-            let loc = sf.span_location(*span);
-            assert_eq!(loc.to_string(), "/etc/ssh/ssh_config:1:6");
-        }
-        other => panic!("expected InvalidValue, got {other:?}"),
-    }
+    let display = err.to_string();
+    assert!(display.contains("invalid integer value"));
+    assert!(display.contains("/etc/ssh/ssh_config:1:6"));
+}
+
+#[test]
+fn located_error_source_chain() {
+    let sf = source("Port notanumber");
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let err = d.parse_args::<PortArgs>().unwrap_err();
+    // Located<E>::source() delegates to E::source()
+    // For InvalidValue, source is ParseIntError
+    use std::error::Error;
+    let source = err.source().expect("should have source");
+    let source_display = source.to_string();
+    assert!(source_display.contains("invalid digit"));
+}
+
+#[test]
+fn location_from_source_file() {
+    let sf = SourceFile::new("config", "Host a\n    HostName b\n".to_string());
+    let loc = sf.location(11); // 'H' of HostName
+    assert_eq!(loc.to_string(), "config:2:5");
+    assert_eq!(loc.line, 2);
+    assert_eq!(loc.column, 5);
 }
 
 // ===========================================================================
@@ -660,50 +662,44 @@ Host *
     Compression yes
     AddKeysToAgent yes
 ";
-    let sf = SourceFile::new(None, input.to_string());
+    let sf = SourceFile::new("/home/user/.ssh/config", input.to_string());
     let entries = sf.parse();
 
-    let directives: Vec<_> = entries
-        .iter()
-        .filter_map(|e| match e {
-            Entry::Directive(d) => Some(d),
-            _ => None,
-        })
-        .collect();
+    let ds = directives(&entries);
 
     // Count directives
-    assert_eq!(directives.len(), 16);
+    assert_eq!(ds.len(), 16);
 
     // Verify no Unknown entries
     assert!(!entries.iter().any(|e| matches!(e, Entry::Unknown(_))));
 
     // Verify equals separator works
-    let hostname_eq = directives
+    let hostname_eq = ds
         .iter()
-        .find(|d| {
-            d.keyword.value == "HostName" && d.arguments[0].value == "prod.internal.example.com"
-        })
+        .find(|d| d.keyword.value == "HostName" && d.arguments.value == "prod.internal.example.com")
         .expect("should find HostName with = separator");
-    assert_eq!(
-        &input[hostname_eq.arguments[0].span.start..hostname_eq.arguments[0].span.end],
-        "prod.internal.example.com"
-    );
+    assert_eq!(hostname_eq.arguments.value, "prod.internal.example.com");
 
     // Verify secondary parsing on a few
-    let port_d = directives
+    let port_d = ds
         .iter()
         .find(|d| d.keyword.value.eq_ignore_ascii_case("port"))
         .unwrap();
     let port = port_d.parse_args::<PortArgs>().unwrap();
-    assert_eq!(port.port.value, 2222);
+    assert_eq!(port.value.port.value, 2222);
 
-    let host_star = directives
+    let host_star = ds
         .iter()
-        .find(|d| {
-            d.keyword.value.eq_ignore_ascii_case("host")
-                && d.arguments.first().is_some_and(|a| a.value == "*")
-        })
+        .find(|d| d.keyword.value.eq_ignore_ascii_case("host") && d.arguments.value == "*")
         .unwrap();
     let host_args = host_star.parse_args::<HostArgs>().unwrap();
-    assert_eq!(host_args.patterns[0].value, "*");
+    assert_eq!(host_args.value.patterns[0].value, "*");
+
+    // Verify all paths share the same Arc
+    let path1 = &ds[0].keyword.location.path;
+    let path2 = &ds[5].keyword.location.path;
+    assert!(
+        Arc::ptr_eq(path1, path2),
+        "locations should share Arc<PathBuf>"
+    );
 }
