@@ -321,23 +321,19 @@ async fn relay_input_piped<R>(
     R: AsyncRead + Unpin + Send,
 {
     loop {
-        let event = match reader.next_event().await {
-            Ok(e) => e,
-            Err(_) => break,
-        };
-        match event {
-            ReaderEvent::Data(mut data) => {
+        match reader.next_event().await {
+            Ok(ReaderEvent::Data(mut data)) => {
                 if io::copy(&mut data, &mut stdin).await.is_err() {
                     break;
                 }
             }
-            ReaderEvent::Notice(incoming) => {
+            Ok(ReaderEvent::Notice(incoming)) => {
                 if !handle_piped_notice(incoming, pid).await {
                     break;
                 }
             }
-            ReaderEvent::Eof | ReaderEvent::Close => break,
-            _ => {}
+            Ok(ReaderEvent::Eof | ReaderEvent::Close) | Err(_) => break,
+            Ok(_) => {}
         }
     }
 }
@@ -353,23 +349,19 @@ async fn relay_input_pty<R>(
     R: AsyncRead + Unpin + Send,
 {
     loop {
-        let event = match reader.next_event().await {
-            Ok(e) => e,
-            Err(_) => break,
-        };
-        match event {
-            ReaderEvent::Data(mut data) => {
+        match reader.next_event().await {
+            Ok(ReaderEvent::Data(mut data)) => {
                 if io::copy(&mut data, &mut pty_writer).await.is_err() {
                     break;
                 }
             }
-            ReaderEvent::Notice(incoming) => {
+            Ok(ReaderEvent::Notice(incoming)) => {
                 if !handle_pty_notice(incoming, pid, master_raw_fd).await {
                     break;
                 }
             }
-            ReaderEvent::Eof | ReaderEvent::Close => break,
-            _ => {}
+            Ok(ReaderEvent::Eof | ReaderEvent::Close) | Err(_) => break,
+            Ok(_) => {}
         }
     }
     drop(pty_writer);
