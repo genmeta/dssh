@@ -215,7 +215,7 @@ async fn handle_ssh3_connect(
 /// On success, spawns a task that waits for upgrade, sets up remoc stream
 /// serving, and calls the child's StartSessionFn.
 async fn handle_child_process(
-    request: http::Request<BoxBody>,
+    mut request: http::Request<BoxBody>,
     handle: genmeta_ssh::protocol::ConversationHandle,
     credential: genmeta_ssh::auth::AuthCredential,
     peer_version: String,
@@ -293,28 +293,13 @@ async fn handle_child_process(
             // Takeover the raw ReadStream/WriteStream individually so we can
             // obtain bytes_stream/bytes_sink for remoc message-level serving.
             let (read_stream, write_stream) = {
-                use h3x::hyper::upgrade::{TakeoverError, TakeoverSlot, ReadStream, WriteStream};
+                use h3x::hyper::upgrade::{self, ReadStream, WriteStream};
 
-                let read_pending = request
-                    .extensions()
-                    .get::<TakeoverSlot<ReadStream>>()
-                    .ok_or(TakeoverError::Aborted)
-                    .and_then(|s| s.take());
-                let write_pending = request
-                    .extensions()
-                    .get::<TakeoverSlot<WriteStream>>()
-                    .ok_or(TakeoverError::Aborted)
-                    .and_then(|s| s.take());
-
-                match (read_pending, write_pending) {
-                    (Ok(rp), Ok(wp)) => match (rp.wait().await, wp.wait().await) {
-                        (Ok(r), Ok(w)) => (r, w),
-                        (Err(e), _) | (_, Err(e)) => {
-                            tracing::error!(error = %snafu::Report::from_error(&e), "takeover failed");
-                            let _ = child.kill().await;
-                            return;
-                        }
-                    },
+                match (
+                    upgrade::take::<ReadStream>(&mut request).await,
+                    upgrade::take::<WriteStream>(&mut request).await,
+                ) {
+                    (Ok(r), Ok(w)) => (r, w),
                     (Err(e), _) | (_, Err(e)) => {
                         tracing::error!(error = %snafu::Report::from_error(&e), "takeover failed");
                         let _ = child.kill().await;
