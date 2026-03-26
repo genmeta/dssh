@@ -32,10 +32,45 @@ use super::{Located, ParseArguments};
 /// pattern-lists (comma-separated).  The `!` prefix is parsed out and
 /// stored in [`negated`](Self::negated); [`value`](Self::value) contains
 /// the pattern text without the leading `!`.
+///
+/// Supports `*` (match zero or more characters) and `?` (match exactly
+/// one character).  Matching is case-insensitive per `ssh_config(5)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern<'a> {
     pub negated: bool,
     pub value: &'a str,
+}
+
+impl Pattern<'_> {
+    /// Test whether `text` matches this pattern, respecting negation.
+    ///
+    /// Returns `true` if the glob matches and the pattern is not negated,
+    /// or if the glob does not match and the pattern *is* negated.
+    pub fn matches(&self, text: &str) -> bool {
+        let m = glob_match(self.value.as_bytes(), text.as_bytes());
+        if self.negated { !m } else { m }
+    }
+
+    /// Test the glob only (ignoring negation).
+    pub fn glob_matches(&self, text: &str) -> bool {
+        glob_match(self.value.as_bytes(), text.as_bytes())
+    }
+}
+
+/// Simple glob matching: `*` matches any sequence, `?` matches one char.
+/// Case-insensitive.
+fn glob_match(pat: &[u8], txt: &[u8]) -> bool {
+    match (pat.first(), txt.first()) {
+        (None, None) => true,
+        (Some(b'*'), _) => {
+            glob_match(&pat[1..], txt) || (!txt.is_empty() && glob_match(pat, &txt[1..]))
+        }
+        (Some(b'?'), Some(_)) => glob_match(&pat[1..], &txt[1..]),
+        (Some(&p), Some(&t)) if p.eq_ignore_ascii_case(&t) => {
+            glob_match(&pat[1..], &txt[1..])
+        }
+        _ => false,
+    }
 }
 
 fn parse_pattern<'a>(token: Located<&'a str>) -> Located<Pattern<'a>> {

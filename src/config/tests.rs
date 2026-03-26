@@ -414,6 +414,73 @@ fn source_file_line_col_with_config() {
 }
 
 // ===========================================================================
+// Pattern matching tests
+// ===========================================================================
+
+#[test]
+fn pattern_star_matches() {
+    let p = Pattern {
+        negated: false,
+        value: "*",
+    };
+    assert!(p.matches("anything"));
+    assert!(p.matches(""));
+}
+
+#[test]
+fn pattern_star_suffix() {
+    let p = Pattern {
+        negated: false,
+        value: "*.example.com",
+    };
+    assert!(p.matches("www.example.com"));
+    assert!(!p.matches("example.com"));
+}
+
+#[test]
+fn pattern_question_mark() {
+    let p = Pattern {
+        negated: false,
+        value: "host?",
+    };
+    assert!(p.matches("host1"));
+    assert!(!p.matches("host12"));
+    assert!(!p.matches("host"));
+}
+
+#[test]
+fn pattern_case_insensitive() {
+    let p = Pattern {
+        negated: false,
+        value: "Host",
+    };
+    assert!(p.matches("host"));
+    assert!(p.matches("HOST"));
+    assert!(p.matches("Host"));
+}
+
+#[test]
+fn pattern_negated() {
+    let p = Pattern {
+        negated: true,
+        value: "*.internal",
+    };
+    assert!(!p.matches("srv.internal"));
+    assert!(p.matches("srv.public"));
+}
+
+#[test]
+fn pattern_ip_wildcard() {
+    let p = Pattern {
+        negated: false,
+        value: "192.168.0.?",
+    };
+    assert!(p.matches("192.168.0.1"));
+    assert!(p.matches("192.168.0.9"));
+    assert!(!p.matches("192.168.0.10"));
+}
+
+// ===========================================================================
 // Secondary parsing (ParseArguments) tests
 // ===========================================================================
 
