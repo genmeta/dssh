@@ -18,7 +18,16 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// A resolved source location: file path + 1-based line and column.
+/// Byte offset range in source text.
+///
+/// Invariant: `source[span.start..span.end]` yields the spanned text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// A resolved source location: span + file path + 1-based line and column.
 ///
 /// [`Display`](fmt::Display) produces `path:line:col` (e.g.,
 /// `~/.ssh/config:5:12`) which most terminals recognise as a clickable
@@ -26,6 +35,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub path: Arc<PathBuf>,
+    pub span: Span,
     pub line: usize,
     pub column: usize,
 }
@@ -82,10 +92,10 @@ impl<'a> Located<&'a str> {
     pub fn tokenize(&self) -> Vec<Located<&'a str>> {
         let mut result = Vec::new();
         let s = self.value;
+        let base = self.location.span.start;
         let mut i = 0;
 
         while i < s.len() {
-            // Skip horizontal whitespace
             while i < s.len() && matches!(s.as_bytes()[i], b' ' | b'\t') {
                 i += 1;
             }
@@ -94,7 +104,6 @@ impl<'a> Located<&'a str> {
             }
 
             if s.as_bytes()[i] == b'"' {
-                // Quoted: span covers content inside quotes
                 let content_start = i + 1;
                 let content_end = s[content_start..]
                     .find('"')
@@ -104,6 +113,10 @@ impl<'a> Located<&'a str> {
                     value: &s[content_start..content_end],
                     location: Location {
                         path: self.location.path.clone(),
+                        span: Span {
+                            start: base + content_start,
+                            end: base + content_end,
+                        },
                         line: self.location.line,
                         column: self.location.column + content_start,
                     },
@@ -114,7 +127,6 @@ impl<'a> Located<&'a str> {
                     content_end
                 };
             } else {
-                // Unquoted: scan until whitespace or quote
                 let start = i;
                 while i < s.len() && !matches!(s.as_bytes()[i], b' ' | b'\t' | b'"') {
                     i += 1;
@@ -123,6 +135,10 @@ impl<'a> Located<&'a str> {
                     value: &s[start..i],
                     location: Location {
                         path: self.location.path.clone(),
+                        span: Span {
+                            start: base + start,
+                            end: base + i,
+                        },
                         line: self.location.line,
                         column: self.location.column + start,
                     },
@@ -136,12 +152,17 @@ impl<'a> Located<&'a str> {
     /// Split by commas, preserving sub-locations.
     pub fn split_comma(&self) -> Vec<Located<&'a str>> {
         let mut result = Vec::new();
+        let base = self.location.span.start;
         let mut offset = 0;
         for part in self.value.split(',') {
             result.push(Located {
                 value: part,
                 location: Location {
                     path: self.location.path.clone(),
+                    span: Span {
+                        start: base + offset,
+                        end: base + offset + part.len(),
+                    },
                     line: self.location.line,
                     column: self.location.column + offset,
                 },
@@ -260,11 +281,12 @@ impl SourceFile {
         (line_idx + 1, col)
     }
 
-    /// Resolve a byte offset to a [`Location`].
-    pub fn location(&self, offset: usize) -> Location {
-        let (line, column) = self.line_col(offset);
+    /// Resolve a [`Span`] to a [`Location`].
+    pub fn location(&self, span: Span) -> Location {
+        let (line, column) = self.line_col(span.start);
         Location {
             path: self.path.clone(),
+            span,
             line,
             column,
         }
@@ -272,7 +294,10 @@ impl SourceFile {
 
     fn locate_entry<'a>(&self, raw: parser::RawEntry<'a>) -> Entry<'a> {
         match raw {
-            parser::RawEntry::Empty(span) => Entry::Empty(self.location(span.start)),
+            parser::RawEntry::Empty(span) => Entry::Empty(self.location(Span {
+                start: span.start,
+                end: span.end,
+            })),
             parser::RawEntry::Comment(s) => Entry::Comment(self.locate(s)),
             parser::RawEntry::Directive(d) => Entry::Directive(Directive {
                 keyword: self.locate(d.keyword),
@@ -284,8 +309,11 @@ impl SourceFile {
 
     fn locate<T>(&self, spanned: parser::Spanned<T>) -> Located<T> {
         Located {
-            location: self.location(spanned.span.start),
             value: spanned.value,
+            location: self.location(Span {
+                start: spanned.span.start,
+                end: spanned.span.end,
+            }),
         }
     }
 

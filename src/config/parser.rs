@@ -1,7 +1,6 @@
 // Internal span types used only by the PEG parser.
 // The public API uses `Located<T>` from the parent module.
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Span {
     pub start: usize,

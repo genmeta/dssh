@@ -320,6 +320,65 @@ fn location_on_second_line() {
     assert_eq!(port_arg.location.column, 6);
 }
 
+#[test]
+fn span_slices_source_text() {
+    let input = "Host alpha beta gamma";
+    let sf = source(input);
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+
+    // Keyword span
+    let kw_span = d.keyword.location.span;
+    assert_eq!(&input[kw_span.start..kw_span.end], "Host");
+
+    // Arguments span
+    let args_span = d.arguments.location.span;
+    assert_eq!(&input[args_span.start..args_span.end], "alpha beta gamma");
+
+    // Tokenized spans
+    let tokens = d.arguments.tokenize();
+    for token in &tokens {
+        let s = token.location.span;
+        assert_eq!(&input[s.start..s.end], token.value);
+    }
+}
+
+#[test]
+fn span_slices_quoted() {
+    let input = r#"Host "my server" otherhost"#;
+    let sf = source(input);
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let tokens = d.arguments.tokenize();
+    assert_eq!(
+        &input[tokens[0].location.span.start..tokens[0].location.span.end],
+        "my server"
+    );
+    assert_eq!(
+        &input[tokens[1].location.span.start..tokens[1].location.span.end],
+        "otherhost"
+    );
+}
+
+#[test]
+fn span_slices_comma_split() {
+    let input = "ProxyJump hop1,hop2,hop3";
+    let sf = source(input);
+    let entries = sf.parse();
+    let Entry::Directive(d) = &entries[0] else {
+        panic!("expected Directive");
+    };
+    let args = d.parse_args::<ProxyJumpArgs>().unwrap();
+    for jump in &args.value.jumps {
+        let s = jump.location.span;
+        assert_eq!(&input[s.start..s.end], jump.value);
+    }
+}
+
 // ===========================================================================
 // SourceFile line/column tests
 // ===========================================================================
@@ -628,7 +687,7 @@ fn located_error_source_chain() {
 #[test]
 fn location_from_source_file() {
     let sf = SourceFile::new("config", "Host a\n    HostName b\n".to_string());
-    let loc = sf.location(11); // 'H' of HostName
+    let loc = sf.location(Span { start: 11, end: 19 }); // 'HostName'
     assert_eq!(loc.to_string(), "config:2:5");
     assert_eq!(loc.line, 2);
     assert_eq!(loc.column, 5);
