@@ -290,15 +290,36 @@ async fn handle_child_process(
     // to complete (streams become available after the response is sent).
     tokio::spawn(
         async move {
-            // on_raw returns the raw ReadStream/WriteStream before conversion
-            // to AsyncRead/AsyncWrite, so we can obtain bytes_stream/bytes_sink
-            // for remoc message-level serving.
-            let (read_stream, write_stream) = match h3x::hyper::upgrade::on_raw(request).await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    tracing::error!(error = ?e, "takeover failed");
-                    let _ = child.kill().await;
-                    return;
+            // Takeover the raw ReadStream/WriteStream individually so we can
+            // obtain bytes_stream/bytes_sink for remoc message-level serving.
+            let (read_stream, write_stream) = {
+                use h3x::hyper::upgrade::{TakeoverError, TakeoverSlot, ReadStream, WriteStream};
+
+                let read_pending = request
+                    .extensions()
+                    .get::<TakeoverSlot<ReadStream>>()
+                    .ok_or(TakeoverError::Aborted)
+                    .and_then(|s| s.take());
+                let write_pending = request
+                    .extensions()
+                    .get::<TakeoverSlot<WriteStream>>()
+                    .ok_or(TakeoverError::Aborted)
+                    .and_then(|s| s.take());
+
+                match (read_pending, write_pending) {
+                    (Ok(rp), Ok(wp)) => match (rp.wait().await, wp.wait().await) {
+                        (Ok(r), Ok(w)) => (r, w),
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::error!(error = %snafu::Report::from_error(&e), "takeover failed");
+                            let _ = child.kill().await;
+                            return;
+                        }
+                    },
+                    (Err(e), _) | (_, Err(e)) => {
+                        tracing::error!(error = %snafu::Report::from_error(&e), "takeover failed");
+                        let _ = child.kill().await;
+                        return;
+                    }
                 }
             };
 

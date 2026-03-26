@@ -66,9 +66,7 @@ fn glob_match(pat: &[u8], txt: &[u8]) -> bool {
             glob_match(&pat[1..], txt) || (!txt.is_empty() && glob_match(pat, &txt[1..]))
         }
         (Some(b'?'), Some(_)) => glob_match(&pat[1..], &txt[1..]),
-        (Some(&p), Some(&t)) if p.eq_ignore_ascii_case(&t) => {
-            glob_match(&pat[1..], &txt[1..])
-        }
+        (Some(&p), Some(&t)) if p.eq_ignore_ascii_case(&t) => glob_match(&pat[1..], &txt[1..]),
         _ => false,
     }
 }
