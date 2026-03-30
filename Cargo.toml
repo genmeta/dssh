@@ -5,7 +5,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-h3x = { git = "ssh://git@github.com/genmeta/h3x.git", branch = "feat/v0.5", features = ["remoc", "serde"] }
+h3x = { git = "ssh://git@github.com/genmeta/h3x.git", branch = "feat/v0.5", features = [
+    "remoc",
+    "serde",
+] }
 http = "1"
 http-body-util = "0.1"
 nix = { version = "0.29", features = [

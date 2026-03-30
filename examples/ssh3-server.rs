@@ -22,7 +22,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use clap::Parser;
 use genmeta_ssh::{
-    auth::parse_authorization_header,
+    auth::{AuthCredential, parse_authorization_header},
     client::SSH3_CONNECT_PATH,
     constants::SSH_VERSION,
     conversation::remoc::{ManageStreamBridge, RemoteManageStreamServerShared},
@@ -169,6 +169,14 @@ async fn handle_ssh3_connect(
         }
     };
 
+    let username = match &credential {
+        AuthCredential::Basic { username, .. } => username.clone(),
+        AuthCredential::Certificate => {
+            tracing::warn!("certificate auth not supported in this example");
+            return error_response(StatusCode::UNAUTHORIZED);
+        }
+    };
+
     let peer_version = match request
         .headers()
         .get("ssh-version")
@@ -201,6 +209,7 @@ async fn handle_ssh3_connect(
     handle_child_process(
         request,
         handle,
+        username,
         credential,
         peer_version,
         conversation_id,
@@ -217,13 +226,13 @@ async fn handle_ssh3_connect(
 async fn handle_child_process(
     mut request: http::Request<BoxBody>,
     handle: genmeta_ssh::protocol::ConversationHandle,
+    username: String,
     credential: genmeta_ssh::auth::AuthCredential,
     peer_version: String,
     conversation_id: StreamId,
     session_binary: &std::path::Path,
 ) -> Result<http::Response<BoxBody>, Infallible> {
-    let span =
-        tracing::info_span!("child-session", %conversation_id, user = %credential.username());
+    let span = tracing::info_span!("child-session", %conversation_id, user = %username);
 
     // Spawn the session child process.
     let mut child = match tokio::process::Command::new(session_binary)
@@ -272,7 +281,7 @@ async fn handle_child_process(
 
     // Call the child's PAM authentication.
     let auth_request = AuthRequest {
-        username: credential.username().to_owned(),
+        username,
         credential,
     };
 

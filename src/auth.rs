@@ -6,10 +6,19 @@ use std::fmt;
 use crate::error::ParseAuthError;
 use crate::error::parse_auth_error;
 
-/// Authentication credential — only Basic auth is supported.
+/// Authentication credential.
+///
+/// Variants carry only the data specific to each authentication scheme.
+/// The target username is always in [`AuthRequest::username`](crate::session::AuthRequest::username),
+/// not in the credential.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AuthCredential {
+    /// HTTP Basic authentication (username + password).
     Basic { username: String, password: String },
+    /// mTLS certificate-based authentication.
+    /// The client identity is already verified at the transport layer;
+    /// no additional secret is required.
+    Certificate,
 }
 
 impl fmt::Display for AuthCredential {
@@ -18,22 +27,7 @@ impl fmt::Display for AuthCredential {
             Self::Basic { username, .. } => {
                 write!(f, "Basic(username={username}, password=<redacted>)")
             }
-        }
-    }
-}
-
-impl AuthCredential {
-    /// Returns the username from the credential.
-    pub fn username(&self) -> &str {
-        match self {
-            Self::Basic { username, .. } => username,
-        }
-    }
-
-    /// Returns the password from the credential.
-    pub fn password(&self) -> &str {
-        match self {
-            Self::Basic { password, .. } => password,
+            Self::Certificate => write!(f, "Certificate"),
         }
     }
 }

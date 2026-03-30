@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use genmeta_ssh::{
+    auth::AuthCredential,
     conversation::Conversation,
     session::{
         AuthError, AuthRequest, SessionBootstrap, SessionRunError, StartSessionFn,
@@ -48,39 +49,35 @@ async fn main() {
     .expect("failed to establish remoc channel");
     let conn_handle = tokio::spawn(conn.instrument(tracing::info_span!("remoc_conn")));
 
-    // Create the outer RFnOnce: PAM authentication.
+    // Create the outer RFnOnce: authentication.
     let auth_fn = remoc::rfn::RFnOnce::new_1(|auth_request: AuthRequest| async move {
-        tracing::info!(username = %auth_request.username, "PAM authentication starting");
+        tracing::info!(username = %auth_request.username, credential = %auth_request.credential, "authentication starting");
 
-        // PAM authenticate + acct_mgmt + user lookup.
-        #[cfg(feature = "pam")]
-        let user_info = genmeta_ssh::session::pam::authenticate(
-            "sshd",
-            &auth_request.username,
-            auth_request.credential.password(),
-        )
-        .await
-        .map_err(|e| AuthError::PamFailed {
-            reason: Report::from_error(e).to_string(),
-        })?;
-
-        // Fallback for non-PAM builds: look up the user without authenticating.
-        #[cfg(not(feature = "pam"))]
-        let (uid, gid, shell) = {
-            let user = nix::unistd::User::from_name(&auth_request.username)
+        let (uid, gid, shell) = match &auth_request.credential {
+            AuthCredential::Basic { password, .. } => {
+                let user_info = genmeta_ssh::session::pam::authenticate(
+                    "sshd",
+                    &auth_request.username,
+                    password,
+                )
+                .await
                 .map_err(|e| AuthError::PamFailed {
-                    reason: format!("user lookup failed: {e}"),
-                })?
-                .ok_or_else(|| AuthError::UserNotFound {
-                    username: auth_request.username.clone(),
+                    reason: Report::from_error(e).to_string(),
                 })?;
-            (user.uid.as_raw(), user.gid.as_raw(), user.shell)
+                (user_info.uid, user_info.gid, user_info.shell)
+            }
+            AuthCredential::Certificate => {
+                let user_info =
+                    genmeta_ssh::session::pam::open_session("sshd", &auth_request.username)
+                        .await
+                        .map_err(|e| AuthError::PamFailed {
+                            reason: Report::from_error(e).to_string(),
+                        })?;
+                (user_info.uid, user_info.gid, user_info.shell)
+            }
         };
 
-        #[cfg(feature = "pam")]
-        let (uid, gid, shell) = (user_info.uid, user_info.gid, user_info.shell);
-
-        tracing::info!(uid, gid, "PAM authentication succeeded");
+        tracing::info!(uid, gid, "authentication succeeded");
 
         // Capture user info into the inner closure.
         let username = auth_request.username;

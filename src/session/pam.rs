@@ -39,6 +39,10 @@ pub enum PamAuthError {
     #[snafu(display("PAM account management rejected"))]
     AccountManagement { source: pam_client2::Error },
 
+    /// `pam_open_session` failed.
+    #[snafu(display("PAM open_session failed"))]
+    OpenSession { source: pam_client2::Error },
+
     /// Failed to query `/etc/passwd` for the user.
     #[snafu(display("failed to query user from /etc/passwd"))]
     UserQuery { source: nix::Error },
@@ -93,6 +97,58 @@ fn authenticate_blocking(
     context
         .acct_mgmt(Flag::NONE)
         .context(pam_auth_error::AccountManagementSnafu)?;
+
+    let user = nix::unistd::User::from_name(username)
+        .context(pam_auth_error::UserQuerySnafu)?
+        .context(pam_auth_error::UserNotFoundSnafu { username })?;
+
+    Ok(UserInfo {
+        uid: user.uid.as_raw(),
+        gid: user.gid.as_raw(),
+        home: user.dir,
+        shell: user.shell,
+    })
+}
+
+/// PAM account check and session open **without** password authentication.
+///
+/// Used for mTLS certificate-based logins where the transport layer has
+/// already verified the client's identity. This function:
+/// 1. Creates a PAM context with a no-op conversation (no password)
+/// 2. Calls `pam_acct_mgmt` to verify the account is valid
+/// 3. Calls `pam_open_session` to create a system session
+/// 4. Looks up the user in `/etc/passwd`
+///
+/// The returned PAM context is intentionally leaked because
+/// `pam_close_session` requires root privileges, which are dropped before
+/// the session ends.
+pub async fn open_session(service: &str, username: &str) -> Result<UserInfo, PamAuthError> {
+    let service = service.to_owned();
+    let username = username.to_owned();
+
+    tokio::task::spawn_blocking(move || open_session_blocking(&service, &username))
+        .await
+        .map_err(|_| PamAuthError::TaskCancelled)?
+}
+
+fn open_session_blocking(service: &str, username: &str) -> Result<UserInfo, PamAuthError> {
+    use pam_client2::{Context, Flag, conv_null};
+
+    let conversation = conv_null::Conversation::new();
+    let mut context = Context::new(service, Some(username), conversation)
+        .context(pam_auth_error::CreateContextSnafu)?;
+
+    context
+        .acct_mgmt(Flag::NONE)
+        .context(pam_auth_error::AccountManagementSnafu)?;
+
+    let session = context
+        .open_session(Flag::NONE)
+        .context(pam_auth_error::OpenSessionSnafu)?;
+
+    // Leak both session and context — close_session requires root, which we drop later.
+    std::mem::forget(session);
+    std::mem::forget(context);
 
     let user = nix::unistd::User::from_name(username)
         .context(pam_auth_error::UserQuerySnafu)?
