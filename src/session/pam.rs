@@ -6,22 +6,9 @@
 //! PAM is a synchronous C library, so all calls are run inside
 //! [`tokio::task::spawn_blocking`].
 
-use std::path::PathBuf;
-
 use snafu::{OptionExt, ResultExt, Snafu};
 
-/// Successful PAM authentication result with user info from `/etc/passwd`.
-#[derive(Debug, Clone)]
-pub struct UserInfo {
-    /// POSIX user ID.
-    pub uid: u32,
-    /// POSIX group ID.
-    pub gid: u32,
-    /// User's home directory.
-    pub home: PathBuf,
-    /// User's login shell.
-    pub shell: PathBuf,
-}
+pub use super::UserInfo;
 
 /// Errors that can occur during PAM authentication or user lookup.
 #[derive(Debug, Snafu)]

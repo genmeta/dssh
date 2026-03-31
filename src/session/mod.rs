@@ -18,6 +18,7 @@ pub mod process;
 pub mod pty;
 pub mod signal;
 
+use std::path::PathBuf;
 use std::pin::pin;
 
 use crate::{
@@ -28,8 +29,57 @@ use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
 use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use snafu::{ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// User identity from `/etc/passwd`.
+#[derive(Debug, Clone)]
+pub struct UserInfo {
+    /// POSIX user ID.
+    pub uid: u32,
+    /// POSIX group ID.
+    pub gid: u32,
+    /// User's home directory.
+    pub home: PathBuf,
+    /// User's login shell.
+    pub shell: PathBuf,
+}
+
+/// Error from [`lookup_user`].
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum LookupUserError {
+    /// Failed to query `/etc/passwd` for the user.
+    #[snafu(display("failed to query user from /etc/passwd"))]
+    UserQuery { source: nix::Error },
+
+    /// The username does not exist in `/etc/passwd`.
+    #[snafu(display("user not found in /etc/passwd: {username}"))]
+    UserNotFound { username: String },
+}
+
+/// Look up a user in `/etc/passwd` by name.
+///
+/// This does **not** perform any authentication; it only reads the
+/// system user database.  Used as a fallback when PAM is unavailable
+/// and the client has already been authenticated at the transport
+/// layer (mTLS).
+pub async fn lookup_user(username: &str) -> Result<UserInfo, LookupUserError> {
+    let username = username.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let user = nix::unistd::User::from_name(&username)
+            .context(lookup_user_error::UserQuerySnafu)?
+            .context(lookup_user_error::UserNotFoundSnafu { username })?;
+        Ok(UserInfo {
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            home: user.dir,
+            shell: user.shell,
+        })
+    })
+    .await
+    .expect("lookup_user blocking task cancelled")
+}
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), module)]

@@ -54,6 +54,7 @@ async fn main() {
         tracing::info!(username = %auth_request.username, credential = %auth_request.credential, "authentication starting");
 
         let (uid, gid, shell) = match &auth_request.credential {
+            #[cfg(feature = "pam")]
             AuthCredential::Basic { password, .. } => {
                 let user_info = genmeta_ssh::session::pam::authenticate(
                     "sshd",
@@ -66,6 +67,13 @@ async fn main() {
                 })?;
                 (user_info.uid, user_info.gid, user_info.shell)
             }
+            #[cfg(not(feature = "pam"))]
+            AuthCredential::Basic { .. } => {
+                return Err(AuthError::PamFailed {
+                    reason: "password authentication requires the `pam` feature".to_owned(),
+                });
+            }
+            #[cfg(feature = "pam")]
             AuthCredential::Certificate => {
                 let user_info =
                     genmeta_ssh::session::pam::open_session("sshd", &auth_request.username)
@@ -73,6 +81,15 @@ async fn main() {
                         .map_err(|e| AuthError::PamFailed {
                             reason: Report::from_error(e).to_string(),
                         })?;
+                (user_info.uid, user_info.gid, user_info.shell)
+            }
+            #[cfg(not(feature = "pam"))]
+            AuthCredential::Certificate => {
+                let user_info = genmeta_ssh::session::lookup_user(&auth_request.username)
+                    .await
+                    .map_err(|e| AuthError::PamFailed {
+                        reason: Report::from_error(e).to_string(),
+                    })?;
                 (user_info.uid, user_info.gid, user_info.shell)
             }
         };
