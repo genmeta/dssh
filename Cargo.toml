@@ -37,7 +37,7 @@ remoc = { version = "0.18", default-features = false, features = [
     "rfn",
     "rtc",
     "serde",
-    "default-codec-json",
+    "default-codec-bincode",
 ] }
 pam-client2 = { version = "0.5", default-features = false, optional = true }
 peg = { version = "0.8", optional = true }
