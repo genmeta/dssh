@@ -316,7 +316,14 @@ where
                         }.instrument(tracing::info_span!("direct-streamlocal")));
                     }
                     "socks5" => {
-                        let (reader, writer) = incoming.into_raw_parts();
+                        let pending = incoming.skip_payload();
+                        let (reader, writer) = match pending.accept(config.max_message_size).await {
+                            Ok(ch) => ch.into_inner(),
+                            Err(e) => {
+                                tracing::warn!(error = %snafu::Report::from_error(&e), "socks5 accept failed");
+                                continue;
+                            }
+                        };
                         channel_tasks.spawn(async move {
                             if let Err(e) = crate::forward::socks5::handle_socks5(reader, writer).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "socks5 error");

@@ -28,7 +28,7 @@ const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module)]
 pub enum Socks5Error {
-    #[snafu(display("SOCKS5 protocol I/O failed"))]
+    #[snafu(display("SOCKS5 protocol I/O failed: {source}"))]
     Io { source: std::io::Error },
 
     #[snafu(display("unsupported SOCKS version: 0x{version:02x}"))]
@@ -79,6 +79,7 @@ where
         .write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH])
         .await
         .context(socks5_error::IoSnafu)?;
+    writer.flush().await.context(socks5_error::IoSnafu)?;
 
     // Phase 2: CONNECT request
     let ver = reader.read_u8().await.context(socks5_error::IoSnafu)?;
@@ -159,6 +160,7 @@ where
 
     let local_addr = tcp_stream.local_addr().context(socks5_error::IoSnafu)?;
     send_reply_with_bound_addr(&mut writer, REP_SUCCEEDED, &local_addr).await?;
+    writer.flush().await.context(socks5_error::IoSnafu)?;
 
     // Phase 4: Bidirectional relay
     let (tcp_reader, tcp_writer) = tcp_stream.into_split();
