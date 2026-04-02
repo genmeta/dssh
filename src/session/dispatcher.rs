@@ -234,11 +234,15 @@ where
     // and if cancelled before completing, the ticket blocks subsequent reads.
     let mut accept_global = std::pin::pin!(conversation.accept());
 
+    // Pin accept_channel() for the same reason: it calls accept_stream()
+    // then decode_one(). If cancelled between the two, the stream is lost.
+    let mut accept_channel = std::pin::pin!(conversation.accept_channel());
+
     tracing::debug!("run_session: entering main loop");
 
     loop {
         tokio::select! {
-            channel_result = conversation.accept_channel() => {
+            channel_result = &mut accept_channel => {
                 tracing::debug!("run_session: accept_channel returned");
                 let incoming = match channel_result {
                     Ok(ch) => ch,
@@ -330,6 +334,8 @@ where
                         }
                     }
                 }
+                // Reset the pinned future for the next channel.
+                accept_channel.set(conversation.accept_channel());
             }
 
             global_result = &mut accept_global => {
