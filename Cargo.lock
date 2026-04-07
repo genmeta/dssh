@@ -913,7 +913,7 @@ dependencies = [
 [[package]]
 name = "h3x"
 version = "0.1.0"
-source = "git+ssh://git@github.com/genmeta/h3x.git?branch=feat%2Fv0.5#6378995baa5d83cd562dd8728c82772aed1cd73d"
+source = "git+ssh://git@github.com/genmeta/h3x.git?branch=feat%2Fv0.5#93d817c9c2e680bdfb73d340ca6023184265bda4"
 dependencies = [
  "bon",
  "bytes",

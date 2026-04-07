@@ -25,7 +25,7 @@ use genmeta_ssh::{
     protocol::{ConversationHandle, Ssh3Protocol},
     session::client::ClientSession,
 };
-use h3x::gm_quic::H3Client;
+use h3x::dquic::H3Client;
 use h3x::qpack::field::Protocol;
 use h3x::quic::GetStreamIdExt;
 use h3x::stream_id::StreamId;

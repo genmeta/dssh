@@ -30,7 +30,7 @@ use genmeta_ssh::{
     session::{AuthRequest, AuthenticateFn, SessionBootstrap},
 };
 use h3x::connection::ConnectionBuilder;
-use h3x::gm_quic::H3Servers;
+use h3x::dquic::H3Servers;
 use h3x::hyper::server::TowerService;
 use h3x::message::stream::MessageStreamError;
 use h3x::protocol::Protocols;
