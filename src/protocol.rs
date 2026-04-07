@@ -180,7 +180,7 @@ impl Ssh3Protocol {
         &self,
         (mut reader, writer): ErasedPeekableBiStream,
     ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
-        tracing::trace!("Ssh3Protocol::accept_bi called");
+        tracing::trace!("ssh3 protocol accept_bi called");
 
         // Peek the first VarInt to identify SSH3 streams.
         let signal_value: VarInt = match reader.decode_one().await {
@@ -203,7 +203,7 @@ impl Ssh3Protocol {
             }
         };
 
-        tracing::debug!(%session_id, "SSH3 channel stream accepted, routing to conversation");
+        tracing::debug!(%session_id, "ssh3 channel stream accepted, routing to conversation");
 
         // Convert to StreamReader (preserving buffered bytes from the peek
         // operation), then re-box as a BoxReadStream so downstream consumers

@@ -40,6 +40,7 @@ use h3x::stream_id::StreamId;
 use http::StatusCode;
 use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use remoc::prelude::*;
+use snafu::Report;
 use tracing::Instrument;
 
 type BoxBody = UnsyncBoxBody<Bytes, MessageStreamError>;
@@ -243,7 +244,7 @@ async fn handle_child_process(
     {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, "failed to spawn session binary");
+            tracing::error!(error = %Report::from_error(&e), "failed to spawn session binary");
             return error_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -252,21 +253,22 @@ async fn handle_child_process(
     let child_stdout = child.stdout.take().unwrap();
 
     // Establish remoc channel: we receive AuthenticateFn from the child.
-    let (conn, _tx, mut rx) =
-        match remoc::Connect::io::<_, _, (), AuthenticateFn, remoc::codec::Default>(
-            remoc::Cfg::default(),
-            child_stdout,
-            child_stdin,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to establish remoc channel with child");
-                let _ = child.kill().await;
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        };
+    let (conn, _tx, mut rx) = match remoc::Connect::io::<
+        _,
+        _,
+        (),
+        AuthenticateFn,
+        remoc::codec::Default,
+    >(remoc::Cfg::default(), child_stdout, child_stdin)
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %Report::from_error(&e), "failed to establish remoc channel with child");
+            let _ = child.kill().await;
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let conn_handle = tokio::spawn(conn.instrument(span.clone()));
 
     // Receive the AuthenticateFn from the child.

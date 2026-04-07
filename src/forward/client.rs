@@ -8,7 +8,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use snafu::{ResultExt, Snafu};
+use snafu::{Report, ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::Instrument;
 
@@ -126,7 +126,7 @@ impl LocalForward {
             let (stream, peer) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(error = %e, "accept failed");
+                    tracing::warn!(error = %Report::from_error(&e), "accept failed");
                     continue;
                 }
             };
@@ -155,7 +155,7 @@ impl LocalForward {
             let (stream, _) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(error = %e, "accept failed");
+                    tracing::warn!(error = %Report::from_error(&e), "accept failed");
                     continue;
                 }
             };

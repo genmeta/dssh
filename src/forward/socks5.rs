@@ -28,7 +28,7 @@ const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module)]
 pub enum Socks5Error {
-    #[snafu(display("SOCKS5 protocol I/O failed: {source}"))]
+    #[snafu(display("SOCKS5 protocol I/O failed"))]
     Io { source: std::io::Error },
 
     #[snafu(display("unsupported SOCKS version: 0x{version:02x}"))]
