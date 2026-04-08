@@ -12,8 +12,24 @@
 
 use std::ffi::CString;
 
+use nix::errno::Errno;
 use nix::unistd::{Gid, Uid};
 use snafu::{ResultExt, Snafu};
+
+/// Portable `initgroups` wrapper that works on all platforms including macOS.
+///
+/// `nix::unistd::initgroups` is gated by `#[cfg(not(apple_targets))]`, so we
+/// call `libc::initgroups` directly and convert the result to `nix::Result<()>`
+/// to keep error types consistent.
+fn initgroups(user: &CString, group: Gid) -> nix::Result<()> {
+    let gid: libc::gid_t = group.into();
+    // On macOS the second parameter is `c_int`; on other platforms it's `gid_t`.
+    #[cfg(target_vendor = "apple")]
+    let res = unsafe { libc::initgroups(user.as_ptr(), gid as libc::c_int) };
+    #[cfg(not(target_vendor = "apple"))]
+    let res = unsafe { libc::initgroups(user.as_ptr(), gid) };
+    Errno::result(res).map(drop)
+}
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
@@ -49,7 +65,7 @@ pub fn drop_privileges(uid: u32, gid: u32, username: &str) -> Result<(), DropPri
 
     nix::unistd::setgid(nix_gid).context(SetGidSnafu { gid })?;
 
-    nix::unistd::initgroups(&c_username, nix_gid).context(InitGroupsSnafu { username, gid })?;
+    initgroups(&c_username, nix_gid).context(InitGroupsSnafu { username, gid })?;
 
     nix::unistd::setuid(nix_uid).context(SetUidSnafu { uid })?;
 

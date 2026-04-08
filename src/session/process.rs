@@ -11,7 +11,7 @@
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
@@ -184,15 +184,14 @@ where
 {
     use process_error::*;
 
-    let slave_fd = pty.slave.into_raw_fd();
-    let stdout_fd = nix::unistd::dup(slave_fd).context(DupFdSnafu)?;
-    let stderr_fd = nix::unistd::dup(slave_fd).context(DupFdSnafu)?;
+    let stdout_fd = nix::unistd::dup(pty.slave.as_fd()).context(DupFdSnafu)?;
+    let stderr_fd = nix::unistd::dup(pty.slave.as_fd()).context(DupFdSnafu)?;
 
     let mut cmd = tokio::process::Command::new(mode.program());
     cmd.args(mode.args())
-        .stdin(unsafe { Stdio::from_raw_fd(slave_fd) })
-        .stdout(unsafe { Stdio::from_raw_fd(stdout_fd) })
-        .stderr(unsafe { Stdio::from_raw_fd(stderr_fd) });
+        .stdin(pty.slave)
+        .stdout(stdout_fd)
+        .stderr(stderr_fd);
     unsafe {
         cmd.pre_exec(|| {
             nix::unistd::setsid().map_err(std::io::Error::other)?;
