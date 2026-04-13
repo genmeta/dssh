@@ -271,6 +271,12 @@ impl Protocol for Ssh3Protocol {
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ssh3ProtocolFactory;
 
+impl fmt::Display for Ssh3ProtocolFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SSH3")
+    }
+}
+
 impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
     type Protocol = Ssh3Protocol;
 
