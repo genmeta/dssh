@@ -208,10 +208,16 @@ where
     let mut child = cmd.spawn().context(SpawnSnafu)?;
     let pid = child.id().map(|id| Pid::from_raw(id as i32));
 
+    // Use separate file handles for reading and writing the PTY master.
+    // `tokio::io::split()` on a single `tokio::fs::File` serializes all IO
+    // through one state machine: a blocking read prevents concurrent writes
+    // (and vice versa), causing deadlock-like stalls when the shell queries
+    // the terminal (e.g. DA1) and waits for a response that must be written
+    // back through the same master fd.
     let master_raw_fd = pty.master.as_raw_fd();
-    let master_file = std::fs::File::from(pty.master);
-    let master_tokio = tokio::fs::File::from(master_file);
-    let (mut master_reader, master_writer) = tokio::io::split(master_tokio);
+    let master_write_fd = nix::unistd::dup(pty.master.as_fd()).context(DupFdSnafu)?;
+    let mut master_reader = tokio::fs::File::from(std::fs::File::from(pty.master));
+    let master_writer = tokio::fs::File::from(std::fs::File::from(master_write_fd));
 
     let (reader, mut writer) = channel.into_split();
 
