@@ -248,7 +248,7 @@ pub async fn run_piped<R, W>(
     client_env: &[(String, String)],
 ) -> Result<(), ProcessError>
 where
-    R: AsyncRead + Unpin + Send,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send,
 {
     use process_error::*;
@@ -282,7 +282,9 @@ where
 
     let (reader, mut writer) = channel.into_split();
 
-    let (_, output_result) = tokio::join!(relay_input_piped(reader, stdin, pid), async {
+    let input_handle = tokio::spawn(relay_input_piped(reader, stdin, pid));
+
+    let output_result = async {
         relay_output_piped(&mut stdout, &mut stderr, &mut writer).await?;
         let status = child.wait().await.context(WaitSnafu)?;
         send_exit_notification(&mut writer, &status).await?;
@@ -294,7 +296,11 @@ where
             .await
             .context(ShutdownSnafu)?;
         Ok::<_, ProcessError>(())
-    },);
+    }
+    .await;
+
+    input_handle.abort();
+    let _ = input_handle.await;
     output_result
 }
 
@@ -315,7 +321,7 @@ pub async fn run_pty<R, W>(
     client_env: &[(String, String)],
 ) -> Result<(), ProcessError>
 where
-    R: AsyncRead + Unpin + Send,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send,
 {
     use process_error::*;
@@ -367,27 +373,30 @@ where
 
     let (reader, mut writer) = channel.into_split();
 
-    let (_, output_result) = tokio::join!(
-        relay_input_pty(reader, master_writer, pid, master_raw_fd),
-        async {
-            let output_result = relay_output_pty(&mut master_reader, &mut writer).await;
-            if let Err(ProcessError::ReadPty { ref source }) = output_result
-                && source.raw_os_error() != Some(nix::libc::EIO)
-            {
-                output_result?;
-            }
-            let status = child.wait().await.context(WaitSnafu)?;
-            send_exit_notification(&mut writer, &status).await?;
-            writer.eof().await.context(WriteEofSnafu)?;
-            writer.close().await.context(WriteCloseSnafu)?;
-            writer
-                .writer_mut()
-                .shutdown()
-                .await
-                .context(ShutdownSnafu)?;
-            Ok::<_, ProcessError>(())
-        },
-    );
+    let input_handle = tokio::spawn(relay_input_pty(reader, master_writer, pid, master_raw_fd));
+
+    let output_result = async {
+        let output_result = relay_output_pty(&mut master_reader, &mut writer).await;
+        if let Err(ProcessError::ReadPty { ref source }) = output_result
+            && source.raw_os_error() != Some(nix::libc::EIO)
+        {
+            output_result?;
+        }
+        let status = child.wait().await.context(WaitSnafu)?;
+        send_exit_notification(&mut writer, &status).await?;
+        writer.eof().await.context(WriteEofSnafu)?;
+        writer.close().await.context(WriteCloseSnafu)?;
+        writer
+            .writer_mut()
+            .shutdown()
+            .await
+            .context(ShutdownSnafu)?;
+        Ok::<_, ProcessError>(())
+    }
+    .await;
+
+    input_handle.abort();
+    let _ = input_handle.await;
     output_result
 }
 

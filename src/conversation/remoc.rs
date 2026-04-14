@@ -99,8 +99,8 @@ impl ManageStreamBridge {
         reader: BoxReadStream,
         writer: BoxWriteStream,
     ) -> (ReadStreamClient, WriteStreamClient) {
-        let (rs, rc) = ReadStreamServer::new(reader, 1);
-        let (ws, wc) = WriteStreamServer::new(writer, 1);
+        let (rs, rc) = ReadStreamServer::new(reader, 8);
+        let (ws, wc) = WriteStreamServer::new(writer, 8);
 
         let mut tasks = self.tasks.lock().expect("task set lock not poisoned");
         while tasks.try_join_next().is_some() {}
