@@ -12,6 +12,7 @@
 //! 3. Call [`run`](ClientSession::run) to relay stdin/stdout/stderr until
 //!    the server closes the channel.
 
+use futures::Stream;
 use snafu::prelude::*;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -22,7 +23,8 @@ use crate::conversation::channel::{
 };
 use crate::session::{
     ExecChannelRequest, ExecRequest, ExitSignalRequest, ExitStatusRequest, PtyChannelRequest,
-    PtyRequest, SessionCodecError, ShellChannelRequest,
+    PtyRequest, SessionCodecError, ShellChannelRequest, WindowChangeChannelNotice,
+    WindowChangeRequest,
 };
 
 // ============================================================================
@@ -183,6 +185,28 @@ where
         output_result
     }
 
+    /// Run the IO relay with terminal resize forwarding.
+    ///
+    /// Like [`run`](Self::run), but additionally monitors `resize` for
+    /// terminal dimension changes and sends `window-change` channel
+    /// notices to the server.
+    pub async fn run_interactive(
+        self,
+        stdin: impl AsyncRead + Unpin + Send,
+        stdout: impl AsyncWrite + Unpin + Send,
+        stderr: impl AsyncWrite + Unpin + Send,
+        resize: impl Stream<Item = (u16, u16)> + Unpin + Send,
+    ) -> Result<Option<ExitResult>, RunError> {
+        let (reader, writer) = self.channel.into_split();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let (_, output_result) = tokio::join!(
+            relay_stdin_interactive(stdin, writer, done_rx, resize),
+            relay_output(reader, stdout, stderr, done_tx),
+        );
+        output_result
+    }
+
     /// Consume the session and return the underlying channel.
     pub fn into_inner(self) -> SshChannel<R, W> {
         self.channel
@@ -212,6 +236,58 @@ async fn relay_stdin<W: AsyncWrite + Unpin + Send>(
                             break;
                         }
                     }
+                }
+            }
+        }
+    }
+    let _ = writer.eof().await;
+    let _ = writer.close().await;
+    let _ = writer.writer_mut().shutdown().await;
+}
+
+/// Relay local stdin → channel writer with terminal resize forwarding.
+///
+/// In addition to stdin data, monitors `resize` for `(cols, rows)` changes
+/// and sends `window-change` channel notices to the server.
+async fn relay_stdin_interactive<W: AsyncWrite + Unpin + Send>(
+    mut stdin: impl AsyncRead + Unpin + Send,
+    mut writer: SshChannelWriter<W>,
+    mut done_rx: tokio::sync::oneshot::Receiver<()>,
+    mut resize: impl Stream<Item = (u16, u16)> + Unpin + Send,
+) {
+    use futures::StreamExt;
+    use h3x::varint::VarInt;
+
+    let mut buf = [0u8; 8192];
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut done_rx => break,
+            result = stdin.read(&mut buf) => {
+                match result {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if writer.data(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            size = resize.next() => {
+                let Some((cols, rows)) = size else { continue };
+                let notice = WindowChangeChannelNotice {
+                    payload: WindowChangeRequest {
+                        width_cols: VarInt::from(cols as u32),
+                        height_rows: VarInt::from(rows as u32),
+                        width_px: VarInt::from_u32(0),
+                        height_px: VarInt::from_u32(0),
+                    },
+                };
+                if let Err(e) = writer.notice::<_, SessionCodecError>(&notice).await {
+                    tracing::warn!(
+                        error = %snafu::Report::from_error(&e),
+                        "failed to send window-change notice"
+                    );
                 }
             }
         }
