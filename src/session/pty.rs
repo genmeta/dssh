@@ -125,6 +125,94 @@ pub fn set_window_size_raw(
 }
 
 // ============================================================================
+// Async PTY I/O via epoll (AsyncFd)
+// ============================================================================
+
+/// Async wrapper around a PTY master file descriptor.
+///
+/// Uses [`tokio::io::unix::AsyncFd`] with epoll for non-blocking I/O,
+/// unlike `tokio::fs::File` which routes every operation through
+/// `spawn_blocking` and serializes reads and writes.
+pub struct AsyncPtyFd {
+    inner: tokio::io::unix::AsyncFd<OwnedFd>,
+}
+
+impl AsyncPtyFd {
+    /// Wrap an owned PTY master fd for async I/O.
+    ///
+    /// Sets `O_NONBLOCK` on the fd and registers it with the tokio reactor.
+    pub fn new(fd: OwnedFd) -> std::io::Result<Self> {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let flags = fcntl(&fd, FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
+        let mut oflags = OFlag::from_bits_truncate(flags);
+        oflags |= OFlag::O_NONBLOCK;
+        fcntl(&fd, FcntlArg::F_SETFL(oflags)).map_err(std::io::Error::from)?;
+        Ok(Self {
+            inner: tokio::io::unix::AsyncFd::new(fd)?,
+        })
+    }
+
+    /// Returns the raw file descriptor.
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.inner.get_ref().as_raw_fd()
+    }
+}
+
+impl tokio::io::AsyncRead for AsyncPtyFd {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        loop {
+            let mut guard = std::task::ready!(self.inner.poll_read_ready(cx))?;
+            match guard.try_io(|inner| {
+                nix::unistd::read(inner.get_ref(), buf.initialize_unfilled())
+                    .map_err(std::io::Error::from)
+            }) {
+                Ok(result) => {
+                    buf.advance(result?);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for AsyncPtyFd {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        loop {
+            let mut guard = std::task::ready!(self.inner.poll_write_ready(cx))?;
+            match guard.try_io(|inner| {
+                nix::unistd::write(inner.get_ref(), buf).map_err(std::io::Error::from)
+            }) {
+                Ok(result) => return std::task::Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

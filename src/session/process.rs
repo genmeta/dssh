@@ -11,7 +11,7 @@
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
@@ -47,6 +47,9 @@ pub enum ProcessError {
 
     #[snafu(display("failed to duplicate PTY file descriptor"))]
     DupFd { source: nix::Error },
+
+    #[snafu(display("failed to set up async PTY master"))]
+    AsyncPty { source: std::io::Error },
 
     #[snafu(display("failed to read from process stdout"))]
     ReadStdout { source: std::io::Error },
@@ -208,16 +211,16 @@ where
     let mut child = cmd.spawn().context(SpawnSnafu)?;
     let pid = child.id().map(|id| Pid::from_raw(id as i32));
 
-    // Use separate file handles for reading and writing the PTY master.
-    // `tokio::io::split()` on a single `tokio::fs::File` serializes all IO
-    // through one state machine: a blocking read prevents concurrent writes
-    // (and vice versa), causing deadlock-like stalls when the shell queries
-    // the terminal (e.g. DA1) and waits for a response that must be written
-    // back through the same master fd.
-    let master_raw_fd = pty.master.as_raw_fd();
+    // Use AsyncFd-based wrappers for the PTY master. Unlike tokio::fs::File
+    // (which routes every read/write through spawn_blocking and serializes
+    // them), AsyncPtyFd uses epoll for near-zero-latency non-blocking I/O.
+    // Separate fds for reader and writer avoid any shared state.
     let master_write_fd = nix::unistd::dup(pty.master.as_fd()).context(DupFdSnafu)?;
-    let mut master_reader = tokio::fs::File::from(std::fs::File::from(pty.master));
-    let master_writer = tokio::fs::File::from(std::fs::File::from(master_write_fd));
+    let mut master_reader =
+        super::pty::AsyncPtyFd::new(pty.master).context(AsyncPtySnafu)?;
+    let master_raw_fd = master_reader.as_raw_fd();
+    let master_writer =
+        super::pty::AsyncPtyFd::new(master_write_fd).context(AsyncPtySnafu)?;
 
     let (reader, mut writer) = channel.into_split();
 
