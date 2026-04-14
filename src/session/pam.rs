@@ -174,8 +174,6 @@ fn extract_pam_env<C>(context: &pam_client2::Context<C>) -> Vec<(String, String)
     context
         .envlist()
         .iter_tuples()
-        .filter_map(|(k, v)| {
-            Some((k.to_str()?.to_owned(), v.to_str()?.to_owned()))
-        })
+        .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v.to_str()?.to_owned())))
         .collect()
 }

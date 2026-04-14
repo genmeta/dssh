@@ -137,7 +137,11 @@ impl<'a> CommandMode<'a> {
 ///
 /// Follows the OpenSSH `do_setup_env` convention: clear the inherited
 /// environment entirely, then set a well-known baseline.
-fn build_env(config: &SessionConfig, term: Option<&str>, client_env: &[(String, String)]) -> Vec<(OsString, OsString)> {
+fn build_env(
+    config: &SessionConfig,
+    term: Option<&str>,
+    client_env: &[(String, String)],
+) -> Vec<(OsString, OsString)> {
     let user = &config.user;
     let mut env: Vec<(OsString, OsString)> = Vec::with_capacity(16);
 
@@ -154,10 +158,7 @@ fn build_env(config: &SessionConfig, term: Option<&str>, client_env: &[(String, 
     };
     env.push(("PATH".into(), path.into()));
 
-    env.push((
-        "MAIL".into(),
-        format!("/var/mail/{}", user.username).into(),
-    ));
+    env.push(("MAIL".into(), format!("/var/mail/{}", user.username).into()));
 
     if let Some(t) = term {
         env.push(("TERM".into(), t.into()));
@@ -212,9 +213,10 @@ fn read_environment_file() -> Vec<(String, String)> {
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
             let mut value = value.trim();
-            // Strip optional quotes.
-            if (value.starts_with('"') && value.ends_with('"'))
-                || (value.starts_with('\'') && value.ends_with('\''))
+            // Strip optional quotes (need at least 2 chars for a matching pair).
+            if value.len() >= 2
+                && ((value.starts_with('"') && value.ends_with('"'))
+                    || (value.starts_with('\'') && value.ends_with('\'')))
             {
                 value = &value[1..value.len() - 1];
             }
@@ -252,7 +254,9 @@ where
     use process_error::*;
 
     let home = &config.user.home;
-    let cwd = if home.is_dir() { home.as_path() } else {
+    let cwd = if home.is_dir() {
+        home.as_path()
+    } else {
         tracing::warn!(home = %home.display(), "home directory does not exist, falling back to /");
         Path::new("/")
     };
@@ -320,7 +324,9 @@ where
     let stderr_fd = nix::unistd::dup(pty.slave.as_fd()).context(DupFdSnafu)?;
 
     let home = &config.user.home;
-    let cwd = if home.is_dir() { home.as_path() } else {
+    let cwd = if home.is_dir() {
+        home.as_path()
+    } else {
         tracing::warn!(home = %home.display(), "home directory does not exist, falling back to /");
         Path::new("/")
     };

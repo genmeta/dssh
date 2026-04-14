@@ -3,7 +3,7 @@
 //! Handles `pty-req` and `window-change` channel requests per RFC 4254
 //! Sections 6.2 and 6.7.
 
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::pin::Pin;
 use std::task::Context;
 
@@ -145,14 +145,12 @@ const TTY_OP_OSPEED: u8 = 129;
 /// The function does a `tcgetattr` → modify → `tcsetattr(TCSANOW)` cycle.
 /// Unknown opcodes in 1–159 are silently skipped. Errors from individual
 /// mode settings are logged but do not abort processing.
-pub fn apply_terminal_modes(fd: RawFd, modes: &[u8]) -> Result<(), PtyError> {
+pub fn apply_terminal_modes(fd: BorrowedFd<'_>, modes: &[u8]) -> Result<(), PtyError> {
     if modes.is_empty() {
         return Ok(());
     }
 
-    // SAFETY: fd is a valid open PTY slave fd owned by the caller.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut tio = nix::sys::termios::tcgetattr(borrowed).context(OsSnafu)?;
+    let mut tio = nix::sys::termios::tcgetattr(fd).context(OsSnafu)?;
     let mut pos = 0;
 
     while pos < modes.len() {
@@ -174,7 +172,8 @@ pub fn apply_terminal_modes(fd: RawFd, modes: &[u8]) -> Result<(), PtyError> {
             tracing::warn!(opcode, "truncated terminal modes data");
             break;
         }
-        let value = u32::from_be_bytes([modes[pos], modes[pos + 1], modes[pos + 2], modes[pos + 3]]);
+        let value =
+            u32::from_be_bytes([modes[pos], modes[pos + 1], modes[pos + 2], modes[pos + 3]]);
         pos += 4;
 
         match opcode {
@@ -241,7 +240,7 @@ pub fn apply_terminal_modes(fd: RawFd, modes: &[u8]) -> Result<(), PtyError> {
         }
     }
 
-    nix::sys::termios::tcsetattr(borrowed, nix::sys::termios::SetArg::TCSANOW, &tio).context(OsSnafu)?;
+    nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, &tio).context(OsSnafu)?;
     Ok(())
 }
 
@@ -308,6 +307,7 @@ fn iflag_bit(opcode: u8) -> Option<nix::sys::termios::InputFlags> {
         36 => InputFlags::ICRNL,
         38 => InputFlags::IXON,
         39 => InputFlags::IXANY,
+        37 => InputFlags::IUCLC,
         40 => InputFlags::IXOFF,
         41 => InputFlags::IMAXBEL,
         42 => InputFlags::IUTF8,
@@ -340,6 +340,7 @@ fn oflag_bit(opcode: u8) -> Option<nix::sys::termios::OutputFlags> {
     use nix::sys::termios::OutputFlags;
     Some(match opcode {
         70 => OutputFlags::OPOST,
+        71 => OutputFlags::OLCUC,
         72 => OutputFlags::ONLCR,
         73 => OutputFlags::OCRNL,
         74 => OutputFlags::ONOCR,

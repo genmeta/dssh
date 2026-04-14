@@ -25,7 +25,7 @@
 //! | unknown | respond failure |
 
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 use std::sync::Arc;
 
 use snafu::prelude::*;
@@ -225,10 +225,8 @@ where
             let modes: Vec<u8> = req.terminal_modes.as_ref().to_vec();
             let pair = crate::session::pty::allocate_pty(&req).context(AllocPtySnafu)?;
             if !modes.is_empty()
-                && let Err(e) = crate::session::pty::apply_terminal_modes(
-                    pair.slave.as_raw_fd(),
-                    &modes,
-                )
+                && let Err(e) =
+                    crate::session::pty::apply_terminal_modes(pair.slave.as_fd(), &modes)
             {
                 tracing::warn!(error = %snafu::Report::from_error(&e), "failed to apply terminal modes");
             }

@@ -56,15 +56,11 @@ async fn main() {
         let user_info: UserInfo = match &auth_request.credential {
             #[cfg(feature = "pam")]
             AuthCredential::Basic { password, .. } => {
-                genmeta_ssh::session::pam::authenticate(
-                    "sshd",
-                    &auth_request.username,
-                    password,
-                )
-                .await
-                .map_err(|e| AuthError::PamFailed {
-                    reason: Report::from_error(e).to_string(),
-                })?
+                genmeta_ssh::session::pam::authenticate("sshd", &auth_request.username, password)
+                    .await
+                    .map_err(|e| AuthError::PamFailed {
+                        reason: Report::from_error(e).to_string(),
+                    })?
             }
             #[cfg(not(feature = "pam"))]
             AuthCredential::Basic { .. } => {
@@ -95,7 +91,11 @@ async fn main() {
             }
         };
 
-        tracing::info!(uid = user_info.uid, gid = user_info.gid, "authentication succeeded");
+        tracing::info!(
+            uid = user_info.uid,
+            gid = user_info.gid,
+            "authentication succeeded"
+        );
 
         // Capture user info into the inner closure.
         let username = auth_request.username;
@@ -112,7 +112,11 @@ async fn main() {
                             reason: Report::from_error(e).to_string(),
                         }
                     })?;
-                    tracing::info!(uid = user_info.uid, gid = user_info.gid, "privileges dropped");
+                    tracing::info!(
+                        uid = user_info.uid,
+                        gid = user_info.gid,
+                        "privileges dropped"
+                    );
                 }
 
                 // Build Conversation from remoc-proxied streams.
