@@ -325,11 +325,13 @@ async fn relay_output<R: AsyncRead + Unpin + Send>(
                     io::copy(&mut data, &mut stdout)
                         .await
                         .context(WriteStdoutSnafu)?;
+                    stdout.flush().await.context(WriteStdoutSnafu)?;
                 }
                 ReaderEvent::ExtendedData { mut data, .. } => {
                     io::copy(&mut data, &mut stderr)
                         .await
                         .context(WriteStderrSnafu)?;
+                    stderr.flush().await.context(WriteStderrSnafu)?;
                 }
                 ReaderEvent::Notice(incoming) => match &**incoming.request_type() {
                     "exit-status" => {
