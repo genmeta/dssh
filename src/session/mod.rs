@@ -35,6 +35,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// User identity from `/etc/passwd`.
 #[derive(Debug, Clone)]
 pub struct UserInfo {
+    /// Login name.
+    pub username: String,
     /// POSIX user ID.
     pub uid: u32,
     /// POSIX group ID.
@@ -43,6 +45,8 @@ pub struct UserInfo {
     pub home: PathBuf,
     /// User's login shell.
     pub shell: PathBuf,
+    /// Environment variables from PAM modules (populated by `open_session`).
+    pub pam_env: Vec<(String, String)>,
 }
 
 /// Error from [`lookup_user`].
@@ -71,14 +75,39 @@ pub async fn lookup_user(username: &str) -> Result<UserInfo, LookupUserError> {
             .context(lookup_user_error::UserQuerySnafu)?
             .context(lookup_user_error::UserNotFoundSnafu { username })?;
         Ok(UserInfo {
+            username: user.name,
             uid: user.uid.as_raw(),
             gid: user.gid.as_raw(),
             home: user.dir,
             shell: user.shell,
+            pam_env: Vec::new(),
         })
     })
     .await
     .expect("lookup_user blocking task cancelled")
+}
+
+/// Check whether login is prohibited by `/etc/nologin` or `/var/run/nologin`.
+///
+/// Root (uid 0) is always allowed. For non-root users, if either nologin
+/// file exists, login is denied. When PAM is in use, `pam_nologin.so`
+/// handles this check during `acct_mgmt`; this function is the fallback
+/// for non-PAM builds.
+pub fn check_nologin(uid: u32) -> Result<(), String> {
+    if uid == 0 {
+        return Ok(());
+    }
+    for path in &["/etc/nologin", "/var/run/nologin"] {
+        if std::path::Path::new(path).exists() {
+            let msg = std::fs::read_to_string(path).unwrap_or_default();
+            return Err(if msg.is_empty() {
+                "system is unavailable".to_owned()
+            } else {
+                msg
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Snafu)]
@@ -248,6 +277,13 @@ pub struct WindowChangeRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignalRequest {
     pub signal_name: SshString,
+}
+
+/// Client-requested environment variable (RFC 4254 §6.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvRequest {
+    pub name: SshString,
+    pub value: SshString,
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for ExecRequest {
@@ -535,6 +571,42 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for SignalRequest {
         let mut stream = pin!(stream);
         stream
             .encode_one(self.signal_name)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for EnvRequest {
+    type Error = SessionCodecError;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = pin!(stream);
+        Ok(Self {
+            name: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::CodecSnafu)?,
+            value: stream
+                .decode_one()
+                .await
+                .context(session_codec_error::CodecSnafu)?,
+        })
+    }
+}
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for EnvRequest {
+    type Output = ();
+    type Error = SessionCodecError;
+
+    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
+        let mut stream = pin!(stream);
+        stream
+            .encode_one(self.name)
+            .await
+            .context(session_codec_error::CodecSnafu)?;
+        stream
+            .encode_one(self.value)
             .await
             .context(session_codec_error::CodecSnafu)?;
         Ok(())

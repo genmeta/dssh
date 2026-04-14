@@ -14,6 +14,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::Stdio;
 
 use h3x::varint::VarInt;
@@ -27,6 +28,7 @@ use crate::conversation::channel::{
     SshChannelWriter, WriteChannelCloseError, WriteChannelEofError, WriteDataError,
     WriteExtendedDataError,
 };
+use crate::session::dispatcher::SessionConfig;
 use crate::session::pty::PtyPair;
 use crate::session::signal;
 use crate::session::{
@@ -111,6 +113,117 @@ impl<'a> CommandMode<'a> {
             Self::Shell { .. } => vec![],
         }
     }
+
+    /// argv[0] for the spawned process.
+    ///
+    /// For interactive shells, returns `-<basename>` (login shell convention).
+    /// For exec commands, returns the plain basename.
+    fn argv0(&self) -> OsString {
+        let basename = Path::new(self.program())
+            .file_name()
+            .unwrap_or(self.program());
+        match self {
+            Self::Shell { .. } => {
+                let mut s = OsString::from("-");
+                s.push(basename);
+                s
+            }
+            Self::Exec { .. } => basename.to_os_string(),
+        }
+    }
+}
+
+/// Build the environment variable set for the child process.
+///
+/// Follows the OpenSSH `do_setup_env` convention: clear the inherited
+/// environment entirely, then set a well-known baseline.
+fn build_env(config: &SessionConfig, term: Option<&str>, client_env: &[(String, String)]) -> Vec<(OsString, OsString)> {
+    let user = &config.user;
+    let mut env: Vec<(OsString, OsString)> = Vec::with_capacity(16);
+
+    env.push(("USER".into(), (&*user.username).into()));
+    env.push(("LOGNAME".into(), (&*user.username).into()));
+    env.push(("HOME".into(), user.home.as_os_str().into()));
+    env.push(("SHELL".into(), user.shell.as_os_str().into()));
+
+    // PATH: root gets sbin directories, normal users do not.
+    let path = if user.uid == 0 {
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    } else {
+        "/usr/local/bin:/usr/bin:/bin"
+    };
+    env.push(("PATH".into(), path.into()));
+
+    env.push((
+        "MAIL".into(),
+        format!("/var/mail/{}", user.username).into(),
+    ));
+
+    if let Some(t) = term {
+        env.push(("TERM".into(), t.into()));
+    }
+
+    // Inherit TZ from parent if set.
+    if let Ok(tz) = std::env::var("TZ") {
+        env.push(("TZ".into(), tz.into()));
+    }
+
+    // Inherit LANG from parent if set (PAM pam_env.so may override via pam_env below).
+    if let Ok(lang) = std::env::var("LANG") {
+        env.push(("LANG".into(), lang.into()));
+    }
+
+    // /etc/environment: system-wide environment variables (inserted before PAM env
+    // so that PAM modules can override them).
+    for (k, v) in read_environment_file() {
+        env.push((k.into(), v.into()));
+    }
+
+    // PAM environment (may override earlier entries; last-set-wins since
+    // Command::envs uses the last value for duplicate keys).
+    for (k, v) in &config.user.pam_env {
+        env.push((k.into(), v.into()));
+    }
+
+    // Client-requested environment variables (from "env" channel requests).
+    for (k, v) in client_env {
+        env.push((k.into(), v.into()));
+    }
+
+    env
+}
+
+/// Read `/etc/environment` and return `KEY=VALUE` pairs.
+///
+/// Lines that are empty, start with `#`, or do not contain `=` are skipped.
+/// Values may optionally be quoted with single or double quotes, which are
+/// stripped (matching OpenSSH `read_environment_file` behaviour).
+fn read_environment_file() -> Vec<(String, String)> {
+    let content = match std::fs::read_to_string("/etc/environment") {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut result = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            let mut value = value.trim();
+            // Strip optional quotes.
+            if (value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\''))
+            {
+                value = &value[1..value.len() - 1];
+            }
+            if !key.is_empty() {
+                result.push((key.to_owned(), value.to_owned()));
+            }
+        }
+    }
+    result
 }
 
 // ============================================================================
@@ -128,6 +241,9 @@ impl<'a> CommandMode<'a> {
 pub async fn run_piped<R, W>(
     channel: SshChannel<R, W>,
     mode: CommandMode<'_>,
+    config: &SessionConfig,
+    term: Option<&str>,
+    client_env: &[(String, String)],
 ) -> Result<(), ProcessError>
 where
     R: AsyncRead + Unpin + Send,
@@ -135,8 +251,18 @@ where
 {
     use process_error::*;
 
+    let home = &config.user.home;
+    let cwd = if home.is_dir() { home.as_path() } else {
+        tracing::warn!(home = %home.display(), "home directory does not exist, falling back to /");
+        Path::new("/")
+    };
+
     let mut cmd = tokio::process::Command::new(mode.program());
-    cmd.args(mode.args())
+    cmd.arg0(mode.argv0())
+        .args(mode.args())
+        .env_clear()
+        .envs(build_env(config, term, client_env))
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -180,6 +306,9 @@ pub async fn run_pty<R, W>(
     channel: SshChannel<R, W>,
     mode: CommandMode<'_>,
     pty: PtyPair,
+    config: &SessionConfig,
+    term: Option<&str>,
+    client_env: &[(String, String)],
 ) -> Result<(), ProcessError>
 where
     R: AsyncRead + Unpin + Send,
@@ -190,8 +319,18 @@ where
     let stdout_fd = nix::unistd::dup(pty.slave.as_fd()).context(DupFdSnafu)?;
     let stderr_fd = nix::unistd::dup(pty.slave.as_fd()).context(DupFdSnafu)?;
 
+    let home = &config.user.home;
+    let cwd = if home.is_dir() { home.as_path() } else {
+        tracing::warn!(home = %home.display(), "home directory does not exist, falling back to /");
+        Path::new("/")
+    };
+
     let mut cmd = tokio::process::Command::new(mode.program());
-    cmd.args(mode.args())
+    cmd.arg0(mode.argv0())
+        .args(mode.args())
+        .env_clear()
+        .envs(build_env(config, term, client_env))
+        .current_dir(cwd)
         .stdin(pty.slave)
         .stdout(stdout_fd)
         .stderr(stderr_fd);
@@ -514,6 +653,7 @@ where
 mod tests {
     use super::*;
     use crate::conversation::channel::ChannelEvent;
+    use crate::session::dispatcher::SessionConfig;
 
     // Helper: create a mock channel pair (in-memory duplex).
     fn channel_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
@@ -526,6 +666,7 @@ mod tests {
         let (server_reader, server_writer) = tokio::io::split(server_stream);
         let (client_reader, client_writer) = tokio::io::split(client_stream);
 
+        let config = SessionConfig::default();
         let handle = tokio::spawn(async move {
             run_piped(
                 SshChannel::new(server_reader, server_writer),
@@ -533,6 +674,9 @@ mod tests {
                     shell: OsStr::new("/bin/sh"),
                     command: b"echo hello",
                 },
+                &config,
+                None,
+                &[],
             )
             .await
         });
@@ -576,6 +720,7 @@ mod tests {
         let (server_reader, server_writer) = tokio::io::split(server_stream);
         let (client_reader, client_writer) = tokio::io::split(client_stream);
 
+        let config = SessionConfig::default();
         let handle = tokio::spawn(async move {
             run_piped(
                 SshChannel::new(server_reader, server_writer),
@@ -583,6 +728,9 @@ mod tests {
                     shell: OsStr::new("/bin/sh"),
                     command: b"echo err >&2",
                 },
+                &config,
+                None,
+                &[],
             )
             .await
         });
@@ -628,6 +776,7 @@ mod tests {
         let (server_reader, server_writer) = tokio::io::split(server_stream);
         let (client_reader, client_writer) = tokio::io::split(client_stream);
 
+        let config = SessionConfig::default();
         let handle = tokio::spawn(async move {
             run_piped(
                 SshChannel::new(server_reader, server_writer),
@@ -635,6 +784,9 @@ mod tests {
                     shell: OsStr::new("/bin/sh"),
                     command: b"exit 42",
                 },
+                &config,
+                None,
+                &[],
             )
             .await
         });

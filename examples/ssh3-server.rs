@@ -135,7 +135,7 @@ async fn main() {
 
     tracing::info!(bind = %cli.bind, "SSH3 server listening");
     let err = servers.run().await;
-    tracing::error!(error = %err, "server stopped");
+    tracing::error!(error = %snafu::Report::from_error(&err), "server stopped");
 }
 
 fn error_response(status: StatusCode) -> Result<http::Response<BoxBody>, Infallible> {

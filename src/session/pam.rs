@@ -85,15 +85,28 @@ fn authenticate_blocking(
         .acct_mgmt(Flag::NONE)
         .context(pam_auth_error::AccountManagementSnafu)?;
 
+    // Open a PAM session so that pam_lastlog, pam_umask, pam_env etc. run.
+    let session = context
+        .open_session(Flag::NONE)
+        .context(pam_auth_error::OpenSessionSnafu)?;
+
+    let pam_env = extract_pam_env(&context);
+
+    // Leak both session and context — close_session requires root, which we drop later.
+    std::mem::forget(session);
+    std::mem::forget(context);
+
     let user = nix::unistd::User::from_name(username)
         .context(pam_auth_error::UserQuerySnafu)?
         .context(pam_auth_error::UserNotFoundSnafu { username })?;
 
     Ok(UserInfo {
+        username: user.name,
         uid: user.uid.as_raw(),
         gid: user.gid.as_raw(),
         home: user.dir,
         shell: user.shell,
+        pam_env,
     })
 }
 
@@ -133,6 +146,8 @@ fn open_session_blocking(service: &str, username: &str) -> Result<UserInfo, PamA
         .open_session(Flag::NONE)
         .context(pam_auth_error::OpenSessionSnafu)?;
 
+    let pam_env = extract_pam_env(&context);
+
     // Leak both session and context — close_session requires root, which we drop later.
     std::mem::forget(session);
     std::mem::forget(context);
@@ -142,9 +157,25 @@ fn open_session_blocking(service: &str, username: &str) -> Result<UserInfo, PamA
         .context(pam_auth_error::UserNotFoundSnafu { username })?;
 
     Ok(UserInfo {
+        username: user.name,
         uid: user.uid.as_raw(),
         gid: user.gid.as_raw(),
         home: user.dir,
         shell: user.shell,
+        pam_env,
     })
+}
+
+/// Extract PAM environment variables as `Vec<(String, String)>`.
+///
+/// Iterates `pam_getenvlist()` and collects `KEY=VALUE` pairs, skipping
+/// entries that are not valid UTF-8.
+fn extract_pam_env<C>(context: &pam_client2::Context<C>) -> Vec<(String, String)> {
+    context
+        .envlist()
+        .iter_tuples()
+        .filter_map(|(k, v)| {
+            Some((k.to_str()?.to_owned(), v.to_str()?.to_owned()))
+        })
+        .collect()
 }

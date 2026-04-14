@@ -24,9 +24,9 @@
 //! | `"cancel-streamlocal-forward@openssh.com"` | Stop Unix socket listener |
 //! | unknown | respond failure |
 
-use std::sync::Arc;
-
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
 
 use snafu::prelude::*;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -42,7 +42,7 @@ use crate::forward::{
 };
 use crate::session::process::CommandMode;
 use crate::session::pty::PtyPair;
-use crate::session::{ExecRequest, PtyRequest, SessionCodecError};
+use crate::session::{EnvRequest, ExecRequest, PtyRequest, SessionCodecError, UserInfo};
 use h3x::varint::VarInt;
 use tracing::Instrument;
 
@@ -53,8 +53,8 @@ use tracing::Instrument;
 /// Configuration for the session dispatcher.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    /// Path to the user's login shell (e.g. `/bin/bash`).
-    pub shell: std::path::PathBuf,
+    /// Authenticated user identity (includes PAM environment).
+    pub user: UserInfo,
     /// Maximum SSH message size for session channels.
     pub max_message_size: VarInt,
 }
@@ -62,7 +62,14 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            shell: std::path::PathBuf::from("/bin/sh"),
+            user: UserInfo {
+                username: String::from("nobody"),
+                uid: 65534,
+                gid: 65534,
+                home: std::path::PathBuf::from("/"),
+                shell: std::path::PathBuf::from("/bin/sh"),
+                pam_env: Vec::new(),
+            },
             max_message_size: crate::constants::DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
@@ -104,6 +111,10 @@ struct SessionSetup {
     command: Vec<u8>,
     is_shell: bool,
     pty: Option<PtyPair>,
+    /// Terminal type from pty-req (e.g. "xterm-256color").
+    term_type: Option<String>,
+    /// Environment variables requested by the client via "env" requests.
+    client_env: Vec<(String, String)>,
 }
 
 /// Read session channel requests (pty-req, exec, shell) and respond.
@@ -124,6 +135,8 @@ where
     let mut pty_request: Option<PtyRequest> = None;
     let mut command: Option<Vec<u8>> = None;
     let mut is_shell = false;
+    let mut term_type: Option<String> = None;
+    let mut client_env: Vec<(String, String)> = Vec::new();
 
     loop {
         let event = channel.next_event().await.context(ReadEventSnafu)?;
@@ -139,9 +152,22 @@ where
                             .context(DecodePayloadSnafu {
                                 request_type: "pty-req",
                             })?;
+                        term_type = Some(payload.term_type.to_string());
                         pty_request = Some(payload);
                         if let Some(r) = responder {
                             // Respond with success; PTY allocation happens later.
+                            let _ = r.respond_success(EmptyPayload).await.context(RespondSnafu);
+                        }
+                    }
+                    "env" => {
+                        let (payload, responder) = incoming
+                            .decode_payload::<EnvRequest, SessionCodecError>()
+                            .await
+                            .context(DecodePayloadSnafu {
+                                request_type: "env",
+                            })?;
+                        client_env.push((payload.name.to_string(), payload.value.to_string()));
+                        if let Some(r) = responder {
                             let _ = r.respond_success(EmptyPayload).await.context(RespondSnafu);
                         }
                     }
@@ -193,9 +219,21 @@ where
         }
     }
 
-    // Allocate PTY if requested.
+    // Allocate PTY if requested, then apply terminal modes to the slave.
     let pty = match pty_request {
-        Some(req) => Some(crate::session::pty::allocate_pty(&req).context(AllocPtySnafu)?),
+        Some(req) => {
+            let modes: Vec<u8> = req.terminal_modes.as_ref().to_vec();
+            let pair = crate::session::pty::allocate_pty(&req).context(AllocPtySnafu)?;
+            if !modes.is_empty()
+                && let Err(e) = crate::session::pty::apply_terminal_modes(
+                    pair.slave.as_raw_fd(),
+                    &modes,
+                )
+            {
+                tracing::warn!(error = %snafu::Report::from_error(&e), "failed to apply terminal modes");
+            }
+            Some(pair)
+        }
         None => None,
     };
 
@@ -203,6 +241,8 @@ where
         command: command.unwrap_or_default(),
         is_shell,
         pty,
+        term_type,
+        client_env,
     })
 }
 
@@ -277,21 +317,28 @@ where
                                 }
                             };
 
-                            let shell = config.shell.as_os_str();
+                            let shell = config.user.shell.as_os_str();
+                            let term = setup.term_type.as_deref();
+
+                            // Display MOTD for interactive login shell with PTY.
+                            if setup.is_shell && setup.pty.is_some() {
+                                send_motd(&mut channel, &config.user.home).await;
+                            }
+
                             let result = if let Some(pty) = setup.pty {
                                 let mode = if setup.is_shell {
                                     CommandMode::Shell { shell }
                                 } else {
                                     CommandMode::Exec { shell, command: &setup.command }
                                 };
-                                super::process::run_pty(channel, mode, pty).await
+                                super::process::run_pty(channel, mode, pty, &config, term, &setup.client_env).await
                             } else {
                                 let mode = if setup.is_shell {
                                     CommandMode::Shell { shell }
                                 } else {
                                     CommandMode::Exec { shell, command: &setup.command }
                                 };
-                                super::process::run_piped(channel, mode).await
+                                super::process::run_piped(channel, mode, &config, term, &setup.client_env).await
                             };
 
                             if let Err(e) = result {
@@ -380,6 +427,28 @@ where
         if let Err(e) = result {
             tracing::warn!(error = %snafu::Report::from_error(&e), "channel task panicked during shutdown");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MOTD
+// ---------------------------------------------------------------------------
+
+/// Send the message of the day to the channel, unless `~/.hushlogin` exists.
+async fn send_motd<R, W>(channel: &mut SshChannel<R, W>, home: &std::path::Path)
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    if home.join(".hushlogin").exists() {
+        return;
+    }
+    let motd = match std::fs::read("/etc/motd") {
+        Ok(data) if !data.is_empty() => data,
+        _ => return,
+    };
+    if let Err(e) = channel.data(&motd).await {
+        tracing::debug!(error = %snafu::Report::from_error(&e), "failed to send MOTD");
     }
 }
 
