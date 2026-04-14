@@ -277,7 +277,7 @@ impl fmt::Display for Ssh3ProtocolFactory {
     }
 }
 
-impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for Ssh3ProtocolFactory {
+impl<C: quic::Connection> ProductProtocol<C> for Ssh3ProtocolFactory {
     type Protocol = Ssh3Protocol;
 
     fn init<'a>(
