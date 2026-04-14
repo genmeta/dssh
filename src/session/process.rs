@@ -216,11 +216,9 @@ where
     // them), AsyncPtyFd uses epoll for near-zero-latency non-blocking I/O.
     // Separate fds for reader and writer avoid any shared state.
     let master_write_fd = nix::unistd::dup(pty.master.as_fd()).context(DupFdSnafu)?;
-    let mut master_reader =
-        super::pty::AsyncPtyFd::new(pty.master).context(AsyncPtySnafu)?;
+    let mut master_reader = super::pty::AsyncPtyFd::new(pty.master).context(AsyncPtySnafu)?;
     let master_raw_fd = master_reader.as_raw_fd();
-    let master_writer =
-        super::pty::AsyncPtyFd::new(master_write_fd).context(AsyncPtySnafu)?;
+    let master_writer = super::pty::AsyncPtyFd::new(master_write_fd).context(AsyncPtySnafu)?;
 
     let (reader, mut writer) = channel.into_split();
 

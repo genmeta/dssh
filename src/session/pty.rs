@@ -4,10 +4,13 @@
 //! Sections 6.2 and 6.7.
 
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::pin::Pin;
+use std::task::Context;
 
 use nix::libc;
 use nix::pty::{Winsize, openpty};
 use snafu::prelude::*;
+use tokio::io;
 
 use crate::session::{PtyRequest, WindowChangeRequest};
 
@@ -134,7 +137,7 @@ pub fn set_window_size_raw(
 /// unlike `tokio::fs::File` which routes every operation through
 /// `spawn_blocking` and serializes reads and writes.
 pub struct AsyncPtyFd {
-    inner: tokio::io::unix::AsyncFd<OwnedFd>,
+    inner: io::unix::AsyncFd<OwnedFd>,
 }
 
 impl AsyncPtyFd {
@@ -148,7 +151,7 @@ impl AsyncPtyFd {
         oflags |= OFlag::O_NONBLOCK;
         fcntl(&fd, FcntlArg::F_SETFL(oflags)).map_err(std::io::Error::from)?;
         Ok(Self {
-            inner: tokio::io::unix::AsyncFd::new(fd)?,
+            inner: io::unix::AsyncFd::new(fd)?,
         })
     }
 
@@ -158,11 +161,11 @@ impl AsyncPtyFd {
     }
 }
 
-impl tokio::io::AsyncRead for AsyncPtyFd {
+impl io::AsyncRead for AsyncPtyFd {
     fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         loop {
             let mut guard = std::task::ready!(self.inner.poll_read_ready(cx))?;
@@ -180,10 +183,10 @@ impl tokio::io::AsyncRead for AsyncPtyFd {
     }
 }
 
-impl tokio::io::AsyncWrite for AsyncPtyFd {
+impl io::AsyncWrite for AsyncPtyFd {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         loop {
@@ -198,15 +201,15 @@ impl tokio::io::AsyncWrite for AsyncPtyFd {
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
     }
