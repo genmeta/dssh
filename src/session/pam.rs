@@ -90,12 +90,11 @@ fn authenticate_blocking(
         .open_session(Flag::NONE)
         .context(pam_auth_error::OpenSessionSnafu)?;
 
-    // Leak session first to release the mutable borrow on context,
-    // then extract environment variables while context is still alive.
-    std::mem::forget(session);
-    let pam_env = extract_pam_env(&context);
+    // Extract PAM environment from the session while it borrows context.
+    let pam_env = extract_pam_env(&session);
 
-    // Leak context — close_session requires root, which we drop later.
+    // Leak both — close_session requires root, which we drop later.
+    let _ = session.leak();
     std::mem::forget(context);
 
     let user = nix::unistd::User::from_name(username)
@@ -148,12 +147,11 @@ fn open_session_blocking(service: &str, username: &str) -> Result<UserInfo, PamA
         .open_session(Flag::NONE)
         .context(pam_auth_error::OpenSessionSnafu)?;
 
-    // Leak session first to release the mutable borrow on context,
-    // then extract environment variables while context is still alive.
-    std::mem::forget(session);
-    let pam_env = extract_pam_env(&context);
+    // Extract PAM environment from the session while it borrows context.
+    let pam_env = extract_pam_env(&session);
 
-    // Leak context — close_session requires root, which we drop later.
+    // Leak both — close_session requires root, which we drop later.
+    let _ = session.leak();
     std::mem::forget(context);
 
     let user = nix::unistd::User::from_name(username)
@@ -172,10 +170,12 @@ fn open_session_blocking(service: &str, username: &str) -> Result<UserInfo, PamA
 
 /// Extract PAM environment variables as `Vec<(String, String)>`.
 ///
-/// Iterates `pam_getenvlist()` and collects `KEY=VALUE` pairs, skipping
-/// entries that are not valid UTF-8.
-fn extract_pam_env<C>(context: &pam_client2::Context<C>) -> Vec<(String, String)> {
-    context
+/// Calls `pam_getenvlist()` via the session handle and collects `KEY=VALUE`
+/// pairs, skipping entries that are not valid UTF-8.
+fn extract_pam_env<C: pam_client2::ConversationHandler>(
+    session: &pam_client2::Session<'_, C>,
+) -> Vec<(String, String)> {
+    session
         .envlist()
         .iter_tuples()
         .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v.to_str()?.to_owned())))
