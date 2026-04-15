@@ -352,7 +352,7 @@ where
             // Set the PTY slave (already on fd 0/1/2) as the controlling terminal.
             // Without this, the shell has no controlling TTY and job control fails
             // ("tcgetpgrp failed", "setpgid: Inappropriate ioctl for device").
-            if nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) < 0 {
+            if nix::libc::ioctl(0, nix::libc::TIOCSCTTY as nix::libc::c_ulong, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

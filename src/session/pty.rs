@@ -297,22 +297,22 @@ fn cc_index(opcode: u8) -> Option<usize> {
 /// Map iflag opcode (30–42) to `nix::sys::termios::InputFlags` bit.
 fn iflag_bit(opcode: u8) -> Option<nix::sys::termios::InputFlags> {
     use nix::sys::termios::InputFlags;
-    Some(match opcode {
-        30 => InputFlags::IGNPAR,
-        31 => InputFlags::PARMRK,
-        32 => InputFlags::INPCK,
-        33 => InputFlags::ISTRIP,
-        34 => InputFlags::INLCR,
-        35 => InputFlags::IGNCR,
-        36 => InputFlags::ICRNL,
-        38 => InputFlags::IXON,
-        39 => InputFlags::IXANY,
-        37 => InputFlags::IUCLC,
-        40 => InputFlags::IXOFF,
-        41 => InputFlags::IMAXBEL,
-        42 => InputFlags::IUTF8,
-        _ => return None,
-    })
+    match opcode {
+        30 => Some(InputFlags::IGNPAR),
+        31 => Some(InputFlags::PARMRK),
+        32 => Some(InputFlags::INPCK),
+        33 => Some(InputFlags::ISTRIP),
+        34 => Some(InputFlags::INLCR),
+        35 => Some(InputFlags::IGNCR),
+        36 => Some(InputFlags::ICRNL),
+        37 => iuclc_bit(),
+        38 => Some(InputFlags::IXON),
+        39 => Some(InputFlags::IXANY),
+        40 => Some(InputFlags::IXOFF),
+        41 => Some(InputFlags::IMAXBEL),
+        42 => Some(InputFlags::IUTF8),
+        _ => None,
+    }
 }
 
 /// Map lflag opcode (50–62) to `nix::sys::termios::LocalFlags` bit.
@@ -338,15 +338,35 @@ fn lflag_bit(opcode: u8) -> Option<nix::sys::termios::LocalFlags> {
 /// Map oflag opcode (70–75) to `nix::sys::termios::OutputFlags` bit.
 fn oflag_bit(opcode: u8) -> Option<nix::sys::termios::OutputFlags> {
     use nix::sys::termios::OutputFlags;
-    Some(match opcode {
-        70 => OutputFlags::OPOST,
-        71 => OutputFlags::OLCUC,
-        72 => OutputFlags::ONLCR,
-        73 => OutputFlags::OCRNL,
-        74 => OutputFlags::ONOCR,
-        75 => OutputFlags::ONLRET,
-        _ => return None,
-    })
+    match opcode {
+        70 => Some(OutputFlags::OPOST),
+        71 => olcuc_bit(),
+        72 => Some(OutputFlags::ONLCR),
+        73 => Some(OutputFlags::OCRNL),
+        74 => Some(OutputFlags::ONOCR),
+        75 => Some(OutputFlags::ONLRET),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn iuclc_bit() -> Option<nix::sys::termios::InputFlags> {
+    Some(nix::sys::termios::InputFlags::IUCLC)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn iuclc_bit() -> Option<nix::sys::termios::InputFlags> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn olcuc_bit() -> Option<nix::sys::termios::OutputFlags> {
+    Some(nix::sys::termios::OutputFlags::OLCUC)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn olcuc_bit() -> Option<nix::sys::termios::OutputFlags> {
+    None
 }
 
 /// Map cflag opcode (90–93) to `nix::sys::termios::ControlFlags` bit.
