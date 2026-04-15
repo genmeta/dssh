@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod byte_channel;
 pub mod channel;
+#[cfg(feature = "client")]
 pub mod client;
 pub mod codec;
 #[cfg(feature = "config")]

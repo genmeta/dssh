@@ -9,7 +9,8 @@
 //!
 //! Each session spawns a child process (`--session-binary <path>`) that
 //! performs PAM authentication and runs the session after dropping
-//! privileges. Communication uses remoc RFnOnce over stdin/stdout.
+//! privileges. Communication uses remoc RPC over a MuxChannel socketpair,
+//! with stream data forwarded via FD-passing Unix socketpairs.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -23,18 +24,17 @@ use bytes::Bytes;
 use clap::Parser;
 use genmeta_ssh::{
     auth::{AuthCredential, parse_authorization_header},
-    client::SSH3_CONNECT_PATH,
-    constants::SSH_VERSION,
-    conversation::remoc::{ManageStreamBridge, RemoteManageStreamServerShared},
+    constants::{SSH_VERSION, SSH3_CONNECT_PATH},
+    conversation::ipc::{IpcManageSessionStreamServerShared, IpcManageStreamAdapter},
     protocol::Ssh3ProtocolFactory,
     session::{AuthRequest, AuthenticateFn, SessionBootstrap},
 };
 use h3x::connection::ConnectionBuilder;
 use h3x::dquic::H3Servers;
 use h3x::hyper::server::TowerService;
+use h3x::ipc::transport::MuxChannel;
 use h3x::message::stream::MessageStreamError;
 use h3x::protocol::Protocols;
-use h3x::remoc::message::{ReadMessageStreamServer, WriteMessageStreamServer};
 use h3x::server::Router;
 use h3x::stream_id::StreamId;
 use http::StatusCode;
@@ -202,7 +202,7 @@ async fn handle_ssh3_connect(
     let handle = match ssh3_proto.register(conversation_id) {
         Ok(h) => h,
         Err(e) => {
-            tracing::error!(error = %snafu::Report::from_error(&e), "register failed");
+            tracing::error!(error = %Report::from_error(&e), "register failed");
             return error_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -221,8 +221,12 @@ async fn handle_ssh3_connect(
 
 /// Child-process session: spawn ssh3-session, PAM auth via remoc RFnOnce.
 ///
+/// Communication uses a MuxChannel socketpair (remoc RPC + FD passing):
+/// - remoc channel for RFnOnce exchange and IpcManageSessionStream RPC
+/// - FD sideband for control stream and per-stream Unix socketpairs
+///
 /// PAM authentication happens synchronously before the response is sent.
-/// On success, spawns a task that waits for upgrade, sets up remoc stream
+/// On success, spawns a task that waits for upgrade, sets up FD-based stream
 /// serving, and calls the child's StartSessionFn.
 async fn handle_child_process(
     mut request: http::Request<BoxBody>,
@@ -235,10 +239,19 @@ async fn handle_child_process(
 ) -> Result<http::Response<BoxBody>, Infallible> {
     let span = tracing::info_span!("child-session", %conversation_id, user = %username);
 
-    // Spawn the session child process.
+    // Create MuxChannel socketpair for parent↔child IPC.
+    let (parent_mux, child_fd) = match MuxChannel::create_pair() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(error = %Report::from_error(&e), "failed to create MuxChannel pair");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    // Spawn the session child process with the MuxChannel FD on stdin.
     let mut child = match tokio::process::Command::new(session_binary)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdin(child_fd)
+        .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
     {
@@ -249,22 +262,30 @@ async fn handle_child_process(
         }
     };
 
-    let child_stdin = child.stdin.take().unwrap();
-    let child_stdout = child.stdout.take().unwrap();
+    // Split MuxChannel and establish remoc connection.
+    let (sink, stream) = match parent_mux.split() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(error = %Report::from_error(&e), "failed to split MuxChannel");
+            let _ = child.kill().await;
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
-    // Establish remoc channel: we receive AuthenticateFn from the child.
-    let (conn, _tx, mut rx) = match remoc::Connect::io::<
+    let fd_sender = sink.fd_sender();
+
+    let (conn, _tx, mut rx) = match remoc::Connect::framed::<
         _,
         _,
         (),
         AuthenticateFn,
         remoc::codec::Default,
-    >(remoc::Cfg::default(), child_stdout, child_stdin)
+    >(remoc::Cfg::default(), sink, stream)
     .await
     {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %Report::from_error(&e), "failed to establish remoc channel with child");
+            tracing::error!(error = %Report::from_error(&e), "failed to establish remoc channel");
             let _ = child.kill().await;
             return error_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -301,8 +322,7 @@ async fn handle_child_process(
     // to complete (streams become available after the response is sent).
     tokio::spawn(
         async move {
-            // Takeover the raw ReadStream/WriteStream individually so we can
-            // obtain bytes_stream/bytes_sink for remoc message-level serving.
+            // Takeover the raw ReadStream/WriteStream for the SSH3 control channel.
             let (read_stream, write_stream) = {
                 use h3x::hyper::upgrade::{self, ReadStream, WriteStream};
 
@@ -319,28 +339,52 @@ async fn handle_child_process(
                 }
             };
 
-            // Serve control streams via remoc so the child can use them.
-            let (rs, rc) =
-                ReadMessageStreamServer::new(Box::pin(read_stream.into_bytes_stream()), 1);
-            tokio::spawn(
-                async move {
-                    let _ = rs.serve().await;
+            // Set up control stream via Unix socketpair + FD passing.
+            let (ctrl_srv, ctrl_cli) = match std::os::unix::net::UnixStream::pair() {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::error!(error = %Report::from_error(&e), "control socketpair failed");
+                    let _ = child.kill().await;
+                    return;
                 }
+            };
+            let ctrl_fd_id = match fd_sender.queue_fds(vec![ctrl_cli.into()]) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %Report::from_error(&e), "queue control FD failed");
+                    let _ = child.kill().await;
+                    return;
+                }
+            };
+            let ctrl_srv = match tokio::net::UnixStream::from_std(ctrl_srv) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %Report::from_error(&e), "control from_std failed");
+                    let _ = child.kill().await;
+                    return;
+                }
+            };
+            let (ctrl_read, ctrl_write) = ctrl_srv.into_split();
+
+            // Bridge QUIC CONNECT streams ↔ control stream socketpair.
+            tokio::spawn(
+                genmeta_ssh::conversation::ipc::bridge_message_reader_to_unix(
+                    Box::pin(read_stream.into_bytes_stream()),
+                    ctrl_write,
+                )
+                .in_current_span(),
+            );
+            tokio::spawn(
+                genmeta_ssh::conversation::ipc::bridge_unix_to_message_writer(
+                    ctrl_read,
+                    Box::pin(write_stream.into_bytes_sink()),
+                )
                 .in_current_span(),
             );
 
-            let (ws, wc) =
-                WriteMessageStreamServer::new(Box::pin(write_stream.into_bytes_sink()), 1);
-            tokio::spawn(
-                async move {
-                    let _ = ws.serve().await;
-                }
-                .in_current_span(),
-            );
-
-            // Serve the stream management bridge via remoc.
-            let bridge = ManageStreamBridge::new(handle);
-            let (ms, mc) = RemoteManageStreamServerShared::new(Arc::new(bridge), 1);
+            // Serve the stream management bridge via IPC FD passing.
+            let adapter = IpcManageStreamAdapter::new(handle, fd_sender);
+            let (ms, mc) = IpcManageSessionStreamServerShared::new(Arc::new(adapter), 1);
             tokio::spawn(
                 async move {
                     let _ = ms.serve(true).await;
@@ -350,8 +394,7 @@ async fn handle_child_process(
 
             let bootstrap = SessionBootstrap {
                 manage_stream: mc,
-                control_reader: rc,
-                control_writer: wc,
+                control_fd_id: ctrl_fd_id,
                 conversation_id,
                 peer_version,
             };

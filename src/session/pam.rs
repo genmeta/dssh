@@ -90,10 +90,12 @@ fn authenticate_blocking(
         .open_session(Flag::NONE)
         .context(pam_auth_error::OpenSessionSnafu)?;
 
+    // Leak session first to release the mutable borrow on context,
+    // then extract environment variables while context is still alive.
+    std::mem::forget(session);
     let pam_env = extract_pam_env(&context);
 
-    // Leak both session and context — close_session requires root, which we drop later.
-    std::mem::forget(session);
+    // Leak context — close_session requires root, which we drop later.
     std::mem::forget(context);
 
     let user = nix::unistd::User::from_name(username)
@@ -146,10 +148,12 @@ fn open_session_blocking(service: &str, username: &str) -> Result<UserInfo, PamA
         .open_session(Flag::NONE)
         .context(pam_auth_error::OpenSessionSnafu)?;
 
+    // Leak session first to release the mutable borrow on context,
+    // then extract environment variables while context is still alive.
+    std::mem::forget(session);
     let pam_env = extract_pam_env(&context);
 
-    // Leak both session and context — close_session requires root, which we drop later.
-    std::mem::forget(session);
+    // Leak context — close_session requires root, which we drop later.
     std::mem::forget(context);
 
     let user = nix::unistd::User::from_name(username)

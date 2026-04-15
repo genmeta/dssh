@@ -1,7 +1,12 @@
+#[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "server")]
 pub mod direct;
+#[cfg(feature = "server")]
 pub mod reverse;
+#[cfg(feature = "server")]
 pub mod socks5;
+#[cfg(feature = "client")]
 pub mod spec;
 
 use crate::codec::{CodecError, SshString};

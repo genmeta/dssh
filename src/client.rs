@@ -6,7 +6,8 @@ use base64::engine::{Engine, general_purpose::STANDARD};
 use http::HeaderValue;
 
 /// Well-known path for SSH3 Extended CONNECT requests.
-pub const SSH3_CONNECT_PATH: &str = "/.well-known/ssh3/connect";
+#[deprecated(note = "use `constants::SSH3_CONNECT_PATH` instead")]
+pub use crate::constants::SSH3_CONNECT_PATH;
 
 /// Encode Basic auth header value: `Basic base64(username:password)`.
 pub fn encode_basic_auth(username: &str, password: &str) -> HeaderValue {

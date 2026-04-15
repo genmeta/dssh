@@ -9,16 +9,21 @@
 //! - [`Signal`](signal::Signal) for SSH signal handling
 //! - Bootstrap types for privilege-separated child processes
 
+#[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "server")]
 pub mod dispatcher;
 #[cfg(feature = "pam")]
 pub mod pam;
+#[cfg(feature = "server")]
 pub mod privilege;
+#[cfg(feature = "server")]
 pub mod process;
+#[cfg(feature = "server")]
 pub mod pty;
+#[cfg(feature = "server")]
 pub mod signal;
 
-use std::path::PathBuf;
 use std::pin::pin;
 
 use crate::{
@@ -26,89 +31,239 @@ use crate::{
     conversation::{EmptyPayload, NotifyChannelRequest, WantReplyChannelRequest},
 };
 use h3x::codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto};
-use h3x::stream_id::StreamId;
 use h3x::varint::VarInt;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use snafu::{OptionExt, ResultExt, Snafu};
+use serde::{Deserialize, Serialize};
+use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// User identity from `/etc/passwd`.
-#[derive(Debug, Clone)]
-pub struct UserInfo {
-    /// Login name.
-    pub username: String,
-    /// POSIX user ID.
-    pub uid: u32,
-    /// POSIX group ID.
-    pub gid: u32,
-    /// User's home directory.
-    pub home: PathBuf,
-    /// User's login shell.
-    pub shell: PathBuf,
-    /// Environment variables from PAM modules (populated by `open_session`).
-    pub pam_env: Vec<(String, String)>,
-}
+// =========================================================================
+// Server-only types: user identity, authentication, session bootstrap
+// =========================================================================
 
-/// Error from [`lookup_user`].
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum LookupUserError {
-    /// Failed to query `/etc/passwd` for the user.
-    #[snafu(display("failed to query user from /etc/passwd"))]
-    UserQuery { source: nix::Error },
+#[cfg(feature = "server")]
+mod server {
+    use std::path::PathBuf;
 
-    /// The username does not exist in `/etc/passwd`.
-    #[snafu(display("user not found in /etc/passwd: {username}"))]
-    UserNotFound { username: String },
-}
+    use h3x::stream_id::StreamId;
+    use h3x::varint::VarInt;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use snafu::{OptionExt, ResultExt, Snafu};
 
-/// Look up a user in `/etc/passwd` by name.
-///
-/// This does **not** perform any authentication; it only reads the
-/// system user database.  Used as a fallback when PAM is unavailable
-/// and the client has already been authenticated at the transport
-/// layer (mTLS).
-pub async fn lookup_user(username: &str) -> Result<UserInfo, LookupUserError> {
-    let username = username.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let user = nix::unistd::User::from_name(&username)
-            .context(lookup_user_error::UserQuerySnafu)?
-            .context(lookup_user_error::UserNotFoundSnafu { username })?;
-        Ok(UserInfo {
-            username: user.name,
-            uid: user.uid.as_raw(),
-            gid: user.gid.as_raw(),
-            home: user.dir,
-            shell: user.shell,
-            pam_env: Vec::new(),
-        })
-    })
-    .await
-    .expect("lookup_user blocking task cancelled")
-}
-
-/// Check whether login is prohibited by `/etc/nologin` or `/var/run/nologin`.
-///
-/// Root (uid 0) is always allowed. For non-root users, if either nologin
-/// file exists, login is denied. When PAM is in use, `pam_nologin.so`
-/// handles this check during `acct_mgmt`; this function is the fallback
-/// for non-PAM builds.
-pub fn check_nologin(uid: u32) -> Result<(), String> {
-    if uid == 0 {
-        return Ok(());
+    /// User identity from `/etc/passwd`.
+    #[derive(Debug, Clone)]
+    pub struct UserInfo {
+        /// Login name.
+        pub username: String,
+        /// POSIX user ID.
+        pub uid: u32,
+        /// POSIX group ID.
+        pub gid: u32,
+        /// User's home directory.
+        pub home: PathBuf,
+        /// User's login shell.
+        pub shell: PathBuf,
+        /// Environment variables from PAM modules (populated by `open_session`).
+        pub pam_env: Vec<(String, String)>,
     }
-    for path in &["/etc/nologin", "/var/run/nologin"] {
-        if std::path::Path::new(path).exists() {
-            let msg = std::fs::read_to_string(path).unwrap_or_default();
-            return Err(if msg.is_empty() {
-                "system is unavailable".to_owned()
-            } else {
-                msg
-            });
+
+    /// Error from [`lookup_user`].
+    #[derive(Debug, Snafu)]
+    #[snafu(module)]
+    pub enum LookupUserError {
+        /// Failed to query `/etc/passwd` for the user.
+        #[snafu(display("failed to query user from /etc/passwd"))]
+        UserQuery { source: nix::Error },
+
+        /// The username does not exist in `/etc/passwd`.
+        #[snafu(display("user not found in /etc/passwd: {username}"))]
+        UserNotFound { username: String },
+    }
+
+    /// Look up a user in `/etc/passwd` by name.
+    ///
+    /// This does **not** perform any authentication; it only reads the
+    /// system user database.  Used as a fallback when PAM is unavailable
+    /// and the client has already been authenticated at the transport
+    /// layer (mTLS).
+    pub async fn lookup_user(username: &str) -> Result<UserInfo, LookupUserError> {
+        let username = username.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let user = nix::unistd::User::from_name(&username)
+                .context(lookup_user_error::UserQuerySnafu)?
+                .context(lookup_user_error::UserNotFoundSnafu { username })?;
+            Ok(UserInfo {
+                username: user.name,
+                uid: user.uid.as_raw(),
+                gid: user.gid.as_raw(),
+                home: user.dir,
+                shell: user.shell,
+                pam_env: Vec::new(),
+            })
+        })
+        .await
+        .expect("lookup_user blocking task cancelled")
+    }
+
+    /// Check whether login is prohibited by `/etc/nologin` or `/var/run/nologin`.
+    ///
+    /// Root (uid 0) is always allowed. For non-root users, if either nologin
+    /// file exists, login is denied. When PAM is in use, `pam_nologin.so`
+    /// handles this check during `acct_mgmt`; this function is the fallback
+    /// for non-PAM builds.
+    pub fn check_nologin(uid: u32) -> Result<(), String> {
+        if uid == 0 {
+            return Ok(());
+        }
+        for path in &["/etc/nologin", "/var/run/nologin"] {
+            if std::path::Path::new(path).exists() {
+                let msg = std::fs::read_to_string(path).unwrap_or_default();
+                return Err(if msg.is_empty() {
+                    "system is unavailable".to_owned()
+                } else {
+                    msg
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Argument to the outer [`AuthenticateFn`]: carries the credential to the child
+    /// process for PAM authentication.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AuthRequest {
+        /// Username extracted from the HTTP Authorization header.
+        pub username: String,
+        /// Authentication credential for PAM.
+        pub credential: crate::auth::AuthCredential,
+    }
+
+    /// Argument to the inner [`StartSessionFn`]: everything the child needs to
+    /// construct a [`Conversation`](crate::conversation::Conversation) after
+    /// authentication succeeds and the parent completes the HTTP upgrade.
+    ///
+    /// Stream data travels through Unix socketpairs via FD passing, not through
+    /// remoc serialization. The `manage_stream` field provides an RPC interface
+    /// that returns FD-registry batch IDs; the `control_fd_id` identifies the
+    /// pre-established control stream socketpair.
+    #[derive(Serialize, Deserialize)]
+    pub struct SessionBootstrap {
+        /// RPC client for opening/accepting QUIC streams via IPC FD passing.
+        pub manage_stream: crate::conversation::ipc::IpcManageSessionStreamClient,
+        /// FD-registry batch ID for the control stream socketpair.
+        ///
+        /// The child calls [`FdRegistry::wait_fds`](h3x::ipc::transport::FdRegistry::wait_fds)
+        /// with this ID to receive a single `OwnedFd` for a bidirectional Unix
+        /// socketpair. One half carries data from the SSH3 client (control reader),
+        /// the other half carries data to the SSH3 client (control writer).
+        pub control_fd_id: VarInt,
+        /// Unique session identifier.
+        #[serde(
+            serialize_with = "serialize_stream_id",
+            deserialize_with = "deserialize_stream_id"
+        )]
+        pub conversation_id: StreamId,
+        /// Negotiated SSH version string.
+        pub peer_version: String,
+    }
+
+    /// Error returned by the outer [`AuthenticateFn`] when PAM authentication or
+    /// user lookup fails.
+    #[derive(Debug, Snafu, Serialize, Deserialize)]
+    #[snafu(module)]
+    pub enum AuthError {
+        /// PAM authentication or account management failed.
+        #[snafu(display("PAM authentication failed: {reason}"))]
+        PamFailed {
+            /// Human-readable reason from PAM.
+            reason: String,
+        },
+
+        /// The authenticated user does not exist in `/etc/passwd`.
+        #[snafu(display("user not found: {username}"))]
+        UserNotFound {
+            /// The username that was looked up.
+            username: String,
+        },
+
+        /// The remote function call itself failed (transport error).
+        #[snafu(display("remote call failed"))]
+        RemoteCall {
+            /// The underlying call error.
+            source: remoc::rfn::CallError,
+        },
+    }
+
+    impl From<remoc::rfn::CallError> for AuthError {
+        fn from(source: remoc::rfn::CallError) -> Self {
+            Self::RemoteCall { source }
         }
     }
-    Ok(())
+
+    /// Error returned by the inner [`StartSessionFn`] when the session fails to
+    /// start (privilege drop failure, etc.).
+    #[derive(Debug, Snafu, Serialize, Deserialize)]
+    #[snafu(module)]
+    pub enum SessionRunError {
+        /// Dropping privileges to the target user failed.
+        #[snafu(display("failed to drop privileges: {reason}"))]
+        DropPrivileges {
+            /// Human-readable reason for the failure.
+            reason: String,
+        },
+
+        /// Building the [`Conversation`](crate::conversation::Conversation) failed.
+        #[snafu(display("failed to build conversation: {reason}"))]
+        ConversationBuild {
+            /// Human-readable reason for the failure.
+            reason: String,
+        },
+
+        /// The remote function call itself failed (transport error).
+        #[snafu(display("remote call failed"))]
+        RemoteCall {
+            /// The underlying call error.
+            source: remoc::rfn::CallError,
+        },
+    }
+
+    impl From<remoc::rfn::CallError> for SessionRunError {
+        fn from(source: remoc::rfn::CallError) -> Self {
+            Self::RemoteCall { source }
+        }
+    }
+
+    /// Outer remote function: the child creates this and sends it to the parent.
+    ///
+    /// When the parent calls it with [`AuthRequest`], the child performs PAM
+    /// authentication. On success it returns a [`StartSessionFn`] continuation;
+    /// on failure it returns [`AuthError`].
+    pub type AuthenticateFn =
+        remoc::rfn::RFnOnce<(AuthRequest,), Result<StartSessionFn, AuthError>>;
+
+    /// Inner remote function: returned by [`AuthenticateFn`] on success.
+    ///
+    /// When the parent calls it with [`SessionBootstrap`] (after HTTP upgrade),
+    /// the child drops privileges and runs the session dispatcher.
+    pub type StartSessionFn = remoc::rfn::RFnOnce<(SessionBootstrap,), Result<(), SessionRunError>>;
+
+    fn serialize_stream_id<S>(stream_id: &StreamId, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u64(stream_id.into_inner())
+    }
+
+    fn deserialize_stream_id<'de, D>(deserializer: D) -> Result<StreamId, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = u64::deserialize(deserializer)?;
+        StreamId::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
+
+#[cfg(feature = "server")]
+pub use server::*;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), module)]
@@ -122,116 +277,6 @@ pub enum SessionCodecError {
     #[snafu(display("session stream write failed"))]
     WriteIo { source: std::io::Error },
 }
-
-/// Argument to the outer [`AuthenticateFn`]: carries the credential to the child
-/// process for PAM authentication.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthRequest {
-    /// Username extracted from the HTTP Authorization header.
-    pub username: String,
-    /// Authentication credential for PAM.
-    pub credential: crate::auth::AuthCredential,
-}
-
-/// Argument to the inner [`StartSessionFn`]: everything the child needs to
-/// construct a [`Conversation`](crate::conversation::Conversation) after
-/// authentication succeeds and the parent completes the HTTP upgrade.
-#[derive(Serialize, Deserialize)]
-pub struct SessionBootstrap {
-    /// Remoc proxy for opening/accepting QUIC streams.
-    pub manage_stream: crate::conversation::remoc::RemoteManageStreamClient,
-    /// Remoc-proxied control stream reader (message-level, HTTP/3 DATA framed).
-    pub control_reader: h3x::remoc::message::ReadMessageStreamClient,
-    /// Remoc-proxied control stream writer (message-level, HTTP/3 DATA framed).
-    pub control_writer: h3x::remoc::message::WriteMessageStreamClient,
-    /// Unique session identifier.
-    #[serde(
-        serialize_with = "serialize_stream_id",
-        deserialize_with = "deserialize_stream_id"
-    )]
-    pub conversation_id: StreamId,
-    /// Negotiated SSH version string.
-    pub peer_version: String,
-}
-
-/// Error returned by the outer [`AuthenticateFn`] when PAM authentication or
-/// user lookup fails.
-#[derive(Debug, Snafu, Serialize, Deserialize)]
-#[snafu(module)]
-pub enum AuthError {
-    /// PAM authentication or account management failed.
-    #[snafu(display("PAM authentication failed: {reason}"))]
-    PamFailed {
-        /// Human-readable reason from PAM.
-        reason: String,
-    },
-
-    /// The authenticated user does not exist in `/etc/passwd`.
-    #[snafu(display("user not found: {username}"))]
-    UserNotFound {
-        /// The username that was looked up.
-        username: String,
-    },
-
-    /// The remote function call itself failed (transport error).
-    #[snafu(display("remote call failed"))]
-    RemoteCall {
-        /// The underlying call error.
-        source: remoc::rfn::CallError,
-    },
-}
-
-impl From<remoc::rfn::CallError> for AuthError {
-    fn from(source: remoc::rfn::CallError) -> Self {
-        Self::RemoteCall { source }
-    }
-}
-
-/// Error returned by the inner [`StartSessionFn`] when the session fails to
-/// start (privilege drop failure, etc.).
-#[derive(Debug, Snafu, Serialize, Deserialize)]
-#[snafu(module)]
-pub enum SessionRunError {
-    /// Dropping privileges to the target user failed.
-    #[snafu(display("failed to drop privileges: {reason}"))]
-    DropPrivileges {
-        /// Human-readable reason for the failure.
-        reason: String,
-    },
-
-    /// Building the [`Conversation`](crate::conversation::Conversation) failed.
-    #[snafu(display("failed to build conversation: {reason}"))]
-    ConversationBuild {
-        /// Human-readable reason for the failure.
-        reason: String,
-    },
-
-    /// The remote function call itself failed (transport error).
-    #[snafu(display("remote call failed"))]
-    RemoteCall {
-        /// The underlying call error.
-        source: remoc::rfn::CallError,
-    },
-}
-
-impl From<remoc::rfn::CallError> for SessionRunError {
-    fn from(source: remoc::rfn::CallError) -> Self {
-        Self::RemoteCall { source }
-    }
-}
-
-/// Outer remote function: the child creates this and sends it to the parent.
-///
-/// When the parent calls it with [`AuthRequest`], the child performs PAM
-/// authentication. On success it returns a [`StartSessionFn`] continuation;
-/// on failure it returns [`AuthError`].
-pub type AuthenticateFn = remoc::rfn::RFnOnce<(AuthRequest,), Result<StartSessionFn, AuthError>>;
-
-/// Inner remote function: returned by [`AuthenticateFn`] on success.
-///
-/// When the parent calls it with [`SessionBootstrap`] (after HTTP upgrade),
-/// the child drops privileges and runs the session dispatcher.
-pub type StartSessionFn = remoc::rfn::RFnOnce<(SessionBootstrap,), Result<(), SessionRunError>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecRequest {
@@ -782,21 +827,6 @@ impl NotifyChannelRequest for ExitSignalChannelNotice {
     }
 }
 
-fn serialize_stream_id<S>(stream_id: &StreamId, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_u64(stream_id.into_inner())
-}
-
-fn deserialize_stream_id<'de, D>(deserializer: D) -> Result<StreamId, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw = u64::deserialize(deserializer)?;
-    StreamId::try_from(raw).map_err(serde::de::Error::custom)
-}
-
 /// Serializable error type for RTC method returns.
 ///
 /// This type crosses process boundaries via remoc, so it must be fully serializable.
@@ -936,6 +966,7 @@ impl From<std::io::ErrorKind> for IoErrorKind {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "server")]
     #[test]
     fn auth_request_roundtrip() {
         let req = AuthRequest {
@@ -950,6 +981,7 @@ mod tests {
         assert_eq!(decoded.username, "alice");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn auth_error_display() {
         let err = AuthError::PamFailed {
@@ -966,6 +998,7 @@ mod tests {
         assert_eq!(err.to_string(), "user not found: nobody");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn session_run_error_display() {
         let err = SessionRunError::DropPrivileges {

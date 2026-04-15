@@ -1,15 +1,18 @@
-//! SSH3 session child process.
+//! SSH3 session child process example.
 //!
-//! Launched by the gateway (ssh3-server) as a privilege-separated subprocess.
-//! Communicates with the parent via a remoc channel over stdin/stdout using
-//! nested [`RFnOnce`](remoc::rfn::RFnOnce) remote functions.
+//! Spawned by the SSH3 server (ssh3-server example) for each connection.
+//! Communicates with the parent via remoc RPC over a MuxChannel socketpair
+//! received on stdin (FD 0).
 //!
 //! Flow:
-//! 1. Create a nested `AuthenticateFn` closure and send it to the parent
-//! 2. Parent calls the outer fn with [`AuthRequest`] → child runs PAM
-//! 3. On success, return inner `StartSessionFn` to parent
-//! 4. Parent calls inner fn with [`SessionBootstrap`] → child drops
-//!    privileges and runs the session dispatcher
+//! 1. Send `AuthenticateFn` to parent over remoc
+//! 2. Parent calls it with `AuthRequest` → child runs PAM authentication
+//! 3. On success, return `StartSessionFn` to parent
+//! 4. Parent calls it with `SessionBootstrap` → child drops privileges
+//!    and runs the session dispatcher
+//!
+//! Stream data travels through FD-passed Unix socketpairs, not through
+//! remoc serialization.
 
 use std::sync::Arc;
 
@@ -22,50 +25,57 @@ use genmeta_ssh::{
         privilege::drop_privileges,
     },
 };
+use h3x::ipc::transport::MuxChannel;
 use snafu::Report;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 #[tokio::main]
 async fn main() {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install default crypto provider");
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
 
-    // Establish remoc channel over stdin/stdout.
-    // Parent receives AuthenticateFn; child sends it.
-    let (conn, mut tx, _rx) = remoc::Connect::io::<
+    // Recover the MuxChannel FD from stdin (passed by the parent process).
+    let mux_fd = {
+        use std::os::fd::FromRawFd;
+        // SAFETY: the parent process passed the socketpair FD as our stdin
+        // (FD 0) via tokio::process::Command.
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(0) }
+    };
+
+    let mux = MuxChannel::from_fd(mux_fd).expect("failed to create MuxChannel from stdin");
+    let (sink, stream) = mux.split().expect("failed to split MuxChannel");
+
+    // Capture FD registry before remoc consumes the stream.
+    let fd_registry = stream.fd_registry();
+
+    // Establish remoc channel over MuxSink/MuxStream.
+    let (conn, mut tx, _rx) = remoc::Connect::framed::<
         _,
         _,
         genmeta_ssh::session::AuthenticateFn,
         (),
         remoc::codec::Default,
-    >(remoc::Cfg::default(), stdin, stdout)
+    >(remoc::Cfg::default(), sink, stream)
     .await
     .expect("failed to establish remoc channel");
-    let conn_handle = tokio::spawn(conn.instrument(tracing::info_span!("remoc_conn")));
+    let conn_handle = AbortOnDropHandle::new(tokio::spawn(
+        conn.instrument(tracing::info_span!("remoc_conn")),
+    ));
 
     // Create the outer RFnOnce: authentication.
     let auth_fn = remoc::rfn::RFnOnce::new_1(|auth_request: AuthRequest| async move {
-        tracing::info!(username = %auth_request.username, credential = %auth_request.credential, "authentication starting");
+        tracing::info!(
+            username = %auth_request.username,
+            credential = %auth_request.credential,
+            "authentication starting"
+        );
 
         let user_info: UserInfo = match &auth_request.credential {
-            #[cfg(feature = "pam")]
-            AuthCredential::Basic { password, .. } => {
-                genmeta_ssh::session::pam::authenticate("sshd", &auth_request.username, password)
-                    .await
-                    .map_err(|e| AuthError::PamFailed {
-                        reason: Report::from_error(e).to_string(),
-                    })?
-            }
-            #[cfg(not(feature = "pam"))]
             AuthCredential::Basic { .. } => {
                 return Err(AuthError::PamFailed {
-                    reason: "password authentication requires the `pam` feature".to_owned(),
+                    reason: "password authentication is no longer supported".to_owned(),
                 });
             }
             #[cfg(feature = "pam")]
@@ -83,7 +93,6 @@ async fn main() {
                     .map_err(|e| AuthError::PamFailed {
                         reason: Report::from_error(e).to_string(),
                     })?;
-                // Without PAM, explicitly check /etc/nologin.
                 if let Err(msg) = genmeta_ssh::session::check_nologin(user_info.uid) {
                     return Err(AuthError::PamFailed { reason: msg });
                 }
@@ -97,7 +106,6 @@ async fn main() {
             "authentication succeeded"
         );
 
-        // Capture user info into the inner closure.
         let username = auth_request.username;
 
         // Create the inner RFnOnce: drop privileges + run session.
@@ -105,7 +113,6 @@ async fn main() {
             remoc::rfn::RFnOnce::new_1(move |bootstrap: SessionBootstrap| async move {
                 tracing::info!(%username, "starting session");
 
-                // Drop privileges from root to target user.
                 if nix::unistd::getuid().is_root() {
                     drop_privileges(user_info.uid, user_info.gid, &username).map_err(|e| {
                         SessionRunError::DropPrivileges {
@@ -119,16 +126,38 @@ async fn main() {
                     );
                 }
 
-                // Build Conversation from remoc-proxied streams.
-                let control_reader = bootstrap.control_reader.into_box_reader();
-                let control_writer = bootstrap.control_writer.into_box_writer();
+                // Resolve control stream from FD registry.
+                let fds = fd_registry
+                    .wait_fds(bootstrap.control_fd_id)
+                    .await
+                    .map_err(|e| SessionRunError::ConversationBuild {
+                        reason: Report::from_error(e).to_string(),
+                    })?;
+                let ctrl_fd =
+                    fds.into_iter()
+                        .next()
+                        .ok_or_else(|| SessionRunError::ConversationBuild {
+                            reason: "expected 1 FD for control stream, got 0".into(),
+                        })?;
+                let ctrl_unix =
+                    tokio::net::UnixStream::from_std(std::os::unix::net::UnixStream::from(ctrl_fd))
+                        .map_err(|e| SessionRunError::ConversationBuild {
+                            reason: format!("failed to convert control FD to tokio stream: {e}"),
+                        })?;
+                let (control_reader, control_writer) = ctrl_unix.into_split();
+
+                // Create IPC manage stream handle.
+                let manage_stream = genmeta_ssh::conversation::ipc::IpcManageStreamHandle::new(
+                    bootstrap.manage_stream,
+                    fd_registry,
+                );
 
                 let conversation = Arc::new(Conversation::new(
                     bootstrap.conversation_id,
                     bootstrap.peer_version,
                     control_reader,
                     control_writer,
-                    bootstrap.manage_stream,
+                    manage_stream,
                 ));
 
                 let config = SessionConfig {
@@ -149,7 +178,6 @@ async fn main() {
         .await
         .expect("failed to send AuthenticateFn to parent");
 
-    // Wait for remoc connection to close (rfn tasks run in background).
     let _ = conn_handle.await;
-    tracing::info!("child process exiting");
+    tracing::info!("ssh session process exiting");
 }

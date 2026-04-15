@@ -6,7 +6,7 @@ edition = "2024"
 
 [dependencies]
 h3x = { git = "ssh://git@github.com/genmeta/h3x.git", branch = "main", features = [
-    "remoc",
+    "rpc",
     "serde",
 ] }
 http = "1"
@@ -46,7 +46,9 @@ serde = { version = "1", features = ["derive"] }
 futures = "0.3"
 
 [features]
-pam = ["dep:pam-client2"]
+client = []
+server = ["h3x/ipc"]
+pam = ["server", "dep:pam-client2"]
 cli = ["dep:peg"]
 config = ["dep:peg"]
 
@@ -61,8 +63,17 @@ rustls = { version = "0.23", default-features = false, features = [
 serde_json = "1"
 tempfile = "3"
 tower-service = "0.3"
+tokio-util = "0.7"
 tracing-subscriber = "0.3"
 
 [[example]]
 name = "ssh3-client"
-required-features = ["cli"]
+required-features = ["client", "cli"]
+
+[[example]]
+name = "ssh3-server"
+required-features = ["server"]
+
+[[example]]
+name = "ssh3-session"
+required-features = ["server"]
