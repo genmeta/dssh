@@ -77,6 +77,10 @@ fn authenticate_blocking(
     let mut context = Context::new(service, Some(username), conversation)
         .context(pam_auth_error::CreateContextSnafu)?;
 
+    // Set PAM_TTY so that pam_systemd registers a logind session.
+    // OpenSSH sets this to "ssh" before PTY allocation.
+    let _ = context.set_tty(Some("ssh"));
+
     context
         .authenticate(Flag::NONE)
         .context(pam_auth_error::AuthenticateSnafu)?;
@@ -138,6 +142,10 @@ fn open_session_blocking(service: &str, username: &str) -> Result<UserInfo, PamA
     let conversation = conv_null::Conversation::new();
     let mut context = Context::new(service, Some(username), conversation)
         .context(pam_auth_error::CreateContextSnafu)?;
+
+    // Set PAM_TTY so that pam_systemd registers a logind session.
+    // OpenSSH sets this to "ssh" before PTY allocation.
+    let _ = context.set_tty(Some("ssh"));
 
     context
         .acct_mgmt(Flag::NONE)

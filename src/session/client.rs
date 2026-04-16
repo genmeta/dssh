@@ -317,6 +317,11 @@ async fn relay_output<R: AsyncRead + Unpin + Send>(
                 {
                     break;
                 }
+                Err(e) if exit_result.is_some() => {
+                    // Already received exit status/signal; transport errors
+                    // during shutdown are expected (e.g. QUIC idle timeout).
+                    break;
+                }
                 Err(e) => return Err(e).context(ReadEventSnafu),
             };
 
