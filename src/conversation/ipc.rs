@@ -243,15 +243,25 @@ async fn bridge_unix_to_quic_writer(mut reader: OwnedReadHalf, mut writer: BoxWr
     loop {
         buf.reserve(8192);
         match reader.read_buf(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
+            Ok(0) => {
+                tracing::debug!("bridge_unix_to_quic: unix socket EOF");
+                break;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "bridge_unix_to_quic: unix socket read error");
+                break;
+            }
+            Ok(n) => {
+                tracing::trace!(bytes = n, "bridge_unix_to_quic: forwarding to QUIC");
                 if writer.send(buf.split().freeze()).await.is_err() {
+                    tracing::debug!("bridge_unix_to_quic: QUIC write failed");
                     break;
                 }
             }
         }
     }
     let _ = writer.close().await;
+    tracing::debug!("bridge_unix_to_quic: closed");
 }
 
 // ---------------------------------------------------------------------------

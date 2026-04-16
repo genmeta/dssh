@@ -315,11 +315,16 @@ async fn relay_output<R: AsyncRead + Unpin + Send>(
                 Err(ReadChannelEventError::DecodeMessageType { source })
                     if source.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
+                    tracing::debug!("relay_output: stream EOF");
                     break;
                 }
                 Err(e) if exit_result.is_some() => {
                     // Already received exit status/signal; transport errors
                     // during shutdown are expected (e.g. QUIC idle timeout).
+                    tracing::debug!(
+                        error = %snafu::Report::from_error(&e),
+                        "relay_output: post-exit transport error (ignored)"
+                    );
                     break;
                 }
                 Err(e) => return Err(e).context(ReadEventSnafu),
@@ -361,8 +366,13 @@ async fn relay_output<R: AsyncRead + Unpin + Send>(
                         break;
                     }
                 },
-                ReaderEvent::Eof => {}
-                ReaderEvent::Close => break,
+                ReaderEvent::Eof => {
+                    tracing::debug!("relay_output: received channel EOF");
+                }
+                ReaderEvent::Close => {
+                    tracing::debug!("relay_output: received channel Close");
+                    break;
+                }
                 _ => {}
             }
         }

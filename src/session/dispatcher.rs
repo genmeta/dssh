@@ -266,6 +266,7 @@ where
     let mut unix_forwards: HashMap<String, AbortHandle> = HashMap::new();
     let mut channel_tasks: JoinSet<()> = JoinSet::new();
     let mut forward_tasks: JoinSet<()> = JoinSet::new();
+    let mut had_session = false;
 
     // Pin the accept() future so it survives across select! iterations.
     // accept() is NOT cancellation-safe: it eagerly takes a reader ticket,
@@ -296,6 +297,7 @@ where
 
                 match &*channel_type {
                     "session" => {
+                        had_session = true;
                         let pending = incoming.skip_payload();
                         channel_tasks.spawn(async move {
                             let mut channel = match pending.accept(max_msg).await {
@@ -408,6 +410,10 @@ where
             Some(result) = channel_tasks.join_next() => {
                 if let Err(e) = result {
                     tracing::warn!(error = %snafu::Report::from_error(&e), "channel task panicked");
+                }
+                if had_session && channel_tasks.is_empty() {
+                    tracing::debug!("run_session: all channel tasks completed, exiting");
+                    break;
                 }
             }
 

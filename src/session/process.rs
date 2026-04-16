@@ -377,20 +377,25 @@ where
 
     let output_result = async {
         let output_result = relay_output_pty(&mut master_reader, &mut writer).await;
+        tracing::debug!(?output_result, "relay_output_pty finished");
         if let Err(ProcessError::ReadPty { ref source }) = output_result
             && source.raw_os_error() != Some(nix::libc::EIO)
         {
             output_result?;
         }
         let status = child.wait().await.context(WaitSnafu)?;
+        tracing::debug!(?status, "child process exited");
         send_exit_notification(&mut writer, &status).await?;
+        tracing::debug!("exit notification sent");
         writer.eof().await.context(WriteEofSnafu)?;
         writer.close().await.context(WriteCloseSnafu)?;
+        tracing::debug!("eof + close written");
         writer
             .writer_mut()
             .shutdown()
             .await
             .context(ShutdownSnafu)?;
+        tracing::debug!("writer shutdown complete");
         Ok::<_, ProcessError>(())
     }
     .await;
