@@ -167,10 +167,7 @@ pub struct IpcManageStreamAdapter {
 
 impl IpcManageStreamAdapter {
     pub fn new(handle: ConversationHandle, fd_sender: FdSender) -> Self {
-        Self {
-            handle,
-            fd_sender,
-        }
+        Self { handle, fd_sender }
     }
 
     fn bridge_and_queue(

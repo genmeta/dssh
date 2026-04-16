@@ -285,11 +285,31 @@ where
     let input_handle = tokio::spawn(relay_input_piped(reader, stdin, pid));
 
     let output_result = async {
-        relay_output_piped(&mut stdout, &mut stderr, &mut writer).await?;
-        let status = child.wait().await.context(WaitSnafu)?;
-        send_exit_notification(&mut writer, &status).await?;
-        writer.eof().await.context(WriteEofSnafu)?;
-        writer.close().await.context(WriteCloseSnafu)?;
+        // Race output relay against child exit (same rationale as run_pty).
+        let early_exit_status: Option<std::process::ExitStatus> = tokio::select! {
+            output_result = relay_output_piped(&mut stdout, &mut stderr, &mut writer) => {
+                output_result?;
+                None
+            }
+            status_result = child.wait() => {
+                tracing::debug!("child exited while relay_output_piped still active");
+                Some(status_result.context(WaitSnafu)?)
+            }
+        };
+
+        let status = match early_exit_status {
+            Some(s) => s,
+            None => child.wait().await.context(WaitSnafu)?,
+        };
+
+        if early_exit_status.is_none() {
+            send_exit_notification(&mut writer, &status).await?;
+            writer.eof().await.context(WriteEofSnafu)?;
+            writer.close().await.context(WriteCloseSnafu)?;
+        } else {
+            tracing::info!("output relay was backpressured, shutting down transport directly");
+        }
+
         writer
             .writer_mut()
             .shutdown()
@@ -376,20 +396,56 @@ where
     let input_handle = tokio::spawn(relay_input_pty(reader, master_writer, pid, master_raw_fd));
 
     let output_result = async {
-        let output_result = relay_output_pty(&mut master_reader, &mut writer).await;
-        tracing::debug!(?output_result, "relay_output_pty finished");
-        if let Err(ProcessError::ReadPty { ref source }) = output_result
-            && source.raw_os_error() != Some(nix::libc::EIO)
-        {
-            output_result?;
-        }
-        let status = child.wait().await.context(WaitSnafu)?;
+        // Race relay_output_pty against child.wait().
+        //
+        // When the data path is backpressured (IPC socketpair / QUIC flow
+        // control), relay_output_pty can block on writer.data() indefinitely.
+        // Meanwhile the shell has already exited (PTY slave closed) but the
+        // PTY master EIO is never read because the write is stuck.
+        //
+        // By racing with child.wait(), we detect shell exit promptly and can
+        // shut down the channel even if the output relay is still blocked.
+        //
+        // child.wait() is cancel-safe (tokio docs): dropping the future does
+        // not reap the child, so re-awaiting it later is fine.
+        let early_exit_status: Option<std::process::ExitStatus> = tokio::select! {
+            output_result = relay_output_pty(&mut master_reader, &mut writer) => {
+                tracing::debug!(?output_result, "relay_output_pty finished");
+                if let Err(ProcessError::ReadPty { ref source }) = output_result
+                    && source.raw_os_error() != Some(nix::libc::EIO)
+                {
+                    output_result?;
+                }
+                None
+            }
+            status_result = child.wait() => {
+                tracing::debug!("child exited while relay_output_pty still active");
+                Some(status_result.context(WaitSnafu)?)
+            }
+        };
+
+        let status = match early_exit_status {
+            Some(s) => s,
+            None => child.wait().await.context(WaitSnafu)?,
+        };
         tracing::debug!(?status, "child process exited");
-        send_exit_notification(&mut writer, &status).await?;
-        tracing::debug!("exit notification sent");
-        writer.eof().await.context(WriteEofSnafu)?;
-        writer.close().await.context(WriteCloseSnafu)?;
-        tracing::debug!("eof + close written");
+
+        if early_exit_status.is_none() {
+            // Normal path: relay finished cleanly, writer in consistent state.
+            send_exit_notification(&mut writer, &status).await?;
+            tracing::debug!("exit notification sent");
+            writer.eof().await.context(WriteEofSnafu)?;
+            writer.close().await.context(WriteCloseSnafu)?;
+            tracing::debug!("eof + close written");
+        } else {
+            // Backpressure path: relay_output_pty was cancelled mid-write,
+            // so the SSH framing on this socketpair may be inconsistent.
+            // Skip exit-notification / eof / close to avoid sending garbage;
+            // the transport shutdown below will cause the client to see EOF
+            // and exit promptly (with unknown exit code).
+            tracing::info!("output relay was backpressured, shutting down transport directly");
+        }
+
         writer
             .writer_mut()
             .shutdown()
