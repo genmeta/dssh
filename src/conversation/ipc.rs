@@ -181,7 +181,7 @@ impl IpcManageStreamAdapter {
 
         let fd_id = self
             .fd_sender
-            .queue_fds(vec![cli.into()])
+            .queue_fds(vec![cli.into()].into())
             .map_err(|e| to_conn_error(e, "queue_fds"))?;
 
         let srv = UnixStream::from_std(srv).map_err(|e| to_conn_error(e, "from_std"))?;
