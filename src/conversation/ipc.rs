@@ -25,8 +25,6 @@
 //! 2. Retrieves the socketpair FD from the [`FdRegistry`].
 //! 3. Splits it into `(OwnedReadHalf, OwnedWriteHalf)`.
 
-use std::sync::Mutex;
-
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use h3x::{
@@ -42,7 +40,6 @@ use tokio::{
         UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
-    task::JoinSet,
 };
 use tracing::Instrument;
 
@@ -156,10 +153,16 @@ impl super::ManageSessionStream for IpcManageStreamHandle {
 ///
 /// Each call opens a real QUIC stream, creates a Unix socketpair, spawns
 /// bridge tasks, and queues the client-side FD through the [`FdSender`].
+///
+/// Bridge tasks are spawned via [`tokio::spawn`] so they outlive this
+/// adapter. They terminate naturally when the Unix socketpair is closed
+/// (i.e. when the child process drops its half). This is important because
+/// the adapter may be dropped (via the remoc `ServerShared` lifecycle)
+/// before the bridge has finished flushing final data — such as SSH
+/// exit-status, EOF and Close messages — to the QUIC stream.
 pub struct IpcManageStreamAdapter {
     handle: ConversationHandle,
     fd_sender: FdSender,
-    tasks: Mutex<JoinSet<()>>,
 }
 
 impl IpcManageStreamAdapter {
@@ -167,7 +170,6 @@ impl IpcManageStreamAdapter {
         Self {
             handle,
             fd_sender,
-            tasks: Mutex::new(JoinSet::new()),
         }
     }
 
@@ -187,15 +189,11 @@ impl IpcManageStreamAdapter {
         let srv = UnixStream::from_std(srv).map_err(|e| to_conn_error(e, "from_std"))?;
         let (srv_read, srv_write) = srv.into_split();
 
-        let mut tasks = self
-            .tasks
-            .lock()
-            .map_err(|e| to_conn_error(e, "lock task set"))?;
-        // Reap completed tasks lazily.
-        while tasks.try_join_next().is_some() {}
-
-        tasks.spawn(bridge_quic_reader_to_unix(reader, srv_write).in_current_span());
-        tasks.spawn(bridge_unix_to_quic_writer(srv_read, writer).in_current_span());
+        // Spawn bridge tasks independently so they are NOT aborted when this
+        // adapter is dropped. The tasks will terminate on their own once the
+        // Unix socketpair closes (child process exit / fd drop).
+        tokio::spawn(bridge_quic_reader_to_unix(reader, srv_write).in_current_span());
+        tokio::spawn(bridge_unix_to_quic_writer(srv_read, writer).in_current_span());
 
         Ok(fd_id)
     }
