@@ -285,31 +285,10 @@ where
     let input_handle = tokio::spawn(relay_input_piped(reader, stdin, pid));
 
     let output_result = async {
-        // Race output relay against child exit (same rationale as run_pty).
-        let early_exit_status: Option<std::process::ExitStatus> = tokio::select! {
-            output_result = relay_output_piped(&mut stdout, &mut stderr, &mut writer) => {
-                output_result?;
-                None
-            }
-            status_result = child.wait() => {
-                tracing::debug!("child exited while relay_output_piped still active");
-                Some(status_result.context(WaitSnafu)?)
-            }
-        };
-
-        let status = match early_exit_status {
-            Some(s) => s,
-            None => child.wait().await.context(WaitSnafu)?,
-        };
-
-        if early_exit_status.is_none() {
-            send_exit_notification(&mut writer, &status).await?;
-            writer.eof().await.context(WriteEofSnafu)?;
-            writer.close().await.context(WriteCloseSnafu)?;
-        } else {
-            tracing::info!("output relay was backpressured, shutting down transport directly");
-        }
-
+        let status = relay_output_piped(&mut stdout, &mut stderr, &mut writer, &mut child).await?;
+        send_exit_notification(&mut writer, &status).await?;
+        writer.eof().await.context(WriteEofSnafu)?;
+        writer.close().await.context(WriteCloseSnafu)?;
         writer
             .writer_mut()
             .shutdown()
@@ -396,56 +375,13 @@ where
     let input_handle = tokio::spawn(relay_input_pty(reader, master_writer, pid, master_raw_fd));
 
     let output_result = async {
-        // Race relay_output_pty against child.wait().
-        //
-        // When the data path is backpressured (IPC socketpair / QUIC flow
-        // control), relay_output_pty can block on writer.data() indefinitely.
-        // Meanwhile the shell has already exited (PTY slave closed) but the
-        // PTY master EIO is never read because the write is stuck.
-        //
-        // By racing with child.wait(), we detect shell exit promptly and can
-        // shut down the channel even if the output relay is still blocked.
-        //
-        // child.wait() is cancel-safe (tokio docs): dropping the future does
-        // not reap the child, so re-awaiting it later is fine.
-        let early_exit_status: Option<std::process::ExitStatus> = tokio::select! {
-            output_result = relay_output_pty(&mut master_reader, &mut writer) => {
-                tracing::debug!(?output_result, "relay_output_pty finished");
-                if let Err(ProcessError::ReadPty { ref source }) = output_result
-                    && source.raw_os_error() != Some(nix::libc::EIO)
-                {
-                    output_result?;
-                }
-                None
-            }
-            status_result = child.wait() => {
-                tracing::debug!("child exited while relay_output_pty still active");
-                Some(status_result.context(WaitSnafu)?)
-            }
-        };
-
-        let status = match early_exit_status {
-            Some(s) => s,
-            None => child.wait().await.context(WaitSnafu)?,
-        };
+        let status = relay_output_pty(&mut master_reader, &mut writer, &mut child).await?;
         tracing::debug!(?status, "child process exited");
-
-        if early_exit_status.is_none() {
-            // Normal path: relay finished cleanly, writer in consistent state.
-            send_exit_notification(&mut writer, &status).await?;
-            tracing::debug!("exit notification sent");
-            writer.eof().await.context(WriteEofSnafu)?;
-            writer.close().await.context(WriteCloseSnafu)?;
-            tracing::debug!("eof + close written");
-        } else {
-            // Backpressure path: relay_output_pty was cancelled mid-write,
-            // so the SSH framing on this socketpair may be inconsistent.
-            // Skip exit-notification / eof / close to avoid sending garbage;
-            // the transport shutdown below will cause the client to see EOF
-            // and exit promptly (with unknown exit code).
-            tracing::info!("output relay was backpressured, shutting down transport directly");
-        }
-
+        send_exit_notification(&mut writer, &status).await?;
+        tracing::debug!("exit notification sent");
+        writer.eof().await.context(WriteEofSnafu)?;
+        writer.close().await.context(WriteCloseSnafu)?;
+        tracing::debug!("eof + close written");
         writer
             .writer_mut()
             .shutdown()
@@ -465,12 +401,14 @@ where
 // Output relay
 // ============================================================================
 
-/// Multiplex stdout and stderr to the channel writer using `tokio::select!`.
+/// Multiplex stdout and stderr to the channel writer, racing each read against
+/// child exit. See [`relay_output_pty`] for the rationale.
 async fn relay_output_piped<W>(
     stdout: &mut (impl AsyncRead + Unpin),
     stderr: &mut (impl AsyncRead + Unpin),
     writer: &mut SshChannelWriter<W>,
-) -> Result<(), ProcessError>
+    child: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus, ProcessError>
 where
     W: AsyncWrite + Unpin + Send,
 {
@@ -508,17 +446,32 @@ where
                     .await
                     .context(WriteExtendedDataSnafu)?;
             }
+            wait_result = child.wait() => {
+                return wait_result.context(WaitSnafu);
+            }
         }
     }
 
-    Ok(())
+    child.wait().await.context(WaitSnafu)
 }
 
-/// Relay PTY master output to the channel writer.
+/// Relay PTY master output to the channel writer, racing each read against
+/// child exit.
+///
+/// On every iteration the function selects between a PTY read and
+/// `child.wait()`:
+///
+/// - **Read wins** — the data is forwarded to `writer`, then the race repeats.
+/// - **`child.wait()` wins** — the child has exited and we are at a clean SSH
+///   frame boundary (not mid-write), so the caller can safely send
+///   `exit-status` / EOF / Close.
+/// - **PTY closes (EIO / `Ok(0)`)** — the read loop ends and we wait for the
+///   child before returning.
 async fn relay_output_pty<W>(
     master: &mut (impl AsyncRead + Unpin),
     writer: &mut SshChannelWriter<W>,
-) -> Result<(), ProcessError>
+    child: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus, ProcessError>
 where
     W: AsyncWrite + Unpin + Send,
 {
@@ -526,13 +479,26 @@ where
 
     let mut buf = [0u8; 8192];
     loop {
-        let n = master.read(&mut buf).await.context(ReadPtySnafu)?;
-        if n == 0 {
-            break;
+        tokio::select! {
+            read_result = master.read(&mut buf) => {
+                match read_result {
+                    // PTY slave closed — normal shell exit path.
+                    Err(ref e) if e.raw_os_error() == Some(nix::libc::EIO) => break,
+                    Err(e) => return Err(e).context(ReadPtySnafu),
+                    Ok(0) => break,
+                    Ok(n) => writer.data(&buf[..n]).await.context(WriteDataSnafu)?,
+                }
+            }
+            wait_result = child.wait() => {
+                // Child exited while we were between reads: we are at a clean
+                // SSH frame boundary, so the caller can safely send
+                // exit-status / EOF / Close.
+                return wait_result.context(WaitSnafu);
+            }
         }
-        writer.data(&buf[..n]).await.context(WriteDataSnafu)?;
     }
-    Ok(())
+    // PTY closed cleanly. Wait for the child to confirm exit.
+    child.wait().await.context(WaitSnafu)
 }
 
 // ============================================================================
