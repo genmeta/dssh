@@ -28,6 +28,7 @@ use crate::conversation::channel::{
     SshChannelWriter, WriteChannelCloseError, WriteChannelEofError, WriteDataError,
     WriteExtendedDataError,
 };
+use crate::message::SSH_EXTENDED_DATA_STDERR;
 use crate::session::dispatcher::SessionConfig;
 use crate::session::pty::PtyPair;
 use crate::session::signal;
@@ -440,7 +441,7 @@ where
                 }
                 writer
                     .extended_data(
-                        VarInt::from(1u8), // SSH_EXTENDED_DATA_STDERR
+                        SSH_EXTENDED_DATA_STDERR,
                         &stderr_buf[..n],
                     )
                     .await
