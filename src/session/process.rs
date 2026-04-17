@@ -377,18 +377,18 @@ where
 
     let output_result = async {
         let status = relay_output_pty(&mut master_reader, &mut writer, &mut child).await?;
-        tracing::debug!(?status, "child process exited");
+        tracing::trace!(?status, "child process exited");
         send_exit_notification(&mut writer, &status).await?;
-        tracing::debug!("exit notification sent");
+        tracing::trace!("exit notification sent");
         writer.eof().await.context(WriteEofSnafu)?;
         writer.close().await.context(WriteCloseSnafu)?;
-        tracing::debug!("eof + close written");
+        tracing::trace!("eof + close written");
         writer
             .writer_mut()
             .shutdown()
             .await
             .context(ShutdownSnafu)?;
-        tracing::debug!("writer shutdown complete");
+        tracing::trace!("writer shutdown complete");
         Ok::<_, ProcessError>(())
     }
     .await;
