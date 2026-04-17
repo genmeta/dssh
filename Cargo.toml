@@ -1,11 +1,11 @@
 [package]
 name = "genmeta-ssh"
 description = "SSH3 core session, channel, and wire-format foundation"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-h3x = { git = "ssh://git@github.com/genmeta/h3x.git", branch = "main", features = [
+h3x = { git = "https://github.com/genmeta/h3x.git", tag = "v0.2.0", features = [
     "rpc",
     "serde",
 ] }
