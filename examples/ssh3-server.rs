@@ -349,7 +349,7 @@ async fn handle_child_process(
                     return;
                 }
             };
-            let ctrl_fd_id = match fd_sender.queue_fds(vec![ctrl_cli.into()]) {
+            let ctrl_fd_id = match fd_sender.queue_fds(smallvec::smallvec![ctrl_cli.into()]) {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::error!(error = %Report::from_error(&e), "queue control FD failed");
