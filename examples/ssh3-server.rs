@@ -29,12 +29,12 @@ use genmeta_ssh::{
     protocol::Ssh3ProtocolFactory,
     session::{AuthRequest, AuthenticateFn, SessionBootstrap},
 };
-use h3x::connection::ConnectionBuilder;
+use h3x::connection::{ConnectionBuilder, ConnectionState};
 use h3x::dquic::H3Servers;
 use h3x::hyper::server::TowerService;
 use h3x::ipc::transport::MuxChannel;
 use h3x::message::stream::MessageStreamError;
-use h3x::protocol::Protocols;
+use h3x::quic::DynConnection;
 use h3x::server::Router;
 use h3x::stream_id::StreamId;
 use http::StatusCode;
@@ -191,12 +191,13 @@ async fn handle_ssh3_connect(
         .extensions()
         .get::<StreamId>()
         .expect("StreamId not in extensions");
-    let protocols = request
+    let connection = request
         .extensions()
-        .get::<Arc<Protocols>>()
-        .expect("Protocols not in extensions")
+        .get::<Arc<ConnectionState<dyn DynConnection>>>()
+        .expect("ConnectionState not in extensions")
         .clone();
-    let ssh3_proto = protocols
+    let ssh3_proto = connection
+        .protocols()
         .get::<genmeta_ssh::protocol::Ssh3Protocol>()
         .expect("Ssh3ProtocolFactory not registered");
     let handle = match ssh3_proto.register(conversation_id) {
