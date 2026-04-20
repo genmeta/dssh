@@ -34,8 +34,12 @@ use super::spec::{Endpoint, LocalForward, RemoteForward};
 pub enum BindLocalForwardError {
     #[snafu(display("failed to bind TCP listener"))]
     TcpBind { source: io::Error },
+    #[cfg(unix)]
     #[snafu(display("failed to bind Unix listener"))]
     UnixBind { source: io::Error },
+    #[cfg(not(unix))]
+    #[snafu(display("unix socket forwarding is not supported on this platform"))]
+    UnixUnsupported,
 }
 
 /// Error from [`RemoteForward::request`].
@@ -102,12 +106,15 @@ impl LocalForward {
                 );
                 self.accept_loop_tcp(listener, conversation).await
             }
+            #[cfg(unix)]
             Endpoint::Unix { path } => {
                 let listener = tokio::net::UnixListener::bind(path)
                     .context(bind_local_forward_error::UnixBindSnafu)?;
                 tracing::info!(bind = %self.bind, "local forward listening");
                 self.accept_loop_unix(listener, conversation).await
             }
+            #[cfg(not(unix))]
+            Endpoint::Unix { .. } => Err(BindLocalForwardError::UnixUnsupported),
         }
     }
 
@@ -140,6 +147,7 @@ impl LocalForward {
         }
     }
 
+    #[cfg(unix)]
     async fn accept_loop_unix<M>(
         &self,
         listener: tokio::net::UnixListener,
@@ -314,11 +322,17 @@ pub async fn connect_locally(
             let (r, w) = stream.into_split();
             Ok((Box::pin(r), Box::pin(w)))
         }
+        #[cfg(unix)]
         Endpoint::Unix { path } => {
             let stream = tokio::net::UnixStream::connect(path).await?;
             let (r, w) = stream.into_split();
             Ok((Box::pin(r), Box::pin(w)))
         }
+        #[cfg(not(unix))]
+        Endpoint::Unix { .. } => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unix socket is not supported on this platform",
+        )),
     }
 }
 

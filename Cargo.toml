@@ -18,8 +18,8 @@ nix = { version = "0.31", features = [
     "fs",
     "process",
     "user",
-] }
-libc = "0.2"
+], optional = true }
+libc = { version = "0.2", optional = true }
 snafu = "0.9"
 tracing = "0.1"
 bytes = { version = "1", features = ["serde"] }
@@ -47,7 +47,7 @@ futures = "0.3"
 
 [features]
 client = []
-server = ["h3x/ipc"]
+server = ["h3x/ipc", "dep:nix", "dep:libc"]
 pam = ["server", "dep:pam-client2"]
 cli = ["dep:peg"]
 config = ["dep:peg"]
