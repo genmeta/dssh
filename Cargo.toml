@@ -5,7 +5,7 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-h3x = { git = "https://github.com/genmeta/h3x.git", branch = "main", features = [
+h3x = { git = "https://github.com/genmeta/h3x.git", branch = "endpoint", features = [
     "rpc",
     "serde",
 ] }
