@@ -45,6 +45,11 @@ use tracing::Instrument;
 
 use crate::protocol::{ConversationHandle, HandleError};
 
+fn unix_stream_from_std(stream: std::os::unix::net::UnixStream) -> std::io::Result<UnixStream> {
+    stream.set_nonblocking(true)?;
+    UnixStream::from_std(stream)
+}
+
 // ---------------------------------------------------------------------------
 // RPC trait
 // ---------------------------------------------------------------------------
@@ -113,7 +118,7 @@ impl IpcManageStreamHandle {
             .next()
             .context(UnexpectedFdCountSnafu { actual: 0_usize })?;
         let stream =
-            UnixStream::from_std(std::os::unix::net::UnixStream::from(fd)).context(FromFdSnafu)?;
+            unix_stream_from_std(std::os::unix::net::UnixStream::from(fd)).context(FromFdSnafu)?;
         Ok(stream.into_split())
     }
 }
@@ -177,13 +182,15 @@ impl IpcManageStreamAdapter {
     ) -> Result<VarInt, ConnectionError> {
         let (srv, cli) =
             std::os::unix::net::UnixStream::pair().map_err(|e| to_conn_error(e, "socketpair"))?;
+        cli.set_nonblocking(true)
+            .map_err(|e| to_conn_error(e, "set_nonblocking"))?;
 
         let fd_id = self
             .fd_sender
             .queue_fds(vec![cli.into()].into())
             .map_err(|e| to_conn_error(e, "queue_fds"))?;
 
-        let srv = UnixStream::from_std(srv).map_err(|e| to_conn_error(e, "from_std"))?;
+        let srv = unix_stream_from_std(srv).map_err(|e| to_conn_error(e, "from_std"))?;
         let (srv_read, srv_write) = srv.into_split();
 
         // Spawn bridge tasks independently so they are NOT aborted when this
@@ -321,4 +328,24 @@ fn handle_error_to_connection_error(e: HandleError) -> ConnectionError {
         reason: std::borrow::Cow::Owned(snafu::Report::from_error(e).to_string()),
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::unix_stream_from_std;
+
+    #[tokio::test]
+    async fn unix_stream_from_std_accepts_default_blocking_socketpair() {
+        let (left, right) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut left = unix_stream_from_std(left).expect("left stream");
+        let mut right = unix_stream_from_std(right).expect("right stream");
+
+        left.write_all(b"x").await.expect("write");
+        let mut buf = [0_u8; 1];
+        right.read_exact(&mut buf).await.expect("read");
+
+        assert_eq!(buf, [b'x']);
+    }
 }
