@@ -50,7 +50,7 @@ pub fn deliver(pid: nix::unistd::Pid, signal: Signal) -> Result<(), nix::Error> 
 /// Map a Unix signal number to its SSH name (without "SIG" prefix).
 ///
 /// Returns `None` for unrecognized signal numbers. Uses a fallback format
-/// `"signal-N@genmeta-ssh3"` for the caller to handle unknown signals.
+/// `"signal-N@dssh"` for the caller to handle unknown signals.
 pub fn to_ssh_name(signal_number: i32) -> Option<&'static str> {
     use nix::libc;
     match signal_number {

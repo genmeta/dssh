@@ -22,7 +22,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use clap::Parser;
-use genmeta_ssh::{
+use dssh::{
     auth::{AuthCredential, parse_authorization_header},
     constants::{SSH_VERSION, SSH3_CONNECT_PATH},
     conversation::ipc::{IpcManageSessionStreamServerShared, IpcManageStreamAdapter},
@@ -30,12 +30,18 @@ use genmeta_ssh::{
     session::{AuthRequest, AuthenticateFn, SessionBootstrap},
 };
 use h3x::connection::{ConnectionBuilder, ConnectionState};
-use h3x::dquic::H3Servers;
+use h3x::dquic::{
+    QuicEndpoint,
+    binds::BindPattern,
+    cert::handy::{ToCertificate, ToPrivateKey},
+    identity::Identity,
+    server::ServerQuicConfig,
+};
 use h3x::hyper::server::TowerService;
 use h3x::ipc::transport::MuxChannel;
 use h3x::message::stream::MessageStreamError;
 use h3x::quic::DynConnection;
-use h3x::server::Router;
+use h3x::server::{Servers, Service as Router};
 use h3x::stream_id::StreamId;
 use http::StatusCode;
 use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
@@ -112,26 +118,30 @@ async fn main() {
 
     let router = Router::new().connect(SSH3_CONNECT_PATH, service);
 
-    let builder = ConnectionBuilder::new(Arc::default()).protocol(Ssh3ProtocolFactory);
-
-    let mut servers: H3Servers<_> = H3Servers::builder()
-        .without_client_cert_verifier()
-        .expect("failed to configure TLS")
-        .with_builder(Arc::new(builder))
-        .listen()
-        .expect("failed to create listener");
-
-    servers
-        .add_server(
-            "localhost",
-            cert_pem.as_slice(),
-            key_pem.as_slice(),
-            None::<Vec<u8>>,
-            [format!("inet://{}", cli.bind)],
-            router,
-        )
-        .await
-        .expect("failed to add server");
+    let builder = Arc::new(ConnectionBuilder::new(Arc::default()).protocol(Ssh3ProtocolFactory));
+    let identity = Arc::new(Identity {
+        name: "localhost".parse().expect("localhost is a valid DNS name"),
+        certs: Arc::new(cert_pem.as_slice().to_certificate()),
+        key: Arc::new(key_pem.as_slice().to_private_key()),
+        ocsp: Arc::new(None),
+    });
+    let bind: BindPattern = format!("inet://{}", cli.bind)
+        .parse()
+        .expect("failed to parse bind address");
+    let quic = QuicEndpoint::builder()
+        .maybe_identity(Some(identity))
+        .server(ServerQuicConfig {
+            alpns: vec![b"h3".to_vec()],
+            ..Default::default()
+        })
+        .bind(Arc::new(vec![bind]))
+        .build()
+        .await;
+    let mut servers = Servers::from_quic_listener()
+        .listener(quic)
+        .service(router)
+        .builder(builder)
+        .build();
 
     tracing::info!(bind = %cli.bind, "SSH3 server listening");
     let err = servers.run().await;
@@ -198,7 +208,7 @@ async fn handle_ssh3_connect(
         .clone();
     let ssh3_proto = connection
         .protocols()
-        .get::<genmeta_ssh::protocol::Ssh3Protocol>()
+        .get::<dssh::protocol::Ssh3Protocol>()
         .expect("Ssh3ProtocolFactory not registered");
     let handle = match ssh3_proto.register(conversation_id) {
         Ok(h) => h,
@@ -231,9 +241,9 @@ async fn handle_ssh3_connect(
 /// serving, and calls the child's StartSessionFn.
 async fn handle_child_process(
     mut request: http::Request<BoxBody>,
-    handle: genmeta_ssh::protocol::ConversationHandle,
+    handle: dssh::protocol::ConversationHandle,
     username: String,
-    credential: genmeta_ssh::auth::AuthCredential,
+    credential: dssh::auth::AuthCredential,
     peer_version: String,
     conversation_id: StreamId,
     session_binary: &std::path::Path,
@@ -369,14 +379,14 @@ async fn handle_child_process(
 
             // Bridge QUIC CONNECT streams ↔ control stream socketpair.
             tokio::spawn(
-                genmeta_ssh::conversation::ipc::bridge_message_reader_to_unix(
+                dssh::conversation::ipc::bridge_message_reader_to_unix(
                     Box::pin(read_stream.into_bytes_stream()),
                     ctrl_write,
                 )
                 .in_current_span(),
             );
             tokio::spawn(
-                genmeta_ssh::conversation::ipc::bridge_unix_to_message_writer(
+                dssh::conversation::ipc::bridge_unix_to_message_writer(
                     ctrl_read,
                     Box::pin(write_stream.into_bytes_sink()),
                 )

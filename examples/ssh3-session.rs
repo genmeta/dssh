@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use genmeta_ssh::{
+use dssh::{
     auth::AuthCredential,
     conversation::Conversation,
     session::{
@@ -51,15 +51,14 @@ async fn main() {
     let fd_registry = stream.fd_registry();
 
     // Establish remoc channel over MuxSink/MuxStream.
-    let (conn, mut tx, _rx) = remoc::Connect::framed::<
-        _,
-        _,
-        genmeta_ssh::session::AuthenticateFn,
-        (),
-        remoc::codec::Default,
-    >(remoc::Cfg::default(), sink, stream)
-    .await
-    .expect("failed to establish remoc channel");
+    let (conn, mut tx, _rx) =
+        remoc::Connect::framed::<_, _, dssh::session::AuthenticateFn, (), remoc::codec::Default>(
+            remoc::Cfg::default(),
+            sink,
+            stream,
+        )
+        .await
+        .expect("failed to establish remoc channel");
     let conn_handle = AbortOnDropHandle::new(tokio::spawn(
         conn.instrument(tracing::info_span!("remoc_conn")),
     ));
@@ -80,7 +79,7 @@ async fn main() {
             }
             #[cfg(feature = "pam")]
             AuthCredential::Certificate => {
-                genmeta_ssh::session::pam::open_session("sshd", &auth_request.username)
+                dssh::session::pam::open_session("sshd", &auth_request.username)
                     .await
                     .map_err(|e| AuthError::PamFailed {
                         reason: Report::from_error(e).to_string(),
@@ -88,12 +87,12 @@ async fn main() {
             }
             #[cfg(not(feature = "pam"))]
             AuthCredential::Certificate => {
-                let user_info = genmeta_ssh::session::lookup_user(&auth_request.username)
+                let user_info = dssh::session::lookup_user(&auth_request.username)
                     .await
                     .map_err(|e| AuthError::PamFailed {
                         reason: Report::from_error(e).to_string(),
                     })?;
-                if let Err(msg) = genmeta_ssh::session::check_nologin(user_info.uid) {
+                if let Err(msg) = dssh::session::check_nologin(user_info.uid) {
                     return Err(AuthError::PamFailed { reason: msg });
                 }
                 user_info
@@ -147,7 +146,7 @@ async fn main() {
                 let (control_reader, control_writer) = ctrl_unix.into_split();
 
                 // Create IPC manage stream handle.
-                let manage_stream = genmeta_ssh::conversation::ipc::IpcManageStreamHandle::new(
+                let manage_stream = dssh::conversation::ipc::IpcManageStreamHandle::new(
                     bootstrap.manage_stream,
                     fd_registry,
                 );

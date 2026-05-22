@@ -640,6 +640,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "dssh"
+version = "0.2.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "clap",
+ "futures",
+ "h3x",
+ "http",
+ "http-body-util",
+ "libc",
+ "nix 0.31.2",
+ "pam-client2",
+ "peg",
+ "remoc",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -810,36 +840,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "genmeta-ssh"
-version = "0.2.0"
-dependencies = [
- "base64",
- "bytes",
- "clap",
- "futures",
- "h3x",
- "http",
- "http-body-util",
- "libc",
- "nix 0.31.2",
- "pam-client2",
- "peg",
- "remoc",
- "ring",
- "rustls",
- "serde",
- "serde_json",
- "smallvec",
- "snafu",
- "tempfile",
- "tokio",
- "tokio-util",
- "tower-service",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
