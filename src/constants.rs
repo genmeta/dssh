@@ -1,6 +1,6 @@
 use h3x::varint::VarInt;
 
-pub const SSH_VERSION: &str = "genmeta-ssh-00";
+pub const SSH_VERSION: &str = "dssh-00";
 
 pub const SUPPORTED_SSH_VERSIONS: &[&str] = &[SSH_VERSION];
 

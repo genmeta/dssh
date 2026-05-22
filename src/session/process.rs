@@ -660,7 +660,7 @@ where
     if let Some(signal_number) = status.signal() {
         let signal_name = signal::to_ssh_name(signal_number)
             .map(Cow::Borrowed)
-            .unwrap_or_else(|| Cow::Owned(format!("signal-{signal_number}@genmeta-ssh3")));
+            .unwrap_or_else(|| Cow::Owned(format!("signal-{signal_number}@dssh")));
 
         writer
             .notice(&ExitSignalChannelNotice {

@@ -1,8 +1,9 @@
 [package]
-name = "genmeta-ssh"
-description = "SSH3 core session, channel, and wire-format foundation"
+name = "dssh"
+description = "DSSH core session, channel, and wire-format foundation"
 version = "0.2.0"
 edition = "2024"
+repository = "https://github.com/genmeta/dssh"
 
 [dependencies]
 h3x = { git = "https://github.com/genmeta/h3x.git", branch = "endpoint", features = [

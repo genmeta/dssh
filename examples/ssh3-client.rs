@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use clap::Parser;
-use genmeta_ssh::{
+use dssh::{
     client::SSH3_CONNECT_PATH,
     client::encode_basic_auth,
     constants::{DEFAULT_MAX_MESSAGE_SIZE, SSH_VERSION},
@@ -25,7 +25,10 @@ use genmeta_ssh::{
     protocol::{ConversationHandle, Ssh3Protocol},
     session::client::ClientSession,
 };
-use h3x::dquic::H3Client;
+use h3x::dquic::{
+    H3Endpoint, QuicEndpoint,
+    client::{ClientQuicConfig, ServerCertVerifierChoice},
+};
 use h3x::qpack::field::Protocol;
 use h3x::quic::GetStreamIdExt;
 use h3x::stream_id::StreamId;
@@ -93,7 +96,7 @@ struct Cli {
 async fn connect(
     authority: &str,
     auth_header: HeaderValue,
-    client: &H3Client,
+    client: &H3Endpoint,
 ) -> Result<Conversation<ConversationHandle>, Whatever> {
     let authority_parsed: http::uri::Authority =
         authority.parse().whatever_context("invalid authority")?;
@@ -238,22 +241,32 @@ async fn main() {
     };
 
     let has_remote_forwards = !cli.remote_forward.is_empty();
-    let client: H3Client = {
-        let mut builder = H3Client::builder()
-            .without_server_cert_verification()
-            .without_identity()
-            .expect("failed to configure TLS");
+    let client: H3Endpoint = {
+        let quic = QuicEndpoint::builder()
+            .client(ClientQuicConfig {
+                verifier: ServerCertVerifierChoice::Dangerous,
+                alpns: vec![b"h3".to_vec()],
+                ..Default::default()
+            })
+            .build()
+            .await;
 
         // Register Ssh3Protocol so the client can accept incoming channels
         // from the server (required for remote forwarding -R).
-        if has_remote_forwards {
+        let conn_builder = if has_remote_forwards {
             use h3x::connection::ConnectionBuilder;
-            let conn_builder = ConnectionBuilder::new(Arc::default())
-                .protocol(genmeta_ssh::protocol::Ssh3ProtocolFactory);
-            builder = builder.with_builder(Arc::new(conn_builder));
-        }
+            Arc::new(
+                ConnectionBuilder::new(Arc::default())
+                    .protocol(dssh::protocol::Ssh3ProtocolFactory),
+            )
+        } else {
+            Arc::new(h3x::connection::ConnectionBuilder::new(Arc::default()))
+        };
 
-        builder.build()
+        H3Endpoint::builder()
+            .quic(quic)
+            .builder(conn_builder)
+            .build()
     };
 
     let auth_header = encode_basic_auth(&cli.user, &cli.password);
@@ -337,8 +350,8 @@ async fn main() {
         .expect("session IO relay failed");
 
     let exit_code = match exit {
-        Some(genmeta_ssh::session::client::ExitResult::Status(code)) => code,
-        Some(genmeta_ssh::session::client::ExitResult::Signal { signal_name, .. }) => {
+        Some(dssh::session::client::ExitResult::Status(code)) => code,
+        Some(dssh::session::client::ExitResult::Signal { signal_name, .. }) => {
             tracing::info!(%signal_name, "process killed by signal");
             128
         }

@@ -28,7 +28,7 @@ fn repo_root() -> PathBuf {
 
 /// Build example binaries inside a `rust:1-bookworm` Docker container.
 ///
-/// The workspace root (parent of genmeta-ssh3) is volume-mounted so that
+/// The workspace root (parent of dssh) is volume-mounted so that
 /// path dependencies (h3x, gm-quic, etc.) are available.
 ///
 /// Returns the host path to the directory containing the built binaries.

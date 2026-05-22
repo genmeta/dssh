@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn no_match() {
-        let err = negotiate_version(&headers_with("genmeta-ssh3-99")).unwrap_err();
+        let err = negotiate_version(&headers_with("dssh-99")).unwrap_err();
         assert!(err.to_string().contains("no supported"));
     }
 
