@@ -49,6 +49,7 @@ futures = "0.3"
 [features]
 client = []
 server = ["h3x/ipc", "dep:nix", "dep:libc"]
+webtransport = ["h3x/webtransport"]
 pam = ["server", "dep:pam-client2"]
 cli = ["dep:peg"]
 config = ["dep:peg"]
