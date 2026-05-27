@@ -19,7 +19,7 @@ use h3x::{
 use snafu::{ResultExt, Snafu};
 use tokio::io::AsyncWriteExt;
 
-use crate::conversation::ManageSessionStream;
+use crate::conversation::{Conversation, ManageSessionStream};
 
 /// DSSH-over-WebTransport stream kind for the conversation control stream.
 pub const DSSH_CONTROL_STREAM_KIND: VarInt = VarInt::from_u32(0);
@@ -36,6 +36,13 @@ pub const DSSH_CHANNEL_STREAM_KIND: VarInt = VarInt::from_u32(1);
 pub struct WebTransportStreamManager<S> {
     session: S,
 }
+
+/// DSSH conversation backed by a WebTransport session.
+pub type WebTransportConversation<S> = Conversation<
+    WebTransportStreamManager<S>,
+    StreamReader<<S as h3x::webtransport::Session>::StreamReader>,
+    SinkWriter<<S as h3x::webtransport::Session>::StreamWriter>,
+>;
 
 impl<S> WebTransportStreamManager<S> {
     pub fn new(session: S) -> Self {
@@ -126,6 +133,70 @@ where
     }
 }
 
+/// Error returned when opening a DSSH conversation over WebTransport.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum OpenConversationError {
+    #[snafu(display("failed to open dssh webtransport control stream"))]
+    OpenControl { source: WebTransportStreamError },
+}
+
+/// Error returned when accepting a DSSH conversation over WebTransport.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum AcceptConversationError {
+    #[snafu(display("failed to accept dssh webtransport control stream"))]
+    AcceptControl { source: WebTransportStreamError },
+}
+
+/// Open a DSSH conversation on a WebTransport session.
+///
+/// The client side opens an ordinary WebTransport bidirectional stream, writes
+/// [`DSSH_CONTROL_STREAM_KIND`] as the first field, then uses that stream as the
+/// DSSH conversation control stream. Additional SSH channel streams are managed
+/// by the returned [`WebTransportStreamManager`].
+pub async fn open_conversation<S>(
+    session: S,
+    peer_version: impl Into<String>,
+) -> Result<WebTransportConversation<S>, OpenConversationError>
+where
+    S: h3x::webtransport::Session,
+    S::StreamReader: Unpin,
+    S::StreamWriter: Unpin,
+{
+    let id = session.id();
+    let manager = WebTransportStreamManager::new(session);
+    let (reader, writer) = manager
+        .open_control()
+        .await
+        .context(open_conversation_error::OpenControlSnafu)?;
+    Ok(Conversation::new(id, peer_version, reader, writer, manager))
+}
+
+/// Accept a DSSH conversation on a WebTransport session.
+///
+/// The server side waits for an ordinary WebTransport bidirectional stream
+/// whose first field is [`DSSH_CONTROL_STREAM_KIND`], then uses that stream as
+/// the DSSH conversation control stream. Additional SSH channel streams are
+/// managed by the returned [`WebTransportStreamManager`].
+pub async fn accept_conversation<S>(
+    session: S,
+    peer_version: impl Into<String>,
+) -> Result<WebTransportConversation<S>, AcceptConversationError>
+where
+    S: h3x::webtransport::Session,
+    S::StreamReader: Unpin,
+    S::StreamWriter: Unpin,
+{
+    let id = session.id();
+    let manager = WebTransportStreamManager::new(session);
+    let (reader, writer) = manager
+        .accept_control()
+        .await
+        .context(accept_conversation_error::AcceptControlSnafu)?;
+    Ok(Conversation::new(id, peer_version, reader, writer, manager))
+}
+
 /// Error returned by [`WebTransportStreamManager`] operations.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
@@ -186,6 +257,7 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use super::*;
+    use crate::constants::SSH_VERSION;
 
     #[derive(Debug, Default)]
     struct StreamState {
@@ -473,6 +545,49 @@ mod tests {
             WebTransportStreamError::AcceptBi {
                 source: h3x::webtransport::AcceptStreamError::Closed { .. }
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_conversation_opens_control_stream_and_preserves_metadata() {
+        let session = TestSession::default();
+        let open_state = session.open_state.clone();
+
+        let conversation = open_conversation(session, SSH_VERSION)
+            .await
+            .expect("conversation opens");
+
+        assert_eq!(conversation.id(), StreamId(VarInt::from_u32(4)));
+        assert_eq!(conversation.peer_version(), SSH_VERSION);
+        assert_eq!(open_state.written(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn accept_conversation_accepts_control_stream_and_preserves_metadata() {
+        let session = TestSession::with_accept_bytes(b"\x00control");
+
+        let conversation = accept_conversation(session, SSH_VERSION)
+            .await
+            .expect("conversation accepts");
+
+        assert_eq!(conversation.id(), StreamId(VarInt::from_u32(4)));
+        assert_eq!(conversation.peer_version(), SSH_VERSION);
+    }
+
+    #[tokio::test]
+    async fn accept_conversation_rejects_channel_stream_as_control() {
+        let session = TestSession::with_accept_bytes(b"\x01channel");
+
+        let error = match accept_conversation(session, SSH_VERSION).await {
+            Ok(_) => panic!("channel stream is not a control stream"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            AcceptConversationError::AcceptControl {
+                source: WebTransportStreamError::UnexpectedStreamKind { kind }
+            } if kind == DSSH_CHANNEL_STREAM_KIND
         ));
     }
 }
