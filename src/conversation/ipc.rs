@@ -7,15 +7,16 @@
 //!
 //! # Architecture
 //!
-//! The gateway process wraps a
-//! [`ConversationHandle`](crate::protocol::ConversationHandle) in an
-//! [`IpcManageStreamAdapter`] and serves the generated
-//! [`IpcManageSessionStreamServerShared`]. Each `open_stream` / `accept_stream`
-//! call:
-//! 1. Opens a real QUIC bidirectional stream (with routing header).
+//! The gateway process wraps a [`ManageSessionStream`](super::ManageSessionStream)
+//! implementation (for example
+//! [`ConversationHandle`](crate::protocol::ConversationHandle) or a
+//! WebTransport-backed stream manager) in an [`IpcManageStreamAdapter`] and
+//! serves the generated [`IpcManageSessionStreamServerShared`]. Each
+//! `open_stream` / `accept_stream` call:
+//! 1. Opens a real bidirectional stream through the wrapped manager.
 //! 2. Creates a Unix socketpair.
 //! 3. Queues the client-side FD through the [`FdSender`].
-//! 4. Spawns bridge tasks forwarding data between the QUIC streams and the
+//! 4. Spawns bridge tasks forwarding data between the managed stream and the
 //!    server-side socketpair half.
 //! 5. Returns the FD-registry batch ID over RPC.
 //!
@@ -28,22 +29,19 @@
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use h3x::{
-    codec::{BoxReadStream, BoxWriteStream},
     ipc::transport::{FdRegistry, FdSender, WaitFdsError},
     quic::ConnectionError,
     varint::VarInt,
 };
 use snafu::{OptionExt, Snafu};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{
         UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
 };
 use tracing::Instrument;
-
-use crate::protocol::{ConversationHandle, HandleError};
 
 fn unix_stream_from_std(stream: std::os::unix::net::UnixStream) -> std::io::Result<UnixStream> {
     stream.set_nonblocking(true)?;
@@ -153,10 +151,10 @@ impl super::ManageSessionStream for IpcManageStreamHandle {
 // Server: IpcManageStreamAdapter
 // ---------------------------------------------------------------------------
 
-/// Server-side adapter bridging a [`ConversationHandle`] to the
+/// Server-side adapter bridging a [`ManageSessionStream`](super::ManageSessionStream) to the
 /// [`IpcManageSessionStream`] RPC trait.
 ///
-/// Each call opens a real QUIC stream, creates a Unix socketpair, spawns
+/// Each call opens a real managed stream, creates a Unix socketpair, spawns
 /// bridge tasks, and queues the client-side FD through the [`FdSender`].
 ///
 /// Bridge tasks are spawned via [`tokio::spawn`] so they outlive this
@@ -164,22 +162,25 @@ impl super::ManageSessionStream for IpcManageStreamHandle {
 /// (i.e. when the child process drops its half). This is important because
 /// the adapter may be dropped (via the remoc `ServerShared` lifecycle)
 /// before the bridge has finished flushing final data — such as SSH
-/// exit-status, EOF and Close messages — to the QUIC stream.
-pub struct IpcManageStreamAdapter {
-    handle: ConversationHandle,
+/// exit-status, EOF and Close messages — to the managed stream.
+pub struct IpcManageStreamAdapter<M> {
+    manage_stream: M,
     fd_sender: FdSender,
 }
 
-impl IpcManageStreamAdapter {
-    pub fn new(handle: ConversationHandle, fd_sender: FdSender) -> Self {
-        Self { handle, fd_sender }
+impl<M> IpcManageStreamAdapter<M> {
+    pub fn new(manage_stream: M, fd_sender: FdSender) -> Self {
+        Self {
+            manage_stream,
+            fd_sender,
+        }
     }
 
-    fn bridge_and_queue(
-        &self,
-        reader: BoxReadStream,
-        writer: BoxWriteStream,
-    ) -> Result<VarInt, ConnectionError> {
+    fn bridge_and_queue<R, W>(&self, reader: R, writer: W) -> Result<VarInt, ConnectionError>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let (srv, cli) =
             std::os::unix::net::UnixStream::pair().map_err(|e| to_conn_error(e, "socketpair"))?;
         cli.set_nonblocking(true)
@@ -196,29 +197,35 @@ impl IpcManageStreamAdapter {
         // Spawn bridge tasks independently so they are NOT aborted when this
         // adapter is dropped. The tasks will terminate on their own once the
         // Unix socketpair closes (child process exit / fd drop).
-        tokio::spawn(bridge_quic_reader_to_unix(reader, srv_write).in_current_span());
-        tokio::spawn(bridge_unix_to_quic_writer(srv_read, writer).in_current_span());
+        tokio::spawn(bridge_reader_to_unix(reader, srv_write).in_current_span());
+        tokio::spawn(bridge_unix_to_writer(srv_read, writer).in_current_span());
 
         Ok(fd_id)
     }
 }
 
-impl IpcManageSessionStream for IpcManageStreamAdapter {
+impl<M> IpcManageSessionStream for IpcManageStreamAdapter<M>
+where
+    M: super::ManageSessionStream + 'static,
+    M::StreamReader: AsyncRead + Unpin + Send + 'static,
+    M::StreamWriter: AsyncWrite + Unpin + Send + 'static,
+    M::Error: Send + Sync + 'static,
+{
     async fn open_stream(&self) -> Result<VarInt, ConnectionError> {
         let (reader, writer) = self
-            .handle
-            .open_raw_stream()
+            .manage_stream
+            .open_stream()
             .await
-            .map_err(handle_error_to_connection_error)?;
+            .map_err(manage_stream_error_to_connection_error)?;
         self.bridge_and_queue(reader, writer)
     }
 
     async fn accept_stream(&self) -> Result<VarInt, ConnectionError> {
         let (reader, writer) = self
-            .handle
-            .accept_raw_stream()
+            .manage_stream
+            .accept_stream()
             .await
-            .map_err(handle_error_to_connection_error)?;
+            .map_err(manage_stream_error_to_connection_error)?;
         self.bridge_and_queue(reader, writer)
     }
 }
@@ -227,43 +234,22 @@ impl IpcManageSessionStream for IpcManageStreamAdapter {
 // Bridge helpers: QUIC stream ↔ Unix socketpair
 // ---------------------------------------------------------------------------
 
-/// Forward data from a QUIC read stream to a Unix socket write half.
-async fn bridge_quic_reader_to_unix(mut reader: BoxReadStream, mut writer: OwnedWriteHalf) {
-    while let Some(Ok(chunk)) = reader.next().await {
-        if writer.write_all(&chunk).await.is_err() {
-            break;
-        }
-    }
+/// Forward bytes from an async reader to a Unix socket write half.
+pub async fn bridge_reader_to_unix<R>(mut reader: R, mut writer: OwnedWriteHalf)
+where
+    R: AsyncRead + Unpin,
+{
+    let _ = tokio::io::copy(&mut reader, &mut writer).await;
     let _ = writer.shutdown().await;
 }
 
-/// Forward data from a Unix socket read half to a QUIC write stream.
-async fn bridge_unix_to_quic_writer(mut reader: OwnedReadHalf, mut writer: BoxWriteStream) {
-    use tokio::io::AsyncReadExt;
-
-    let mut buf = BytesMut::with_capacity(8192);
-    loop {
-        buf.reserve(8192);
-        match reader.read_buf(&mut buf).await {
-            Ok(0) => {
-                tracing::debug!("bridge_unix_to_quic: unix socket EOF");
-                break;
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "bridge_unix_to_quic: unix socket read error");
-                break;
-            }
-            Ok(n) => {
-                tracing::trace!(bytes = n, "bridge_unix_to_quic: forwarding to QUIC");
-                if writer.send(buf.split().freeze()).await.is_err() {
-                    tracing::debug!("bridge_unix_to_quic: QUIC write failed");
-                    break;
-                }
-            }
-        }
-    }
-    let _ = writer.close().await;
-    tracing::debug!("bridge_unix_to_quic: closed");
+/// Forward bytes from a Unix socket read half to an async writer.
+pub async fn bridge_unix_to_writer<W>(mut reader: OwnedReadHalf, mut writer: W)
+where
+    W: AsyncWrite + Unpin,
+{
+    let _ = tokio::io::copy(&mut reader, &mut writer).await;
+    let _ = writer.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,27 +300,79 @@ pub async fn bridge_unix_to_message_writer(
 // ---------------------------------------------------------------------------
 
 fn to_conn_error(err: impl std::fmt::Display, context: &str) -> ConnectionError {
-    tracing::warn!(%err, context, "IPC manage stream error");
+    tracing::warn!(%err, context, "ipc manage stream error");
     h3x::quic::ApplicationError {
         code: h3x::error::Code::from(VarInt::from_u32(0)),
-        reason: std::borrow::Cow::Owned(format!("IPC {context}: {err}")),
+        reason: std::borrow::Cow::Owned(format!("ipc {context}: {err}")),
     }
     .into()
 }
 
-fn handle_error_to_connection_error(e: HandleError) -> ConnectionError {
+fn manage_stream_error_to_connection_error<E>(error: E) -> ConnectionError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     h3x::quic::ApplicationError {
         code: h3x::error::Code::from(VarInt::from_u32(0)),
-        reason: std::borrow::Cow::Owned(snafu::Report::from_error(e).to_string()),
+        reason: std::borrow::Cow::Owned(snafu::Report::from_error(&error).to_string()),
     }
     .into()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use h3x::{ipc::transport::MuxChannel, varint::VarInt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::unix_stream_from_std;
+    use super::{IpcManageSessionStream, IpcManageStreamAdapter, unix_stream_from_std};
+    use crate::conversation::ManageSessionStream;
+
+    #[derive(Clone, Debug)]
+    struct MockManageStream {
+        open_calls: Arc<AtomicUsize>,
+    }
+
+    impl ManageSessionStream for MockManageStream {
+        type StreamReader = tokio::io::Empty;
+        type StreamWriter = tokio::io::Sink;
+        type Error = std::io::Error;
+
+        async fn open_stream(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            Ok((tokio::io::empty(), tokio::io::sink()))
+        }
+
+        async fn accept_stream(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+            Ok((tokio::io::empty(), tokio::io::sink()))
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_adapter_accepts_generic_manage_session_stream() {
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let manage_stream = MockManageStream {
+            open_calls: open_calls.clone(),
+        };
+        let (channel, _remote_fd) = MuxChannel::create_pair().expect("mux channel");
+        let (sink, _stream) = channel.split().expect("split mux channel");
+        let adapter = IpcManageStreamAdapter::new(manage_stream, sink.fd_sender());
+
+        let fd_id = IpcManageSessionStream::open_stream(&adapter)
+            .await
+            .expect("open stream through adapter");
+
+        assert_eq!(fd_id, VarInt::from_u32(0));
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn unix_stream_from_std_accepts_default_blocking_socketpair() {
