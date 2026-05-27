@@ -82,14 +82,16 @@ impl LocalForward {
     ///
     /// This function runs an infinite accept loop and only returns if the
     /// initial bind fails.
-    pub async fn run<M>(
+    pub async fn run<M, R, W>(
         &self,
-        conversation: Arc<Conversation<M>>,
+        conversation: Arc<Conversation<M, R, W>>,
     ) -> Result<Infallible, BindLocalForwardError>
     where
         M: ManageSessionStream + 'static,
         M::StreamReader: 'static,
         M::StreamWriter: 'static,
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
     {
         match &self.bind {
             Endpoint::Tcp { host, port } => {
@@ -118,15 +120,17 @@ impl LocalForward {
         }
     }
 
-    async fn accept_loop_tcp<M>(
+    async fn accept_loop_tcp<M, R, W>(
         &self,
         listener: tokio::net::TcpListener,
-        conversation: Arc<Conversation<M>>,
+        conversation: Arc<Conversation<M, R, W>>,
     ) -> Result<Infallible, BindLocalForwardError>
     where
         M: ManageSessionStream + 'static,
         M::StreamReader: 'static,
         M::StreamWriter: 'static,
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -148,15 +152,17 @@ impl LocalForward {
     }
 
     #[cfg(unix)]
-    async fn accept_loop_unix<M>(
+    async fn accept_loop_unix<M, R, W>(
         &self,
         listener: tokio::net::UnixListener,
-        conversation: Arc<Conversation<M>>,
+        conversation: Arc<Conversation<M, R, W>>,
     ) -> Result<Infallible, BindLocalForwardError>
     where
         M: ManageSessionStream + 'static,
         M::StreamReader: 'static,
         M::StreamWriter: 'static,
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -178,8 +184,8 @@ impl LocalForward {
 }
 
 /// Open an SSH channel to the connect endpoint and relay data bidirectionally.
-async fn open_channel_and_relay<M>(
-    conversation: Arc<Conversation<M>>,
+async fn open_channel_and_relay<M, R, W>(
+    conversation: Arc<Conversation<M, R, W>>,
     connect: Endpoint,
     local_reader: Pin<Box<dyn AsyncRead + Send>>,
     local_writer: Pin<Box<dyn AsyncWrite + Send>>,
@@ -187,6 +193,8 @@ async fn open_channel_and_relay<M>(
     M: ManageSessionStream + 'static,
     M::StreamReader: 'static,
     M::StreamWriter: 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let channel_result = match &connect {
         Endpoint::Tcp { host, port } => {
@@ -239,10 +247,15 @@ impl RemoteForward {
     /// Send a global request to the server to start listening on the remote
     /// bind endpoint. Returns the established binding info (including any
     /// server-allocated port).
-    pub async fn request<M: ManageSessionStream>(
+    pub async fn request<M, R, W>(
         &self,
-        conversation: &Conversation<M>,
-    ) -> Result<RemoteForwardEstablished, RequestRemoteForwardError> {
+        conversation: &Conversation<M, R, W>,
+    ) -> Result<RemoteForwardEstablished, RequestRemoteForwardError>
+    where
+        M: ManageSessionStream,
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
         use request_remote_forward_error::*;
 
         match &self.bind {
@@ -341,13 +354,15 @@ pub async fn connect_locally(
 /// based on the provided mappings.
 ///
 /// Runs until the conversation's channel accept stream ends.
-pub async fn accept_forwarded_channels<M>(
-    conversation: Arc<Conversation<M>>,
+pub async fn accept_forwarded_channels<M, R, W>(
+    conversation: Arc<Conversation<M, R, W>>,
     mappings: Vec<RemoteForwardEstablished>,
 ) where
     M: ManageSessionStream + 'static,
     M::StreamReader: 'static,
     M::StreamWriter: 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut tasks = tokio::task::JoinSet::new();
     loop {
