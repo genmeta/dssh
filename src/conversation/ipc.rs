@@ -8,9 +8,8 @@
 //! # Architecture
 //!
 //! The gateway process wraps a [`ManageSessionStream`](super::ManageSessionStream)
-//! implementation (for example
-//! [`ConversationHandle`](crate::protocol::ConversationHandle) or a
-//! WebTransport-backed stream manager) in an [`IpcManageStreamAdapter`] and
+//! implementation (for example a WebTransport-backed stream manager) in an
+//! [`IpcManageStreamAdapter`] and
 //! serves the generated [`IpcManageSessionStreamServerShared`]. Each
 //! `open_stream` / `accept_stream` call:
 //! 1. Opens a real bidirectional stream through the wrapped manager.

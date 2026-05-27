@@ -13,7 +13,20 @@ pub mod conversation;
 pub mod error;
 pub mod forward;
 pub mod message;
-pub mod protocol;
 pub mod session;
 pub mod version;
 pub mod webtransport;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn legacy_raw_ssh3_protocol_module_is_not_exported() {
+        let lib = include_str!("lib.rs");
+        let legacy_protocol_export = concat!("pub mod ", "protocol;");
+
+        assert!(
+            !lib.contains(legacy_protocol_export),
+            "dssh transport must stay WebTransport-only"
+        );
+    }
+}

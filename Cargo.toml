@@ -71,13 +71,5 @@ tokio-util = "0.7"
 tracing-subscriber = "0.3"
 
 [[example]]
-name = "ssh3-client"
-required-features = ["client", "cli"]
-
-[[example]]
-name = "ssh3-server"
-required-features = ["server"]
-
-[[example]]
 name = "ssh3-session"
 required-features = ["server"]
