@@ -136,7 +136,9 @@ pub enum WebTransportStreamError {
     },
 
     #[snafu(display("failed to accept webtransport bidirectional stream"))]
-    AcceptBi { source: h3x::webtransport::Closed },
+    AcceptBi {
+        source: h3x::webtransport::AcceptStreamError,
+    },
 
     #[snafu(display("failed to encode dssh webtransport stream kind"))]
     EncodeStreamKind { source: std::io::Error },
@@ -177,7 +179,10 @@ mod tests {
 
     use bytes::Bytes;
     use futures::{Sink, SinkExt, Stream};
-    use h3x::quic::{CancelStream, GetStreamId, StopStream};
+    use h3x::{
+        quic::{CancelStream, GetStreamId, StopStream},
+        stream_id::StreamId,
+    };
     use tokio::io::AsyncReadExt;
 
     use super::*;
@@ -307,8 +312,8 @@ mod tests {
         type StreamReader = TestReadStream;
         type StreamWriter = TestWriteStream;
 
-        fn session_id(&self) -> VarInt {
-            VarInt::from_u32(4)
+        fn id(&self) -> StreamId {
+            StreamId(VarInt::from_u32(4))
         }
 
         async fn open_bi(
@@ -333,15 +338,20 @@ mod tests {
 
         async fn accept_bi(
             &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), h3x::webtransport::Closed> {
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), h3x::webtransport::AcceptStreamError>
+        {
             self.accept_streams
                 .lock()
                 .expect("accept lock poisoned")
                 .pop_front()
-                .ok_or(h3x::webtransport::Closed)
+                .ok_or(h3x::webtransport::AcceptStreamError::Closed {
+                    source: h3x::webtransport::SessionClosed,
+                })
         }
 
-        async fn accept_uni(&self) -> Result<Self::StreamReader, h3x::webtransport::Closed> {
+        async fn accept_uni(
+            &self,
+        ) -> Result<Self::StreamReader, h3x::webtransport::AcceptStreamError> {
             unreachable!("dssh webtransport manager uses only bidirectional streams")
         }
     }
@@ -445,6 +455,24 @@ mod tests {
         assert!(matches!(
             error,
             WebTransportStreamError::DecodeStreamKind { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_empty_session_preserves_closed_accept_error() {
+        let session = TestSession::default();
+        let manager = WebTransportStreamManager::new(session);
+
+        let error = match manager.accept_stream().await {
+            Ok(_) => panic!("empty session cannot accept a channel stream"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            WebTransportStreamError::AcceptBi {
+                source: h3x::webtransport::AcceptStreamError::Closed { .. }
+            }
         ));
     }
 }

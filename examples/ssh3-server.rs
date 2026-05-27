@@ -37,13 +37,13 @@ use h3x::dquic::{
     identity::Identity,
     server::ServerQuicConfig,
 };
+use h3x::endpoint::H3Endpoint;
 use h3x::hyper::server::TowerService;
 use h3x::ipc::transport::MuxChannel;
 use h3x::message::stream::MessageStreamError;
 use h3x::quic::DynConnection;
-use h3x::server::{Servers, Service as Router};
 use h3x::stream_id::StreamId;
-use http::StatusCode;
+use http::{Method, StatusCode};
 use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use remoc::prelude::*;
 use snafu::Report;
@@ -116,8 +116,6 @@ async fn main() {
         session_binary: cli.session_binary,
     });
 
-    let router = Router::new().connect(SSH3_CONNECT_PATH, service);
-
     let builder = Arc::new(ConnectionBuilder::new(Arc::default()).protocol(Ssh3ProtocolFactory));
     let identity = Arc::new(Identity {
         name: "localhost".parse().expect("localhost is a valid DNS name"),
@@ -137,15 +135,12 @@ async fn main() {
         .bind(Arc::new(vec![bind]))
         .build()
         .await;
-    let mut servers = Servers::from_quic_listener()
-        .listener(quic)
-        .service(router)
-        .builder(builder)
-        .build();
+    let mut endpoint = H3Endpoint::builder().quic(quic).builder(builder).build();
 
-    tracing::info!(bind = %cli.bind, "SSH3 server listening");
-    let err = servers.run().await;
-    tracing::error!(error = %snafu::Report::from_error(&err), "server stopped");
+    tracing::info!(bind = %cli.bind, "ssh3 server listening");
+    if let Err(error) = endpoint.serve(service).await {
+        tracing::error!(error = %snafu::Report::from_error(&error), "server stopped");
+    }
 }
 
 fn error_response(status: StatusCode) -> Result<http::Response<BoxBody>, Infallible> {
@@ -167,6 +162,10 @@ async fn handle_ssh3_connect(
     request: http::Request<BoxBody>,
     session_binary: PathBuf,
 ) -> Result<http::Response<BoxBody>, Infallible> {
+    if request.method() != Method::CONNECT || request.uri().path() != SSH3_CONNECT_PATH {
+        return error_response(StatusCode::NOT_FOUND);
+    }
+
     let auth_header = request
         .headers()
         .get("authorization")
