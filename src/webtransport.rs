@@ -11,15 +11,23 @@
 //! control stream is an ordinary WebTransport bidirectional stream marked with
 //! the control kind.
 
+use std::convert::Infallible;
+
+use bytes::Bytes;
 use h3x::{
     codec::{DecodeExt, EncodeExt, SinkWriter, StreamReader},
     quic,
     varint::VarInt,
 };
-use snafu::{ResultExt, Snafu};
+use http::{HeaderValue, header::AUTHORIZATION, uri::Authority};
+use http_body_util::{BodyExt, Empty};
+use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use tokio::io::AsyncWriteExt;
 
+use crate::constants::{SSH_VERSION, SSH3_CONNECT_PATH};
 use crate::conversation::{Conversation, ManageSessionStream};
+use crate::error::NegotiateVersionError;
+use crate::version::{SshVersion, negotiate_version, version_response_header};
 
 /// DSSH-over-WebTransport stream kind for the conversation control stream.
 pub const DSSH_CONTROL_STREAM_KIND: VarInt = VarInt::from_u32(0);
@@ -43,6 +51,18 @@ pub type WebTransportConversation<S> = Conversation<
     StreamReader<<S as h3x::webtransport::Session>::StreamReader>,
     SinkWriter<<S as h3x::webtransport::Session>::StreamWriter>,
 >;
+
+/// DSSH conversation backed by a concrete h3x WebTransport session.
+pub type ClientWebTransportConversation =
+    WebTransportConversation<h3x::webtransport::WebTransportSession>;
+
+/// Accepted server-side WebTransport session plus the HTTP response that must
+/// be returned to complete the Extended CONNECT handshake.
+pub struct AcceptedWebTransportSession {
+    pub response: http::Response<Empty<Bytes>>,
+    pub session: h3x::webtransport::WebTransportSession,
+    pub peer_version: String,
+}
 
 impl<S> WebTransportStreamManager<S> {
     pub fn new(session: S) -> Self {
@@ -197,6 +217,172 @@ where
     Ok(Conversation::new(id, peer_version, reader, writer, manager))
 }
 
+/// Error returned when constructing a client-side DSSH WebTransport CONNECT
+/// request.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum BuildClientConnectRequestError {
+    #[snafu(display("failed to build dssh webtransport connect URI"))]
+    Uri { source: http::uri::InvalidUri },
+    #[snafu(display("failed to build dssh webtransport connect request"))]
+    Request { source: http::Error },
+}
+
+/// Error returned when opening a client-side DSSH conversation over
+/// WebTransport.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ClientConnectConversationError {
+    #[snafu(display("failed to build dssh webtransport connect request"))]
+    BuildRequest {
+        source: BuildClientConnectRequestError,
+    },
+    #[snafu(display("failed to execute dssh webtransport connect request"))]
+    Execute {
+        source: h3x::hyper::client::RequestError<Infallible>,
+    },
+    #[snafu(display("failed to validate dssh peer version"))]
+    PeerVersion { source: NegotiateVersionError },
+    #[snafu(display("failed to establish extended connect"))]
+    Establish {
+        source: h3x::hyper::extended_connect::EstablishError,
+    },
+    #[snafu(display("successful dssh webtransport connect response was not validated"))]
+    MissingValidatedPeerVersion,
+    #[snafu(display("failed to register webtransport session"))]
+    RegisterSession {
+        source: h3x::webtransport::RegisterSessionError,
+    },
+    #[snafu(display("failed to open dssh webtransport conversation"))]
+    OpenConversation { source: OpenConversationError },
+}
+
+/// Error returned when accepting a server-side DSSH WebTransport session from
+/// an Extended CONNECT request.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum AcceptServerSessionError {
+    #[snafu(display("extended connect path {path} is not the dssh connect path"))]
+    UnexpectedPath { path: String },
+    #[snafu(display("failed to validate dssh peer version"))]
+    PeerVersion { source: NegotiateVersionError },
+    #[snafu(display("failed to accept extended connect"))]
+    Accept {
+        source: h3x::hyper::extended_connect::AcceptError,
+    },
+    #[snafu(display("failed to register webtransport session"))]
+    RegisterSession {
+        source: h3x::webtransport::RegisterSessionError,
+    },
+}
+
+/// Build a DSSH WebTransport Extended CONNECT request.
+///
+/// The returned request carries `:protocol = webtransport-h3` through h3x's
+/// [`h3x::qpack::field::Protocol`] extension and includes the DSSH
+/// `ssh-version` header. Authentication, when present, is carried as a normal
+/// HTTP `Authorization` header.
+pub fn client_connect_request(
+    authority: &Authority,
+    authorization: Option<HeaderValue>,
+) -> Result<http::Request<Empty<Bytes>>, BuildClientConnectRequestError> {
+    let uri = format!("https://{authority}{SSH3_CONNECT_PATH}")
+        .parse::<http::Uri>()
+        .context(build_client_connect_request_error::UriSnafu)?;
+
+    let mut builder = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(uri)
+        .header("ssh-version", SSH_VERSION)
+        .extension(h3x::qpack::field::Protocol::new(
+            h3x::webtransport::WEBTRANSPORT_H3,
+        ));
+    if let Some(value) = authorization {
+        builder = builder.header(AUTHORIZATION, value);
+    }
+
+    builder
+        .body(Empty::<Bytes>::new())
+        .context(build_client_connect_request_error::RequestSnafu)
+}
+
+fn peer_version(headers: &http::HeaderMap) -> Result<SshVersion, NegotiateVersionError> {
+    negotiate_version(headers)
+}
+
+/// Send a DSSH WebTransport Extended CONNECT request and open the DSSH
+/// conversation control stream on the resulting WebTransport session.
+pub async fn open_client_conversation<C>(
+    connection: &h3x::connection::Connection<C>,
+    authority: &Authority,
+    authorization: Option<HeaderValue>,
+) -> Result<ClientWebTransportConversation, ClientConnectConversationError>
+where
+    C: h3x::quic::Connection,
+{
+    let request = client_connect_request(authority, authorization)
+        .context(client_connect_conversation_error::BuildRequestSnafu)?;
+    let response = connection
+        .execute_hyper_request(request)
+        .await
+        .context(client_connect_conversation_error::ExecuteSnafu)?;
+    let peer_version = if response.status().is_success() {
+        Some(
+            peer_version(response.headers())
+                .context(client_connect_conversation_error::PeerVersionSnafu)?,
+        )
+    } else {
+        None
+    };
+    let connect = h3x::hyper::extended_connect::establish(response.map(|body| body.boxed_unsync()))
+        .await
+        .context(client_connect_conversation_error::EstablishSnafu)?;
+    let peer_version = peer_version
+        .context(client_connect_conversation_error::MissingValidatedPeerVersionSnafu)?;
+    let session = h3x::webtransport::WebTransportSession::try_from(connect)
+        .context(client_connect_conversation_error::RegisterSessionSnafu)?;
+    open_conversation(session, peer_version.version_string)
+        .await
+        .context(client_connect_conversation_error::OpenConversationSnafu)
+}
+
+/// Accept a DSSH WebTransport Extended CONNECT request after the caller has
+/// already made its authentication and authorization decision.
+///
+/// The returned HTTP response must be sent back to the peer. Only after that
+/// response is on the wire should the server call [`accept_conversation`] in a
+/// task that owns the returned session; otherwise client and server can
+/// deadlock waiting for each other.
+pub async fn accept_server_session<B>(
+    request: http::Request<B>,
+) -> Result<AcceptedWebTransportSession, AcceptServerSessionError>
+where
+    B: http_body::Body + Unpin + Send + 'static,
+{
+    ensure!(
+        request.uri().path() == SSH3_CONNECT_PATH,
+        accept_server_session_error::UnexpectedPathSnafu {
+            path: request.uri().path().to_owned(),
+        }
+    );
+    let version =
+        peer_version(request.headers()).context(accept_server_session_error::PeerVersionSnafu)?;
+    let (mut response, connect) = h3x::hyper::extended_connect::accept(request)
+        .await
+        .context(accept_server_session_error::AcceptSnafu)?;
+    let session = h3x::webtransport::WebTransportSession::try_from(connect)
+        .context(accept_server_session_error::RegisterSessionSnafu)?;
+    response
+        .headers_mut()
+        .insert("ssh-version", version_response_header(&version));
+
+    Ok(AcceptedWebTransportSession {
+        response,
+        session,
+        peer_version: version.version_string,
+    })
+}
+
 /// Error returned by [`WebTransportStreamManager`] operations.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
@@ -254,6 +440,7 @@ mod tests {
         quic::{CancelStream, GetStreamId, StopStream},
         stream_id::StreamId,
     };
+    use http::HeaderMap;
     use tokio::io::AsyncReadExt;
 
     use super::*;
@@ -588,6 +775,109 @@ mod tests {
             AcceptConversationError::AcceptControl {
                 source: WebTransportStreamError::UnexpectedStreamKind { kind }
             } if kind == DSSH_CHANNEL_STREAM_KIND
+        ));
+    }
+
+    #[test]
+    fn client_connect_request_uses_webtransport_protocol_and_version() {
+        let authority: Authority = "example.test:443".parse().expect("authority");
+        let authorization = HeaderValue::from_static("Basic abc");
+
+        let request = client_connect_request(&authority, Some(authorization.clone()))
+            .expect("request builds");
+
+        assert_eq!(request.method(), http::Method::CONNECT);
+        assert_eq!(
+            request.uri().to_string(),
+            format!("https://{authority}{SSH3_CONNECT_PATH}")
+        );
+        assert_eq!(
+            request.headers().get("ssh-version"),
+            Some(&HeaderValue::from_static(SSH_VERSION))
+        );
+        assert_eq!(request.headers().get(AUTHORIZATION), Some(&authorization));
+        assert_eq!(
+            request
+                .extensions()
+                .get::<h3x::qpack::field::Protocol>()
+                .map(h3x::qpack::field::Protocol::as_str),
+            Some(h3x::webtransport::WEBTRANSPORT_H3)
+        );
+    }
+
+    #[test]
+    fn peer_version_rejects_missing_invalid_and_unsupported_values() {
+        let headers = HeaderMap::new();
+        assert!(matches!(
+            peer_version(&headers),
+            Err(NegotiateVersionError::MissingSshVersionHeader)
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "ssh-version",
+            HeaderValue::from_bytes(b"dssh-00\xff").expect("opaque header value"),
+        );
+        assert!(matches!(
+            peer_version(&headers),
+            Err(NegotiateVersionError::InvalidSshVersionHeaderValue { .. })
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("ssh-version", HeaderValue::from_static("dssh-99"));
+        assert!(matches!(
+            peer_version(&headers),
+            Err(NegotiateVersionError::UnsupportedSshVersion { offered }) if offered == "dssh-99"
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("ssh-version", HeaderValue::from_static(SSH_VERSION));
+        assert_eq!(
+            peer_version(&headers)
+                .expect("supported version")
+                .version_string,
+            SSH_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_server_session_rejects_wrong_path_before_registering_session() {
+        let request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://example.test/not-dssh")
+            .header("ssh-version", SSH_VERSION)
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+
+        let error = match accept_server_session(request).await {
+            Ok(_) => panic!("wrong path must not be accepted"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            AcceptServerSessionError::UnexpectedPath { path } if path == "/not-dssh"
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_server_session_rejects_missing_version_before_registering_session() {
+        let request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://example.test{SSH3_CONNECT_PATH}"))
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+
+        let error = match accept_server_session(request).await {
+            Ok(_) => panic!("missing version must not be accepted"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            AcceptServerSessionError::PeerVersion {
+                source: NegotiateVersionError::MissingSshVersionHeader
+            }
         ));
     }
 }

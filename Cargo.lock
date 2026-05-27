@@ -649,6 +649,7 @@ dependencies = [
  "futures",
  "h3x",
  "http",
+ "http-body",
  "http-body-util",
  "libc",
  "nix 0.31.2",
@@ -926,7 +927,7 @@ dependencies = [
 [[package]]
 name = "h3x"
 version = "0.2.0"
-source = "git+https://github.com/genmeta/h3x.git?branch=endpoint#4a07393120b46a6013cf9abf37e9cd744859bd6f"
+source = "git+https://github.com/genmeta/h3x.git?branch=endpoint#dbc8d2dd9e19043f23b7dc589a8f8689144eddb9"
 dependencies = [
  "arc-swap",
  "async-channel",
