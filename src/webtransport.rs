@@ -24,7 +24,7 @@ use http_body_util::{BodyExt, Empty};
 use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use tokio::io::AsyncWriteExt;
 
-use crate::constants::{SSH_VERSION, SSH3_CONNECT_PATH};
+use crate::constants::SSH_VERSION;
 use crate::conversation::{Conversation, ManageSessionStream};
 use crate::error::NegotiateVersionError;
 use crate::version::{SshVersion, negotiate_version, version_response_header};
@@ -281,12 +281,16 @@ pub enum AcceptServerSessionError {
 /// The returned request carries `:protocol = webtransport-h3` through h3x's
 /// [`h3x::qpack::field::Protocol`] extension and includes the DSSH
 /// `ssh-version` header. Authentication, when present, is carried as a normal
-/// HTTP `Authorization` header.
+/// HTTP `Authorization` header. `path` is supplied by the caller so gateways
+/// can keep their routed SSH location, while clients that want a stable
+/// well-known endpoint can pass
+/// [`DSSH_CONNECT_PATH`](crate::constants::DSSH_CONNECT_PATH).
 pub fn client_connect_request(
     authority: &Authority,
+    path: &str,
     authorization: Option<HeaderValue>,
 ) -> Result<http::Request<Empty<Bytes>>, BuildClientConnectRequestError> {
-    let uri = format!("https://{authority}{SSH3_CONNECT_PATH}")
+    let uri = format!("https://{authority}{path}")
         .parse::<http::Uri>()
         .context(build_client_connect_request_error::UriSnafu)?;
 
@@ -315,12 +319,13 @@ fn peer_version(headers: &http::HeaderMap) -> Result<SshVersion, NegotiateVersio
 pub async fn open_client_conversation<C>(
     connection: &h3x::connection::Connection<C>,
     authority: &Authority,
+    path: &str,
     authorization: Option<HeaderValue>,
 ) -> Result<ClientWebTransportConversation, ClientConnectConversationError>
 where
     C: h3x::quic::Connection,
 {
-    let request = client_connect_request(authority, authorization)
+    let request = client_connect_request(authority, path, authorization)
         .context(client_connect_conversation_error::BuildRequestSnafu)?;
     let response = connection
         .execute_hyper_request(request)
@@ -349,18 +354,23 @@ where
 /// Accept a DSSH WebTransport Extended CONNECT request after the caller has
 /// already made its authentication and authorization decision.
 ///
+/// The accepted request path must match `path`. This keeps route ownership with
+/// the server or gateway layer instead of forcing every deployment to use the
+/// well-known DSSH path.
+///
 /// The returned HTTP response must be sent back to the peer. Only after that
 /// response is on the wire should the server call [`accept_conversation`] in a
 /// task that owns the returned session; otherwise client and server can
 /// deadlock waiting for each other.
 pub async fn accept_server_session<B>(
     request: http::Request<B>,
+    path: &str,
 ) -> Result<AcceptedWebTransportSession, AcceptServerSessionError>
 where
     B: http_body::Body + Unpin + Send + 'static,
 {
     ensure!(
-        request.uri().path() == SSH3_CONNECT_PATH,
+        request.uri().path() == path,
         accept_server_session_error::UnexpectedPathSnafu {
             path: request.uri().path().to_owned(),
         }
@@ -444,7 +454,7 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use super::*;
-    use crate::constants::SSH_VERSION;
+    use crate::constants::{DSSH_CONNECT_PATH, SSH_VERSION};
 
     #[derive(Debug, Default)]
     struct StreamState {
@@ -779,17 +789,23 @@ mod tests {
     }
 
     #[test]
-    fn client_connect_request_uses_webtransport_protocol_and_version() {
+    fn dssh_connect_path_is_well_known_dssh_path() {
+        assert_eq!(DSSH_CONNECT_PATH, "/.well-known/dssh/connect");
+    }
+
+    #[test]
+    fn client_connect_request_uses_custom_path_webtransport_protocol_and_version() {
         let authority: Authority = "example.test:443".parse().expect("authority");
         let authorization = HeaderValue::from_static("Basic abc");
+        let path = "/ssh/yiyue";
 
-        let request = client_connect_request(&authority, Some(authorization.clone()))
+        let request = client_connect_request(&authority, path, Some(authorization.clone()))
             .expect("request builds");
 
         assert_eq!(request.method(), http::Method::CONNECT);
         assert_eq!(
             request.uri().to_string(),
-            format!("https://{authority}{SSH3_CONNECT_PATH}")
+            format!("https://{authority}{path}")
         );
         assert_eq!(
             request.headers().get("ssh-version"),
@@ -849,7 +865,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .expect("request");
 
-        let error = match accept_server_session(request).await {
+        let error = match accept_server_session(request, DSSH_CONNECT_PATH).await {
             Ok(_) => panic!("wrong path must not be accepted"),
             Err(error) => error,
         };
@@ -864,11 +880,11 @@ mod tests {
     async fn accept_server_session_rejects_missing_version_before_registering_session() {
         let request = http::Request::builder()
             .method(http::Method::CONNECT)
-            .uri(format!("https://example.test{SSH3_CONNECT_PATH}"))
+            .uri(format!("https://example.test{DSSH_CONNECT_PATH}"))
             .body(Empty::<Bytes>::new())
             .expect("request");
 
-        let error = match accept_server_session(request).await {
+        let error = match accept_server_session(request, DSSH_CONNECT_PATH).await {
             Ok(_) => panic!("missing version must not be accepted"),
             Err(error) => error,
         };
