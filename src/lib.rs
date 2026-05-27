@@ -16,6 +16,4 @@ pub mod message;
 pub mod protocol;
 pub mod session;
 pub mod version;
-
-#[cfg(feature = "webtransport")]
 pub mod webtransport;
