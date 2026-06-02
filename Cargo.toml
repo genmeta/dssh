@@ -56,20 +56,5 @@ cli = ["dep:peg"]
 config = ["dep:peg"]
 
 [dev-dependencies]
-clap = { version = "4", features = ["derive"] }
-ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = [
-    "ring",
-    "logging",
-    "std",
-] }
 serde_json = "1"
-smallvec = "1"
 tempfile = "3"
-tower-service = "0.3"
-tokio-util = "0.7"
-tracing-subscriber = "0.3"
-
-[[example]]
-name = "ssh3-session"
-required-features = ["server"]
