@@ -137,25 +137,30 @@ mod server {
         pub credential: crate::auth::AuthCredential,
     }
 
+    /// Authentication success payload.
+    ///
+    /// The child reserves `control_fd_id` before returning this value. The
+    /// parent delivers the control stream FD with that receiver-chosen ID while
+    /// invoking [`StartSessionFn`].
+    #[derive(Serialize, Deserialize)]
+    pub struct AuthenticatedSession {
+        /// Inner remote function that starts the session.
+        pub start_session: StartSessionFn,
+        /// Receiver-chosen FD transfer ID for the control stream socketpair.
+        pub control_fd_id: VarInt,
+    }
+
     /// Argument to the inner [`StartSessionFn`]: everything the child needs to
     /// construct a [`Conversation`](crate::conversation::Conversation) after
     /// authentication succeeds and the parent completes the HTTP upgrade.
     ///
     /// Stream data travels through Unix socketpairs via FD passing, not through
-    /// remoc serialization. The `manage_stream` field provides an RPC interface
-    /// that returns FD-registry batch IDs; the `control_fd_id` identifies the
-    /// pre-established control stream socketpair.
+    /// remoc serialization. The `manage_stream` field provides an RPC
+    /// interface that uses receiver-chosen FD transfer IDs.
     #[derive(Serialize, Deserialize)]
     pub struct SessionBootstrap {
         /// RPC client for opening/accepting QUIC streams via IPC FD passing.
         pub manage_stream: crate::conversation::ipc::IpcManageSessionStreamClient,
-        /// FD-registry batch ID for the control stream socketpair.
-        ///
-        /// The child calls [`FdRegistry::wait_fds`](h3x::ipc::transport::FdRegistry::wait_fds)
-        /// with this ID to receive a single `OwnedFd` for a bidirectional Unix
-        /// socketpair. One half carries data from the SSH3 client (control reader),
-        /// the other half carries data to the SSH3 client (control writer).
-        pub control_fd_id: VarInt,
         /// Unique session identifier.
         #[serde(
             serialize_with = "serialize_stream_id",
@@ -235,10 +240,10 @@ mod server {
     /// Outer remote function: the child creates this and sends it to the parent.
     ///
     /// When the parent calls it with [`AuthRequest`], the child performs PAM
-    /// authentication. On success it returns a [`StartSessionFn`] continuation;
-    /// on failure it returns [`AuthError`].
+    /// authentication. On success it returns an [`AuthenticatedSession`]
+    /// continuation; on failure it returns [`AuthError`].
     pub type AuthenticateFn =
-        remoc::rfn::RFnOnce<(AuthRequest,), Result<StartSessionFn, AuthError>>;
+        remoc::rfn::RFnOnce<(AuthRequest,), Result<AuthenticatedSession, AuthError>>;
 
     /// Inner remote function: returned by [`AuthenticateFn`] on success.
     ///
