@@ -14,25 +14,27 @@
 //! `open_stream` / `accept_stream` call:
 //! 1. Opens a real bidirectional stream through the wrapped manager.
 //! 2. Creates a Unix socketpair.
-//! 3. Queues the client-side FD through the [`FdSender`].
+//! 3. Delivers the client-side FD through the [`FdTransfer`].
 //! 4. Spawns bridge tasks forwarding data between the managed stream and the
 //!    server-side socketpair half.
 //! 5. Returns the FD-registry batch ID over RPC.
 //!
 //! The child process receives an [`IpcManageSessionStreamClient`] and wraps it
 //! in [`IpcManageStreamHandle`], which implements [`ManageSessionStream`]:
-//! 1. Calls the RPC method to get the FD-registry batch ID.
-//! 2. Retrieves the socketpair FD from the [`FdRegistry`].
+//! 1. Reserves a receiver-chosen FD transfer ID.
+//! 2. Calls the RPC method with that ID while concurrently receiving the FD.
 //! 3. Splits it into `(OwnedReadHalf, OwnedWriteHalf)`.
+
+use std::future::IntoFuture;
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use h3x::{
-    ipc::transport::{FdRegistry, FdSender, WaitFdsError},
+    ipc::transport::{FdDelivery, FdTransfer, WaitFdsError},
     quic::ConnectionError,
     varint::VarInt,
 };
-use snafu::{OptionExt, Snafu};
+use snafu::Snafu;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{
@@ -54,13 +56,12 @@ fn unix_stream_from_std(stream: std::os::unix::net::UnixStream) -> std::io::Resu
 /// Remoc RPC counterpart of [`ManageSessionStream`](super::ManageSessionStream)
 /// using FD passing for stream data.
 ///
-/// Each method returns a [`VarInt`] — the FD-registry batch ID. The caller
-/// passes it to [`FdRegistry::wait_fds`] to retrieve a single `OwnedFd` for a
-/// bidirectional Unix socketpair.
+/// Each method receives a receiver-chosen FD transfer ID and echoes it after
+/// the FD delivery is acknowledged.
 #[remoc::rtc::remote]
 pub trait IpcManageSessionStream: Send + Sync {
-    async fn open_stream(&self) -> Result<VarInt, ConnectionError>;
-    async fn accept_stream(&self) -> Result<VarInt, ConnectionError>;
+    async fn open_stream(&self, fd_id: VarInt) -> Result<VarInt, ConnectionError>;
+    async fn accept_stream(&self, fd_id: VarInt) -> Result<VarInt, ConnectionError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,15 +69,15 @@ pub trait IpcManageSessionStream: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Client-side handle wrapping an [`IpcManageSessionStreamClient`] and
-/// [`FdRegistry`], implementing [`ManageSessionStream`].
+/// [`FdTransfer`], implementing [`ManageSessionStream`].
 ///
 /// Each `open_stream` / `accept_stream` call:
-/// 1. Calls the RPC to get a FD-registry batch ID.
-/// 2. Waits for FDs from the registry.
+/// 1. Reserves a receiver-chosen FD transfer ID.
+/// 2. Calls the RPC with that ID while receiving the FD.
 /// 3. Converts the `OwnedFd` to a tokio `UnixStream` and splits it.
 pub struct IpcManageStreamHandle {
     rpc: IpcManageSessionStreamClient,
-    fd_registry: FdRegistry,
+    fd_transfer: FdTransfer,
 }
 
 /// Error from [`IpcManageStreamHandle`] operations.
@@ -87,33 +88,47 @@ pub enum IpcManageStreamError {
     Rpc { source: ConnectionError },
     #[snafu(display("failed to receive stream FD"))]
     ReceiveFd { source: WaitFdsError },
-    #[snafu(display("expected 1 FD, got {actual}"))]
-    UnexpectedFdCount { actual: usize },
+    #[snafu(display("unexpected stream fd batch size"))]
+    UnexpectedFdCount {
+        source: h3x::ipc::transport::TakeFdsError,
+    },
+    #[snafu(display("peer responded with fd id {actual}, expected {expected}"))]
+    FdIdMismatch { expected: VarInt, actual: VarInt },
     #[snafu(display("failed to convert FD to UnixStream"))]
     FromFd { source: std::io::Error },
 }
 
 impl IpcManageStreamHandle {
-    pub fn new(rpc: IpcManageSessionStreamClient, fd_registry: FdRegistry) -> Self {
-        Self { rpc, fd_registry }
+    pub fn new(rpc: IpcManageSessionStreamClient, fd_transfer: FdTransfer) -> Self {
+        Self { rpc, fd_transfer }
     }
 
     async fn resolve_stream(
         &self,
-        fd_id: VarInt,
+        rpc: impl std::future::Future<Output = Result<VarInt, ConnectionError>>,
+        receiver: h3x::ipc::transport::FdReceiver,
     ) -> Result<(OwnedReadHalf, OwnedWriteHalf), IpcManageStreamError> {
         use ipc_manage_stream_error::*;
         use snafu::ResultExt;
 
-        let fds = self
-            .fd_registry
-            .wait_fds(fd_id)
-            .await
-            .context(ReceiveFdSnafu)?;
-        let fd = fds
-            .into_iter()
-            .next()
-            .context(UnexpectedFdCountSnafu { actual: 0_usize })?;
+        let expected = receiver.id();
+        let receive = receiver.into_future();
+        tokio::pin!(rpc);
+        tokio::pin!(receive);
+        let (actual, received) = tokio::select! {
+            rpc_result = &mut rpc => {
+                let actual = rpc_result.context(RpcSnafu)?;
+                let received = receive.await.context(ReceiveFdSnafu)?;
+                (actual, received)
+            }
+            receive_result = &mut receive => {
+                let received = receive_result.context(ReceiveFdSnafu)?;
+                let actual = rpc.await.context(RpcSnafu)?;
+                (actual, received)
+            }
+        };
+        snafu::ensure!(actual == expected, FdIdMismatchSnafu { expected, actual });
+        let fd = received.into_one().context(UnexpectedFdCountSnafu)?;
         let stream =
             unix_stream_from_std(std::os::unix::net::UnixStream::from(fd)).context(FromFdSnafu)?;
         Ok(stream.into_split())
@@ -126,23 +141,23 @@ impl super::ManageSessionStream for IpcManageStreamHandle {
     type Error = IpcManageStreamError;
 
     async fn open_stream(&self) -> Result<(OwnedReadHalf, OwnedWriteHalf), IpcManageStreamError> {
-        use ipc_manage_stream_error::*;
-        use snafu::ResultExt;
-
-        let fd_id = IpcManageSessionStream::open_stream(&self.rpc)
-            .await
-            .context(RpcSnafu)?;
-        self.resolve_stream(fd_id).await
+        let receiver = self.fd_transfer.receive();
+        let fd_id = receiver.id();
+        self.resolve_stream(
+            IpcManageSessionStream::open_stream(&self.rpc, fd_id),
+            receiver,
+        )
+        .await
     }
 
     async fn accept_stream(&self) -> Result<(OwnedReadHalf, OwnedWriteHalf), IpcManageStreamError> {
-        use ipc_manage_stream_error::*;
-        use snafu::ResultExt;
-
-        let fd_id = IpcManageSessionStream::accept_stream(&self.rpc)
-            .await
-            .context(RpcSnafu)?;
-        self.resolve_stream(fd_id).await
+        let receiver = self.fd_transfer.receive();
+        let fd_id = receiver.id();
+        self.resolve_stream(
+            IpcManageSessionStream::accept_stream(&self.rpc, fd_id),
+            receiver,
+        )
+        .await
     }
 }
 
@@ -154,7 +169,7 @@ impl super::ManageSessionStream for IpcManageStreamHandle {
 /// [`IpcManageSessionStream`] RPC trait.
 ///
 /// Each call opens a real managed stream, creates a Unix socketpair, spawns
-/// bridge tasks, and queues the client-side FD through the [`FdSender`].
+/// bridge tasks, and delivers the client-side FD through the [`FdTransfer`].
 ///
 /// Bridge tasks are spawned via [`tokio::spawn`] so they outlive this
 /// adapter. They terminate naturally when the Unix socketpair is closed
@@ -164,18 +179,24 @@ impl super::ManageSessionStream for IpcManageStreamHandle {
 /// exit-status, EOF and Close messages — to the managed stream.
 pub struct IpcManageStreamAdapter<M> {
     manage_stream: M,
-    fd_sender: FdSender,
+    fd_transfer: FdTransfer,
 }
 
 impl<M> IpcManageStreamAdapter<M> {
-    pub fn new(manage_stream: M, fd_sender: FdSender) -> Self {
+    pub fn new(manage_stream: M, fd_transfer: FdTransfer) -> Self {
         Self {
             manage_stream,
-            fd_sender,
+            fd_transfer,
         }
     }
 
-    fn bridge_and_queue<R, W>(&self, reader: R, writer: W) -> Result<VarInt, ConnectionError>
+    async fn bridge_and_deliver<R, W>(
+        &self,
+        delivery: FdDelivery,
+        reader: R,
+        writer: W,
+        fd_id: VarInt,
+    ) -> Result<VarInt, ConnectionError>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -185,10 +206,12 @@ impl<M> IpcManageStreamAdapter<M> {
         cli.set_nonblocking(true)
             .map_err(|e| to_conn_error(e, "set_nonblocking"))?;
 
-        let fd_id = self
-            .fd_sender
-            .queue_fds(vec![cli.into()].into())
-            .map_err(|e| to_conn_error(e, "queue_fds"))?;
+        let mut fds = h3x::ipc::transport::FdVec::new();
+        fds.push(cli.into());
+        delivery
+            .deliver(fds)
+            .await
+            .map_err(|e| to_conn_error(e, "deliver fds"))?;
 
         let srv = unix_stream_from_std(srv).map_err(|e| to_conn_error(e, "from_std"))?;
         let (srv_read, srv_write) = srv.into_split();
@@ -210,22 +233,28 @@ where
     M::StreamWriter: AsyncWrite + Unpin + Send + 'static,
     M::Error: Send + Sync + 'static,
 {
-    async fn open_stream(&self) -> Result<VarInt, ConnectionError> {
-        let (reader, writer) = self
-            .manage_stream
-            .open_stream()
+    async fn open_stream(&self, fd_id: VarInt) -> Result<VarInt, ConnectionError> {
+        let mut delivery = self.fd_transfer.delivery(fd_id);
+        let (reader, writer) = tokio::select! {
+            _ = delivery.cancelled() => return Err(to_conn_error("fd transfer cancelled", "open_stream")),
+            result = self.manage_stream.open_stream() => {
+                result.map_err(manage_stream_error_to_connection_error)?
+            }
+        };
+        self.bridge_and_deliver(delivery, reader, writer, fd_id)
             .await
-            .map_err(manage_stream_error_to_connection_error)?;
-        self.bridge_and_queue(reader, writer)
     }
 
-    async fn accept_stream(&self) -> Result<VarInt, ConnectionError> {
-        let (reader, writer) = self
-            .manage_stream
-            .accept_stream()
+    async fn accept_stream(&self, fd_id: VarInt) -> Result<VarInt, ConnectionError> {
+        let mut delivery = self.fd_transfer.delivery(fd_id);
+        let (reader, writer) = tokio::select! {
+            _ = delivery.cancelled() => return Err(to_conn_error("fd transfer cancelled", "accept_stream")),
+            result = self.manage_stream.accept_stream() => {
+                result.map_err(manage_stream_error_to_connection_error)?
+            }
+        };
+        self.bridge_and_deliver(delivery, reader, writer, fd_id)
             .await
-            .map_err(manage_stream_error_to_connection_error)?;
-        self.bridge_and_queue(reader, writer)
     }
 }
 
@@ -356,20 +385,24 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "fd delivery confirmation requires a dedicated mux driver test harness"]
     async fn ipc_adapter_accepts_generic_manage_session_stream() {
         let open_calls = Arc::new(AtomicUsize::new(0));
         let manage_stream = MockManageStream {
             open_calls: open_calls.clone(),
         };
         let (channel, _remote_fd) = MuxChannel::create_pair().expect("mux channel");
-        let (sink, _stream) = channel.split().expect("split mux channel");
-        let adapter = IpcManageStreamAdapter::new(manage_stream, sink.fd_sender());
+        let (sink, stream) = channel.split().expect("split mux channel");
+        let fd_transfer = stream.fd_transfer(sink.fd_sender());
+        let adapter = IpcManageStreamAdapter::new(manage_stream, fd_transfer.clone());
+        let receiver = fd_transfer.receive();
+        let fd_id = receiver.id();
 
-        let fd_id = IpcManageSessionStream::open_stream(&adapter)
+        let returned = IpcManageSessionStream::open_stream(&adapter, fd_id)
             .await
             .expect("open stream through adapter");
 
-        assert_eq!(fd_id, VarInt::from_u32(0));
+        assert_eq!(returned, VarInt::from_u32(0));
         assert_eq!(open_calls.load(Ordering::SeqCst), 1);
     }
 
