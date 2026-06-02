@@ -25,7 +25,10 @@
 //! 2. Calls the RPC method with that ID while concurrently receiving the FD.
 //! 3. Splits it into `(OwnedReadHalf, OwnedWriteHalf)`.
 
-use std::future::IntoFuture;
+use std::{
+    future::{Future, IntoFuture},
+    sync::Mutex,
+};
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -42,6 +45,7 @@ use tokio::{
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
 };
+use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 fn unix_stream_from_std(stream: std::os::unix::net::UnixStream) -> std::io::Result<UnixStream> {
@@ -116,14 +120,15 @@ impl IpcManageStreamHandle {
         tokio::pin!(rpc);
         tokio::pin!(receive);
         let (actual, received) = tokio::select! {
-            rpc_result = &mut rpc => {
-                let actual = rpc_result.context(RpcSnafu)?;
-                let received = receive.await.context(ReceiveFdSnafu)?;
-                (actual, received)
-            }
+            biased;
             receive_result = &mut receive => {
                 let received = receive_result.context(ReceiveFdSnafu)?;
                 let actual = rpc.await.context(RpcSnafu)?;
+                (actual, received)
+            }
+            rpc_result = &mut rpc => {
+                let actual = rpc_result.context(RpcSnafu)?;
+                let received = receive.await.context(ReceiveFdSnafu)?;
                 (actual, received)
             }
         };
@@ -171,15 +176,14 @@ impl super::ManageSessionStream for IpcManageStreamHandle {
 /// Each call opens a real managed stream, creates a Unix socketpair, spawns
 /// bridge tasks, and delivers the client-side FD through the [`FdTransfer`].
 ///
-/// Bridge tasks are spawned via [`tokio::spawn`] so they outlive this
-/// adapter. They terminate naturally when the Unix socketpair is closed
-/// (i.e. when the child process drops its half). This is important because
-/// the adapter may be dropped (via the remoc `ServerShared` lifecycle)
-/// before the bridge has finished flushing final data — such as SSH
-/// exit-status, EOF and Close messages — to the managed stream.
+/// Bridge tasks are owned by this adapter through [`AbortOnDropHandle`]. They
+/// may outlive the individual RPC call that created them, but dropping the
+/// adapter also drops the bridge task handles so a remoc server lifecycle
+/// teardown cannot leak stream-forwarding tasks.
 pub struct IpcManageStreamAdapter<M> {
     manage_stream: M,
     fd_transfer: FdTransfer,
+    bridge_tasks: Mutex<Vec<AbortOnDropHandle<()>>>,
 }
 
 impl<M> IpcManageStreamAdapter<M> {
@@ -187,7 +191,16 @@ impl<M> IpcManageStreamAdapter<M> {
         Self {
             manage_stream,
             fd_transfer,
+            bridge_tasks: Mutex::new(Vec::new()),
         }
+    }
+
+    fn spawn_bridge_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let handle = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
+        self.bridge_tasks
+            .lock()
+            .expect("bridge task registry should not be poisoned")
+            .push(handle);
     }
 
     async fn bridge_and_deliver<R, W>(
@@ -216,11 +229,8 @@ impl<M> IpcManageStreamAdapter<M> {
         let srv = unix_stream_from_std(srv).map_err(|e| to_conn_error(e, "from_std"))?;
         let (srv_read, srv_write) = srv.into_split();
 
-        // Spawn bridge tasks independently so they are NOT aborted when this
-        // adapter is dropped. The tasks will terminate on their own once the
-        // Unix socketpair closes (child process exit / fd drop).
-        tokio::spawn(bridge_reader_to_unix(reader, srv_write).in_current_span());
-        tokio::spawn(bridge_unix_to_writer(srv_read, writer).in_current_span());
+        self.spawn_bridge_task(bridge_reader_to_unix(reader, srv_write));
+        self.spawn_bridge_task(bridge_unix_to_writer(srv_read, writer));
 
         Ok(fd_id)
     }
@@ -236,6 +246,7 @@ where
     async fn open_stream(&self, fd_id: VarInt) -> Result<VarInt, ConnectionError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let (reader, writer) = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(to_conn_error("fd transfer cancelled", "open_stream")),
             result = self.manage_stream.open_stream() => {
                 result.map_err(manage_stream_error_to_connection_error)?
@@ -248,6 +259,7 @@ where
     async fn accept_stream(&self, fd_id: VarInt) -> Result<VarInt, ConnectionError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let (reader, writer) = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(to_conn_error("fd transfer cancelled", "accept_stream")),
             result = self.manage_stream.accept_stream() => {
                 result.map_err(manage_stream_error_to_connection_error)?
@@ -349,9 +361,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        future::IntoFuture,
+        os::fd::OwnedFd,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use h3x::{ipc::transport::MuxChannel, varint::VarInt};
@@ -382,6 +399,41 @@ mod tests {
         ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
             Ok((tokio::io::empty(), tokio::io::sink()))
         }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct BlockingManageStream {
+        held_peers: Arc<Mutex<Vec<tokio::io::DuplexStream>>>,
+    }
+
+    impl ManageSessionStream for BlockingManageStream {
+        type StreamReader = tokio::io::DuplexStream;
+        type StreamWriter = tokio::io::DuplexStream;
+        type Error = std::io::Error;
+
+        async fn open_stream(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+            let (reader, reader_peer) = tokio::io::duplex(64);
+            let (writer_peer, writer) = tokio::io::duplex(64);
+            let mut held_peers = self.held_peers.lock().expect("held peer lock");
+            held_peers.push(reader_peer);
+            held_peers.push(writer_peer);
+            Ok((reader, writer))
+        }
+
+        async fn accept_stream(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
+            self.open_stream().await
+        }
+    }
+
+    fn mux_pair() -> (MuxChannel, MuxChannel) {
+        let (left, right) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let left = MuxChannel::from_fd(OwnedFd::from(left)).expect("left mux channel");
+        let right = MuxChannel::from_fd(OwnedFd::from(right)).expect("right mux channel");
+        (left, right)
     }
 
     #[tokio::test]
@@ -417,5 +469,57 @@ mod tests {
         right.read_exact(&mut buf).await.expect("read");
 
         assert_eq!(buf, [b'x']);
+    }
+
+    #[tokio::test]
+    async fn dropping_ipc_adapter_aborts_owned_bridge_tasks() {
+        let (server_mux, client_mux) = mux_pair();
+        let (server_sink, server_stream) = server_mux.split().expect("server mux split");
+        let server_fd_transfer = server_stream.fd_transfer(server_sink.fd_sender());
+        let (client_sink, client_stream) = client_mux.split().expect("client mux split");
+        let client_fd_transfer = client_stream.fd_transfer(client_sink.fd_sender());
+
+        let manage_stream = BlockingManageStream::default();
+        let held_peers = manage_stream.held_peers.clone();
+        let adapter = IpcManageStreamAdapter::new(manage_stream, server_fd_transfer);
+        let receiver = client_fd_transfer.receive();
+        let fd_id = receiver.id();
+        let (returned, received) = {
+            let call = IpcManageSessionStream::open_stream(&adapter, fd_id);
+            let receive = receiver.into_future();
+            tokio::pin!(call);
+            tokio::pin!(receive);
+            tokio::join!(call, receive)
+        };
+        assert_eq!(returned.expect("open stream"), fd_id);
+        let fd = received
+            .expect("receive delivered fd")
+            .into_one()
+            .expect("one stream fd");
+        let mut stream =
+            unix_stream_from_std(std::os::unix::net::UnixStream::from(fd)).expect("tokio stream");
+
+        let mut buf = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf))
+                .await
+                .is_err(),
+            "stream peer should remain open while adapter owns bridge tasks",
+        );
+
+        drop(adapter);
+        assert_eq!(
+            held_peers.lock().expect("held peer lock").len(),
+            2,
+            "the test keeps the managed stream peers open after adapter drop",
+        );
+
+        let read = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf))
+            .await
+            .expect("bridge task drop should close the peer fd")
+            .expect("read after adapter drop");
+
+        assert_eq!(read, 0);
+        drop((server_sink, server_stream, client_sink, client_stream));
     }
 }
