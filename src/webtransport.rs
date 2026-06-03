@@ -447,7 +447,7 @@ mod tests {
     use bytes::Bytes;
     use futures::{Sink, SinkExt, Stream};
     use h3x::{
-        quic::{CancelStream, GetStreamId, StopStream},
+        quic::{GetStreamId, ResetStream, StopStream},
         stream_id::StreamId,
     };
     use http::HeaderMap;
@@ -549,8 +549,8 @@ mod tests {
         }
     }
 
-    impl CancelStream for TestWriteStream {
-        fn poll_cancel(
+    impl ResetStream for TestWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             _code: VarInt,
