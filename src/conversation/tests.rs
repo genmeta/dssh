@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::{Sink, Stream, channel::mpsc};
 use h3x::{
     codec::{SinkWriter, StreamReader as H3xStreamReader},
-    quic::{CancelStream, GetStreamId, StopStream, StreamError},
+    quic::{GetStreamId, ResetStream, StopStream, StreamError},
 };
 
 // -- Mock stream types that implement h3x ReadStream / WriteStream ------
@@ -103,8 +103,8 @@ impl GetStreamId for TestQuicWriter {
     }
 }
 
-impl CancelStream for TestQuicWriter {
-    fn poll_cancel(
+impl ResetStream for TestQuicWriter {
+    fn poll_reset(
         self: Pin<&mut Self>,
         _cx: &mut Context,
         _code: VarInt,
