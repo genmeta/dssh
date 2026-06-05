@@ -61,7 +61,7 @@ fn unix_stream_from_std(stream: std::os::unix::net::UnixStream) -> std::io::Resu
 /// using FD passing for stream data.
 ///
 /// Each method receives a receiver-chosen FD transfer ID and echoes it after
-/// the FD delivery is acknowledged.
+/// the FD delivery is queued to the local mux writer FIFO.
 #[remoc::rtc::remote]
 pub trait IpcManageSessionStream: Send + Sync {
     async fn open_stream(&self, fd_id: VarInt) -> Result<VarInt, ConnectionError>;
@@ -244,27 +244,23 @@ where
     M::Error: Send + Sync + 'static,
 {
     async fn open_stream(&self, fd_id: VarInt) -> Result<VarInt, ConnectionError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let (reader, writer) = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(to_conn_error("fd transfer cancelled", "open_stream")),
-            result = self.manage_stream.open_stream() => {
-                result.map_err(manage_stream_error_to_connection_error)?
-            }
-        };
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let (reader, writer) = self
+            .manage_stream
+            .open_stream()
+            .await
+            .map_err(manage_stream_error_to_connection_error)?;
         self.bridge_and_deliver(delivery, reader, writer, fd_id)
             .await
     }
 
     async fn accept_stream(&self, fd_id: VarInt) -> Result<VarInt, ConnectionError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let (reader, writer) = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(to_conn_error("fd transfer cancelled", "accept_stream")),
-            result = self.manage_stream.accept_stream() => {
-                result.map_err(manage_stream_error_to_connection_error)?
-            }
-        };
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let (reader, writer) = self
+            .manage_stream
+            .accept_stream()
+            .await
+            .map_err(manage_stream_error_to_connection_error)?;
         self.bridge_and_deliver(delivery, reader, writer, fd_id)
             .await
     }
@@ -339,8 +335,8 @@ pub async fn bridge_unix_to_message_writer(
 // Error helpers
 // ---------------------------------------------------------------------------
 
-fn to_conn_error(err: impl std::fmt::Display, context: &str) -> ConnectionError {
-    tracing::warn!(%err, context, "ipc manage stream error");
+fn to_conn_error(err: impl std::error::Error, context: &str) -> ConnectionError {
+    tracing::warn!(error = %snafu::Report::from_error(&err), context, "ipc manage stream error");
     h3x::quic::ApplicationError {
         code: h3x::error::Code::from(VarInt::from_u32(0)),
         reason: std::borrow::Cow::Owned(format!("ipc {context}: {err}")),
@@ -371,7 +367,7 @@ mod tests {
         time::Duration,
     };
 
-    use h3x::{ipc::transport::MuxChannel, varint::VarInt};
+    use h3x::ipc::transport::MuxChannel;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{IpcManageSessionStream, IpcManageStreamAdapter, unix_stream_from_std};
@@ -437,25 +433,32 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "fd delivery confirmation requires a dedicated mux driver test harness"]
     async fn ipc_adapter_accepts_generic_manage_session_stream() {
         let open_calls = Arc::new(AtomicUsize::new(0));
         let manage_stream = MockManageStream {
             open_calls: open_calls.clone(),
         };
-        let (channel, _remote_fd) = MuxChannel::create_pair().expect("mux channel");
-        let (sink, stream) = channel.split().expect("split mux channel");
-        let fd_transfer = stream.fd_transfer(sink.fd_sender());
-        let adapter = IpcManageStreamAdapter::new(manage_stream, fd_transfer.clone());
-        let receiver = fd_transfer.receive();
+        let (server_mux, client_mux) = mux_pair();
+        let (server_sink, server_stream) = server_mux.split().expect("server mux split");
+        let server_fd_transfer = server_stream.fd_transfer(server_sink.fd_sender());
+        let (client_sink, client_stream) = client_mux.split().expect("client mux split");
+        let client_fd_transfer = client_stream.fd_transfer(client_sink.fd_sender());
+        let adapter = IpcManageStreamAdapter::new(manage_stream, server_fd_transfer);
+        let receiver = client_fd_transfer.receive();
         let fd_id = receiver.id();
 
-        let returned = IpcManageSessionStream::open_stream(&adapter, fd_id)
-            .await
-            .expect("open stream through adapter");
+        let (returned, received) = {
+            let call = IpcManageSessionStream::open_stream(&adapter, fd_id);
+            let receive = receiver.into_future();
+            tokio::pin!(call);
+            tokio::pin!(receive);
+            tokio::join!(call, receive)
+        };
 
-        assert_eq!(returned, VarInt::from_u32(0));
+        assert_eq!(returned.expect("open stream through adapter"), fd_id);
+        assert_eq!(received.expect("receive delivered fd").len(), 1);
         assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        drop((server_sink, server_stream, client_sink, client_stream));
     }
 
     #[tokio::test]
