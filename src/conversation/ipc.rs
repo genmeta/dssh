@@ -207,7 +207,7 @@ impl<M> IpcManageStreamAdapter<M> {
         &self,
         delivery: FdDelivery,
         reader: R,
-        writer: W,
+        mut writer: W,
         fd_id: VarInt,
     ) -> Result<VarInt, ConnectionError>
     where
@@ -218,16 +218,15 @@ impl<M> IpcManageStreamAdapter<M> {
             std::os::unix::net::UnixStream::pair().map_err(|e| to_conn_error(e, "socketpair"))?;
         cli.set_nonblocking(true)
             .map_err(|e| to_conn_error(e, "set_nonblocking"))?;
+        let srv = unix_stream_from_std(srv).map_err(|e| to_conn_error(e, "from_std"))?;
+        let (srv_read, srv_write) = srv.into_split();
 
         let mut fds = h3x::ipc::transport::FdVec::new();
         fds.push(cli.into());
-        delivery
-            .deliver(fds)
-            .await
-            .map_err(|e| to_conn_error(e, "deliver fds"))?;
-
-        let srv = unix_stream_from_std(srv).map_err(|e| to_conn_error(e, "from_std"))?;
-        let (srv_read, srv_write) = srv.into_split();
+        if let Err(error) = delivery.deliver(fds).await {
+            let _ = writer.shutdown().await;
+            return Err(to_conn_error(error, "deliver fds"));
+        }
 
         self.spawn_bridge_task(bridge_reader_to_unix(reader, srv_write));
         self.spawn_bridge_task(bridge_unix_to_writer(srv_read, writer));
