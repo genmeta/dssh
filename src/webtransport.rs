@@ -239,7 +239,7 @@ pub enum ClientConnectConversationError {
     },
     #[snafu(display("failed to execute dssh webtransport connect request"))]
     Execute {
-        source: h3x::hyper::client::RequestError<Infallible>,
+        source: h3x::hyper::RequestError<Infallible>,
     },
     #[snafu(display("failed to validate dssh peer version"))]
     PeerVersion { source: NegotiateVersionError },
