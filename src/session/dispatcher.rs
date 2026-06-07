@@ -35,7 +35,7 @@ use tokio::task::{AbortHandle, JoinSet};
 use crate::channel::reason_code;
 use crate::conversation::channel::{ChannelEvent, ReadChannelEventError, SshChannel};
 use crate::conversation::global::IncomingGlobal;
-use crate::conversation::{Conversation, EmptyPayload, ManageSessionStream};
+use crate::conversation::{Conversation, EmptyPayload};
 use crate::forward::{
     CancelStreamlocalForwardRequest, CancelTcpipForwardRequest, ForwardError,
     StreamlocalForwardRequest, TcpipForwardRequest,
@@ -73,6 +73,25 @@ impl Default for SessionConfig {
             max_message_size: crate::constants::DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
+}
+
+/// Result of the server-side session dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunSessionOutcome {
+    /// The conversation accept paths closed before a session channel completed.
+    ConversationClosed,
+    /// At least one session channel ran and all channel tasks completed.
+    SessionFinished,
+}
+
+/// Error returned by [`run_session`].
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum RunSessionError {
+    #[snafu(display("session channel failed"))]
+    SessionChannel {
+        source: crate::session::process::ProcessError,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -253,25 +272,29 @@ where
 /// Concurrently accepts channels and global requests from the conversation,
 /// dispatching each to the appropriate handler. Returns when the conversation
 /// is closed (both accept methods return errors indicating shutdown).
-pub async fn run_session<M, R, W>(conversation: Arc<Conversation<M, R, W>>, config: SessionConfig)
+pub async fn run_session<S>(
+    conversation: Arc<Conversation<S>>,
+    config: SessionConfig,
+) -> Result<RunSessionOutcome, RunSessionError>
 where
-    M: ManageSessionStream + 'static,
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-    M::StreamReader: AsyncRead + Send + Unpin + 'static,
-    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
-    M::Error: Send + Sync + 'static,
+    S: h3x::webtransport::Session + 'static,
+    S::StreamReader: 'static,
+    S::StreamWriter: 'static,
 {
+    use run_session_error::*;
+
     let mut tcp_forwards: HashMap<(String, u16), AbortHandle> = HashMap::new();
     let mut unix_forwards: HashMap<String, AbortHandle> = HashMap::new();
-    let mut channel_tasks: JoinSet<()> = JoinSet::new();
+    let mut channel_tasks: JoinSet<Result<(), crate::session::process::ProcessError>> =
+        JoinSet::new();
     let mut forward_tasks: JoinSet<()> = JoinSet::new();
     let mut had_session = false;
+    let mut outcome = RunSessionOutcome::ConversationClosed;
 
     // Pin the accept() future so it survives across select! iterations.
     // accept() is NOT cancellation-safe: it eagerly takes a reader ticket,
     // and if cancelled before completing, the ticket blocks subsequent reads.
-    let mut accept_global = std::pin::pin!(conversation.accept());
+    let mut accept_global = std::pin::pin!(conversation.accept_global_request());
 
     // Pin accept_channel() for the same reason: it calls accept_stream()
     // then decode_one(). If cancelled between the two, the stream is lost.
@@ -304,7 +327,7 @@ where
                                 Ok(ch) => ch,
                                 Err(e) => {
                                     tracing::warn!(error = %snafu::Report::from_error(&e), "failed to accept session channel");
-                                    return;
+                                    return Ok(());
                                 }
                             };
 
@@ -313,7 +336,7 @@ where
                                 Ok(s) => s,
                                 Err(e) => {
                                     tracing::warn!(error = %snafu::Report::from_error(&e), "session setup failed");
-                                    return;
+                                    return Ok(());
                                 }
                             };
 
@@ -325,7 +348,7 @@ where
                                 send_motd(&mut channel, &config.user.home).await;
                             }
 
-                            let result = if let Some(pty) = setup.pty {
+                            if let Some(pty) = setup.pty {
                                 let mode = if setup.is_shell {
                                     CommandMode::Shell { shell }
                                 } else {
@@ -339,10 +362,6 @@ where
                                     CommandMode::Exec { shell, command: &setup.command }
                                 };
                                 super::process::run_piped(channel, mode, &config, term, &setup.client_env).await
-                            };
-
-                            if let Err(e) = result {
-                                tracing::warn!(error = %snafu::Report::from_error(&e), "session channel error");
                             }
                         }.instrument(tracing::info_span!("session")));
                     }
@@ -352,6 +371,7 @@ where
                             if let Err(e) = crate::forward::direct::handle_direct_tcpip(reader, writer).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "direct-tcpip error");
                             }
+                            Ok(())
                         }.instrument(tracing::info_span!("direct-tcpip")));
                     }
                     "direct-streamlocal@openssh.com" => {
@@ -360,6 +380,7 @@ where
                             if let Err(e) = crate::forward::direct::handle_direct_streamlocal(reader, writer).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "direct-streamlocal error");
                             }
+                            Ok(())
                         }.instrument(tracing::info_span!("direct-streamlocal")));
                     }
                     "socks5" => {
@@ -375,6 +396,7 @@ where
                             if let Err(e) = crate::forward::socks5::handle_socks5(reader, writer).await {
                                 tracing::warn!(error = %snafu::Report::from_error(&e), "socks5 error");
                             }
+                            Ok(())
                         }.instrument(tracing::info_span!("socks5")));
                     }
                     _ => {
@@ -397,7 +419,7 @@ where
                     Ok(incoming) => {
                         dispatch_global(incoming, &conversation, &mut tcp_forwards, &mut unix_forwards, &mut forward_tasks).await;
                         // Reset the pinned future for the next global request.
-                        accept_global.set(conversation.accept());
+                        accept_global.set(conversation.accept_global_request());
                     }
                     Err(e) => {
                         tracing::debug!(error = %snafu::Report::from_error(&e), "accept global ended");
@@ -408,11 +430,16 @@ where
 
             // Reap completed channel tasks (prevents unbounded growth).
             Some(result) = channel_tasks.join_next() => {
-                if let Err(e) = result {
-                    tracing::warn!(error = %snafu::Report::from_error(&e), "channel task panicked");
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error).context(SessionChannelSnafu),
+                    Err(e) => {
+                        tracing::warn!(error = %snafu::Report::from_error(&e), "channel task panicked");
+                    }
                 }
                 if had_session && channel_tasks.is_empty() {
                     tracing::debug!("run_session: all channel tasks completed, exiting");
+                    outcome = RunSessionOutcome::SessionFinished;
                     break;
                 }
             }
@@ -428,10 +455,16 @@ where
 
     // Wait for all remaining channel tasks.
     while let Some(result) = channel_tasks.join_next().await {
-        if let Err(e) = result {
-            tracing::warn!(error = %snafu::Report::from_error(&e), "channel task panicked during shutdown");
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error).context(SessionChannelSnafu),
+            Err(e) => {
+                tracing::warn!(error = %snafu::Report::from_error(&e), "channel task panicked during shutdown");
+            }
         }
     }
+
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -460,18 +493,18 @@ where
 // Global request dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_global<M, R, W>(
+async fn dispatch_global<S, R, W>(
     incoming: IncomingGlobal<R, W>,
-    conversation: &Arc<Conversation<M, R, W>>,
+    conversation: &Arc<Conversation<S>>,
     tcp_forwards: &mut HashMap<(String, u16), AbortHandle>,
     unix_forwards: &mut HashMap<String, AbortHandle>,
     forward_tasks: &mut JoinSet<()>,
 ) where
-    M: ManageSessionStream + 'static,
+    S: h3x::webtransport::Session + 'static,
+    S::StreamReader: 'static,
+    S::StreamWriter: 'static,
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
-    M::StreamReader: AsyncRead + Send + Unpin + 'static,
-    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
 {
     match incoming {
         IncomingGlobal::Request(req) => {

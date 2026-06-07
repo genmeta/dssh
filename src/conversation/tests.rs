@@ -12,6 +12,7 @@ use h3x::{
     codec::{SinkWriter, StreamReader as H3xStreamReader},
     quic::{GetStreamId, ResetStream, StopStream, StreamError},
 };
+use tokio::sync::mpsc as tokio_mpsc;
 
 // -- Mock stream types that implement h3x ReadStream / WriteStream ------
 
@@ -113,24 +114,85 @@ impl ResetStream for TestQuicWriter {
     }
 }
 
-// -- Concrete types for ManageSessionStream -----------------------------
+// -- Concrete fake WebTransport session -------------------------------
 
 type MockReader = H3xStreamReader<TestQuicReader>;
 type MockWriter = SinkWriter<TestQuicWriter>;
 
-struct TestManageStream;
+#[derive(Clone)]
+struct TestSession(Arc<TestSessionState>);
 
-impl ManageSessionStream for TestManageStream {
-    type StreamReader = MockReader;
-    type StreamWriter = MockWriter;
-    type Error = std::convert::Infallible;
+struct TestSessionState {
+    id: StreamId,
+    open_tx: tokio_mpsc::UnboundedSender<(MockReader, MockWriter)>,
+    open_rx: std::sync::Mutex<tokio_mpsc::UnboundedReceiver<(MockReader, MockWriter)>>,
+    accept_tx: tokio_mpsc::UnboundedSender<(MockReader, MockWriter)>,
+    accept_rx: std::sync::Mutex<tokio_mpsc::UnboundedReceiver<(MockReader, MockWriter)>>,
+}
 
-    async fn open_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-        unreachable!("not used in global request tests")
+impl TestSession {
+    fn new(id: StreamId) -> Self {
+        let (open_tx, open_rx) = tokio_mpsc::unbounded_channel();
+        let (accept_tx, accept_rx) = tokio_mpsc::unbounded_channel();
+        Self(Arc::new(TestSessionState {
+            id,
+            open_tx,
+            open_rx: std::sync::Mutex::new(open_rx),
+            accept_tx,
+            accept_rx: std::sync::Mutex::new(accept_rx),
+        }))
     }
 
-    async fn accept_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-        unreachable!("not used in global request tests")
+    fn provide_open_stream(&self, reader: MockReader, writer: MockWriter) {
+        self.0.open_tx.send((reader, writer)).unwrap();
+    }
+
+    fn provide_accept_stream(&self, reader: MockReader, writer: MockWriter) {
+        self.0.accept_tx.send((reader, writer)).unwrap();
+    }
+}
+
+impl h3x::webtransport::Session for TestSession {
+    type StreamReader = TestQuicReader;
+    type StreamWriter = TestQuicWriter;
+
+    fn id(&self) -> StreamId {
+        self.0.id
+    }
+
+    async fn open_bi(
+        &self,
+    ) -> Result<(Self::StreamReader, Self::StreamWriter), h3x::webtransport::OpenStreamError> {
+        let (reader, writer) = self
+            .0
+            .open_rx
+            .lock()
+            .unwrap()
+            .try_recv()
+            .expect("no open_bi pair provided");
+        Ok((reader.into_inner(), writer.into_inner()))
+    }
+
+    async fn open_uni(&self) -> Result<Self::StreamWriter, h3x::webtransport::OpenStreamError> {
+        unreachable!("dssh tests use only bidirectional streams")
+    }
+
+    async fn accept_bi(
+        &self,
+    ) -> Result<(Self::StreamReader, Self::StreamWriter), h3x::webtransport::AcceptStreamError>
+    {
+        let (reader, writer) = self
+            .0
+            .accept_rx
+            .lock()
+            .unwrap()
+            .try_recv()
+            .expect("no accept_bi pair provided");
+        Ok((reader.into_inner(), writer.into_inner()))
+    }
+
+    async fn accept_uni(&self) -> Result<Self::StreamReader, h3x::webtransport::AcceptStreamError> {
+        unreachable!("dssh tests use only bidirectional streams")
     }
 }
 
@@ -148,23 +210,18 @@ fn make_half(stream_id: VarInt) -> (MockReader, MockWriter) {
     (reader, writer)
 }
 
-async fn make_conversation() -> (
-    Conversation<TestManageStream, MockReader, MockWriter>,
-    MockReader,
-    MockWriter,
-) {
-    let stream_id = VarInt::from_u32(42);
+async fn make_conversation() -> (Conversation<TestSession>, MockReader, MockWriter) {
+    let stream_id = VarInt::from_u32(40);
     // local reads ← remote writes
     let (local_reader, remote_writer) = make_half(stream_id);
     // remote reads ← local writes
     let (remote_reader, local_writer) = make_half(stream_id);
 
-    let conv = Conversation::new(
-        StreamId(stream_id),
+    let conv = Conversation::from_control_streams(
+        TestSession::new(StreamId(stream_id)),
         "test-version",
         local_reader,
         local_writer,
-        TestManageStream,
     );
     (conv, remote_reader, remote_writer)
 }
@@ -280,7 +337,7 @@ async fn remote_send_failure(writer: &mut MockWriter) {
 #[tokio::test]
 async fn conversation_id() {
     let (conv, _remote_reader, _remote_writer) = make_conversation().await;
-    assert_eq!(conv.id(), StreamId(VarInt::from_u32(42)));
+    assert_eq!(conv.id(), StreamId(VarInt::from_u32(40)));
 }
 
 // -- request() tests ----------------------------------------------------
@@ -303,7 +360,7 @@ async fn request_success_roundtrip() {
     let req = TestRequest {
         payload: TestPayload(SshString::from("hello".to_string())),
     };
-    let result: VarInt = conv.request(&req).await.unwrap();
+    let result: VarInt = conv.send_global_request(&req).await.unwrap();
     assert_eq!(result, VarInt::from_u32(99));
 
     handle.await.unwrap();
@@ -322,7 +379,7 @@ async fn request_rejected() {
     let req = TestRequest {
         payload: TestPayload(SshString::from("hi".to_string())),
     };
-    let result: Result<VarInt, _> = conv.request(&req).await;
+    let result: Result<VarInt, _> = conv.send_global_request(&req).await;
     assert!(matches!(result, Err(SendRequestError::Rejected)));
 
     handle.await.unwrap();
@@ -337,7 +394,7 @@ async fn notify_sends_correctly() {
     let notice = TestNotice {
         payload: TestPayload(SshString::from("world".to_string())),
     };
-    conv.notify(&notice).await.unwrap();
+    conv.send_global_notification(&notice).await.unwrap();
 
     let (req_type, want_reply) = remote_read_global_request_header(&mut remote_reader).await;
     assert_eq!(&*req_type, "test-notice");
@@ -355,7 +412,7 @@ async fn accept_incoming_request_decode_and_respond_success() {
     // Remote sends a want_reply=true request
     remote_send_global_request(&mut remote_writer, "tcpip-forward", true, "bind-addr").await;
 
-    let incoming = conv.accept().await.unwrap();
+    let incoming = conv.accept_global_request().await.unwrap();
     let req = match incoming {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
@@ -386,7 +443,7 @@ async fn accept_incoming_request_respond_failure() {
 
     remote_send_global_request(&mut remote_writer, "unknown-req", true, "data").await;
 
-    let incoming = conv.accept().await.unwrap();
+    let incoming = conv.accept_global_request().await.unwrap();
     let req = match incoming {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
@@ -405,7 +462,7 @@ async fn accept_incoming_notice() {
 
     remote_send_global_request(&mut remote_writer, "keepalive", false, "ping").await;
 
-    let incoming = conv.accept().await.unwrap();
+    let incoming = conv.accept_global_request().await.unwrap();
     let notice = match incoming {
         IncomingGlobal::Notify(n) => n,
         _ => panic!("expected Notify"),
@@ -424,7 +481,7 @@ async fn drop_request_before_decode_poisons_session() {
 
     remote_send_global_request(&mut remote_writer, "test", true, "data").await;
 
-    let incoming = conv.accept().await.unwrap();
+    let incoming = conv.accept_global_request().await.unwrap();
     let req = match incoming {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
@@ -436,7 +493,7 @@ async fn drop_request_before_decode_poisons_session() {
     assert!(conv.shared.poisoned.load(Ordering::SeqCst));
 
     // Subsequent accept should fail with SessionPoisoned
-    let result = conv.accept().await;
+    let result = conv.accept_global_request().await;
     assert!(matches!(result, Err(AcceptError::SessionPoisoned)));
 }
 
@@ -446,7 +503,7 @@ async fn drop_notice_before_decode_poisons_session() {
 
     remote_send_global_request(&mut remote_writer, "test", false, "data").await;
 
-    let incoming = conv.accept().await.unwrap();
+    let incoming = conv.accept_global_request().await.unwrap();
     let notice = match incoming {
         IncomingGlobal::Notify(n) => n,
         _ => panic!("expected Notify"),
@@ -462,7 +519,7 @@ async fn drop_request_after_decode_queues_auto_failure() {
 
     remote_send_global_request(&mut remote_writer, "test", true, "data").await;
 
-    let incoming = conv.accept().await.unwrap();
+    let incoming = conv.accept_global_request().await.unwrap();
     let req = match incoming {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
@@ -484,7 +541,7 @@ async fn drop_request_after_decode_queues_auto_failure() {
     let notice = TestNotice {
         payload: TestPayload(SshString::from("after".to_string())),
     };
-    conv.notify(&notice).await.unwrap();
+    conv.send_global_notification(&notice).await.unwrap();
 
     // Remote should first see the auto-failure response, then the notify
     let msg_type: VarInt = remote_reader.decode_one().await.unwrap();
@@ -505,14 +562,14 @@ async fn incoming_request_responses_ordered_correctly() {
     remote_send_global_request(&mut remote_writer, "req-b", true, "b").await;
 
     // Accept both
-    let incoming_a = conv.accept().await.unwrap();
+    let incoming_a = conv.accept_global_request().await.unwrap();
     let req_a = match incoming_a {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
     };
     let decoded_a = req_a.decode_payload::<SshString, _>().await.unwrap();
 
-    let incoming_b = conv.accept().await.unwrap();
+    let incoming_b = conv.accept_global_request().await.unwrap();
     let req_b = match incoming_b {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
@@ -560,7 +617,7 @@ async fn unexpected_message_type_poisons_session() {
         .unwrap();
     AsyncWriteExt::flush(&mut remote_writer).await.unwrap();
 
-    let result = conv.accept().await;
+    let result = conv.accept_global_request().await;
     assert!(matches!(
         result,
         Err(AcceptError::UnexpectedMessageType { .. })
@@ -582,7 +639,7 @@ async fn concurrent_requests_ordered_correctly() {
     let conv_a = Arc::clone(&conv);
     let handle_a = tokio::spawn(async move {
         conv_a
-            .request::<TestRequest, _, _>(&TestRequest {
+            .send_global_request::<TestRequest, _, _>(&TestRequest {
                 payload: TestPayload(SshString::from_static("alpha")),
             })
             .await
@@ -591,7 +648,7 @@ async fn concurrent_requests_ordered_correctly() {
     let conv_b = Arc::clone(&conv);
     let handle_b = tokio::spawn(async move {
         conv_b
-            .request::<TestRequest, _, _>(&TestRequest {
+            .send_global_request::<TestRequest, _, _>(&TestRequest {
                 payload: TestPayload(SshString::from_static("beta")),
             })
             .await
@@ -646,7 +703,7 @@ async fn consecutive_auto_failures_drained_by_next_writer() {
     // Accept and decode all three, but DON'T respond — just drop them.
     // This should queue 3 auto-failure writer tickets.
     for _ in 0..3 {
-        match conv.accept().await.unwrap() {
+        match conv.accept_global_request().await.unwrap() {
             IncomingGlobal::Request(req) => {
                 let _decoded = req.decode_payload::<SshString, _>().await.unwrap();
                 // Drop DecodedGlobalRequest without responding → auto-failure queued
@@ -661,7 +718,9 @@ async fn consecutive_auto_failures_drained_by_next_writer() {
     let notice = TestNotice {
         payload: TestPayload(SshString::from_static("ping")),
     };
-    conv.notify::<TestNotice, _>(&notice).await.unwrap();
+    conv.send_global_notification::<TestNotice, _>(&notice)
+        .await
+        .unwrap();
 
     // Remote should see: 3x failure, then the notify
     for _ in 0..3 {
@@ -685,7 +744,7 @@ async fn poisoned_session_rejects_request() {
     conv.shared.poison();
 
     let result = conv
-        .request::<TestRequest, _, _>(&TestRequest {
+        .send_global_request::<TestRequest, _, _>(&TestRequest {
             payload: TestPayload(SshString::from_static("hello")),
         })
         .await;
@@ -702,7 +761,9 @@ async fn poisoned_session_rejects_notify() {
     let notice = TestNotice {
         payload: TestPayload(SshString::from_static("hello")),
     };
-    let result = conv.notify::<TestNotice, _>(&notice).await;
+    let result = conv
+        .send_global_notification::<TestNotice, _>(&notice)
+        .await;
 
     assert!(matches!(result, Err(SendNotifyError::SessionPoisoned)));
 }
@@ -713,7 +774,7 @@ async fn poisoned_session_rejects_accept() {
 
     conv.shared.poison();
 
-    let result = conv.accept().await;
+    let result = conv.accept_global_request().await;
     assert!(matches!(result, Err(AcceptError::SessionPoisoned)));
 }
 
@@ -723,7 +784,7 @@ async fn poisoned_session_rejects_respond_success() {
 
     remote_send_global_request(&mut remote_writer, "test", true, "data").await;
 
-    let req = match conv.accept().await.unwrap() {
+    let req = match conv.accept_global_request().await.unwrap() {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
     };
@@ -743,7 +804,7 @@ async fn poisoned_session_rejects_respond_failure() {
 
     remote_send_global_request(&mut remote_writer, "test", true, "data").await;
 
-    let req = match conv.accept().await.unwrap() {
+    let req = match conv.accept_global_request().await.unwrap() {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
     };
@@ -764,7 +825,7 @@ async fn respond_success_cancelled_poisons_session() {
 
     remote_send_global_request(&mut remote_writer, "test", true, "data").await;
 
-    let req = match conv.accept().await.unwrap() {
+    let req = match conv.accept_global_request().await.unwrap() {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
     };
@@ -817,7 +878,7 @@ async fn multiple_sequential_accepts() {
 
     // Accept, decode, and respond to each one sequentially.
     for i in 0..3u32 {
-        let req = match conv.accept().await.unwrap() {
+        let req = match conv.accept_global_request().await.unwrap() {
             IncomingGlobal::Request(r) => r,
             _ => panic!("expected Request"),
         };
@@ -861,14 +922,16 @@ async fn interleaved_request_and_notify_on_writer() {
     let notice = TestNotice {
         payload: TestPayload(SshString::from_static("notice-1")),
     };
-    conv.notify::<TestNotice, _>(&notice).await.unwrap();
+    conv.send_global_notification::<TestNotice, _>(&notice)
+        .await
+        .unwrap();
 
     // Now send a request
     // Pre-send the response so request() can complete
     remote_send_success(&mut remote_writer, 777).await;
 
     let result = conv
-        .request::<TestRequest, _, _>(&TestRequest {
+        .send_global_request::<TestRequest, _, _>(&TestRequest {
             payload: TestPayload(SshString::from_static("req-after-notify")),
         })
         .await;
@@ -897,7 +960,7 @@ async fn auto_failure_at_current_serving_drained_immediately() {
 
     // Accept, decode, but drop without responding → auto-failure at ticket 0
     {
-        let req = match conv.accept().await.unwrap() {
+        let req = match conv.accept_global_request().await.unwrap() {
             IncomingGlobal::Request(r) => r,
             _ => panic!("expected Request"),
         };
@@ -910,7 +973,9 @@ async fn auto_failure_at_current_serving_drained_immediately() {
     let notice = TestNotice {
         payload: TestPayload(SshString::from_static("after-auto")),
     };
-    conv.notify::<TestNotice, _>(&notice).await.unwrap();
+    conv.send_global_notification::<TestNotice, _>(&notice)
+        .await
+        .unwrap();
 
     // Remote should see: failure response, then the notify
     let msg_type: VarInt = remote_reader.decode_one().await.unwrap();
@@ -935,7 +1000,7 @@ async fn auto_failures_interleaved_with_real_responses() {
     // Accept all 4
     let mut decoded_reqs: Vec<DecodedGlobalRequest<SshString, MockReader, MockWriter>> = Vec::new();
     for _ in 0..4 {
-        match conv.accept().await.unwrap() {
+        match conv.accept_global_request().await.unwrap() {
             IncomingGlobal::Request(r) => {
                 let decoded = r.decode_payload::<SshString, _>().await.unwrap();
                 decoded_reqs.push(decoded);
@@ -964,7 +1029,9 @@ async fn auto_failures_interleaved_with_real_responses() {
     let notice = TestNotice {
         payload: TestPayload(SshString::from_static("end")),
     };
-    conv.notify::<TestNotice, _>(&notice).await.unwrap();
+    conv.send_global_notification::<TestNotice, _>(&notice)
+        .await
+        .unwrap();
 
     // Remote expects: success(1), failure(B-auto), failure(C), failure(D-auto), notify
     let msg_a: VarInt = remote_reader.decode_one().await.unwrap();
@@ -1104,7 +1171,7 @@ async fn accept_alternating_requests_and_notices() {
 
     // Accept #1: request
     {
-        let req = match conv.accept().await.unwrap() {
+        let req = match conv.accept_global_request().await.unwrap() {
             IncomingGlobal::Request(r) => r,
             _ => panic!("expected Request"),
         };
@@ -1115,7 +1182,7 @@ async fn accept_alternating_requests_and_notices() {
 
     // Accept #2: notice
     {
-        let ntf = match conv.accept().await.unwrap() {
+        let ntf = match conv.accept_global_request().await.unwrap() {
             IncomingGlobal::Notify(n) => n,
             _ => panic!("expected Notify"),
         };
@@ -1125,7 +1192,7 @@ async fn accept_alternating_requests_and_notices() {
 
     // Accept #3: request
     {
-        let req = match conv.accept().await.unwrap() {
+        let req = match conv.accept_global_request().await.unwrap() {
             IncomingGlobal::Request(r) => r,
             _ => panic!("expected Request"),
         };
@@ -1136,7 +1203,7 @@ async fn accept_alternating_requests_and_notices() {
 
     // Accept #4: notice
     {
-        let ntf = match conv.accept().await.unwrap() {
+        let ntf = match conv.accept_global_request().await.unwrap() {
             IncomingGlobal::Notify(n) => n,
             _ => panic!("expected Notify"),
         };
@@ -1165,7 +1232,7 @@ async fn decode_payload_success_releases_reader() {
     remote_send_global_request(&mut remote_writer, "second", false, "y").await;
 
     // Accept and decode first request
-    let req = match conv.accept().await.unwrap() {
+    let req = match conv.accept_global_request().await.unwrap() {
         IncomingGlobal::Request(r) => r,
         _ => panic!("expected Request"),
     };
@@ -1174,7 +1241,7 @@ async fn decode_payload_success_releases_reader() {
 
     // After decode_payload succeeds, the reader is released and we can
     // accept the next message without blocking.
-    let ntf = match conv.accept().await.unwrap() {
+    let ntf = match conv.accept_global_request().await.unwrap() {
         IncomingGlobal::Notify(n) => n,
         _ => panic!("expected Notify"),
     };
@@ -1232,7 +1299,9 @@ async fn request_with_empty_payload() {
     // No success body — EmptyPayload reads nothing
     AsyncWriteExt::flush(&mut remote_writer).await.unwrap();
 
-    let result = conv.request::<EmptyRequest, _, _>(&EmptyRequest).await;
+    let result = conv
+        .send_global_request::<EmptyRequest, _, _>(&EmptyRequest)
+        .await;
     assert!(result.is_ok());
 
     // Remote reads the request header and (empty) payload
@@ -1246,121 +1315,28 @@ async fn request_with_empty_payload() {
 // Channel tests
 // =======================================================================
 
-// -- Channel-capable ManageSessionStream ---------------------------------
+// -- Channel-capable fake WebTransport session ---------------------------
 
-use tokio::sync::mpsc as tokio_mpsc;
-
-/// A ManageSessionStream impl that delivers pre-created stream pairs via
-/// channels, allowing tests to control what the "remote" sends/receives.
-struct ChannelManageStream {
-    /// Sender for streams returned by open_stream().
-    open_tx: tokio_mpsc::UnboundedSender<(MockReader, MockWriter)>,
-    open_rx: std::sync::Mutex<tokio_mpsc::UnboundedReceiver<(MockReader, MockWriter)>>,
-    /// Sender for streams returned by accept_stream().
-    accept_tx: tokio_mpsc::UnboundedSender<(MockReader, MockWriter)>,
-    accept_rx: std::sync::Mutex<tokio_mpsc::UnboundedReceiver<(MockReader, MockWriter)>>,
-}
-
-impl ChannelManageStream {
-    fn new() -> Self {
-        let (open_tx, open_rx) = tokio_mpsc::unbounded_channel();
-        let (accept_tx, accept_rx) = tokio_mpsc::unbounded_channel();
-        Self {
-            open_tx,
-            open_rx: std::sync::Mutex::new(open_rx),
-            accept_tx,
-            accept_rx: std::sync::Mutex::new(accept_rx),
-        }
-    }
-
-    /// Enqueue a stream pair that open_stream() will return.
-    fn provide_open_stream(&self, reader: MockReader, writer: MockWriter) {
-        self.open_tx.send((reader, writer)).unwrap();
-    }
-
-    /// Enqueue a stream pair that accept_stream() will return.
-    fn provide_accept_stream(&self, reader: MockReader, writer: MockWriter) {
-        self.accept_tx.send((reader, writer)).unwrap();
-    }
-}
-
-impl ManageSessionStream for ChannelManageStream {
-    type StreamReader = MockReader;
-    type StreamWriter = MockWriter;
-    type Error = std::convert::Infallible;
-
-    async fn open_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-        let pair = self
-            .open_rx
-            .lock()
-            .unwrap()
-            .try_recv()
-            .expect("no open_stream pair provided");
-        Ok(pair)
-    }
-
-    async fn accept_stream(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-        let pair = self
-            .accept_rx
-            .lock()
-            .unwrap()
-            .try_recv()
-            .expect("no accept_stream pair provided");
-        Ok(pair)
-    }
-}
-
-/// Create a Conversation backed by ChannelManageStream plus the control
-/// stream remote ends.
+/// Create a Conversation backed by a fake WebTransport session plus the
+/// control stream remote ends.
 async fn make_channel_conversation() -> (
-    Conversation<
-        impl ManageSessionStream<
-            StreamReader = MockReader,
-            StreamWriter = MockWriter,
-            Error = std::convert::Infallible,
-        >,
-        MockReader,
-        MockWriter,
-    >,
+    Conversation<TestSession>,
     MockReader,
     MockWriter,
-    Arc<ChannelManageStream>,
+    TestSession,
 ) {
-    let stream_id = VarInt::from_u32(42);
+    let stream_id = VarInt::from_u32(40);
     let (local_reader, remote_writer) = make_half(stream_id);
     let (remote_reader, local_writer) = make_half(stream_id);
 
-    let manage = Arc::new(ChannelManageStream::new());
-
-    // We need to pass the manage stream by value. Create a wrapper that
-    // delegates to the Arc'd version.
-    struct ArcManage(Arc<ChannelManageStream>);
-    impl ManageSessionStream for ArcManage {
-        type StreamReader = MockReader;
-        type StreamWriter = MockWriter;
-        type Error = std::convert::Infallible;
-
-        async fn open_stream(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-            self.0.open_stream().await
-        }
-
-        async fn accept_stream(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-            self.0.accept_stream().await
-        }
-    }
-
-    let conv = Conversation::new(
-        StreamId(stream_id),
+    let session = TestSession::new(StreamId(stream_id));
+    let conv = Conversation::from_control_streams(
+        session.clone(),
         "test-version",
         local_reader,
         local_writer,
-        ArcManage(Arc::clone(&manage)),
     );
-    (conv, remote_reader, remote_writer, manage)
+    (conv, remote_reader, remote_writer, session)
 }
 
 // -- Test ChannelOpen implementation ------------------------------------
@@ -1409,14 +1385,14 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for SessionChannel {
 
 #[tokio::test]
 async fn open_channel_roundtrip() {
-    let (conv, _remote_reader, _remote_writer, manage) = make_channel_conversation().await;
+    let (conv, _remote_reader, _remote_writer, session) = make_channel_conversation().await;
 
     // Create a channel stream pair: the "channel reader/writer" that the
     // remote side will use.
     let ch_stream_id = VarInt::from_u32(100);
     let (ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
     let (ch_local_reader, mut ch_remote_writer) = make_half(ch_stream_id);
-    manage.provide_open_stream(ch_local_reader, ch_local_writer);
+    session.provide_open_stream(ch_local_reader, ch_local_writer);
 
     let max_msg_size = VarInt::from_u32(1 << 20);
     let channel = TestChannel {
@@ -1426,6 +1402,9 @@ async fn open_channel_roundtrip() {
     // Spawn a "remote side" that reads the channel header then sends confirmation.
     let remote_task = tokio::spawn(async move {
         let mut rr = ch_remote_reader;
+
+        let kind: VarInt = rr.decode_one().await.unwrap();
+        assert_eq!(kind, crate::webtransport::DSSH_CHANNEL_STREAM_KIND);
 
         let mms: VarInt = rr.decode_one().await.unwrap();
         assert_eq!(mms, max_msg_size);
@@ -1458,16 +1437,19 @@ async fn open_channel_roundtrip() {
 
 #[tokio::test]
 async fn accept_channel_roundtrip() {
-    let (conv, _remote_reader, _remote_writer, manage) = make_channel_conversation().await;
+    let (conv, _remote_reader, _remote_writer, session) = make_channel_conversation().await;
 
     let ch_stream_id = VarInt::from_u32(200);
     let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
     let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
 
     // Remote encodes channel data starting at max_message_size
-    // (signal value and session ID are handled by ManageSessionStream).
+    // (WebTransport session prefix is handled by h3x; DSSH stream kind is part of this test).
     let mut rw = ch_remote_writer;
     let max_msg_size = VarInt::from_u32(1 << 20);
+    rw.encode_one(crate::webtransport::DSSH_CHANNEL_STREAM_KIND)
+        .await
+        .unwrap();
     rw.encode_one(max_msg_size).await.unwrap();
     rw.encode_one(SshString::from_static("test-channel"))
         .await
@@ -1477,8 +1459,8 @@ async fn accept_channel_roundtrip() {
         .unwrap();
     AsyncWriteExt::flush(&mut rw).await.unwrap();
 
-    // accept_stream will return the local side of the channel
-    manage.provide_accept_stream(ch_local_reader, ch_local_writer);
+    // accept_bi will return the local side of the channel
+    session.provide_accept_stream(ch_local_reader, ch_local_writer);
 
     let incoming = conv
         .accept_channel()
@@ -1499,22 +1481,25 @@ async fn accept_channel_roundtrip() {
 
 #[tokio::test]
 async fn accept_channel_session_no_payload() {
-    let (conv, _remote_reader, _remote_writer, manage) = make_channel_conversation().await;
+    let (conv, _remote_reader, _remote_writer, session) = make_channel_conversation().await;
 
     let ch_stream_id = VarInt::from_u32(300);
     let (ch_local_reader, ch_remote_writer) = make_half(ch_stream_id);
     let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
 
     // Remote sends channel data starting at max_message_size
-    // (signal value and session ID are handled by ManageSessionStream).
+    // (WebTransport session prefix is handled by h3x; DSSH stream kind is part of this test).
     let mut rw = ch_remote_writer;
+    rw.encode_one(crate::webtransport::DSSH_CHANNEL_STREAM_KIND)
+        .await
+        .unwrap();
     rw.encode_one(VarInt::from_u32(1 << 20)).await.unwrap();
     rw.encode_one(SshString::from_static("session"))
         .await
         .unwrap();
     AsyncWriteExt::flush(&mut rw).await.unwrap();
 
-    manage.provide_accept_stream(ch_local_reader, ch_local_writer);
+    session.provide_accept_stream(ch_local_reader, ch_local_writer);
 
     let incoming = conv.accept_channel().await.unwrap();
     assert_eq!(incoming.channel_type().as_ref() as &[u8], b"session");
@@ -1525,17 +1510,20 @@ async fn accept_channel_session_no_payload() {
 
 #[tokio::test]
 async fn open_channel_session_no_payload() {
-    let (conv, _remote_reader, _remote_writer, manage) = make_channel_conversation().await;
+    let (conv, _remote_reader, _remote_writer, session) = make_channel_conversation().await;
 
     let ch_stream_id = VarInt::from_u32(600);
     let (ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
     let (ch_local_reader, mut ch_remote_writer) = make_half(ch_stream_id);
 
-    manage.provide_open_stream(ch_local_reader, ch_local_writer);
+    session.provide_open_stream(ch_local_reader, ch_local_writer);
 
     // Remote reads header and sends confirmation.
     let remote_task = tokio::spawn(async move {
         let mut rr = ch_remote_reader;
+
+        let kind: VarInt = rr.decode_one().await.unwrap();
+        assert_eq!(kind, crate::webtransport::DSSH_CHANNEL_STREAM_KIND);
 
         let mms: VarInt = rr.decode_one().await.unwrap();
         assert_eq!(mms, VarInt::from_u32(1 << 20));
@@ -1567,57 +1555,38 @@ async fn open_channel_session_no_payload() {
 #[tokio::test]
 async fn open_and_accept_channel_full_roundtrip() {
     // Test open on one side, accept on the other.
-    let stream_id = VarInt::from_u32(42);
+    let stream_id = VarInt::from_u32(40);
 
     // Create two conversations sharing a control stream.
     let (ctrl_a_reader, ctrl_b_writer) = make_half(stream_id);
     let (ctrl_b_reader, ctrl_a_writer) = make_half(stream_id);
 
-    let manage_a = Arc::new(ChannelManageStream::new());
-    let manage_b = Arc::new(ChannelManageStream::new());
+    let session_a = TestSession::new(StreamId(stream_id));
+    let session_b = TestSession::new(StreamId(stream_id));
 
-    struct ArcManage2(Arc<ChannelManageStream>);
-    impl ManageSessionStream for ArcManage2 {
-        type StreamReader = MockReader;
-        type StreamWriter = MockWriter;
-        type Error = std::convert::Infallible;
-        async fn open_stream(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-            self.0.open_stream().await
-        }
-        async fn accept_stream(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::Error> {
-            self.0.accept_stream().await
-        }
-    }
-
-    let conv_a = Conversation::new(
-        StreamId(stream_id),
+    let conv_a = Conversation::from_control_streams(
+        session_a.clone(),
         "test-version",
         ctrl_a_reader,
         ctrl_a_writer,
-        ArcManage2(Arc::clone(&manage_a)),
     );
-    let conv_b = Conversation::new(
-        StreamId(stream_id),
+    let conv_b = Conversation::from_control_streams(
+        session_b.clone(),
         "test-version",
         ctrl_b_reader,
         ctrl_b_writer,
-        ArcManage2(Arc::clone(&manage_b)),
     );
 
     // Create the channel stream: A opens, B accepts.
-    // A's open_stream returns (ch_a_reader, ch_a_writer).
-    // B's accept_stream returns (ch_b_reader, ch_b_writer).
+    // A's open_bi returns (ch_a_reader, ch_a_writer).
+    // B's accept_bi returns (ch_b_reader, ch_b_writer).
     // We need ch_a_writer → ch_b_reader and ch_b_writer → ch_a_reader.
     let ch_id = VarInt::from_u32(700);
     let (ch_b_reader, ch_a_writer) = make_half(ch_id);
     let (ch_a_reader, ch_b_writer) = make_half(ch_id);
 
-    manage_a.provide_open_stream(ch_a_reader, ch_a_writer);
-    manage_b.provide_accept_stream(ch_b_reader, ch_b_writer);
+    session_a.provide_open_stream(ch_a_reader, ch_a_writer);
+    session_b.provide_accept_stream(ch_b_reader, ch_b_writer);
 
     let max_msg = VarInt::from_u32(1 << 20);
     let channel = TestChannel {

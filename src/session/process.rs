@@ -697,10 +697,52 @@ mod tests {
     use super::*;
     use crate::conversation::channel::ChannelEvent;
     use crate::session::dispatcher::SessionConfig;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     // Helper: create a mock channel pair (in-memory duplex).
     fn channel_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
         tokio::io::duplex(64 * 1024)
+    }
+
+    struct ShutdownFailWriter;
+
+    impl AsyncWrite for ShutdownFailWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("shutdown failed")))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_piped_reports_channel_shutdown_failure() {
+        let config = SessionConfig::default();
+
+        let error = run_piped(
+            SshChannel::new(tokio::io::empty(), ShutdownFailWriter),
+            CommandMode::Exec {
+                shell: OsStr::new("/bin/sh"),
+                command: b"true",
+            },
+            &config,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("writer shutdown failure must be reported");
+
+        assert!(matches!(error, ProcessError::Shutdown { .. }));
     }
 
     #[tokio::test]

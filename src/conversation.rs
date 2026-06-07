@@ -1,7 +1,7 @@
 //! SSH3 conversation (session) abstraction.
 //!
 //! A *conversation* is the SSH3 equivalent of an SSH2 session — it manages
-//! channels and global requests over a QUIC CONNECT stream.
+//! channels and global requests over a WebTransport session.
 //!
 //! # Design
 //!
@@ -45,18 +45,16 @@
 
 use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
-use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use h3x::{
-    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
+    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto, SinkWriter, StreamReader},
     stream_id::StreamId,
     varint::VarInt,
 };
 use snafu::ResultExt;
-use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
@@ -216,8 +214,8 @@ impl<T> Drop for OrderedGuard<T> {
 /// A global request that expects a reply (`want_reply = true`).
 ///
 /// Implementors define the payload and success response types. Encoding and
-/// decoding bounds are checked at the call site against the concrete stream
-/// types from [`ManageSessionStream`].
+/// decoding bounds are checked at the call site against the concrete streams
+/// carried by [`Conversation`].
 pub trait WantReplyGlobalRequest {
     /// Successful response type, decoded directly from the stream.
     type Success;
@@ -327,33 +325,6 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for EmptyPayload {
 }
 
 // ===========================================================================
-// ManageSessionStream trait
-// ===========================================================================
-
-/// Trait for managing QUIC stream creation and acceptance.
-///
-/// Implementations handle the transport-specific framing (e.g. SSH3 signal
-/// value and session ID). The [`Conversation`] receives streams already
-/// positioned past transport framing.
-pub trait ManageSessionStream: Send + Sync {
-    type StreamReader: AsyncRead + Unpin + Send;
-    type StreamWriter: AsyncWrite + Unpin + Send;
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    fn open_stream(
-        &self,
-    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Self::Error>> + Send;
-
-    fn accept_stream(
-        &self,
-    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Self::Error>> + Send;
-}
-
-/// IPC-based bridge using FD passing over [`h3x::ipc::transport::MuxChannel`].
-#[cfg(feature = "server")]
-pub mod ipc;
-
-// ===========================================================================
 // Conversation shared state
 // ===========================================================================
 
@@ -440,29 +411,38 @@ where
 // Conversation
 // ===========================================================================
 
-pub struct Conversation<
-    M: ManageSessionStream,
-    R = Pin<Box<dyn AsyncRead + Send>>,
-    W = Pin<Box<dyn AsyncWrite + Send>>,
-> {
-    id: StreamId,
-    peer_version: String,
-    shared: Arc<ConversationShared<R, W>>,
-    _manage_stream: M,
+type ConversationReader<S> = StreamReader<<S as h3x::webtransport::Session>::StreamReader>;
+type ConversationWriter<S> = SinkWriter<<S as h3x::webtransport::Session>::StreamWriter>;
+type ConversationSharedState<S> = ConversationShared<ConversationReader<S>, ConversationWriter<S>>;
+
+fn conversation_id_from_session<I>(id: I) -> StreamId
+where
+    I: Into<StreamId>,
+{
+    id.into()
 }
 
-impl<M: ManageSessionStream, R, W> Conversation<M, R, W>
+pub struct Conversation<S = h3x::webtransport::WebTransportSession>
 where
-    R: AsyncRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
+    S: h3x::webtransport::Session,
 {
-    pub fn new(
-        id: StreamId,
+    id: StreamId,
+    peer_version: String,
+    shared: Arc<ConversationSharedState<S>>,
+    session: S,
+}
+
+impl<S> Conversation<S>
+where
+    S: h3x::webtransport::Session,
+{
+    pub(crate) fn from_control_streams(
+        session: S,
         peer_version: impl Into<String>,
-        control_stream_reader: R,
-        control_stream_writer: W,
-        manage_stream: M,
+        control_stream_reader: StreamReader<S::StreamReader>,
+        control_stream_writer: SinkWriter<S::StreamWriter>,
     ) -> Self {
+        let id = conversation_id_from_session(session.id());
         Self {
             id,
             peer_version: peer_version.into(),
@@ -473,7 +453,7 @@ where
                 ticket_pair_lock: std::sync::Mutex::new(()),
                 auto_failures: std::sync::Mutex::new(BTreeSet::new()),
             }),
-            _manage_stream: manage_stream,
+            session,
         }
     }
 
@@ -485,6 +465,118 @@ where
         &self.peer_version
     }
 
+    /// Open a DSSH conversation over a WebTransport session.
+    ///
+    /// This opens the DSSH control stream and writes the DSSH control stream
+    /// kind as the first field on that WebTransport bidirectional stream.
+    pub async fn open(
+        session: S,
+        peer_version: impl Into<String>,
+    ) -> Result<Self, crate::webtransport::OpenConversationError> {
+        let (reader, writer) =
+            Self::open_stream_kind(&session, crate::webtransport::DSSH_CONTROL_STREAM_KIND)
+                .await
+                .context(crate::webtransport::open_conversation_error::OpenControlSnafu)?;
+        Ok(Self::from_control_streams(
+            session,
+            peer_version,
+            reader,
+            writer,
+        ))
+    }
+
+    /// Accept a DSSH conversation over a WebTransport session.
+    ///
+    /// This accepts the DSSH control stream and validates that its first field
+    /// is the DSSH control stream kind.
+    pub async fn accept(
+        session: S,
+        peer_version: impl Into<String>,
+    ) -> Result<Self, crate::webtransport::AcceptConversationError> {
+        let (reader, writer) =
+            Self::accept_stream_kind(&session, crate::webtransport::DSSH_CONTROL_STREAM_KIND)
+                .await
+                .context(crate::webtransport::accept_conversation_error::AcceptControlSnafu)?;
+        Ok(Self::from_control_streams(
+            session,
+            peer_version,
+            reader,
+            writer,
+        ))
+    }
+
+    async fn open_channel_stream(
+        &self,
+    ) -> Result<
+        (StreamReader<S::StreamReader>, SinkWriter<S::StreamWriter>),
+        crate::webtransport::WebTransportStreamError,
+    > {
+        Self::open_stream_kind(&self.session, crate::webtransport::DSSH_CHANNEL_STREAM_KIND).await
+    }
+
+    async fn accept_channel_stream(
+        &self,
+    ) -> Result<
+        (StreamReader<S::StreamReader>, SinkWriter<S::StreamWriter>),
+        crate::webtransport::WebTransportStreamError,
+    > {
+        Self::accept_stream_kind(&self.session, crate::webtransport::DSSH_CHANNEL_STREAM_KIND).await
+    }
+
+    async fn open_stream_kind(
+        session: &S,
+        kind: VarInt,
+    ) -> Result<
+        (StreamReader<S::StreamReader>, SinkWriter<S::StreamWriter>),
+        crate::webtransport::WebTransportStreamError,
+    > {
+        let (reader, writer) = session
+            .open_bi()
+            .await
+            .context(crate::webtransport::web_transport_stream_error::OpenBiSnafu)?;
+        let writer = Self::write_stream_kind(writer, kind).await?;
+        Ok((StreamReader::new(reader), writer))
+    }
+
+    async fn accept_stream_kind(
+        session: &S,
+        expected: VarInt,
+    ) -> Result<
+        (StreamReader<S::StreamReader>, SinkWriter<S::StreamWriter>),
+        crate::webtransport::WebTransportStreamError,
+    > {
+        let (reader, writer) = session
+            .accept_bi()
+            .await
+            .context(crate::webtransport::web_transport_stream_error::AcceptBiSnafu)?;
+        let mut reader = StreamReader::new(reader);
+        let actual = reader
+            .decode_one::<VarInt>()
+            .await
+            .context(crate::webtransport::web_transport_stream_error::DecodeStreamKindSnafu)?;
+        if actual != expected {
+            return Err(
+                crate::webtransport::WebTransportStreamError::UnexpectedStreamKind { kind: actual },
+            );
+        }
+        Ok((reader, SinkWriter::new(writer)))
+    }
+
+    async fn write_stream_kind(
+        writer: S::StreamWriter,
+        kind: VarInt,
+    ) -> Result<SinkWriter<S::StreamWriter>, crate::webtransport::WebTransportStreamError> {
+        let mut writer = SinkWriter::new(writer);
+        writer
+            .encode_one(kind)
+            .await
+            .context(crate::webtransport::web_transport_stream_error::EncodeStreamKindSnafu)?;
+        AsyncWriteExt::flush(&mut writer)
+            .await
+            .context(crate::webtransport::web_transport_stream_error::FlushStreamKindSnafu)?;
+        Ok(writer)
+    }
+
     /// Send a global request that expects a reply and wait for the response.
     ///
     /// Multiple concurrent calls are safe; the ticket mechanism ensures
@@ -492,7 +584,7 @@ where
     ///
     /// `PE` and `SE` are the encode/decode error types of the payload and
     /// success response respectively. They are inferred from the trait bounds.
-    pub async fn request<RQ, PE, SE>(
+    pub async fn send_global_request<RQ, PE, SE>(
         &self,
         request: &RQ,
     ) -> Result<RQ::Success, SendRequestError<PE, SE>>
@@ -500,8 +592,9 @@ where
         RQ: WantReplyGlobalRequest,
         PE: std::error::Error + Send + Sync + 'static,
         SE: std::error::Error + Send + Sync + 'static,
-        for<'w> RQ::Payload: EncodeInto<&'w mut W, Output = (), Error = PE>,
-        for<'r> RQ::Success: DecodeFrom<&'r mut R, Error = SE>,
+        for<'w> RQ::Payload:
+            EncodeInto<&'w mut SinkWriter<S::StreamWriter>, Output = (), Error = PE>,
+        for<'r> RQ::Success: DecodeFrom<&'r mut StreamReader<S::StreamReader>, Error = SE>,
     {
         use self::global::send_request_error::*;
 
@@ -575,11 +668,15 @@ where
     }
 
     /// Send a global notification (no reply expected).
-    pub async fn notify<N, PE>(&self, notice: &N) -> Result<(), SendNotifyError<PE>>
+    pub async fn send_global_notification<N, PE>(
+        &self,
+        notice: &N,
+    ) -> Result<(), SendNotifyError<PE>>
     where
         N: NotifyGlobalRequest,
         PE: std::error::Error + Send + Sync + 'static,
-        for<'w> N::Payload: EncodeInto<&'w mut W, Output = (), Error = PE>,
+        for<'w> N::Payload:
+            EncodeInto<&'w mut SinkWriter<S::StreamWriter>, Output = (), Error = PE>,
     {
         use self::global::send_notify_error::*;
 
@@ -626,9 +723,14 @@ where
     /// Returns an [`IncomingGlobal`] that holds a reader guard for the caller
     /// to decode the payload. The reader guard **must** be released (via
     /// [`IncomingGlobalRequest::decode_payload`] or
-    /// [`IncomingGlobalNotice::decode_payload`]) before the next `accept()`
-    /// can proceed.
-    pub async fn accept(&self) -> Result<IncomingGlobal<R, W>, AcceptError> {
+    /// [`IncomingGlobalNotice::decode_payload`]) before the next
+    /// `accept_global_request()` can proceed.
+    pub async fn accept_global_request(
+        &self,
+    ) -> Result<
+        IncomingGlobal<StreamReader<S::StreamReader>, SinkWriter<S::StreamWriter>>,
+        AcceptError,
+    > {
         use self::global::accept_error::*;
 
         let read_ticket = self.shared.reader.take_ticket();
@@ -692,29 +794,27 @@ where
 
     /// Open a new channel.
     ///
-    /// The transport framing (signal value and session ID) is written by the
-    /// [`ManageSessionStream`] implementation. This method writes the remaining
-    /// channel header fields: `max_message_size`, `channel_type`, and the
-    /// type-specific payload.
+    /// The WebTransport session carries the stream lifetime. This method only
+    /// writes the DSSH channel stream kind and SSH channel header fields:
+    /// `max_message_size`, `channel_type`, and the type-specific payload.
     ///
     /// Returns the (reader, writer) pair for subsequent channel communication.
     pub async fn open_channel<C, PE>(
         &self,
         channel: &C,
         max_message_size: VarInt,
-    ) -> Result<(M::StreamReader, M::StreamWriter), OpenChannelError<M::Error, PE>>
+    ) -> Result<
+        (StreamReader<S::StreamReader>, SinkWriter<S::StreamWriter>),
+        OpenChannelError<crate::webtransport::WebTransportStreamError, PE>,
+    >
     where
         C: ChannelOpen,
         PE: std::error::Error + Send + Sync + 'static,
-        for<'w> C: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = PE>,
+        for<'w> C: EncodeInto<&'w mut SinkWriter<S::StreamWriter>, Output = (), Error = PE>,
     {
         use self::channel::open_channel_error::*;
 
-        let (mut reader, mut writer) = self
-            ._manage_stream
-            .open_stream()
-            .await
-            .context(OpenStreamSnafu)?;
+        let (mut reader, mut writer) = self.open_channel_stream().await.context(OpenStreamSnafu)?;
 
         writer
             .encode_one(max_message_size)
@@ -743,20 +843,24 @@ where
 
     /// Accept an incoming channel.
     ///
-    /// The transport framing (signal value and session ID) has already been
-    /// consumed by the [`ManageSessionStream`] implementation. This method
-    /// reads the remaining channel header fields: `max_message_size` and
-    /// `channel_type`.
+    /// The WebTransport session carries the stream lifetime. This method
+    /// accepts a WebTransport bidirectional stream, validates the DSSH channel
+    /// stream kind, and reads the SSH channel header fields: `max_message_size`
+    /// and `channel_type`.
     ///
     /// Returns an [`IncomingChannel`] holding the channel type string and the
     /// stream pair. The caller inspects the type string and then calls
     /// [`IncomingChannel::decode_payload`] to decode the type-specific payload.
-    pub async fn accept_channel(&self) -> Result<IncomingChannel<M>, AcceptChannelError<M::Error>> {
+    pub async fn accept_channel(
+        &self,
+    ) -> Result<
+        IncomingChannel<StreamReader<S::StreamReader>, SinkWriter<S::StreamWriter>>,
+        AcceptChannelError<crate::webtransport::WebTransportStreamError>,
+    > {
         use self::channel::accept_channel_error::*;
 
         let (mut reader, writer) = self
-            ._manage_stream
-            .accept_stream()
+            .accept_channel_stream()
             .await
             .context(AcceptStreamSnafu)?;
 
