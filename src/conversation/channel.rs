@@ -9,10 +9,10 @@ use crate::channel::ChannelOpenFailure;
 use crate::codec::{CodecError, SshBool, SshString};
 
 use super::{
-    ManageSessionStream, NotifyChannelRequest, SSH_MSG_CHANNEL_CLOSE, SSH_MSG_CHANNEL_DATA,
-    SSH_MSG_CHANNEL_EOF, SSH_MSG_CHANNEL_EXTENDED_DATA, SSH_MSG_CHANNEL_FAILURE,
-    SSH_MSG_CHANNEL_OPEN_CONFIRMATION, SSH_MSG_CHANNEL_OPEN_FAILURE, SSH_MSG_CHANNEL_REQUEST,
-    SSH_MSG_CHANNEL_SUCCESS, WantReplyChannelRequest,
+    NotifyChannelRequest, SSH_MSG_CHANNEL_CLOSE, SSH_MSG_CHANNEL_DATA, SSH_MSG_CHANNEL_EOF,
+    SSH_MSG_CHANNEL_EXTENDED_DATA, SSH_MSG_CHANNEL_FAILURE, SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
+    SSH_MSG_CHANNEL_OPEN_FAILURE, SSH_MSG_CHANNEL_REQUEST, SSH_MSG_CHANNEL_SUCCESS,
+    WantReplyChannelRequest,
 };
 
 // ===========================================================================
@@ -258,22 +258,22 @@ pub enum WriteChannelOpenFailureError {
 ///
 /// Unlike global requests, channels have independent streams. Dropping this
 /// struct simply closes the streams — it does **not** poison the session.
-pub struct IncomingChannel<M: ManageSessionStream> {
+pub struct IncomingChannel<R, W> {
     channel_type: SshString,
     max_message_size: VarInt,
-    reader: M::StreamReader,
-    writer: M::StreamWriter,
+    reader: R,
+    writer: W,
 }
 
-impl<M: ManageSessionStream> IncomingChannel<M> {
+impl<R, W> IncomingChannel<R, W> {
     /// Create an `IncomingChannel` from its constituent parts.
     ///
     /// Used by [`super::Conversation::accept_channel`].
     pub(super) fn new(
         channel_type: SshString,
         max_message_size: VarInt,
-        reader: M::StreamReader,
-        writer: M::StreamWriter,
+        reader: R,
+        writer: W,
     ) -> Self {
         Self {
             channel_type,
@@ -298,11 +298,9 @@ impl<M: ManageSessionStream> IncomingChannel<M> {
     ///
     /// Returns the decoded payload together with a [`PendingChannel`] that
     /// must be accepted or rejected to complete the channel handshake.
-    pub async fn decode_payload<T, DE>(
-        mut self,
-    ) -> Result<(T, PendingChannel<M::StreamReader, M::StreamWriter>), DE>
+    pub async fn decode_payload<T, DE>(mut self) -> Result<(T, PendingChannel<R, W>), DE>
     where
-        T: for<'r> DecodeFrom<&'r mut M::StreamReader, Error = DE>,
+        T: for<'r> DecodeFrom<&'r mut R, Error = DE>,
     {
         let value = T::decode_from(&mut self.reader).await?;
         Ok((
@@ -318,7 +316,7 @@ impl<M: ManageSessionStream> IncomingChannel<M> {
     ///
     /// Useful for channel types that carry no additional payload (e.g.
     /// `"session"` channels).
-    pub fn skip_payload(self) -> PendingChannel<M::StreamReader, M::StreamWriter> {
+    pub fn skip_payload(self) -> PendingChannel<R, W> {
         PendingChannel {
             reader: self.reader,
             writer: self.writer,
@@ -329,7 +327,7 @@ impl<M: ManageSessionStream> IncomingChannel<M> {
     ///
     /// Useful when passing streams to a handler that performs its own payload
     /// decoding (e.g. direct forwarding handlers).
-    pub fn into_raw_parts(self) -> (M::StreamReader, M::StreamWriter) {
+    pub fn into_raw_parts(self) -> (R, W) {
         (self.reader, self.writer)
     }
 }

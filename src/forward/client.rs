@@ -14,7 +14,7 @@ use tracing::Instrument;
 
 use crate::codec::SshString;
 use crate::constants::DEFAULT_MAX_MESSAGE_SIZE;
-use crate::conversation::{Conversation, ManageSessionStream};
+use crate::conversation::Conversation;
 use crate::forward::{
     DirectStreamlocal, DirectTcpip, ForwardedStreamlocal, ForwardedTcpip,
     StreamlocalForwardGlobalRequest, StreamlocalForwardRequest, TcpipForwardGlobalRequest,
@@ -82,16 +82,14 @@ impl LocalForward {
     ///
     /// This function runs an infinite accept loop and only returns if the
     /// initial bind fails.
-    pub async fn run<M, R, W>(
+    pub async fn run<S>(
         &self,
-        conversation: Arc<Conversation<M, R, W>>,
+        conversation: Arc<Conversation<S>>,
     ) -> Result<Infallible, BindLocalForwardError>
     where
-        M: ManageSessionStream + 'static,
-        M::StreamReader: 'static,
-        M::StreamWriter: 'static,
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
+        S: h3x::webtransport::Session + 'static,
+        S::StreamReader: 'static,
+        S::StreamWriter: 'static,
     {
         match &self.bind {
             Endpoint::Tcp { host, port } => {
@@ -120,17 +118,15 @@ impl LocalForward {
         }
     }
 
-    async fn accept_loop_tcp<M, R, W>(
+    async fn accept_loop_tcp<S>(
         &self,
         listener: tokio::net::TcpListener,
-        conversation: Arc<Conversation<M, R, W>>,
+        conversation: Arc<Conversation<S>>,
     ) -> Result<Infallible, BindLocalForwardError>
     where
-        M: ManageSessionStream + 'static,
-        M::StreamReader: 'static,
-        M::StreamWriter: 'static,
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
+        S: h3x::webtransport::Session + 'static,
+        S::StreamReader: 'static,
+        S::StreamWriter: 'static,
     {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -152,17 +148,15 @@ impl LocalForward {
     }
 
     #[cfg(unix)]
-    async fn accept_loop_unix<M, R, W>(
+    async fn accept_loop_unix<S>(
         &self,
         listener: tokio::net::UnixListener,
-        conversation: Arc<Conversation<M, R, W>>,
+        conversation: Arc<Conversation<S>>,
     ) -> Result<Infallible, BindLocalForwardError>
     where
-        M: ManageSessionStream + 'static,
-        M::StreamReader: 'static,
-        M::StreamWriter: 'static,
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
+        S: h3x::webtransport::Session + 'static,
+        S::StreamReader: 'static,
+        S::StreamWriter: 'static,
     {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -184,17 +178,15 @@ impl LocalForward {
 }
 
 /// Open an SSH channel to the connect endpoint and relay data bidirectionally.
-async fn open_channel_and_relay<M, R, W>(
-    conversation: Arc<Conversation<M, R, W>>,
+async fn open_channel_and_relay<S>(
+    conversation: Arc<Conversation<S>>,
     connect: Endpoint,
     local_reader: Pin<Box<dyn AsyncRead + Send>>,
     local_writer: Pin<Box<dyn AsyncWrite + Send>>,
 ) where
-    M: ManageSessionStream + 'static,
-    M::StreamReader: 'static,
-    M::StreamWriter: 'static,
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
+    S: h3x::webtransport::Session + 'static,
+    S::StreamReader: 'static,
+    S::StreamWriter: 'static,
 {
     let channel_result = match &connect {
         Endpoint::Tcp { host, port } => {
@@ -247,14 +239,12 @@ impl RemoteForward {
     /// Send a global request to the server to start listening on the remote
     /// bind endpoint. Returns the established binding info (including any
     /// server-allocated port).
-    pub async fn request<M, R, W>(
+    pub async fn request<S>(
         &self,
-        conversation: &Conversation<M, R, W>,
+        conversation: &Conversation<S>,
     ) -> Result<RemoteForwardEstablished, RequestRemoteForwardError>
     where
-        M: ManageSessionStream,
-        R: AsyncRead + Unpin + Send,
-        W: AsyncWrite + Unpin + Send,
+        S: h3x::webtransport::Session,
     {
         use request_remote_forward_error::*;
 
@@ -267,7 +257,7 @@ impl RemoteForward {
                     },
                 };
                 let reply: TcpipForwardReply = conversation
-                    .request(&request)
+                    .send_global_request(&request)
                     .await
                     .map_err(|e| RequestError {
                         message: e.to_string(),
@@ -296,7 +286,7 @@ impl RemoteForward {
                     },
                 };
                 conversation
-                    .request(&request)
+                    .send_global_request(&request)
                     .await
                     .map_err(|e| RequestError {
                         message: e.to_string(),
@@ -354,15 +344,13 @@ pub async fn connect_locally(
 /// based on the provided mappings.
 ///
 /// Runs until the conversation's channel accept stream ends.
-pub async fn accept_forwarded_channels<M, R, W>(
-    conversation: Arc<Conversation<M, R, W>>,
+pub async fn accept_forwarded_channels<S>(
+    conversation: Arc<Conversation<S>>,
     mappings: Vec<RemoteForwardEstablished>,
 ) where
-    M: ManageSessionStream + 'static,
-    M::StreamReader: 'static,
-    M::StreamWriter: 'static,
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
+    S: h3x::webtransport::Session + 'static,
+    S::StreamReader: 'static,
+    S::StreamWriter: 'static,
 {
     let mut tasks = tokio::task::JoinSet::new();
     loop {

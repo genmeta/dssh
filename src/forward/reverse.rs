@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::{
     constants::DEFAULT_MAX_MESSAGE_SIZE,
     conversation::global::{DecodedGlobalRequest, RespondSuccessError},
-    conversation::{ChannelOpen, Conversation, ManageSessionStream},
+    conversation::{ChannelOpen, Conversation},
     forward::{
         ForwardError, ForwardedStreamlocal, ForwardedTcpip, StreamlocalForwardRequest,
         TcpipForwardReply, TcpipForwardRequest, relay,
@@ -95,13 +95,11 @@ impl TcpForwardListener {
     ///
     /// Runs until the listener encounters an accept error. Cancel the
     /// enclosing task to stop the listener.
-    pub async fn run<M, R, W>(self, conversation: Arc<Conversation<M, R, W>>)
+    pub async fn run<S>(self, conversation: Arc<Conversation<S>>)
     where
-        M: ManageSessionStream + 'static,
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
-        M::StreamReader: AsyncRead + Send + Unpin + 'static,
-        M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+        S: h3x::webtransport::Session + 'static,
+        S::StreamReader: 'static,
+        S::StreamWriter: 'static,
     {
         let connected_port = self.bound_addr.port();
         let connected_addr = self.bound_addr.ip().to_string();
@@ -170,13 +168,11 @@ impl UnixForwardListener {
     /// Runs until the listener encounters an accept error. Cancel the
     /// enclosing task to stop the listener. The socket file is removed
     /// when this future is dropped (including on cancellation).
-    pub async fn run<M, R, W>(self, conversation: Arc<Conversation<M, R, W>>)
+    pub async fn run<S>(self, conversation: Arc<Conversation<S>>)
     where
-        M: ManageSessionStream + 'static,
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
-        M::StreamReader: AsyncRead + Send + Unpin + 'static,
-        M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+        S: h3x::webtransport::Session + 'static,
+        S::StreamReader: 'static,
+        S::StreamWriter: 'static,
     {
         let _guard = self.guard;
         let socket_path = &_guard.0;
@@ -308,22 +304,25 @@ where
 // Conversation helper: open channel and relay
 // ---------------------------------------------------------------------------
 
-impl<M: ManageSessionStream + 'static, R, W> Conversation<M, R, W>
+impl<S> Conversation<S>
 where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-    M::StreamReader: AsyncRead + Send + Unpin + 'static,
-    M::StreamWriter: AsyncWrite + Send + Unpin + 'static,
+    S: h3x::webtransport::Session + 'static,
+    S::StreamReader: 'static,
+    S::StreamWriter: 'static,
 {
     /// Open a channel for reverse forwarding and relay `local_stream`
     /// through it bidirectionally.
     ///
     /// On failure to open the channel, logs a warning and returns silently.
-    pub(crate) async fn open_channel_and_relay<C, S>(&self, channel_open: C, local_stream: S)
+    pub(crate) async fn open_channel_and_relay<C, T>(&self, channel_open: C, local_stream: T)
     where
         C: ChannelOpen,
-        for<'w> C: EncodeInto<&'w mut M::StreamWriter, Output = (), Error = ForwardError>,
-        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        for<'w> C: EncodeInto<
+                &'w mut h3x::codec::SinkWriter<S::StreamWriter>,
+                Output = (),
+                Error = ForwardError,
+            >,
+        T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let (reader, writer) = match self
             .open_channel(&channel_open, DEFAULT_MAX_MESSAGE_SIZE)
@@ -352,74 +351,213 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use h3x::stream_id::StreamId;
-    use h3x::varint::VarInt;
+    use bytes::Bytes;
+    use futures::{Sink, Stream, channel::mpsc};
+    use h3x::{
+        codec::{SinkWriter, StreamReader as H3xStreamReader},
+        quic::{GetStreamId, ResetStream, StopStream, StreamError},
+        stream_id::StreamId,
+        varint::VarInt,
+    };
+    use std::pin::Pin;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::io::{DuplexStream, duplex};
-    use tokio::sync::Mutex as AsyncMutex;
+    use std::task::{Context, Poll};
+
+    struct TestQuicReader {
+        stream_id: VarInt,
+        inner: mpsc::Receiver<Bytes>,
+    }
+
+    impl Unpin for TestQuicReader {}
+
+    impl Stream for TestQuicReader {
+        type Item = Result<Bytes, StreamError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Pin::new(&mut self.inner)
+                .poll_next(cx)
+                .map(|opt| opt.map(Ok))
+        }
+    }
+
+    impl GetStreamId for TestQuicReader {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl StopStream for TestQuicReader {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _code: VarInt,
+        ) -> Poll<Result<(), StreamError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct TestQuicWriter {
+        stream_id: VarInt,
+        inner: mpsc::Sender<Bytes>,
+    }
+
+    impl Unpin for TestQuicWriter {}
+
+    impl Sink<Bytes> for TestQuicWriter {
+        type Error = StreamError;
+
+        fn poll_ready(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.inner)
+                .poll_ready(cx)
+                .map_err(|_| StreamError::Reset {
+                    code: VarInt::from_u32(0),
+                })
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+            Pin::new(&mut self.inner)
+                .start_send(item)
+                .map_err(|_| StreamError::Reset {
+                    code: VarInt::from_u32(0),
+                })
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.inner)
+                .poll_flush(cx)
+                .map_err(|_| StreamError::Reset {
+                    code: VarInt::from_u32(0),
+                })
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.inner)
+                .poll_close(cx)
+                .map_err(|_| StreamError::Reset {
+                    code: VarInt::from_u32(0),
+                })
+        }
+    }
+
+    impl GetStreamId for TestQuicWriter {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl ResetStream for TestQuicWriter {
+        fn poll_reset(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _code: VarInt,
+        ) -> Poll<Result<(), StreamError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    type MockReader = H3xStreamReader<TestQuicReader>;
+    type MockWriter = SinkWriter<TestQuicWriter>;
+
+    fn make_half(stream_id: VarInt) -> (MockReader, MockWriter) {
+        let (tx, rx) = mpsc::channel(64);
+        let reader = H3xStreamReader::new(TestQuicReader {
+            stream_id,
+            inner: rx,
+        });
+        let writer = SinkWriter::new(TestQuicWriter {
+            stream_id,
+            inner: tx,
+        });
+        (reader, writer)
+    }
 
     struct MockStreamState {
-        pairs: AsyncMutex<Vec<(DuplexStream, DuplexStream)>>,
+        pairs: Mutex<Vec<(MockReader, MockWriter)>>,
         open_called: AtomicBool,
     }
 
     impl MockStreamState {
         fn new() -> Self {
             Self {
-                pairs: AsyncMutex::new(Vec::new()),
+                pairs: Mutex::new(Vec::new()),
                 open_called: AtomicBool::new(false),
             }
         }
 
-        async fn provide_pair(&self, reader: DuplexStream, writer: DuplexStream) {
-            self.pairs.lock().await.push((reader, writer));
+        fn provide_pair(&self, reader: MockReader, writer: MockWriter) {
+            self.pairs.lock().unwrap().push((reader, writer));
         }
     }
 
-    impl ManageSessionStream for MockStreamState {
-        type StreamReader = DuplexStream;
-        type StreamWriter = DuplexStream;
-        type Error = std::io::Error;
+    #[derive(Clone)]
+    struct TestSession(Arc<MockStreamState>);
 
-        async fn open_stream(&self) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
-            self.open_called.store(true, Ordering::SeqCst);
-            self.pairs
-                .lock()
-                .await
-                .pop()
-                .ok_or_else(|| std::io::Error::other("no pairs enqueued"))
+    impl h3x::webtransport::Session for TestSession {
+        type StreamReader = TestQuicReader;
+        type StreamWriter = TestQuicWriter;
+
+        fn id(&self) -> StreamId {
+            StreamId(VarInt::from_u32(40))
         }
 
-        async fn accept_stream(&self) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), h3x::webtransport::OpenStreamError>
+        {
+            self.0.open_called.store(true, Ordering::SeqCst);
+            let (reader, writer) = self
+                .0
+                .pairs
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("no pairs enqueued");
+            Ok((reader.into_inner(), writer.into_inner()))
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, h3x::webtransport::OpenStreamError> {
+            unreachable!("dssh reverse tests use only bidirectional streams")
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), h3x::webtransport::AcceptStreamError>
+        {
             std::future::pending().await
         }
-    }
 
-    struct ArcMock(Arc<MockStreamState>);
-
-    impl ManageSessionStream for ArcMock {
-        type StreamReader = DuplexStream;
-        type StreamWriter = DuplexStream;
-        type Error = std::io::Error;
-
-        async fn open_stream(&self) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
-            self.0.open_stream().await
-        }
-
-        async fn accept_stream(&self) -> Result<(DuplexStream, DuplexStream), std::io::Error> {
-            self.0.accept_stream().await
+        async fn accept_uni(
+            &self,
+        ) -> Result<Self::StreamReader, h3x::webtransport::AcceptStreamError> {
+            unreachable!("dssh reverse tests use only bidirectional streams")
         }
     }
 
-    fn make_conversation(
-        mock: Arc<MockStreamState>,
-    ) -> Arc<Conversation<ArcMock, tokio::io::Empty, tokio::io::Sink>> {
-        Arc::new(Conversation::new(
-            StreamId(VarInt::from_u32(1)),
+    fn make_conversation(mock: Arc<MockStreamState>) -> Arc<Conversation<TestSession>> {
+        let stream_id = VarInt::from_u32(40);
+        let (local_reader, _remote_writer) = make_half(stream_id);
+        let (_remote_reader, local_writer) = make_half(stream_id);
+        Arc::new(Conversation::from_control_streams(
+            TestSession(mock),
             "test",
-            tokio::io::empty(),
-            tokio::io::sink(),
-            ArcMock(mock),
+            local_reader,
+            local_writer,
         ))
     }
 
@@ -448,9 +586,10 @@ mod tests {
         let port = listener.bound_addr().port();
         let handle = tokio::spawn(listener.run(Arc::clone(&conv)));
 
-        let (local_rd, remote_wr) = duplex(8192);
-        let (remote_rd, local_wr) = duplex(8192);
-        mock.provide_pair(local_rd, local_wr).await;
+        let stream_id = VarInt::from_u32(44);
+        let (remote_rd, local_wr) = make_half(stream_id);
+        let (local_rd, remote_wr) = make_half(stream_id);
+        mock.provide_pair(local_rd, local_wr);
 
         let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -460,6 +599,8 @@ mod tests {
         let mut remote_rd = remote_rd;
         let mut remote_wr = remote_wr;
 
+        let stream_kind: VarInt = remote_rd.decode_one().await.unwrap();
+        assert_eq!(stream_kind, crate::webtransport::DSSH_CHANNEL_STREAM_KIND);
         let _max_msg: VarInt = remote_rd.decode_one().await.unwrap();
         let _channel_type: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
         let _connected_addr: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
@@ -468,7 +609,7 @@ mod tests {
         let _orig_port: VarInt = remote_rd.decode_one().await.unwrap();
 
         use h3x::codec::EncodeExt;
-        remote_wr.encode_one(VarInt::from_u32(0)).await.unwrap();
+        remote_wr.encode_one(VarInt::from_u32(91)).await.unwrap();
         remote_wr.encode_one(VarInt::from_u32(32768)).await.unwrap();
         remote_wr.flush().await.unwrap();
 

@@ -44,9 +44,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 mod server {
     use std::path::PathBuf;
 
-    use h3x::stream_id::StreamId;
-    use h3x::varint::VarInt;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Serialize};
     use snafu::{OptionExt, ResultExt, Snafu};
 
     /// User identity from `/etc/passwd`.
@@ -138,35 +136,22 @@ mod server {
     }
 
     /// Authentication success payload.
-    ///
-    /// The child reserves `control_fd_id` before returning this value. The
-    /// parent delivers the control stream FD with that receiver-chosen ID while
-    /// invoking [`StartSessionFn`].
     #[derive(Serialize, Deserialize)]
     pub struct AuthenticatedSession {
         /// Inner remote function that starts the session.
         pub start_session: StartSessionFn,
-        /// Receiver-chosen FD transfer ID for the control stream socketpair.
-        pub control_fd_id: VarInt,
     }
 
     /// Argument to the inner [`StartSessionFn`]: everything the child needs to
     /// construct a [`Conversation`](crate::conversation::Conversation) after
     /// authentication succeeds and the parent completes the HTTP upgrade.
     ///
-    /// Stream data travels through Unix socketpairs via FD passing, not through
-    /// remoc serialization. The `manage_stream` field provides an RPC
-    /// interface that uses receiver-chosen FD transfer IDs.
+    /// Stream data travels through Unix socketpairs via h3x WebTransport IPC,
+    /// not through remoc serialization.
     #[derive(Serialize, Deserialize)]
     pub struct SessionBootstrap {
-        /// RPC client for opening/accepting QUIC streams via IPC FD passing.
-        pub manage_stream: crate::conversation::ipc::IpcManageSessionStreamClient,
-        /// Unique session identifier.
-        #[serde(
-            serialize_with = "serialize_stream_id",
-            deserialize_with = "deserialize_stream_id"
-        )]
-        pub conversation_id: StreamId,
+        /// WebTransport session IPC bootstrap.
+        pub webtransport_session: h3x::ipc::webtransport::WebTransportSessionBootstrap,
         /// Negotiated SSH version string.
         pub peer_version: String,
     }
@@ -223,6 +208,13 @@ mod server {
             reason: String,
         },
 
+        /// Running the session dispatcher failed.
+        #[snafu(display("session dispatcher failed: {reason}"))]
+        Session {
+            /// Human-readable reason for the failure.
+            reason: String,
+        },
+
         /// The remote function call itself failed (transport error).
         #[snafu(display("remote call failed"))]
         RemoteCall {
@@ -250,21 +242,6 @@ mod server {
     /// When the parent calls it with [`SessionBootstrap`] (after HTTP upgrade),
     /// the child drops privileges and runs the session dispatcher.
     pub type StartSessionFn = remoc::rfn::RFnOnce<(SessionBootstrap,), Result<(), SessionRunError>>;
-
-    fn serialize_stream_id<S>(stream_id: &StreamId, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_u64(stream_id.into_inner())
-    }
-
-    fn deserialize_stream_id<'de, D>(deserializer: D) -> Result<StreamId, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = u64::deserialize(deserializer)?;
-        StreamId::try_from(raw).map_err(serde::de::Error::custom)
-    }
 }
 
 #[cfg(feature = "server")]
