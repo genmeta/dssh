@@ -178,11 +178,15 @@ where
         let (reader, writer) = self.channel.into_split();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let (_, output_result) = tokio::join!(
-            relay_stdin(stdin, writer, done_rx),
-            relay_output(reader, stdout, stderr, done_tx),
-        );
-        output_result
+        let stdin_relay = relay_stdin(stdin, writer, done_rx);
+        let output_relay = relay_output(reader, stdout, stderr, done_tx);
+        tokio::pin!(stdin_relay);
+        tokio::pin!(output_relay);
+
+        tokio::select! {
+            output_result = &mut output_relay => output_result,
+            _ = &mut stdin_relay => output_relay.await,
+        }
     }
 
     /// Run the IO relay with terminal resize forwarding.
@@ -200,11 +204,15 @@ where
         let (reader, writer) = self.channel.into_split();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let (_, output_result) = tokio::join!(
-            relay_stdin_interactive(stdin, writer, done_rx, resize),
-            relay_output(reader, stdout, stderr, done_tx),
-        );
-        output_result
+        let stdin_relay = relay_stdin_interactive(stdin, writer, done_rx, resize);
+        let output_relay = relay_output(reader, stdout, stderr, done_tx);
+        tokio::pin!(stdin_relay);
+        tokio::pin!(output_relay);
+
+        tokio::select! {
+            output_result = &mut output_relay => output_result,
+            _ = &mut stdin_relay => output_relay.await,
+        }
     }
 
     /// Consume the session and return the underlying channel.
@@ -394,9 +402,34 @@ mod tests {
     use super::*;
     use crate::conversation::channel::SshChannel;
     use h3x::varint::VarInt;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
     fn channel_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
         tokio::io::duplex(64 * 1024)
+    }
+
+    struct ShutdownPendingWriter;
+
+    impl AsyncWrite for ShutdownPendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
     }
 
     #[tokio::test]
@@ -494,5 +527,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn run_returns_after_remote_close_when_stdin_shutdown_does_not_complete() {
+        let (client, server) = channel_pair();
+        let (client_reader, _client_writer) = tokio::io::split(client);
+        let (_server_reader, server_writer) = tokio::io::split(server);
+
+        let mut sw = SshChannel::new(_server_reader, server_writer);
+        sw.notice(&crate::session::ExitStatusChannelNotice {
+            payload: ExitStatusRequest {
+                exit_status: VarInt::from_u32(0),
+            },
+        })
+        .await
+        .unwrap();
+        sw.eof().await.unwrap();
+        sw.close().await.unwrap();
+        sw.writer_mut().shutdown().await.unwrap();
+
+        let (stdin_reader, _stdin_writer) = tokio::io::duplex(1);
+        let session = ClientSession::new(SshChannel::new(client_reader, ShutdownPendingWriter));
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            session.run(stdin_reader, tokio::io::sink(), tokio::io::sink()),
+        )
+        .await
+        .expect("run should not wait indefinitely for stdin writer shutdown")
+        .unwrap();
+
+        assert_eq!(result, Some(ExitResult::Status(0)));
     }
 }
