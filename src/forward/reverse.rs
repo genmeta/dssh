@@ -512,8 +512,30 @@ mod tests {
         type StreamReader = TestQuicReader;
         type StreamWriter = TestQuicWriter;
 
-        fn id(&self) -> StreamId {
-            StreamId(VarInt::from_u32(40))
+        fn id(&self) -> h3x::webtransport::WebTransportSessionId {
+            h3x::webtransport::WebTransportSessionId::try_from(StreamId(VarInt::from_u32(40)))
+                .expect("test session id must be client-initiated bidirectional")
+        }
+
+        async fn drain(&self) -> Result<(), h3x::webtransport::DrainSessionError> {
+            Ok(())
+        }
+
+        async fn close(
+            &self,
+            _close: h3x::webtransport::CloseSession,
+        ) -> Result<(), h3x::webtransport::CloseSessionError> {
+            Ok(())
+        }
+
+        async fn drained(&self) -> h3x::webtransport::SessionDrain {
+            h3x::webtransport::SessionDrain::Closed(self.closed().await)
+        }
+
+        async fn closed(&self) -> h3x::webtransport::CloseReason {
+            h3x::webtransport::CloseReason::Session(
+                h3x::webtransport::SessionCloseReason::ControlStreamError,
+            )
         }
 
         async fn open_bi(
