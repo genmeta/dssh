@@ -266,246 +266,44 @@ pub enum WebTransportStreamError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        pin::Pin,
-        sync::{Arc, Mutex},
-        task::{Context, Poll},
-    };
-
-    use bytes::Bytes;
-    use futures::{Sink, Stream};
-    use h3x::{
-        quic::{self, GetStreamId, ResetStream, StopStream},
-        stream_id::StreamId,
-    };
+    use h3x::{codec::DecodeExt, stream_id::StreamId};
     use http::HeaderMap;
 
     use super::*;
     use crate::constants::{DSSH_CONNECT_PATH, SSH_VERSION};
+    use crate::test_support::{MockWebTransportSession as TestSession, stream_pair as make_half};
 
-    #[derive(Debug, Default)]
-    struct StreamState {
-        written: Mutex<Vec<u8>>,
+    fn test_session() -> TestSession {
+        TestSession::new(StreamId(VarInt::from_u32(4)))
     }
 
-    impl StreamState {
-        fn written(&self) -> Vec<u8> {
-            self.written.lock().expect("written lock poisoned").clone()
-        }
-    }
-
-    #[derive(Debug)]
-    struct TestReadStream {
-        chunks: VecDeque<Bytes>,
-        stream_id: VarInt,
-    }
-
-    impl Stream for TestReadStream {
-        type Item = Result<Bytes, quic::StreamError>;
-
-        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.chunks.pop_front().map(Ok))
-        }
-    }
-
-    impl GetStreamId for TestReadStream {
-        fn poll_stream_id(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<VarInt, quic::StreamError>> {
-            Poll::Ready(Ok(self.stream_id))
-        }
-    }
-
-    impl StopStream for TestReadStream {
-        fn poll_stop(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _code: VarInt,
-        ) -> Poll<Result<(), quic::StreamError>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[derive(Debug)]
-    struct TestWriteStream {
-        state: Arc<StreamState>,
-        stream_id: VarInt,
-    }
-
-    impl Sink<Bytes> for TestWriteStream {
-        type Error = quic::StreamError;
-
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-            self.state
-                .written
-                .lock()
-                .expect("written lock poisoned")
-                .extend_from_slice(&item);
-            Ok(())
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl GetStreamId for TestWriteStream {
-        fn poll_stream_id(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<VarInt, quic::StreamError>> {
-            Poll::Ready(Ok(self.stream_id))
-        }
-    }
-
-    impl ResetStream for TestWriteStream {
-        fn poll_reset(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _code: VarInt,
-        ) -> Poll<Result<(), quic::StreamError>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct TestSession {
-        open_state: Arc<StreamState>,
-        accept_streams: Mutex<VecDeque<(TestReadStream, TestWriteStream)>>,
-    }
-
-    impl TestSession {
-        fn with_accept_bytes(bytes: &'static [u8]) -> Self {
-            let session = Self::default();
-            session
-                .accept_streams
-                .lock()
-                .expect("accept lock poisoned")
-                .push_back(stream_pair_with_read(bytes, VarInt::from_u32(7)));
-            session
-        }
-    }
-
-    impl h3x::webtransport::Session for TestSession {
-        type StreamReader = TestReadStream;
-        type StreamWriter = TestWriteStream;
-
-        fn id(&self) -> h3x::webtransport::WebTransportSessionId {
-            h3x::webtransport::WebTransportSessionId::try_from(StreamId(VarInt::from_u32(4)))
-                .expect("test session id must be client-initiated bidirectional")
-        }
-
-        async fn drain(&self) -> Result<(), h3x::webtransport::DrainSessionError> {
-            Ok(())
-        }
-
-        async fn close(
-            &self,
-            _close: h3x::webtransport::CloseSession,
-        ) -> Result<(), h3x::webtransport::CloseSessionError> {
-            Ok(())
-        }
-
-        async fn drained(&self) -> h3x::webtransport::SessionDrain {
-            h3x::webtransport::SessionDrain::Closed(self.closed().await)
-        }
-
-        async fn closed(&self) -> h3x::webtransport::CloseReason {
-            h3x::webtransport::CloseReason::Session(
-                h3x::webtransport::SessionCloseReason::ControlStreamError,
-            )
-        }
-
-        async fn open_bi(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), h3x::webtransport::OpenStreamError>
-        {
-            Ok((
-                TestReadStream {
-                    chunks: VecDeque::new(),
-                    stream_id: VarInt::from_u32(5),
-                },
-                TestWriteStream {
-                    state: self.open_state.clone(),
-                    stream_id: VarInt::from_u32(5),
-                },
-            ))
-        }
-
-        async fn open_uni(&self) -> Result<Self::StreamWriter, h3x::webtransport::OpenStreamError> {
-            unreachable!("dssh webtransport conversation uses only bidirectional streams")
-        }
-
-        async fn accept_bi(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), h3x::webtransport::AcceptStreamError>
-        {
-            self.accept_streams
-                .lock()
-                .expect("accept lock poisoned")
-                .pop_front()
-                .ok_or(h3x::webtransport::AcceptStreamError::Closed {
-                    source: h3x::webtransport::SessionClosed,
-                })
-        }
-
-        async fn accept_uni(
-            &self,
-        ) -> Result<Self::StreamReader, h3x::webtransport::AcceptStreamError> {
-            unreachable!("dssh webtransport conversation uses only bidirectional streams")
-        }
-    }
-
-    fn stream_pair_with_read(
-        bytes: &'static [u8],
-        stream_id: VarInt,
-    ) -> (TestReadStream, TestWriteStream) {
-        let state = Arc::new(StreamState::default());
-        (
-            TestReadStream {
-                chunks: VecDeque::from([Bytes::from_static(bytes)]),
-                stream_id,
-            },
-            TestWriteStream { state, stream_id },
-        )
+    fn session_with_accept_bytes(bytes: &'static [u8]) -> TestSession {
+        let session = test_session();
+        session.provide_accept_bytes(VarInt::from_u32(8), Bytes::from_static(bytes));
+        session
     }
 
     #[tokio::test]
     async fn open_conversation_opens_control_stream_and_preserves_metadata() {
-        let session = TestSession::default();
-        let open_state = session.open_state.clone();
+        let session = test_session();
+        let stream_id = VarInt::from_u32(8);
+        let (local_reader, _remote_writer) = make_half(stream_id);
+        let (mut remote_reader, local_writer) = make_half(stream_id);
+        session.provide_open_stream(local_reader, local_writer);
 
         let conversation = Conversation::open(session, SSH_VERSION)
             .await
             .expect("conversation opens");
 
+        let kind: VarInt = remote_reader.decode_one().await.expect("stream kind");
+        assert_eq!(kind, DSSH_CONTROL_STREAM_KIND);
         assert_eq!(conversation.id(), StreamId(VarInt::from_u32(4)));
         assert_eq!(conversation.peer_version(), SSH_VERSION);
-        assert_eq!(open_state.written(), vec![0]);
     }
 
     #[tokio::test]
     async fn accept_conversation_accepts_control_stream_and_preserves_metadata() {
-        let session = TestSession::with_accept_bytes(b"\x00control");
+        let session = session_with_accept_bytes(b"\x00control");
 
         let conversation = Conversation::accept(session, SSH_VERSION)
             .await
@@ -517,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_conversation_rejects_channel_stream_as_control() {
-        let session = TestSession::with_accept_bytes(b"\x01channel");
+        let session = session_with_accept_bytes(b"\x01channel");
 
         let error = match Conversation::accept(session, SSH_VERSION).await {
             Ok(_) => panic!("channel stream is not a control stream"),

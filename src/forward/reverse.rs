@@ -351,232 +351,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use futures::{Sink, Stream, channel::mpsc};
-    use h3x::{
-        codec::{SinkWriter, StreamReader as H3xStreamReader},
-        quic::{GetStreamId, ResetStream, StopStream, StreamError},
-        stream_id::StreamId,
-        varint::VarInt,
-    };
-    use std::pin::Pin;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::{Context, Poll};
+    use crate::test_support::{MockWebTransportSession as TestSession, stream_pair as make_half};
+    use h3x::{stream_id::StreamId, varint::VarInt};
 
-    struct TestQuicReader {
-        stream_id: VarInt,
-        inner: mpsc::Receiver<Bytes>,
+    fn make_test_session() -> TestSession {
+        TestSession::new(StreamId(VarInt::from_u32(40)))
     }
 
-    impl Unpin for TestQuicReader {}
-
-    impl Stream for TestQuicReader {
-        type Item = Result<Bytes, StreamError>;
-
-        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Pin::new(&mut self.inner)
-                .poll_next(cx)
-                .map(|opt| opt.map(Ok))
-        }
-    }
-
-    impl GetStreamId for TestQuicReader {
-        fn poll_stream_id(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<VarInt, StreamError>> {
-            Poll::Ready(Ok(self.stream_id))
-        }
-    }
-
-    impl StopStream for TestQuicReader {
-        fn poll_stop(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _code: VarInt,
-        ) -> Poll<Result<(), StreamError>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    struct TestQuicWriter {
-        stream_id: VarInt,
-        inner: mpsc::Sender<Bytes>,
-    }
-
-    impl Unpin for TestQuicWriter {}
-
-    impl Sink<Bytes> for TestQuicWriter {
-        type Error = StreamError;
-
-        fn poll_ready(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Pin::new(&mut self.inner)
-                .poll_ready(cx)
-                .map_err(|_| StreamError::Reset {
-                    code: VarInt::from_u32(0),
-                })
-        }
-
-        fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-            Pin::new(&mut self.inner)
-                .start_send(item)
-                .map_err(|_| StreamError::Reset {
-                    code: VarInt::from_u32(0),
-                })
-        }
-
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Pin::new(&mut self.inner)
-                .poll_flush(cx)
-                .map_err(|_| StreamError::Reset {
-                    code: VarInt::from_u32(0),
-                })
-        }
-
-        fn poll_close(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Pin::new(&mut self.inner)
-                .poll_close(cx)
-                .map_err(|_| StreamError::Reset {
-                    code: VarInt::from_u32(0),
-                })
-        }
-    }
-
-    impl GetStreamId for TestQuicWriter {
-        fn poll_stream_id(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<VarInt, StreamError>> {
-            Poll::Ready(Ok(self.stream_id))
-        }
-    }
-
-    impl ResetStream for TestQuicWriter {
-        fn poll_reset(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _code: VarInt,
-        ) -> Poll<Result<(), StreamError>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    type MockReader = H3xStreamReader<TestQuicReader>;
-    type MockWriter = SinkWriter<TestQuicWriter>;
-
-    fn make_half(stream_id: VarInt) -> (MockReader, MockWriter) {
-        let (tx, rx) = mpsc::channel(64);
-        let reader = H3xStreamReader::new(TestQuicReader {
-            stream_id,
-            inner: rx,
-        });
-        let writer = SinkWriter::new(TestQuicWriter {
-            stream_id,
-            inner: tx,
-        });
-        (reader, writer)
-    }
-
-    struct MockStreamState {
-        pairs: Mutex<Vec<(MockReader, MockWriter)>>,
-        open_called: AtomicBool,
-    }
-
-    impl MockStreamState {
-        fn new() -> Self {
-            Self {
-                pairs: Mutex::new(Vec::new()),
-                open_called: AtomicBool::new(false),
-            }
-        }
-
-        fn provide_pair(&self, reader: MockReader, writer: MockWriter) {
-            self.pairs.lock().unwrap().push((reader, writer));
-        }
-    }
-
-    #[derive(Clone)]
-    struct TestSession(Arc<MockStreamState>);
-
-    impl h3x::webtransport::Session for TestSession {
-        type StreamReader = TestQuicReader;
-        type StreamWriter = TestQuicWriter;
-
-        fn id(&self) -> h3x::webtransport::WebTransportSessionId {
-            h3x::webtransport::WebTransportSessionId::try_from(StreamId(VarInt::from_u32(40)))
-                .expect("test session id must be client-initiated bidirectional")
-        }
-
-        async fn drain(&self) -> Result<(), h3x::webtransport::DrainSessionError> {
-            Ok(())
-        }
-
-        async fn close(
-            &self,
-            _close: h3x::webtransport::CloseSession,
-        ) -> Result<(), h3x::webtransport::CloseSessionError> {
-            Ok(())
-        }
-
-        async fn drained(&self) -> h3x::webtransport::SessionDrain {
-            h3x::webtransport::SessionDrain::Closed(self.closed().await)
-        }
-
-        async fn closed(&self) -> h3x::webtransport::CloseReason {
-            h3x::webtransport::CloseReason::Session(
-                h3x::webtransport::SessionCloseReason::ControlStreamError,
-            )
-        }
-
-        async fn open_bi(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), h3x::webtransport::OpenStreamError>
-        {
-            self.0.open_called.store(true, Ordering::SeqCst);
-            let (reader, writer) = self
-                .0
-                .pairs
-                .lock()
-                .unwrap()
-                .pop()
-                .expect("no pairs enqueued");
-            Ok((reader.into_inner(), writer.into_inner()))
-        }
-
-        async fn open_uni(&self) -> Result<Self::StreamWriter, h3x::webtransport::OpenStreamError> {
-            unreachable!("dssh reverse tests use only bidirectional streams")
-        }
-
-        async fn accept_bi(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), h3x::webtransport::AcceptStreamError>
-        {
-            std::future::pending().await
-        }
-
-        async fn accept_uni(
-            &self,
-        ) -> Result<Self::StreamReader, h3x::webtransport::AcceptStreamError> {
-            unreachable!("dssh reverse tests use only bidirectional streams")
-        }
-    }
-
-    fn make_conversation(mock: Arc<MockStreamState>) -> Arc<Conversation<TestSession>> {
+    fn make_conversation(session: TestSession) -> Arc<Conversation<TestSession>> {
         let stream_id = VarInt::from_u32(40);
         let (local_reader, _remote_writer) = make_half(stream_id);
         let (_remote_reader, local_writer) = make_half(stream_id);
         Arc::new(Conversation::from_control_streams(
-            TestSession(mock),
+            session,
             "test",
             local_reader,
             local_writer,
@@ -585,8 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_forward_bind_and_cancel() {
-        let mock = Arc::new(MockStreamState::new());
-        let conv = make_conversation(Arc::clone(&mock));
+        let conv = make_conversation(make_test_session());
 
         let listener = TcpForwardListener::bind("127.0.0.1:0").await.unwrap();
         assert_ne!(listener.bound_addr().port(), 0, "should get a real port");
@@ -601,8 +387,8 @@ mod tests {
         use h3x::codec::DecodeExt;
         use tokio::io::AsyncWriteExt;
 
-        let mock = Arc::new(MockStreamState::new());
-        let conv = make_conversation(Arc::clone(&mock));
+        let session = make_test_session();
+        let conv = make_conversation(session.clone());
 
         let listener = TcpForwardListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.bound_addr().port();
@@ -611,7 +397,7 @@ mod tests {
         let stream_id = VarInt::from_u32(44);
         let (remote_rd, local_wr) = make_half(stream_id);
         let (local_rd, remote_wr) = make_half(stream_id);
-        mock.provide_pair(local_rd, local_wr);
+        session.provide_open_stream(local_rd, local_wr);
 
         let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -638,7 +424,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         assert!(
-            mock.open_called.load(Ordering::SeqCst),
+            session.open_called(),
             "should have called open_stream via Conversation::open_channel"
         );
 
@@ -651,8 +437,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("test.sock");
 
-        let mock = Arc::new(MockStreamState::new());
-        let conv = make_conversation(Arc::clone(&mock));
+        let conv = make_conversation(make_test_session());
 
         let listener = UnixForwardListener::bind(&sock_path).unwrap();
         assert!(sock_path.exists(), "socket file should exist after bind");
@@ -675,8 +460,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("drop-test.sock");
 
-        let mock = Arc::new(MockStreamState::new());
-        let conv = make_conversation(Arc::clone(&mock));
+        let conv = make_conversation(make_test_session());
 
         let listener = UnixForwardListener::bind(&sock_path).unwrap();
         assert!(sock_path.exists(), "socket file should exist after bind");
