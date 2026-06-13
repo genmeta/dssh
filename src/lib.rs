@@ -18,6 +18,9 @@ pub mod version;
 pub mod webtransport;
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn legacy_raw_ssh3_protocol_module_is_not_exported() {
