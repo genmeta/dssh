@@ -5,9 +5,9 @@
 //!   stderr → channel extended data (type 1).
 //! - **PTY**: all I/O through a PTY master; everything → channel data.
 //!
-//! Both modes use `tokio::join!` for concurrent I/O relay (no spawned tasks,
-//! no cancellation issues). The reader half uses `SshChannelReader::next_event`
-//! which is safe since it never needs to be cancelled.
+//! Both modes run the input relay in a managed spawned task and keep the
+//! output relay inline so exit notification can be emitted promptly while
+//! stdout/stderr or PTY output continues draining before EOF/Close.
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
@@ -282,12 +282,20 @@ where
     let pid = child.id().map(|id| Pid::from_raw(id as i32));
 
     let (reader, mut writer) = channel.into_split();
+    let (stop_input_tx, stop_input_rx) = tokio::sync::oneshot::channel();
+    let mut stop_input_tx = Some(stop_input_tx);
 
-    let input_handle = tokio::spawn(relay_input_piped(reader, stdin, pid));
+    let input_handle = tokio::spawn(relay_input_piped(reader, stdin, pid, stop_input_rx));
 
     let output_result = async {
-        let status = relay_output_piped(&mut stdout, &mut stderr, &mut writer, &mut child).await?;
-        send_exit_notification(&mut writer, &status).await?;
+        relay_output_piped(
+            &mut stdout,
+            &mut stderr,
+            &mut writer,
+            &mut child,
+            &mut stop_input_tx,
+        )
+        .await?;
         writer.eof().await.context(WriteEofSnafu)?;
         writer.close().await.context(WriteCloseSnafu)?;
         writer
@@ -299,7 +307,7 @@ where
     }
     .await;
 
-    input_handle.abort();
+    signal_input_relay_stop(&mut stop_input_tx);
     let _ = input_handle.await;
     output_result
 }
@@ -360,6 +368,7 @@ where
     }
 
     let mut child = cmd.spawn().context(SpawnSnafu)?;
+    drop(cmd);
     let pid = child.id().map(|id| Pid::from_raw(id as i32));
 
     // Use AsyncFd-based wrappers for the PTY master. Unlike tokio::fs::File
@@ -372,28 +381,37 @@ where
     let master_writer = super::pty::AsyncPtyFd::new(master_write_fd).context(AsyncPtySnafu)?;
 
     let (reader, mut writer) = channel.into_split();
+    let (stop_input_tx, stop_input_rx) = tokio::sync::oneshot::channel();
+    let mut stop_input_tx = Some(stop_input_tx);
 
-    let input_handle = tokio::spawn(relay_input_pty(reader, master_writer, pid, master_raw_fd));
+    let input_handle = tokio::spawn(relay_input_pty(
+        reader,
+        master_writer,
+        pid,
+        master_raw_fd,
+        stop_input_rx,
+    ));
 
     let output_result = async {
-        let status = relay_output_pty(&mut master_reader, &mut writer, &mut child).await?;
-        tracing::trace!(?status, "child process exited");
-        send_exit_notification(&mut writer, &status).await?;
-        tracing::trace!("exit notification sent");
+        relay_output_pty(
+            &mut master_reader,
+            &mut writer,
+            &mut child,
+            &mut stop_input_tx,
+        )
+        .await?;
         writer.eof().await.context(WriteEofSnafu)?;
         writer.close().await.context(WriteCloseSnafu)?;
-        tracing::trace!("eof + close written");
         writer
             .writer_mut()
             .shutdown()
             .await
             .context(ShutdownSnafu)?;
-        tracing::trace!("writer shutdown complete");
         Ok::<_, ProcessError>(())
     }
     .await;
 
-    input_handle.abort();
+    signal_input_relay_stop(&mut stop_input_tx);
     let _ = input_handle.await;
     output_result
 }
@@ -402,13 +420,15 @@ where
 // Output relay
 // ============================================================================
 
-/// Multiplex stdout and stderr to the channel writer, racing each read against
-/// child exit. See [`relay_output_pty`] for the rationale.
+/// Multiplex stdout and stderr to the channel writer while watching for child
+/// exit. Once the child exits, send the exit notification promptly, stop the
+/// input relay, and continue draining remaining output until both pipes close.
 async fn relay_output_piped<W>(
     stdout: &mut (impl AsyncRead + Unpin),
     stderr: &mut (impl AsyncRead + Unpin),
     writer: &mut SshChannelWriter<W>,
     child: &mut tokio::process::Child,
+    stop_input_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<std::process::ExitStatus, ProcessError>
 where
     W: AsyncWrite + Unpin + Send,
@@ -419,6 +439,7 @@ where
     let mut stderr_buf = [0u8; 8192];
     let mut stdout_done = false;
     let mut stderr_done = false;
+    let mut exit_status = None;
 
     while !stdout_done || !stderr_done {
         tokio::select! {
@@ -447,13 +468,26 @@ where
                     .await
                     .context(WriteExtendedDataSnafu)?;
             }
-            wait_result = child.wait() => {
-                return wait_result.context(WaitSnafu);
+            wait_result = child.wait(), if exit_status.is_none() => {
+                let status = wait_result.context(WaitSnafu)?;
+                signal_input_relay_stop(stop_input_tx);
+                send_exit_notification(writer, &status).await?;
+                exit_status = Some(status);
             }
         }
     }
 
-    child.wait().await.context(WaitSnafu)
+    let status = match exit_status {
+        Some(status) => status,
+        None => {
+            let status = child.wait().await.context(WaitSnafu)?;
+            signal_input_relay_stop(stop_input_tx);
+            send_exit_notification(writer, &status).await?;
+            status
+        }
+    };
+
+    Ok(status)
 }
 
 /// Relay PTY master output to the channel writer, racing each read against
@@ -463,15 +497,16 @@ where
 /// `child.wait()`:
 ///
 /// - **Read wins** — the data is forwarded to `writer`, then the race repeats.
-/// - **`child.wait()` wins** — the child has exited and we are at a clean SSH
-///   frame boundary (not mid-write), so the caller can safely send
-///   `exit-status` / EOF / Close.
+/// - **`child.wait()` wins** — the child has exited, so this function sends
+///   `exit-status` / `exit-signal`, stops the input relay, and keeps draining
+///   PTY output until the master closes.
 /// - **PTY closes (EIO / `Ok(0)`)** — the read loop ends and we wait for the
-///   child before returning.
+///   child if we have not observed its exit yet.
 async fn relay_output_pty<W>(
     master: &mut (impl AsyncRead + Unpin),
     writer: &mut SshChannelWriter<W>,
     child: &mut tokio::process::Child,
+    stop_input_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<std::process::ExitStatus, ProcessError>
 where
     W: AsyncWrite + Unpin + Send,
@@ -479,6 +514,7 @@ where
     use process_error::*;
 
     let mut buf = [0u8; 8192];
+    let mut exit_status = None;
     loop {
         tokio::select! {
             read_result = master.read(&mut buf) => {
@@ -490,75 +526,103 @@ where
                     Ok(n) => writer.data(&buf[..n]).await.context(WriteDataSnafu)?,
                 }
             }
-            wait_result = child.wait() => {
-                // Child exited while we were between reads: we are at a clean
-                // SSH frame boundary, so the caller can safely send
-                // exit-status / EOF / Close.
-                return wait_result.context(WaitSnafu);
+            wait_result = child.wait(), if exit_status.is_none() => {
+                let status = wait_result.context(WaitSnafu)?;
+                signal_input_relay_stop(stop_input_tx);
+                send_exit_notification(writer, &status).await?;
+                exit_status = Some(status);
             }
         }
     }
-    // PTY closed cleanly. Wait for the child to confirm exit.
-    child.wait().await.context(WaitSnafu)
+
+    let status = match exit_status {
+        Some(status) => status,
+        None => {
+            let status = child.wait().await.context(WaitSnafu)?;
+            signal_input_relay_stop(stop_input_tx);
+            send_exit_notification(writer, &status).await?;
+            status
+        }
+    };
+
+    Ok(status)
 }
 
 // ============================================================================
 // Input relay
 // ============================================================================
 
-/// Read from channel, write data to process stdin, deliver signals.
+/// Read from channel, write data to process stdin, deliver signals, and stop
+/// when the output relay tells us the child has exited.
 async fn relay_input_piped<R>(
     mut reader: SshChannelReader<R>,
     mut stdin: impl AsyncWrite + Unpin + Send,
     pid: Option<Pid>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) where
     R: AsyncRead + Unpin + Send,
 {
     loop {
-        match reader.next_event().await {
-            Ok(ReaderEvent::Data(mut data)) => {
-                if io::copy(&mut data, &mut stdin).await.is_err() {
-                    break;
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => break,
+            event = reader.next_event() => match event {
+                Ok(ReaderEvent::Data(mut data)) => {
+                    if io::copy(&mut data, &mut stdin).await.is_err() {
+                        break;
+                    }
                 }
-            }
-            Ok(ReaderEvent::Notice(incoming)) => {
-                if !handle_piped_notice(incoming, pid).await {
-                    break;
+                Ok(ReaderEvent::Notice(incoming)) => {
+                    if !handle_piped_notice(incoming, pid).await {
+                        break;
+                    }
                 }
+                Ok(ReaderEvent::Eof | ReaderEvent::Close) | Err(_) => break,
+                Ok(_) => {}
             }
-            Ok(ReaderEvent::Eof | ReaderEvent::Close) | Err(_) => break,
-            Ok(_) => {}
         }
     }
 }
 
 /// Read from channel, write data to PTY master, deliver signals, handle
-/// window-change requests.
+/// window-change requests, and stop when the output relay tells us the child
+/// has exited.
 async fn relay_input_pty<R>(
     mut reader: SshChannelReader<R>,
     mut pty_writer: impl AsyncWrite + Unpin + Send,
     pid: Option<Pid>,
     master_raw_fd: RawFd,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) where
     R: AsyncRead + Unpin + Send,
 {
     loop {
-        match reader.next_event().await {
-            Ok(ReaderEvent::Data(mut data)) => {
-                if io::copy(&mut data, &mut pty_writer).await.is_err() {
-                    break;
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => break,
+            event = reader.next_event() => match event {
+                Ok(ReaderEvent::Data(mut data)) => {
+                    if io::copy(&mut data, &mut pty_writer).await.is_err() {
+                        break;
+                    }
                 }
-            }
-            Ok(ReaderEvent::Notice(incoming)) => {
-                if !handle_pty_notice(incoming, pid, master_raw_fd).await {
-                    break;
+                Ok(ReaderEvent::Notice(incoming)) => {
+                    if !handle_pty_notice(incoming, pid, master_raw_fd).await {
+                        break;
+                    }
                 }
+                Ok(ReaderEvent::Eof | ReaderEvent::Close) | Err(_) => break,
+                Ok(_) => {}
             }
-            Ok(ReaderEvent::Eof | ReaderEvent::Close) | Err(_) => break,
-            Ok(_) => {}
         }
     }
     drop(pty_writer);
+}
+
+fn signal_input_relay_stop(stop_tx: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    if let Some(stop_tx) = stop_tx.take() {
+        let _ = stop_tx.send(());
+    }
 }
 
 // ============================================================================
@@ -695,14 +759,86 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::SshBytes;
     use crate::conversation::channel::ChannelEvent;
     use crate::session::dispatcher::SessionConfig;
+    use crate::session::PtyRequest;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RecordedEvent {
+        Data(String),
+        ExtendedData(String),
+        ExitStatus(u32),
+        ExitSignal(String),
+        Eof,
+        Close,
+    }
 
     // Helper: create a mock channel pair (in-memory duplex).
     fn channel_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
         tokio::io::duplex(64 * 1024)
+    }
+
+    fn test_pty_request() -> PtyRequest {
+        PtyRequest {
+            term_type: "xterm-256color".into(),
+            width_cols: VarInt::from(80u32),
+            height_rows: VarInt::from(24u32),
+            width_px: VarInt::from_u32(0),
+            height_px: VarInt::from_u32(0),
+            terminal_modes: SshBytes::from(vec![]),
+        }
+    }
+
+    async fn collect_events<R, W>(channel: &mut SshChannel<R, W>) -> Vec<RecordedEvent>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
+        let mut events = Vec::new();
+        loop {
+            match channel.next_event().await {
+                Ok(ChannelEvent::Data(mut data)) => {
+                    let bytes = data.read_all().await.unwrap();
+                    events.push(RecordedEvent::Data(
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    ));
+                }
+                Ok(ChannelEvent::ExtendedData { mut data, .. }) => {
+                    let bytes = data.read_all().await.unwrap();
+                    events.push(RecordedEvent::ExtendedData(
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    ));
+                }
+                Ok(ChannelEvent::Request(incoming)) => {
+                    if &**incoming.request_type() == "exit-status" {
+                        let (req, _) = incoming
+                            .decode_payload::<ExitStatusRequest, SessionCodecError>()
+                            .await
+                            .unwrap();
+                        events.push(RecordedEvent::ExitStatus(
+                            req.exit_status.into_inner() as u32,
+                        ));
+                    } else if &**incoming.request_type() == "exit-signal" {
+                        let (req, _) = incoming
+                            .decode_payload::<ExitSignalRequest, SessionCodecError>()
+                            .await
+                            .unwrap();
+                        events.push(RecordedEvent::ExitSignal(req.signal_name.to_string()));
+                    }
+                }
+                Ok(ChannelEvent::Eof) => events.push(RecordedEvent::Eof),
+                Ok(ChannelEvent::Close) => {
+                    events.push(RecordedEvent::Close);
+                    break;
+                }
+                Err(error) => panic!("unexpected channel error: {error}"),
+                _ => {}
+            }
+        }
+        events
     }
 
     struct ShutdownFailWriter;
@@ -900,6 +1036,95 @@ mod tests {
         }
 
         assert_eq!(exit_code, Some(42));
+        drop(channel);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_piped_sends_exit_status_before_late_stdout_but_still_delivers_output() {
+        let (client_stream, server_stream) = channel_pair();
+        let (server_reader, server_writer) = tokio::io::split(server_stream);
+        let (client_reader, client_writer) = tokio::io::split(client_stream);
+
+        let config = SessionConfig::default();
+        let handle = tokio::spawn(async move {
+            run_piped(
+                SshChannel::new(server_reader, server_writer),
+                CommandMode::Exec {
+                    shell: OsStr::new("/bin/sh"),
+                    command: b"(sleep 0.05; printf late-output) & exit 23",
+                },
+                &config,
+                None,
+                &[],
+            )
+            .await
+        });
+
+        let mut channel = SshChannel::new(client_reader, client_writer);
+        let events = collect_events(&mut channel).await;
+
+        let exit_index = events
+            .iter()
+            .position(|event| matches!(event, RecordedEvent::ExitStatus(code) if *code == 23))
+            .unwrap();
+        let data_index = events
+            .iter()
+            .position(|event| matches!(event, RecordedEvent::Data(text) if text == "late-output"))
+            .unwrap();
+
+        assert!(
+            exit_index < data_index,
+            "expected exit-status before late stdout drain: {events:#?}",
+        );
+        assert!(matches!(events.last(), Some(RecordedEvent::Close)));
+
+        drop(channel);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_pty_sends_exit_status_before_late_output_but_still_drains_pty() {
+        let (client_stream, server_stream) = channel_pair();
+        let (server_reader, server_writer) = tokio::io::split(server_stream);
+        let (client_reader, client_writer) = tokio::io::split(client_stream);
+
+        let pty = crate::session::pty::allocate_pty(&test_pty_request()).unwrap();
+        let config = SessionConfig::default();
+        let handle = tokio::spawn(async move {
+            run_pty(
+                SshChannel::new(server_reader, server_writer),
+                CommandMode::Exec {
+                    shell: OsStr::new("/bin/sh"),
+                    command: b"trap '' HUP; (sleep 0.05; printf late-pty) & exit 29",
+                },
+                pty,
+                &config,
+                Some("xterm-256color"),
+                &[],
+            )
+            .await
+        });
+
+        let mut channel = SshChannel::new(client_reader, client_writer);
+        let events = collect_events(&mut channel).await;
+
+        let exit_index = events
+            .iter()
+            .position(|event| matches!(event, RecordedEvent::ExitStatus(code) if *code == 29))
+            .unwrap();
+        let data_index = events
+            .iter()
+            .position(|event| matches!(event, RecordedEvent::Data(text) if text.contains("late-pty")))
+            .unwrap();
+
+        assert!(
+            exit_index < data_index,
+            "expected exit-status before late PTY data drain: {events:#?}",
+        );
+        assert!(events.iter().any(|event| matches!(event, RecordedEvent::Eof)));
+        assert!(matches!(events.last(), Some(RecordedEvent::Close)));
+
         drop(channel);
         handle.await.unwrap().unwrap();
     }
