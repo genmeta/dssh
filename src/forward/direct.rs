@@ -66,13 +66,14 @@ pub enum DirectForwardError {
     RelayJoin { source: tokio::task::JoinError },
 }
 
-/// Send `ChannelOpenFailure` with `SSH_OPEN_CONNECT_FAILED`.
+/// Send `ChannelOpenFailure` with the provided reason code.
 async fn send_open_failure<R, W: AsyncWrite + Unpin + Send>(
     pending: PendingChannel<R, W>,
+    reason: VarInt,
     description: &str,
 ) -> Result<(), DirectForwardError> {
     pending
-        .reject(reason_code::CONNECT_FAILED, description.to_owned().into())
+        .reject(reason, description.to_owned().into())
         .await
         .context(direct_forward_error::RejectSnafu)
 }
@@ -139,20 +140,27 @@ where
         .await
         .context(direct_forward_error::DecodeVarintSnafu)?;
 
-    let raw_port = dest_port.into_inner();
-    snafu::ensure!(
-        raw_port <= u16::MAX as u64,
-        direct_forward_error::PortOverflowSnafu { raw_port }
-    );
-    let port = raw_port as u16;
-
     let pending = PendingChannel::from_raw_parts(reader, writer);
+    let raw_port = dest_port.into_inner();
+    let port = match u16::try_from(raw_port) {
+        Ok(port) => port,
+        Err(_) => {
+            send_open_failure(
+                pending,
+                reason_code::ADMINISTRATIVELY_PROHIBITED,
+                "invalid destination port",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
     let addr = format!("{}:{}", &*dest_host, port);
     let tcp_stream = match TcpStream::connect(&addr).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(%addr, error = %snafu::Report::from_error(&e), "direct-tcpip connect failed");
-            send_open_failure(pending, "connect failed").await?;
+            send_open_failure(pending, reason_code::CONNECT_FAILED, "connect failed").await?;
             return Ok(());
         }
     };
@@ -194,7 +202,7 @@ where
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(%path, error = %snafu::Report::from_error(&e), "direct-streamlocal connect failed");
-            send_open_failure(pending, "connect failed").await?;
+            send_open_failure(pending, reason_code::CONNECT_FAILED, "connect failed").await?;
             return Ok(());
         }
     };
@@ -292,21 +300,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_tcpip_port_overflow() {
+    async fn direct_tcpip_port_overflow_is_rejected() {
         let req = encode_tcpip_request("127.0.0.1", 70000, "127.0.0.1", 11111).await;
 
         let (mut client_wr, server_rd) = duplex(8192);
-        let (server_wr, _client_rd) = duplex(8192);
+        let (server_wr, mut client_rd) = duplex(8192);
 
         client_wr.write_all(&req).await.unwrap();
         drop(client_wr);
 
-        // Port overflow causes PortOverflow error (not a failure message)
-        let result = handle_direct_tcpip(server_rd, server_wr).await;
-        assert!(result.is_err());
-        assert!(
-            format!("{:?}", result.unwrap_err()).contains("PortOverflow"),
-            "expected PortOverflow error"
-        );
+        handle_direct_tcpip(server_rd, server_wr).await.unwrap();
+
+        let result = read_channel_open_response(&mut client_rd).await;
+        assert!(matches!(
+            result,
+            Err(crate::conversation::channel::AwaitOpenError::Rejected { .. })
+        ));
     }
 }

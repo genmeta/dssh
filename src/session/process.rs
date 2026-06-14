@@ -761,8 +761,8 @@ mod tests {
     use super::*;
     use crate::codec::SshBytes;
     use crate::conversation::channel::ChannelEvent;
-    use crate::session::dispatcher::SessionConfig;
     use crate::session::PtyRequest;
+    use crate::session::dispatcher::SessionConfig;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -819,7 +819,7 @@ mod tests {
                             .await
                             .unwrap();
                         events.push(RecordedEvent::ExitStatus(
-                            req.exit_status.into_inner() as u32,
+                            req.exit_status.into_inner() as u32
                         ));
                     } else if &**incoming.request_type() == "exit-signal" {
                         let (req, _) = incoming
@@ -1115,14 +1115,20 @@ mod tests {
             .unwrap();
         let data_index = events
             .iter()
-            .position(|event| matches!(event, RecordedEvent::Data(text) if text.contains("late-pty")))
+            .position(
+                |event| matches!(event, RecordedEvent::Data(text) if text.contains("late-pty")),
+            )
             .unwrap();
 
         assert!(
             exit_index < data_index,
             "expected exit-status before late PTY data drain: {events:#?}",
         );
-        assert!(events.iter().any(|event| matches!(event, RecordedEvent::Eof)));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RecordedEvent::Eof))
+        );
         assert!(matches!(events.last(), Some(RecordedEvent::Close)));
 
         drop(channel);
