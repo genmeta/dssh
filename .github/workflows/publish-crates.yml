@@ -25,6 +25,11 @@ jobs:
       - name: Install Rust stable toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
+      - name: Install PAM development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libpam0g-dev
+
       - name: Check formatting
         run: cargo fmt --check
 
