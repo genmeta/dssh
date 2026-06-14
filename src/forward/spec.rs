@@ -174,7 +174,10 @@ peg::parser! {
             }
             / bp:port() ":" c:connect_endpoint() {
                 RemoteForward {
-                    bind: Endpoint::Tcp { host: String::new(), port: bp },
+                    bind: Endpoint::Tcp {
+                        host: crate::forward::CANONICAL_REMOTE_LOOPBACK_HOST.to_owned(),
+                        port: bp,
+                    },
                     connect: Some(c),
                 }
             }
@@ -199,7 +202,10 @@ peg::parser! {
             }
             / bp:port() {
                 RemoteForward {
-                    bind: Endpoint::Tcp { host: String::new(), port: bp },
+                    bind: Endpoint::Tcp {
+                        host: crate::forward::CANONICAL_REMOTE_LOOPBACK_HOST.to_owned(),
+                        port: bp,
+                    },
                     connect: None,
                 }
             }
@@ -416,7 +422,7 @@ mod tests {
         assert_eq!(
             f.bind,
             Endpoint::Tcp {
-                host: String::new(),
+                host: "localhost".into(),
                 port: 8080
             }
         );
@@ -454,7 +460,7 @@ mod tests {
         assert_eq!(
             f.bind,
             Endpoint::Tcp {
-                host: String::new(),
+                host: "localhost".into(),
                 port: 8080
             }
         );
@@ -498,7 +504,7 @@ mod tests {
         assert_eq!(
             f.bind,
             Endpoint::Tcp {
-                host: String::new(),
+                host: "localhost".into(),
                 port: 8080
             }
         );

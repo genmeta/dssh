@@ -24,6 +24,45 @@ use h3x::varint::VarInt;
 
 use super::spec::{Endpoint, LocalForward, RemoteForward};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectOriginator {
+    host: String,
+    port: u16,
+}
+
+impl DirectOriginator {
+    fn from_socket_addr(addr: std::net::SocketAddr) -> Self {
+        Self {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        }
+    }
+
+    fn placeholder() -> Self {
+        Self {
+            host: "127.0.0.1".to_owned(),
+            port: 65535,
+        }
+    }
+}
+
+fn remote_forward_bind_key(bind: &Endpoint) -> Option<(String, u16)> {
+    match bind {
+        Endpoint::Tcp { host, port } => Some((
+            crate::forward::canonicalize_remote_bind_host(host).into_owned(),
+            *port,
+        )),
+        Endpoint::Unix { .. } => None,
+    }
+}
+
+fn forwarded_tcpip_bind_key(host: &str, port: u16) -> (String, u16) {
+    (
+        crate::forward::canonicalize_remote_bind_host(host).into_owned(),
+        port,
+    )
+}
+
 // ============================================================================
 // Error types
 // ============================================================================
@@ -139,9 +178,10 @@ impl LocalForward {
             };
             let conv = conversation.clone();
             let connect = self.connect.clone();
+            let originator = DirectOriginator::from_socket_addr(peer);
             let (r, w) = stream.into_split();
             tasks.spawn(
-                open_channel_and_relay(conv, connect, Box::pin(r), Box::pin(w))
+                open_channel_and_relay(conv, connect, originator, Box::pin(r), Box::pin(w))
                     .instrument(tracing::info_span!("conn", %peer)),
             );
         }
@@ -171,7 +211,14 @@ impl LocalForward {
             let connect = self.connect.clone();
             let (r, w) = stream.into_split();
             tasks.spawn(
-                open_channel_and_relay(conv, connect, Box::pin(r), Box::pin(w)).in_current_span(),
+                open_channel_and_relay(
+                    conv,
+                    connect,
+                    DirectOriginator::placeholder(),
+                    Box::pin(r),
+                    Box::pin(w),
+                )
+                .in_current_span(),
             );
         }
     }
@@ -181,6 +228,7 @@ impl LocalForward {
 async fn open_channel_and_relay<S>(
     conversation: Arc<Conversation<S>>,
     connect: Endpoint,
+    originator: DirectOriginator,
     local_reader: Pin<Box<dyn AsyncRead + Send>>,
     local_writer: Pin<Box<dyn AsyncWrite + Send>>,
 ) where
@@ -195,8 +243,8 @@ async fn open_channel_and_relay<S>(
                     &DirectTcpip {
                         dest_host: SshString::from(host.clone()),
                         dest_port: VarInt::from(*port as u32),
-                        originator_host: SshString::from_static(""),
-                        originator_port: VarInt::from(0u32),
+                        originator_host: SshString::from(originator.host.clone()),
+                        originator_port: VarInt::from(originator.port as u32),
                     },
                     DEFAULT_MAX_MESSAGE_SIZE,
                 )
@@ -250,9 +298,11 @@ impl RemoteForward {
 
         match &self.bind {
             Endpoint::Tcp { host, port } => {
+                let canonical_host =
+                    crate::forward::canonicalize_remote_bind_host(host).into_owned();
                 let request = TcpipForwardGlobalRequest {
                     payload: TcpipForwardRequest {
-                        bind_address: SshString::from(host.clone()),
+                        bind_address: SshString::from(canonical_host.clone()),
                         bind_port: VarInt::from(*port as u32),
                     },
                 };
@@ -273,7 +323,7 @@ impl RemoteForward {
 
                 Ok(RemoteForwardEstablished {
                     bind: Endpoint::Tcp {
-                        host: host.clone(),
+                        host: canonical_host,
                         port: allocated_port,
                     },
                     connect: self.connect.clone(),
@@ -383,14 +433,11 @@ pub async fn accept_forwarded_channels<S>(
 
                 let server_port = payload.connected_port.into_inner() as u16;
                 let server_addr = payload.connected_address.to_string();
+                let incoming_key = forwarded_tcpip_bind_key(&server_addr, server_port);
 
                 let mapping = mappings.iter().find(|m| match &m.bind {
-                    Endpoint::Tcp { host, port } => {
-                        *port == server_port
-                            && (host.is_empty()
-                                || host == "0.0.0.0"
-                                || host == "*"
-                                || *host == server_addr)
+                    Endpoint::Tcp { .. } => {
+                        remote_forward_bind_key(&m.bind) == Some(incoming_key.clone())
                     }
                     _ => false,
                 });
@@ -520,4 +567,204 @@ async fn handle_forwarded_channel<R, W>(
     let ch2s = tokio::spawn(relay(ch_reader, local_writer).in_current_span());
     let s2ch = tokio::spawn(relay(local_reader, ch_writer).in_current_span());
     let _ = tokio::join!(ch2s, s2ch);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{SshBool, SshString};
+    use crate::test_support::{MockWebTransportSession as TestSession, stream_pair as make_half};
+    use h3x::{
+        codec::{DecodeExt, EncodeExt},
+        stream_id::StreamId,
+        varint::VarInt,
+    };
+    use tokio::io::{AsyncWriteExt, empty, sink};
+
+    fn make_test_session() -> TestSession {
+        TestSession::new(StreamId(VarInt::from_u32(40)))
+    }
+
+    fn make_conversation(session: TestSession) -> Arc<Conversation<TestSession>> {
+        let stream_id = VarInt::from_u32(40);
+        let (local_reader, _remote_writer) = make_half(stream_id);
+        let (_remote_reader, local_writer) = make_half(stream_id);
+        Arc::new(Conversation::from_control_streams(
+            session,
+            "test",
+            local_reader,
+            local_writer,
+        ))
+    }
+
+    #[tokio::test]
+    async fn direct_tcpip_uses_real_tcp_originator() {
+        let session = make_test_session();
+        let conv = make_conversation(session.clone());
+
+        let stream_id = VarInt::from_u32(44);
+        let (mut remote_rd, local_wr) = make_half(stream_id);
+        let (local_rd, mut remote_wr) = make_half(stream_id);
+        session.provide_open_stream(local_rd, local_wr);
+
+        let handle = tokio::spawn(open_channel_and_relay(
+            Arc::clone(&conv),
+            Endpoint::Tcp {
+                host: "example.com".into(),
+                port: 443,
+            },
+            DirectOriginator::from_socket_addr("127.0.0.1:2222".parse().unwrap()),
+            Box::pin(empty()),
+            Box::pin(sink()),
+        ));
+
+        let _stream_kind: VarInt = remote_rd.decode_one().await.unwrap();
+        let _max_msg: VarInt = remote_rd.decode_one().await.unwrap();
+        let _channel_type: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
+        let _dest_host: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
+        let _dest_port: VarInt = remote_rd.decode_one().await.unwrap();
+        let originator_host: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
+        let originator_port: VarInt = remote_rd.decode_one().await.unwrap();
+
+        assert_eq!(&*originator_host, "127.0.0.1");
+        assert_eq!(originator_port, VarInt::from_u32(2222));
+
+        remote_wr.encode_one(VarInt::from_u32(91)).await.unwrap();
+        remote_wr.encode_one(VarInt::from_u32(32768)).await.unwrap();
+        drop(remote_wr);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_tcpip_uses_placeholder_originator_for_unix_forwarders() {
+        let session = make_test_session();
+        let conv = make_conversation(session.clone());
+
+        let stream_id = VarInt::from_u32(46);
+        let (mut remote_rd, local_wr) = make_half(stream_id);
+        let (local_rd, mut remote_wr) = make_half(stream_id);
+        session.provide_open_stream(local_rd, local_wr);
+
+        let handle = tokio::spawn(open_channel_and_relay(
+            Arc::clone(&conv),
+            Endpoint::Tcp {
+                host: "example.com".into(),
+                port: 443,
+            },
+            DirectOriginator::placeholder(),
+            Box::pin(empty()),
+            Box::pin(sink()),
+        ));
+
+        let _stream_kind: VarInt = remote_rd.decode_one().await.unwrap();
+        let _max_msg: VarInt = remote_rd.decode_one().await.unwrap();
+        let _channel_type: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
+        let _dest_host: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
+        let _dest_port: VarInt = remote_rd.decode_one().await.unwrap();
+        let originator_host: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
+        let originator_port: VarInt = remote_rd.decode_one().await.unwrap();
+
+        assert_eq!(&*originator_host, "127.0.0.1");
+        assert_eq!(originator_port, VarInt::from_u32(65535));
+
+        remote_wr.encode_one(VarInt::from_u32(91)).await.unwrap();
+        remote_wr.encode_one(VarInt::from_u32(32768)).await.unwrap();
+        drop(remote_wr);
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn remote_forward_bind_key_normalizes_wildcard_and_preserves_explicit_hosts() {
+        assert_eq!(
+            remote_forward_bind_key(&Endpoint::Tcp {
+                host: "*".into(),
+                port: 9000,
+            }),
+            Some(("".to_owned(), 9000))
+        );
+        assert_eq!(
+            remote_forward_bind_key(&Endpoint::Tcp {
+                host: "localhost".into(),
+                port: 9000,
+            }),
+            Some(("localhost".to_owned(), 9000))
+        );
+        assert_eq!(
+            remote_forward_bind_key(&Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 9000,
+            }),
+            Some(("127.0.0.1".to_owned(), 9000))
+        );
+    }
+
+    #[test]
+    fn forwarded_tcpip_bind_key_uses_canonical_semantics() {
+        assert_eq!(forwarded_tcpip_bind_key("*", 9000), ("".to_owned(), 9000));
+        assert_eq!(forwarded_tcpip_bind_key("", 9000), ("".to_owned(), 9000));
+        assert_eq!(
+            forwarded_tcpip_bind_key("localhost", 9000),
+            ("localhost".to_owned(), 9000)
+        );
+        assert_eq!(
+            forwarded_tcpip_bind_key("::", 9000),
+            ("::".to_owned(), 9000)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_forward_request_sends_canonical_bind_host() {
+        let session = make_test_session();
+
+        let stream_id = VarInt::from_u32(52);
+        let (local_reader, mut remote_writer) = make_half(stream_id);
+        let (mut remote_reader, local_writer) = make_half(stream_id);
+        let conv = Conversation::from_control_streams(session, "test", local_reader, local_writer);
+
+        let handle = tokio::spawn(async move {
+            let msg_type: VarInt = remote_reader.decode_one().await.unwrap();
+            assert_eq!(msg_type, VarInt::from_u32(80));
+            let request_type: SshString = remote_reader.decode_one().await.unwrap();
+            assert_eq!(&*request_type, "tcpip-forward");
+            let want_reply: SshBool = remote_reader.decode_one().await.unwrap();
+            assert!(want_reply.0);
+            let bind_host: SshString = remote_reader.decode_one().await.unwrap();
+            let bind_port: VarInt = remote_reader.decode_one().await.unwrap();
+            assert_eq!(&*bind_host, "");
+            assert_eq!(bind_port, VarInt::from_u32(9000));
+            remote_writer
+                .encode_one(VarInt::from_u32(81))
+                .await
+                .unwrap();
+            remote_writer
+                .encode_one(VarInt::from_u32(9000))
+                .await
+                .unwrap();
+            remote_writer.flush().await.unwrap();
+        });
+
+        let established = RemoteForward {
+            bind: Endpoint::Tcp {
+                host: "*".into(),
+                port: 9000,
+            },
+            connect: Some(Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 22,
+            }),
+        }
+        .request(&conv)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            established.bind,
+            Endpoint::Tcp {
+                host: "".into(),
+                port: 9000,
+            }
+        );
+
+        handle.await.unwrap();
+    }
 }

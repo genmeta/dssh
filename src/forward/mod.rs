@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 #[cfg(feature = "client")]
 pub mod client;
 #[cfg(feature = "server")]
@@ -17,6 +19,17 @@ use h3x::{
 };
 use snafu::{ResultExt, Snafu};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+
+pub(crate) const CANONICAL_REMOTE_WILDCARD_HOST: &str = "";
+pub(crate) const CANONICAL_REMOTE_LOOPBACK_HOST: &str = "localhost";
+
+pub(crate) fn canonicalize_remote_bind_host(host: &str) -> Cow<'_, str> {
+    match host {
+        "" | "*" => Cow::Borrowed(CANONICAL_REMOTE_WILDCARD_HOST),
+        "localhost" => Cow::Borrowed(CANONICAL_REMOTE_LOOPBACK_HOST),
+        other => Cow::Borrowed(other),
+    }
+}
 
 /// Copy all bytes from `reader` to `writer`, then shut down the writer.
 pub async fn relay<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
@@ -216,6 +229,21 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for TcpipForwardReply {
                 .await
                 .context(forward_error::ReadIoSnafu)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalize_remote_bind_host;
+
+    #[test]
+    fn canonicalize_remote_bind_host_normalizes_wildcard_but_keeps_loopback_and_explicit_hosts() {
+        assert_eq!(canonicalize_remote_bind_host(""), "");
+        assert_eq!(canonicalize_remote_bind_host("*"), "");
+        assert_eq!(canonicalize_remote_bind_host("localhost"), "localhost");
+        assert_eq!(canonicalize_remote_bind_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(canonicalize_remote_bind_host("::"), "::");
+        assert_eq!(canonicalize_remote_bind_host("example.com"), "example.com");
     }
 }
 

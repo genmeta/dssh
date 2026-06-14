@@ -31,6 +31,7 @@ use std::sync::Arc;
 use snafu::prelude::*;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::{AbortHandle, JoinSet};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::channel::reason_code;
 use crate::conversation::channel::{ChannelEvent, ReadChannelEventError, SshChannel};
@@ -288,6 +289,8 @@ where
     let mut channel_tasks: JoinSet<Result<(), crate::session::process::ProcessError>> =
         JoinSet::new();
     let mut forward_tasks: JoinSet<()> = JoinSet::new();
+    let forward_relays = TaskTracker::new();
+    let forward_cancel = CancellationToken::new();
     let mut had_session = false;
     let mut outcome = RunSessionOutcome::ConversationClosed;
 
@@ -417,7 +420,16 @@ where
             global_result = &mut accept_global => {
                 match global_result {
                     Ok(incoming) => {
-                        dispatch_global(incoming, &conversation, &mut tcp_forwards, &mut unix_forwards, &mut forward_tasks).await;
+                        dispatch_global(
+                            incoming,
+                            &conversation,
+                            &mut tcp_forwards,
+                            &mut unix_forwards,
+                            &mut forward_tasks,
+                            forward_relays.clone(),
+                            forward_cancel.clone(),
+                        )
+                        .await;
                         // Reset the pinned future for the next global request.
                         accept_global.set(conversation.accept_global_request());
                     }
@@ -464,6 +476,26 @@ where
         }
     }
 
+    for (_, abort) in tcp_forwards.drain() {
+        abort.abort();
+    }
+    for (_, abort) in unix_forwards.drain() {
+        abort.abort();
+    }
+    while let Some(result) = forward_tasks.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            tracing::warn!(
+                error = %snafu::Report::from_error(&error),
+                "forward task panicked during shutdown"
+            );
+        }
+    }
+    forward_cancel.cancel();
+    forward_relays.close();
+    forward_relays.wait().await;
+
     Ok(outcome)
 }
 
@@ -499,6 +531,8 @@ async fn dispatch_global<S, R, W>(
     tcp_forwards: &mut HashMap<(String, u16), AbortHandle>,
     unix_forwards: &mut HashMap<String, AbortHandle>,
     forward_tasks: &mut JoinSet<()>,
+    forward_relays: TaskTracker,
+    forward_cancel: CancellationToken,
 ) where
     S: h3x::webtransport::Session + 'static,
     S::StreamReader: 'static,
@@ -516,13 +550,18 @@ async fn dispatch_global<S, R, W>(
                         .await
                     {
                         Ok(decoded) => {
-                            let bind_addr = decoded.payload().bind_address.to_string();
+                            let bind_addr = crate::forward::canonicalize_remote_bind_host(
+                                &decoded.payload().bind_address.to_string(),
+                            )
+                            .into_owned();
                             match decoded.accept_tcp_forward().await {
                                 Ok(listener) => {
-                                    let port = listener.bound_addr().port();
+                                    let port = listener.bound_port();
+                                    let relay_tasks = forward_relays.clone();
+                                    let relay_cancel = forward_cancel.clone();
                                     let abort = forward_tasks.spawn(
                                         listener
-                                            .run(conversation.clone())
+                                            .run(conversation.clone(), relay_tasks, relay_cancel)
                                             .instrument(tracing::info_span!("tcp-forward", port)),
                                     );
                                     tcp_forwards.insert((bind_addr, port), abort);
@@ -543,7 +582,10 @@ async fn dispatch_global<S, R, W>(
                         .await
                     {
                         Ok(decoded) => {
-                            let bind_addr = decoded.payload().bind_address.to_string();
+                            let bind_addr = crate::forward::canonicalize_remote_bind_host(
+                                &decoded.payload().bind_address.to_string(),
+                            )
+                            .into_owned();
                             let bind_port =
                                 match u16::try_from(decoded.payload().bind_port.into_inner()) {
                                     Ok(p) => p,
@@ -581,13 +623,15 @@ async fn dispatch_global<S, R, W>(
                             let socket_path = decoded.payload().socket_path.to_string();
                             match decoded.accept_unix_forward().await {
                                 Ok(listener) => {
+                                    let relay_tasks = forward_relays.clone();
+                                    let relay_cancel = forward_cancel.clone();
                                     let abort = forward_tasks.spawn(
-                                        listener.run(conversation.clone()).instrument(
-                                            tracing::info_span!(
+                                        listener
+                                            .run(conversation.clone(), relay_tasks, relay_cancel)
+                                            .instrument(tracing::info_span!(
                                                 "unix-forward",
                                                 path = &*socket_path
-                                            ),
-                                        ),
+                                            )),
                                     );
                                     unix_forwards.insert(socket_path, abort);
                                 }
@@ -635,5 +679,130 @@ async fn dispatch_global<S, R, W>(
             );
             notice.poison();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{SshBool, SshString};
+    use crate::conversation::Conversation;
+    use crate::test_support::{MockWebTransportSession as TestSession, stream_pair as make_half};
+    use h3x::{
+        codec::{DecodeExt, EncodeExt},
+        stream_id::StreamId,
+        varint::VarInt,
+    };
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+    async fn make_conversation() -> (
+        Arc<Conversation<TestSession>>,
+        crate::test_support::MockReader,
+        crate::test_support::MockWriter,
+    ) {
+        let stream_id = VarInt::from_u32(40);
+        let (local_reader, remote_writer) = make_half(stream_id);
+        let (remote_reader, local_writer) = make_half(stream_id);
+        let conv = Arc::new(Conversation::from_control_streams(
+            TestSession::new(StreamId(stream_id)),
+            "test-version",
+            local_reader,
+            local_writer,
+        ));
+        (conv, remote_reader, remote_writer)
+    }
+
+    async fn remote_send_cancel_tcpip_forward(
+        writer: &mut crate::test_support::MockWriter,
+        host: &str,
+        raw_port: u64,
+    ) {
+        writer.encode_one(VarInt::from_u32(80)).await.unwrap();
+        writer
+            .encode_one(SshString::from_static("cancel-tcpip-forward"))
+            .await
+            .unwrap();
+        writer.encode_one(SshBool(true)).await.unwrap();
+        writer
+            .encode_one(SshString::from(host.to_owned()))
+            .await
+            .unwrap();
+        writer
+            .encode_one(VarInt::try_from(raw_port).unwrap())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_tcpip_forward_port_overflow_responds_failure() {
+        let (conv, mut remote_reader, mut remote_writer) = make_conversation().await;
+        remote_send_cancel_tcpip_forward(&mut remote_writer, "localhost", 70000).await;
+
+        let incoming = conv.accept_global_request().await.unwrap();
+        let mut tcp_forwards = std::collections::HashMap::new();
+        let mut unix_forwards = std::collections::HashMap::new();
+        let mut forward_tasks = tokio::task::JoinSet::new();
+        let relay_cancel = CancellationToken::new();
+        let relay_tasks = TaskTracker::new();
+
+        dispatch_global(
+            incoming,
+            &conv,
+            &mut tcp_forwards,
+            &mut unix_forwards,
+            &mut forward_tasks,
+            relay_tasks,
+            relay_cancel,
+        )
+        .await;
+
+        let msg_type: VarInt = remote_reader.decode_one().await.unwrap();
+        assert_eq!(msg_type, VarInt::from_u32(82));
+    }
+
+    #[tokio::test]
+    async fn tcpip_forward_port_overflow_responds_failure() {
+        let (conv, mut remote_reader, mut remote_writer) = make_conversation().await;
+        remote_writer
+            .encode_one(VarInt::from_u32(80))
+            .await
+            .unwrap();
+        remote_writer
+            .encode_one(SshString::from_static("tcpip-forward"))
+            .await
+            .unwrap();
+        remote_writer.encode_one(SshBool(true)).await.unwrap();
+        remote_writer
+            .encode_one(SshString::from_static("localhost"))
+            .await
+            .unwrap();
+        remote_writer
+            .encode_one(VarInt::from(70000u32))
+            .await
+            .unwrap();
+        remote_writer.flush().await.unwrap();
+
+        let incoming = conv.accept_global_request().await.unwrap();
+        let mut tcp_forwards = std::collections::HashMap::new();
+        let mut unix_forwards = std::collections::HashMap::new();
+        let mut forward_tasks = tokio::task::JoinSet::new();
+        let relay_cancel = CancellationToken::new();
+        let relay_tasks = TaskTracker::new();
+
+        dispatch_global(
+            incoming,
+            &conv,
+            &mut tcp_forwards,
+            &mut unix_forwards,
+            &mut forward_tasks,
+            relay_tasks,
+            relay_cancel,
+        )
+        .await;
+
+        let msg_type: VarInt = remote_reader.decode_one().await.unwrap();
+        assert_eq!(msg_type, VarInt::from_u32(82));
     }
 }
