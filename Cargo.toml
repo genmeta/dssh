@@ -1,7 +1,7 @@
 [package]
 name = "dssh"
 description = "DSSH core session, channel, and wire-format foundation"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 repository = "https://github.com/genmeta/dssh"
 
