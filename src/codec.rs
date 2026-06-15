@@ -1,4 +1,4 @@
-//! SSH3 binary wire format codec.
+//! DShell binary wire format codec.
 //!
 //! All types use QUIC varint length-prefix + raw bytes encoding,
 //! implementing h3x's `EncodeInto`/`DecodeFrom` traits on `AsyncWrite`/`AsyncRead`.

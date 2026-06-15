@@ -1,4 +1,4 @@
-//! Process spawning and I/O relay for SSH3 session channels.
+//! Process spawning and I/O relay for DShell session channels.
 //!
 //! Provides two execution modes:
 //! - **Piped**: stdin/stdout/stderr are separate pipes; stdout → channel data,
@@ -724,7 +724,7 @@ where
     if let Some(signal_number) = status.signal() {
         let signal_name = signal::to_ssh_name(signal_number)
             .map(Cow::Borrowed)
-            .unwrap_or_else(|| Cow::Owned(format!("signal-{signal_number}@dssh")));
+            .unwrap_or_else(|| Cow::Owned(format!("signal-{signal_number}@dshell")));
 
         writer
             .notice(&ExitSignalChannelNotice {

@@ -1,4 +1,4 @@
-//! SSH3 protocol types and codec
+//! DShell protocol types and codec
 
 pub mod auth;
 pub mod byte_channel;
@@ -23,13 +23,13 @@ mod test_support;
 #[cfg(test)]
 mod tests {
     #[test]
-    fn legacy_raw_ssh3_protocol_module_is_not_exported() {
+    fn legacy_raw_dshell_protocol_module_is_not_exported() {
         let lib = include_str!("lib.rs");
         let legacy_protocol_export = concat!("pub mod ", "protocol;");
 
         assert!(
             !lib.contains(legacy_protocol_export),
-            "dssh transport must stay WebTransport-only"
+            "dshell transport must stay WebTransport-only"
         );
     }
 }

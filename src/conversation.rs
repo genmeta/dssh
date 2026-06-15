@@ -1,6 +1,6 @@
-//! SSH3 conversation (session) abstraction.
+//! DShell conversation (session) abstraction.
 //!
-//! A *conversation* is the SSH3 equivalent of an SSH2 session — it manages
+//! A *conversation* is the DShell equivalent of an SSH2 session — it manages
 //! channels and global requests over a WebTransport session.
 //!
 //! # Design
@@ -465,16 +465,16 @@ where
         &self.peer_version
     }
 
-    /// Open a DSSH conversation over a WebTransport session.
+    /// Open a DShell conversation over a WebTransport session.
     ///
-    /// This opens the DSSH control stream and writes the DSSH control stream
+    /// This opens the DShell control stream and writes the DShell control stream
     /// kind as the first field on that WebTransport bidirectional stream.
     pub async fn open(
         session: S,
         peer_version: impl Into<String>,
     ) -> Result<Self, crate::webtransport::OpenConversationError> {
         let (reader, writer) =
-            Self::open_stream_kind(&session, crate::webtransport::DSSH_CONTROL_STREAM_KIND)
+            Self::open_stream_kind(&session, crate::webtransport::DSHELL_CONTROL_STREAM_KIND)
                 .await
                 .context(crate::webtransport::open_conversation_error::OpenControlSnafu)?;
         Ok(Self::from_control_streams(
@@ -485,16 +485,16 @@ where
         ))
     }
 
-    /// Accept a DSSH conversation over a WebTransport session.
+    /// Accept a DShell conversation over a WebTransport session.
     ///
-    /// This accepts the DSSH control stream and validates that its first field
-    /// is the DSSH control stream kind.
+    /// This accepts the DShell control stream and validates that its first field
+    /// is the DShell control stream kind.
     pub async fn accept(
         session: S,
         peer_version: impl Into<String>,
     ) -> Result<Self, crate::webtransport::AcceptConversationError> {
         let (reader, writer) =
-            Self::accept_stream_kind(&session, crate::webtransport::DSSH_CONTROL_STREAM_KIND)
+            Self::accept_stream_kind(&session, crate::webtransport::DSHELL_CONTROL_STREAM_KIND)
                 .await
                 .context(crate::webtransport::accept_conversation_error::AcceptControlSnafu)?;
         Ok(Self::from_control_streams(
@@ -511,7 +511,11 @@ where
         (StreamReader<S::StreamReader>, SinkWriter<S::StreamWriter>),
         crate::webtransport::WebTransportStreamError,
     > {
-        Self::open_stream_kind(&self.session, crate::webtransport::DSSH_CHANNEL_STREAM_KIND).await
+        Self::open_stream_kind(
+            &self.session,
+            crate::webtransport::DSHELL_CHANNEL_STREAM_KIND,
+        )
+        .await
     }
 
     async fn accept_channel_stream(
@@ -520,7 +524,11 @@ where
         (StreamReader<S::StreamReader>, SinkWriter<S::StreamWriter>),
         crate::webtransport::WebTransportStreamError,
     > {
-        Self::accept_stream_kind(&self.session, crate::webtransport::DSSH_CHANNEL_STREAM_KIND).await
+        Self::accept_stream_kind(
+            &self.session,
+            crate::webtransport::DSHELL_CHANNEL_STREAM_KIND,
+        )
+        .await
     }
 
     async fn open_stream_kind(
@@ -795,7 +803,7 @@ where
     /// Open a new channel.
     ///
     /// The WebTransport session carries the stream lifetime. This method only
-    /// writes the DSSH channel stream kind and SSH channel header fields:
+    /// writes the DShell channel stream kind and SSH channel header fields:
     /// `max_message_size`, `channel_type`, and the type-specific payload.
     ///
     /// Returns the (reader, writer) pair for subsequent channel communication.
@@ -844,7 +852,7 @@ where
     /// Accept an incoming channel.
     ///
     /// The WebTransport session carries the stream lifetime. This method
-    /// accepts a WebTransport bidirectional stream, validates the DSSH channel
+    /// accepts a WebTransport bidirectional stream, validates the DShell channel
     /// stream kind, and reads the SSH channel header fields: `max_message_size`
     /// and `channel_type`.
     ///

@@ -1,4 +1,4 @@
-//! Reverse forwarding: bind listeners that open SSH3 channels back to the
+//! Reverse forwarding: bind listeners that open DShell channels back to the
 //! client for each accepted connection.
 //!
 //! Use [`DecodedGlobalRequest::accept_tcp_forward`] and
@@ -714,7 +714,7 @@ mod tests {
         let mut remote_wr = remote_wr;
 
         let stream_kind: VarInt = remote_rd.decode_one().await.unwrap();
-        assert_eq!(stream_kind, crate::webtransport::DSSH_CHANNEL_STREAM_KIND);
+        assert_eq!(stream_kind, crate::webtransport::DSHELL_CHANNEL_STREAM_KIND);
         let _max_msg: VarInt = remote_rd.decode_one().await.unwrap();
         let _channel_type: crate::codec::SshString = remote_rd.decode_one().await.unwrap();
         let connected_addr: crate::codec::SshString = remote_rd.decode_one().await.unwrap();

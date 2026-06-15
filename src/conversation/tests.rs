@@ -1201,7 +1201,7 @@ async fn open_channel_roundtrip() {
         let mut rr = ch_remote_reader;
 
         let kind: VarInt = rr.decode_one().await.unwrap();
-        assert_eq!(kind, crate::webtransport::DSSH_CHANNEL_STREAM_KIND);
+        assert_eq!(kind, crate::webtransport::DSHELL_CHANNEL_STREAM_KIND);
 
         let mms: VarInt = rr.decode_one().await.unwrap();
         assert_eq!(mms, max_msg_size);
@@ -1241,10 +1241,10 @@ async fn accept_channel_roundtrip() {
     let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
 
     // Remote encodes channel data starting at max_message_size
-    // (WebTransport session prefix is handled by h3x; DSSH stream kind is part of this test).
+    // (WebTransport session prefix is handled by h3x; DShell stream kind is part of this test).
     let mut rw = ch_remote_writer;
     let max_msg_size = VarInt::from_u32(1 << 20);
-    rw.encode_one(crate::webtransport::DSSH_CHANNEL_STREAM_KIND)
+    rw.encode_one(crate::webtransport::DSHELL_CHANNEL_STREAM_KIND)
         .await
         .unwrap();
     rw.encode_one(max_msg_size).await.unwrap();
@@ -1285,9 +1285,9 @@ async fn accept_channel_session_no_payload() {
     let (_ch_remote_reader, ch_local_writer) = make_half(ch_stream_id);
 
     // Remote sends channel data starting at max_message_size
-    // (WebTransport session prefix is handled by h3x; DSSH stream kind is part of this test).
+    // (WebTransport session prefix is handled by h3x; DShell stream kind is part of this test).
     let mut rw = ch_remote_writer;
-    rw.encode_one(crate::webtransport::DSSH_CHANNEL_STREAM_KIND)
+    rw.encode_one(crate::webtransport::DSHELL_CHANNEL_STREAM_KIND)
         .await
         .unwrap();
     rw.encode_one(VarInt::from_u32(1 << 20)).await.unwrap();
@@ -1320,7 +1320,7 @@ async fn open_channel_session_no_payload() {
         let mut rr = ch_remote_reader;
 
         let kind: VarInt = rr.decode_one().await.unwrap();
-        assert_eq!(kind, crate::webtransport::DSSH_CHANNEL_STREAM_KIND);
+        assert_eq!(kind, crate::webtransport::DSHELL_CHANNEL_STREAM_KIND);
 
         let mms: VarInt = rr.decode_one().await.unwrap();
         assert_eq!(mms, VarInt::from_u32(1 << 20));

@@ -5,16 +5,16 @@ use snafu::Snafu;
 #[snafu(visibility(pub), module)]
 pub enum NegotiateVersionError {
     #[snafu(display("missing ssh-version header"))]
-    MissingSshVersionHeader,
+    MissingDshellVersionHeader,
 
     #[snafu(display("invalid ssh-version header value"))]
-    InvalidSshVersionHeaderValue { source: http::header::ToStrError },
+    InvalidDshellVersionHeaderValue { source: http::header::ToStrError },
 
     #[snafu(display("empty ssh-version header"))]
-    EmptySshVersionHeader,
+    EmptyDshellVersionHeader,
 
     #[snafu(display("no supported ssh-version found in client offer: {offered:?}"))]
-    UnsupportedSshVersion { offered: String },
+    UnsupportedDshellVersion { offered: String },
 }
 
 /// Error returned by [`crate::auth::parse_authorization_header`].
