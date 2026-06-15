@@ -1,3 +1,4 @@
+#[cfg(any(feature = "client", feature = "server", test))]
 use std::borrow::Cow;
 
 #[cfg(feature = "client")]
@@ -20,9 +21,12 @@ use h3x::{
 use snafu::{ResultExt, Snafu};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
+#[cfg(any(feature = "client", feature = "server", test))]
 pub(crate) const CANONICAL_REMOTE_WILDCARD_HOST: &str = "";
+#[cfg(any(feature = "client", feature = "server", test))]
 pub(crate) const CANONICAL_REMOTE_LOOPBACK_HOST: &str = "localhost";
 
+#[cfg(any(feature = "client", feature = "server", test))]
 pub(crate) fn canonicalize_remote_bind_host(host: &str) -> Cow<'_, str> {
     match host {
         "" | "*" => Cow::Borrowed(CANONICAL_REMOTE_WILDCARD_HOST),
