@@ -1,4 +1,4 @@
-//! PTY allocation and terminal control for SSH3 sessions.
+//! PTY allocation and terminal control for DShell sessions.
 //!
 //! Handles `pty-req` and `window-change` channel requests per RFC 4254
 //! Sections 6.2 and 6.7.

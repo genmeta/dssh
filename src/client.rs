@@ -1,6 +1,6 @@
-//! SSH3 client utilities.
+//! DShell client utilities.
 //!
-//! Provides helpers for SSH3/DSSH client implementations.
+//! Provides helpers for DShell/DShell client implementations.
 
 use base64::engine::{Engine, general_purpose::STANDARD};
 use http::HeaderValue;

@@ -1,6 +1,6 @@
 //! Server-side session dispatcher.
 //!
-//! Drives an SSH3 session by concurrently accepting channels and global
+//! Drives an DShell session by concurrently accepting channels and global
 //! requests from a [`Conversation`], dispatching each to the appropriate
 //! handler.
 //!
@@ -139,7 +139,7 @@ struct SessionSetup {
 
 /// Read session channel requests (pty-req, exec, shell) and respond.
 ///
-/// The SSH3 protocol expects the client to send setup requests before any
+/// The DShell protocol expects the client to send setup requests before any
 /// data. This function reads those requests using [`SshChannel::next_event`]
 /// (which has writer access for sending replies), then returns the determined
 /// command mode and optional PTY allocation.

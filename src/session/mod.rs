@@ -1,4 +1,4 @@
-//! SSH3 session types, PTY, signal handling, and process management.
+//! DShell session types, PTY, signal handling, and process management.
 //!
 //! This module provides:
 //! - Session channel request/notice types (exec, shell, PTY, signal, window-change)

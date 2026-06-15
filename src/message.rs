@@ -1,11 +1,11 @@
 use h3x::varint::VarInt;
 
-/// SSH global request/response message type constants (RFC 4254 / SSH3 draft).
+/// SSH global request/response message type constants (RFC 4254 / DShell draft).
 pub const SSH_MSG_GLOBAL_REQUEST: VarInt = VarInt::from_u32(80);
 pub const SSH_MSG_REQUEST_SUCCESS: VarInt = VarInt::from_u32(81);
 pub const SSH_MSG_REQUEST_FAILURE: VarInt = VarInt::from_u32(82);
 
-/// SSH channel message type constants (RFC 4254 / SSH3 draft).
+/// SSH channel message type constants (RFC 4254 / DShell draft).
 ///
 /// These are VarInt wire values used by the trait-based encoding/decoding
 /// in [`conversation`](crate::conversation). No enum wrapper is needed.

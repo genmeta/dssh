@@ -268,7 +268,7 @@ impl h3x::webtransport::Session for MockWebTransportSession {
     }
 
     async fn open_uni(&self) -> Result<Self::StreamWriter, h3x::webtransport::OpenStreamError> {
-        unreachable!("dssh tests use only bidirectional streams")
+        unreachable!("dshell tests use only bidirectional streams")
     }
 
     async fn accept_bi(
@@ -286,6 +286,6 @@ impl h3x::webtransport::Session for MockWebTransportSession {
     }
 
     async fn accept_uni(&self) -> Result<Self::StreamReader, h3x::webtransport::AcceptStreamError> {
-        unreachable!("dssh tests use only bidirectional streams")
+        unreachable!("dshell tests use only bidirectional streams")
     }
 }
