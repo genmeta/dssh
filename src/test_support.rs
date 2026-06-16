@@ -199,6 +199,7 @@ impl MockWebTransportSession {
         self.provide_accept_stream(reader, writer);
     }
 
+    #[cfg(feature = "server")]
     pub(crate) fn open_called(&self) -> bool {
         self.state.open_count.load(Ordering::SeqCst) > 0
     }
