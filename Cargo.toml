@@ -1,13 +1,13 @@
 [package]
 name = "dshell"
 description = "DShell core session, channel, and wire-format foundation"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 repository = "https://github.com/genmeta/dssh"
 license = "Apache-2.0"
 
 [dependencies]
-h3x = { version = "0.4.0", features = [
+h3x = { version = "0.5.0", features = [
     "rpc",
     "serde",
     "webtransport",
