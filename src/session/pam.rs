@@ -3,8 +3,9 @@
 //! Performs non-interactive PAM authentication using `pam-client2` and
 //! looks up the user in `/etc/passwd` via `nix::unistd::User`.
 //!
-//! PAM is a synchronous C library, so all calls are run inside
-//! [`tokio::task::spawn_blocking`].
+//! PAM is a synchronous C library. Session-opening calls are intentionally
+//! executed on the thread polling the returned future because Linux
+//! `pam_loginuid` requires the process leader thread.
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
@@ -38,9 +39,12 @@ pub enum PamAuthError {
     #[snafu(display("user not found in /etc/passwd: {username}"))]
     UserNotFound { username: String },
 
-    /// The blocking task was cancelled (should not happen in practice).
-    #[snafu(display("blocking task cancelled"))]
-    TaskCancelled,
+    /// Linux `pam_loginuid` requires PAM session setup on the process leader.
+    #[cfg(target_os = "linux")]
+    #[snafu(display(
+        "PAM session setup must run on the process leader thread (pid={pid}, tid={tid})"
+    ))]
+    ProcessLeaderRequired { pid: i32, tid: i32 },
 }
 
 /// Perform PAM authentication and look up the user's POSIX identity.
@@ -51,19 +55,15 @@ pub enum PamAuthError {
 /// 3. Calls `pam_acct_mgmt` to check account status (expired, locked, etc.)
 /// 4. Looks up the user in `/etc/passwd` via `nix::unistd::User::from_name`
 ///
-/// All PAM calls run inside `spawn_blocking` because PAM is synchronous.
+/// This future performs synchronous PAM work on the thread that polls it.
+/// On Linux, the caller must ensure that thread is the process leader because
+/// `pam_loginuid` writes `/proc/self/loginuid` during `pam_open_session`.
 pub async fn authenticate(
     service: &str,
     username: &str,
     password: &str,
 ) -> Result<UserInfo, PamAuthError> {
-    let service = service.to_owned();
-    let username = username.to_owned();
-    let password = password.to_owned();
-
-    tokio::task::spawn_blocking(move || authenticate_blocking(&service, &username, &password))
-        .await
-        .map_err(|_| PamAuthError::TaskCancelled)?
+    authenticate_blocking(service, username, password)
 }
 
 fn authenticate_blocking(
@@ -72,6 +72,8 @@ fn authenticate_blocking(
     password: &str,
 ) -> Result<UserInfo, PamAuthError> {
     use pam_client2::{Context, Flag, conv_mock};
+
+    ensure_process_leader()?;
 
     let conversation = conv_mock::Conversation::with_credentials(username, password);
     let mut context = Context::new(service, Some(username), conversation)
@@ -127,17 +129,18 @@ fn authenticate_blocking(
 /// The returned PAM context is intentionally leaked because
 /// `pam_close_session` requires root privileges, which are dropped before
 /// the session ends.
+///
+/// This future performs synchronous PAM work on the thread that polls it.
+/// On Linux, the caller must ensure that thread is the process leader because
+/// `pam_loginuid` writes `/proc/self/loginuid` during `pam_open_session`.
 pub async fn open_session(service: &str, username: &str) -> Result<UserInfo, PamAuthError> {
-    let service = service.to_owned();
-    let username = username.to_owned();
-
-    tokio::task::spawn_blocking(move || open_session_blocking(&service, &username))
-        .await
-        .map_err(|_| PamAuthError::TaskCancelled)?
+    open_session_blocking(service, username)
 }
 
 fn open_session_blocking(service: &str, username: &str) -> Result<UserInfo, PamAuthError> {
     use pam_client2::{Context, Flag, conv_null};
+
+    ensure_process_leader()?;
 
     let conversation = conv_null::Conversation::new();
     let mut context = Context::new(service, Some(username), conversation)
@@ -174,6 +177,23 @@ fn open_session_blocking(service: &str, username: &str) -> Result<UserInfo, PamA
         shell: user.shell,
         pam_env,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_process_leader() -> Result<(), PamAuthError> {
+    let pid = nix::unistd::getpid().as_raw();
+    let tid = nix::unistd::gettid().as_raw();
+
+    if pid == tid {
+        Ok(())
+    } else {
+        Err(PamAuthError::ProcessLeaderRequired { pid, tid })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_process_leader() -> Result<(), PamAuthError> {
+    Ok(())
 }
 
 /// Extract PAM environment variables as `Vec<(String, String)>`.
