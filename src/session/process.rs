@@ -15,12 +15,14 @@ use std::os::fd::{AsFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
 use h3x::varint::VarInt;
 use nix::unistd::{Pid, setpgid};
 use snafu::prelude::*;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::codec::{SshBool, SshString};
 use crate::conversation::channel::{
@@ -47,6 +49,9 @@ use crate::session::{
 pub enum ProcessError {
     #[snafu(display("failed to spawn command"))]
     Spawn { source: std::io::Error },
+
+    #[snafu(display("spawned command has no process id"))]
+    MissingPid,
 
     #[snafu(display("failed to duplicate PTY file descriptor"))]
     DupFd { source: nix::Error },
@@ -131,6 +136,102 @@ impl<'a> CommandMode<'a> {
             }
             Self::Exec { .. } => basename.to_os_string(),
         }
+    }
+}
+
+/// Owns the spawned command and its process group until the child is reaped.
+struct SessionProcess {
+    child: tokio::process::Child,
+    process_group: Pid,
+    reaped: bool,
+}
+
+impl SessionProcess {
+    fn new(child: tokio::process::Child) -> Result<Self, ProcessError> {
+        let process_group = child
+            .id()
+            .map(|id| Pid::from_raw(id as i32))
+            .context(process_error::MissingPidSnafu)?;
+        Ok(Self {
+            child,
+            process_group,
+            reaped: false,
+        })
+    }
+
+    fn process_group(&self) -> Pid {
+        self.process_group
+    }
+
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, ProcessError> {
+        let status = self.child.try_wait().context(process_error::WaitSnafu)?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
+    }
+
+    async fn wait_for(&mut self, timeout: Duration) -> Result<bool, ProcessError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.try_wait()?.is_some() {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait(&mut self) -> Result<ExitStatus, ProcessError> {
+        let status = self.child.wait().await.context(process_error::WaitSnafu)?;
+        self.reaped = true;
+        Ok(status)
+    }
+
+    async fn terminate(&mut self) -> Result<(), ProcessError> {
+        const SIGNAL_GRACE: Duration = Duration::from_secs(1);
+
+        if self.reaped || self.try_wait()?.is_some() {
+            return Ok(());
+        }
+
+        for (signal, name) in [
+            (nix::sys::signal::Signal::SIGHUP, "SIGHUP"),
+            (nix::sys::signal::Signal::SIGTERM, "SIGTERM"),
+        ] {
+            if let Err(error) = signal::deliver(self.process_group, signal) {
+                tracing::debug!(
+                    process_group = %self.process_group,
+                    %error,
+                    %name,
+                    "failed to signal session process group"
+                );
+            }
+            if self.wait_for(SIGNAL_GRACE).await? {
+                return Ok(());
+            }
+        }
+
+        if let Err(error) = signal::deliver(self.process_group, nix::sys::signal::Signal::SIGKILL) {
+            tracing::debug!(
+                process_group = %self.process_group,
+                %error,
+                "failed to SIGKILL session process group"
+            );
+        }
+        self.wait().await?;
+        Ok(())
+    }
+}
+
+impl Drop for SessionProcess {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = signal::deliver(self.process_group, nix::sys::signal::Signal::SIGKILL);
     }
 }
 
@@ -247,6 +348,7 @@ pub async fn run_piped<R, W>(
     config: &SessionConfig,
     term: Option<&str>,
     client_env: &[(String, String)],
+    shutdown: CancellationToken,
 ) -> Result<(), ProcessError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -279,7 +381,8 @@ where
     let stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let pid = child.id().map(|id| Pid::from_raw(id as i32));
+    let mut process = SessionProcess::new(child)?;
+    let pid = Some(process.process_group());
 
     let (reader, mut writer) = channel.into_split();
     let (stop_input_tx, stop_input_rx) = tokio::sync::oneshot::channel();
@@ -287,29 +390,48 @@ where
 
     let input_handle = tokio::spawn(relay_input_piped(reader, stdin, pid, stop_input_rx));
 
-    let output_result = async {
-        relay_output_piped(
-            &mut stdout,
-            &mut stderr,
-            &mut writer,
-            &mut child,
-            &mut stop_input_tx,
-        )
-        .await?;
-        writer.eof().await.context(WriteEofSnafu)?;
-        writer.close().await.context(WriteCloseSnafu)?;
-        writer
-            .writer_mut()
-            .shutdown()
-            .await
-            .context(ShutdownSnafu)?;
-        Ok::<_, ProcessError>(())
-    }
-    .await;
+    let output_result = tokio::select! {
+        () = shutdown.cancelled() => None,
+        result = async {
+            relay_output_piped(
+                &mut stdout,
+                &mut stderr,
+                &mut writer,
+                &mut process,
+                &mut stop_input_tx,
+            )
+            .await?;
+            writer.eof().await.context(WriteEofSnafu)?;
+            writer.close().await.context(WriteCloseSnafu)?;
+            writer
+                .writer_mut()
+                .shutdown()
+                .await
+                .context(ShutdownSnafu)?;
+            Ok::<_, ProcessError>(())
+        } => Some(result),
+    };
 
     signal_input_relay_stop(&mut stop_input_tx);
     let _ = input_handle.await;
-    output_result
+    match output_result {
+        Some(Ok(())) => Ok(()),
+        Some(Err(error)) => {
+            if let Err(cleanup_error) = process.terminate().await {
+                tracing::warn!(
+                    error = %snafu::Report::from_error(&cleanup_error),
+                    "failed to clean up piped session process"
+                );
+            }
+            Err(error)
+        }
+        None => {
+            drop(stdout);
+            drop(stderr);
+            drop(writer);
+            process.terminate().await
+        }
+    }
 }
 
 /// Run a command with a PTY.
@@ -327,6 +449,7 @@ pub async fn run_pty<R, W>(
     config: &SessionConfig,
     term: Option<&str>,
     client_env: &[(String, String)],
+    shutdown: CancellationToken,
 ) -> Result<(), ProcessError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -367,9 +490,10 @@ where
         });
     }
 
-    let mut child = cmd.spawn().context(SpawnSnafu)?;
+    let child = cmd.spawn().context(SpawnSnafu)?;
     drop(cmd);
-    let pid = child.id().map(|id| Pid::from_raw(id as i32));
+    let mut process = SessionProcess::new(child)?;
+    let pid = Some(process.process_group());
 
     // Use AsyncFd-based wrappers for the PTY master. Unlike tokio::fs::File
     // (which routes every read/write through spawn_blocking and serializes
@@ -392,28 +516,46 @@ where
         stop_input_rx,
     ));
 
-    let output_result = async {
-        relay_output_pty(
-            &mut master_reader,
-            &mut writer,
-            &mut child,
-            &mut stop_input_tx,
-        )
-        .await?;
-        writer.eof().await.context(WriteEofSnafu)?;
-        writer.close().await.context(WriteCloseSnafu)?;
-        writer
-            .writer_mut()
-            .shutdown()
-            .await
-            .context(ShutdownSnafu)?;
-        Ok::<_, ProcessError>(())
-    }
-    .await;
+    let output_result = tokio::select! {
+        () = shutdown.cancelled() => None,
+        result = async {
+            relay_output_pty(
+                &mut master_reader,
+                &mut writer,
+                &mut process,
+                &mut stop_input_tx,
+            )
+            .await?;
+            writer.eof().await.context(WriteEofSnafu)?;
+            writer.close().await.context(WriteCloseSnafu)?;
+            writer
+                .writer_mut()
+                .shutdown()
+                .await
+                .context(ShutdownSnafu)?;
+            Ok::<_, ProcessError>(())
+        } => Some(result),
+    };
 
     signal_input_relay_stop(&mut stop_input_tx);
     let _ = input_handle.await;
-    output_result
+    match output_result {
+        Some(Ok(())) => Ok(()),
+        Some(Err(error)) => {
+            if let Err(cleanup_error) = process.terminate().await {
+                tracing::warn!(
+                    error = %snafu::Report::from_error(&cleanup_error),
+                    "failed to clean up PTY session process"
+                );
+            }
+            Err(error)
+        }
+        None => {
+            drop(master_reader);
+            drop(writer);
+            process.terminate().await
+        }
+    }
 }
 
 // ============================================================================
@@ -427,7 +569,7 @@ async fn relay_output_piped<W>(
     stdout: &mut (impl AsyncRead + Unpin),
     stderr: &mut (impl AsyncRead + Unpin),
     writer: &mut SshChannelWriter<W>,
-    child: &mut tokio::process::Child,
+    process: &mut SessionProcess,
     stop_input_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<std::process::ExitStatus, ProcessError>
 where
@@ -468,8 +610,8 @@ where
                     .await
                     .context(WriteExtendedDataSnafu)?;
             }
-            wait_result = child.wait(), if exit_status.is_none() => {
-                let status = wait_result.context(WaitSnafu)?;
+            wait_result = process.wait(), if exit_status.is_none() => {
+                let status = wait_result?;
                 signal_input_relay_stop(stop_input_tx);
                 send_exit_notification(writer, &status).await?;
                 exit_status = Some(status);
@@ -480,7 +622,7 @@ where
     let status = match exit_status {
         Some(status) => status,
         None => {
-            let status = child.wait().await.context(WaitSnafu)?;
+            let status = process.wait().await?;
             signal_input_relay_stop(stop_input_tx);
             send_exit_notification(writer, &status).await?;
             status
@@ -505,7 +647,7 @@ where
 async fn relay_output_pty<W>(
     master: &mut (impl AsyncRead + Unpin),
     writer: &mut SshChannelWriter<W>,
-    child: &mut tokio::process::Child,
+    process: &mut SessionProcess,
     stop_input_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<std::process::ExitStatus, ProcessError>
 where
@@ -526,8 +668,8 @@ where
                     Ok(n) => writer.data(&buf[..n]).await.context(WriteDataSnafu)?,
                 }
             }
-            wait_result = child.wait(), if exit_status.is_none() => {
-                let status = wait_result.context(WaitSnafu)?;
+            wait_result = process.wait(), if exit_status.is_none() => {
+                let status = wait_result?;
                 signal_input_relay_stop(stop_input_tx);
                 send_exit_notification(writer, &status).await?;
                 exit_status = Some(status);
@@ -538,7 +680,7 @@ where
     let status = match exit_status {
         Some(status) => status,
         None => {
-            let status = child.wait().await.context(WaitSnafu)?;
+            let status = process.wait().await?;
             signal_input_relay_stop(stop_input_tx);
             send_exit_notification(writer, &status).await?;
             status
@@ -792,6 +934,29 @@ mod tests {
         }
     }
 
+    async fn wait_for_pid(path: &Path) -> Pid {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(path).await
+                    && let Ok(raw_pid) = contents.trim().parse::<i32>()
+                {
+                    return Pid::from_raw(raw_pid);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("session command did not write its pid")
+    }
+
+    fn assert_process_reaped(pid: Pid) {
+        assert_eq!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH),
+            "session process {pid} is still alive"
+        );
+    }
+
     async fn collect_events<R, W>(channel: &mut SshChannel<R, W>) -> Vec<RecordedEvent>
     where
         R: AsyncRead + Unpin + Send,
@@ -874,6 +1039,7 @@ mod tests {
             &config,
             None,
             &[],
+            CancellationToken::new(),
         )
         .await
         .expect_err("writer shutdown failure must be reported");
@@ -898,6 +1064,7 @@ mod tests {
                 &config,
                 None,
                 &[],
+                CancellationToken::new(),
             )
             .await
         });
@@ -952,6 +1119,7 @@ mod tests {
                 &config,
                 None,
                 &[],
+                CancellationToken::new(),
             )
             .await
         });
@@ -1008,6 +1176,7 @@ mod tests {
                 &config,
                 None,
                 &[],
+                CancellationToken::new(),
             )
             .await
         });
@@ -1057,6 +1226,7 @@ mod tests {
                 &config,
                 None,
                 &[],
+                CancellationToken::new(),
             )
             .await
         });
@@ -1102,6 +1272,7 @@ mod tests {
                 &config,
                 Some("xterm-256color"),
                 &[],
+                CancellationToken::new(),
             )
             .await
         });
@@ -1133,5 +1304,87 @@ mod tests {
 
         drop(channel);
         handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_piped_cancellation_kills_and_reaps_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("piped.pid");
+        let command = format!(
+            "echo $$ > '{}'; trap '' HUP TERM; while :; do sleep 1; done",
+            pid_path.display()
+        )
+        .into_bytes();
+        let (client_stream, server_stream) = channel_pair();
+        let (server_reader, server_writer) = tokio::io::split(server_stream);
+        let config = SessionConfig::default();
+        let shutdown = CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            run_piped(
+                SshChannel::new(server_reader, server_writer),
+                CommandMode::Exec {
+                    shell: OsStr::new("/bin/sh"),
+                    command: &command,
+                },
+                &config,
+                None,
+                &[],
+                task_shutdown,
+            )
+            .await
+        });
+
+        let pid = wait_for_pid(&pid_path).await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("piped session did not stop after cancellation")
+            .unwrap()
+            .unwrap();
+        drop(client_stream);
+        assert_process_reaped(pid);
+    }
+
+    #[tokio::test]
+    async fn run_pty_cancellation_kills_and_reaps_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("pty.pid");
+        let command = format!(
+            "echo $$ > '{}'; trap '' HUP TERM; while :; do sleep 1; done",
+            pid_path.display()
+        )
+        .into_bytes();
+        let (client_stream, server_stream) = channel_pair();
+        let (server_reader, server_writer) = tokio::io::split(server_stream);
+        let pty = crate::session::pty::allocate_pty(&test_pty_request()).unwrap();
+        let config = SessionConfig::default();
+        let shutdown = CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            run_pty(
+                SshChannel::new(server_reader, server_writer),
+                CommandMode::Exec {
+                    shell: OsStr::new("/bin/sh"),
+                    command: &command,
+                },
+                pty,
+                &config,
+                Some("xterm-256color"),
+                &[],
+                task_shutdown,
+            )
+            .await
+        });
+
+        let pid = wait_for_pid(&pid_path).await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("PTY session did not stop after cancellation")
+            .unwrap()
+            .unwrap();
+        drop(client_stream);
+        assert_process_reaped(pid);
     }
 }

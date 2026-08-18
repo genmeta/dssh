@@ -83,6 +83,8 @@ pub enum RunSessionOutcome {
     ConversationClosed,
     /// At least one session channel ran and all channel tasks completed.
     SessionFinished,
+    /// The caller requested session shutdown.
+    Shutdown,
 }
 
 /// Error returned by [`run_session`].
@@ -276,6 +278,7 @@ where
 pub async fn run_session<S>(
     conversation: Arc<Conversation<S>>,
     config: SessionConfig,
+    shutdown: CancellationToken,
 ) -> Result<RunSessionOutcome, RunSessionError>
 where
     S: h3x::webtransport::Session + 'static,
@@ -284,6 +287,10 @@ where
 {
     use run_session_error::*;
 
+    if shutdown.is_cancelled() {
+        return Ok(RunSessionOutcome::Shutdown);
+    }
+
     let mut tcp_forwards: HashMap<(String, u16), AbortHandle> = HashMap::new();
     let mut unix_forwards: HashMap<String, AbortHandle> = HashMap::new();
     let mut channel_tasks: JoinSet<Result<(), crate::session::process::ProcessError>> =
@@ -291,6 +298,7 @@ where
     let mut forward_tasks: JoinSet<()> = JoinSet::new();
     let forward_relays = TaskTracker::new();
     let forward_cancel = CancellationToken::new();
+    let channel_shutdown = shutdown.child_token();
     let mut had_session = false;
     let mut outcome = RunSessionOutcome::ConversationClosed;
 
@@ -325,8 +333,12 @@ where
                     "session" => {
                         had_session = true;
                         let pending = incoming.skip_payload();
+                        let task_shutdown = channel_shutdown.child_token();
                         channel_tasks.spawn(async move {
-                            let mut channel = match pending.accept(max_msg).await {
+                            let mut channel = match tokio::select! {
+                                () = task_shutdown.cancelled() => return Ok(()),
+                                result = pending.accept(max_msg) => result,
+                            } {
                                 Ok(ch) => ch,
                                 Err(e) => {
                                     tracing::warn!(error = %snafu::Report::from_error(&e), "failed to accept session channel");
@@ -335,7 +347,10 @@ where
                             };
 
                             // Setup phase: read exec/shell/pty-req requests.
-                            let setup = match session_setup(&mut channel).await {
+                            let setup = match tokio::select! {
+                                () = task_shutdown.cancelled() => return Ok(()),
+                                result = session_setup(&mut channel) => result,
+                            } {
                                 Ok(s) => s,
                                 Err(e) => {
                                     tracing::warn!(error = %snafu::Report::from_error(&e), "session setup failed");
@@ -357,31 +372,43 @@ where
                                 } else {
                                     CommandMode::Exec { shell, command: &setup.command }
                                 };
-                                super::process::run_pty(channel, mode, pty, &config, term, &setup.client_env).await
+                                super::process::run_pty(channel, mode, pty, &config, term, &setup.client_env, task_shutdown).await
                             } else {
                                 let mode = if setup.is_shell {
                                     CommandMode::Shell { shell }
                                 } else {
                                     CommandMode::Exec { shell, command: &setup.command }
                                 };
-                                super::process::run_piped(channel, mode, &config, term, &setup.client_env).await
+                                super::process::run_piped(channel, mode, &config, term, &setup.client_env, task_shutdown).await
                             }
                         }.instrument(tracing::info_span!("session")));
                     }
                     "direct-tcpip" => {
                         let (reader, writer) = incoming.into_raw_parts();
+                        let task_shutdown = channel_shutdown.child_token();
                         channel_tasks.spawn(async move {
-                            if let Err(e) = crate::forward::direct::handle_direct_tcpip(reader, writer).await {
-                                tracing::warn!(error = %snafu::Report::from_error(&e), "direct-tcpip error");
+                            tokio::select! {
+                                () = task_shutdown.cancelled() => {}
+                                result = crate::forward::direct::handle_direct_tcpip(reader, writer) => {
+                                    if let Err(e) = result {
+                                        tracing::warn!(error = %snafu::Report::from_error(&e), "direct-tcpip error");
+                                    }
+                                }
                             }
                             Ok(())
                         }.instrument(tracing::info_span!("direct-tcpip")));
                     }
                     "direct-streamlocal@openssh.com" => {
                         let (reader, writer) = incoming.into_raw_parts();
+                        let task_shutdown = channel_shutdown.child_token();
                         channel_tasks.spawn(async move {
-                            if let Err(e) = crate::forward::direct::handle_direct_streamlocal(reader, writer).await {
-                                tracing::warn!(error = %snafu::Report::from_error(&e), "direct-streamlocal error");
+                            tokio::select! {
+                                () = task_shutdown.cancelled() => {}
+                                result = crate::forward::direct::handle_direct_streamlocal(reader, writer) => {
+                                    if let Err(e) = result {
+                                        tracing::warn!(error = %snafu::Report::from_error(&e), "direct-streamlocal error");
+                                    }
+                                }
                             }
                             Ok(())
                         }.instrument(tracing::info_span!("direct-streamlocal")));
@@ -395,9 +422,15 @@ where
                                 continue;
                             }
                         };
+                        let task_shutdown = channel_shutdown.child_token();
                         channel_tasks.spawn(async move {
-                            if let Err(e) = crate::forward::socks5::handle_socks5(reader, writer).await {
-                                tracing::warn!(error = %snafu::Report::from_error(&e), "socks5 error");
+                            tokio::select! {
+                                () = task_shutdown.cancelled() => {}
+                                result = crate::forward::socks5::handle_socks5(reader, writer) => {
+                                    if let Err(e) = result {
+                                        tracing::warn!(error = %snafu::Report::from_error(&e), "socks5 error");
+                                    }
+                                }
                             }
                             Ok(())
                         }.instrument(tracing::info_span!("socks5")));
@@ -462,8 +495,16 @@ where
                     tracing::warn!(error = %snafu::Report::from_error(&e), "forward task panicked");
                 }
             }
+
+            () = channel_shutdown.cancelled() => {
+                outcome = RunSessionOutcome::Shutdown;
+                break;
+            }
         }
     }
+
+    channel_shutdown.cancel();
+    forward_cancel.cancel();
 
     // Wait for all remaining channel tasks.
     while let Some(result) = channel_tasks.join_next().await {
@@ -492,7 +533,6 @@ where
             );
         }
     }
-    forward_cancel.cancel();
     forward_relays.close();
     forward_relays.wait().await;
 
@@ -711,6 +751,19 @@ mod tests {
             local_writer,
         ));
         (conv, remote_reader, remote_writer)
+    }
+
+    #[tokio::test]
+    async fn run_session_returns_shutdown_when_cancelled() {
+        let (conversation, _remote_reader, _remote_writer) = make_conversation().await;
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let outcome = run_session(conversation, SessionConfig::default(), shutdown)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RunSessionOutcome::Shutdown);
     }
 
     async fn remote_send_cancel_tcpip_forward(
