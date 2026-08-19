@@ -1,7 +1,7 @@
 [package]
 name = "dshell"
 description = "DShell core session, channel, and wire-format foundation"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 repository = "https://github.com/genmeta/dssh"
 license = "Apache-2.0"
